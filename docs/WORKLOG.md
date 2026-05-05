@@ -4,6 +4,62 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 12) — M3 part 2: sessions
+
+**Goal:** Land the session log — per-session sqlite WAL db that captures every RPC dispatched while attached, with the five basic endpoints (`session.create / attach / detach / list / info`). Defer `fork`, `replay`, and `export/import` (`.ldbsession`) to later M3 slices — they require more design conversation around determinism, partial state, and the tarball manifest format.
+
+**Done:**
+
+- **`src/store/session_store.{h,cpp}`** — `SessionStore(root)` ctor opens `${root}/sessions/index.db` (WAL) for the meta-index and creates `${root}/sessions/<uuid>.db` per session on `create()`. The index db lets `list()` enumerate without walking the FS or opening every per-session db. `info(id)` and `list()` aggregate `call_count` / `last_call_at` from the per-session `rpc_log` on demand (read-only open, so a Writer holding the same db doesn't block). `Writer::append(method, request, response, ok, duration_us)` inserts one row with a `ts_ns` timestamp; the dispatcher hands the writer the full `request`/`response` JSON so a future `session.replay` slice has everything it needs. UUID is 16 random bytes (`std::random_device` → 32 lower-hex chars), no new dep.
+- **Per-session schema** (M3 plan §3.4): `meta(k, v)` for name / created_at / target_id / schema_version (currently "1"); `rpc_log(seq, ts_ns, method, request, response, ok, duration_us)` with an index on `method` (an agent doing post-hoc analysis of "every type.layout call I made in this investigation" wants the index — cheap to add). The index db has its own table `sessions(id, name, target_id, created_at, path)` with a DESC index on `created_at`.
+- **Dispatcher refactor (minimal)** — split `dispatch()` into a thin outer wrapper (clock + writer.append on every call when attached) and `dispatch_inner()` (the existing routing logic). Constructor extended with a third `std::shared_ptr<store::SessionStore>` (defaulted to nullptr for unit-test ergonomics). `active_session_writer_` member set by `session.attach`, cleared by `session.detach`. The writer holds its own sqlite handle; multiple attaches replace the prior writer without leaking. Append failures inside the wrapper are logged to stderr (CLAUDE.md: stdout is reserved for JSON-RPC) and *don't* poison the response.
+- **Endpoints wired in `dispatcher.cpp`** + `describe.endpoints` (now 43, up from 38). All five session.* registered with full param/return docstrings. `session.detach` is intentionally permissive — callable when not attached and even when no SessionStore is configured (no-op `detached: false`); makes it safe for an agent to issue defensively at end-of-investigation. Detach explicitly appends its own row before clearing the writer, so the rpc_log shows a "stop" bookmark.
+- **`main.cpp`** instantiates a `SessionStore` rooted at the same path as `ArtifactStore` (single resolution of `LDB_STORE_ROOT` / `--store-root` / `$HOME/.ldb`). Same defensive pattern — startup doesn't fail if the store can't be opened; `session.*` returns -32002 with a clear message.
+- **Unit tests** (`tests/unit/test_session_store.cpp`, 11 cases / 58 assertions): create+info round-trip, target_id round-trip, missing-id returns nullopt (no throw), list newest-first by `created_at` (with explicit 10ms separation between creates), writer.append × N → info.call_count == N, ok=false rows logged too, open_writer on missing id throws, open_writer idempotent on same id (both can append against WAL), persistence across reopen, list empty for fresh root, 200-append burst doesn't drop rows. Tmpdir fixture under `temp_directory_path()`; `~/.ldb` is never touched.
+- **Dispatcher integration tests** (`tests/unit/test_dispatcher_session_log.cpp`, 5 cases / 47 assertions): create→info shows call_count=0; attach→emit RPCs→info shows count >= 4; detach→emit more→count unchanged; session.list reports multiple; bad id → -32000; missing store → -32002; create with empty name → -32602.
+- **Smoke test** (`tests/smoke/test_session.py`, TIMEOUT 30): describe-endpoints check + create×2 + attach + emit + info(>= 4) + detach + emit + info(unchanged) + list newest-first + info-with-target_id + 3 error paths + idempotent-detach. Uses `tempfile.mkdtemp(...)` → `LDB_STORE_ROOT` per the established artifact-store pattern; never touches `~/.ldb`.
+
+**Decisions:**
+
+- **UUID = 16 random bytes from `std::random_device` → 32 lower-hex chars.** No new dependency. 128 bits of entropy is past collision concern at any session scale we'll hit; the namespace is local to one operator's machine; the only consumer is the agent itself. Documented in the impl. If/when sessions need to round-trip across machines (e.g. `.ldbsession` export — deferred slice), the UUID format is RFC-4122-compatible enough that nothing has to change.
+- **`created_at` is nanoseconds, not seconds.** First impl used seconds (matching ArtifactStore); the unit test "list returns newest-first" failed because three creates inside a 10ms window all collided on the same second and the secondary sort (random uuid) is essentially random. Switched to nanoseconds. Plan §3.4 doesn't pin the granularity. Cost: an extra 9 digits in the JSON. Benefit: deterministic ordering even under burst.
+- **Per-session db AND a separate index db.** The plan sketch implies two separate things — `~/.ldb/index.db` (a global index) AND `~/.ldb/sessions/<uuid>.db` (per session). I went further and put the global index INSIDE `~/.ldb/sessions/index.db` so the artifact store's `index.db` doesn't have to know about sessions. Clean separation; can revisit if a future endpoint wants cross-cutting "all sessions touching build_id X" queries.
+- **`info()` / `list()` open the per-session db read-only on each call.** Cheaper than caching open handles, and avoids "is this handle stale because another process wrote to the WAL behind us?" complexity. With WAL the read is concurrent with any in-flight Writer. Cost: one open + close per `info()`. Re-evaluate if listing 1000+ sessions becomes a hot path.
+- **`session.attach` itself IS logged.** Plan implies it ("every subsequent call belongs to it"); detach reads more naturally as "stop logging the next thing" but the *prior* attach call is the natural breadcrumb that tells you the session started. Two consequences: (a) `info` while attached shows `call_count >= 1` immediately; (b) the dispatch wrapper observes `active_session_writer_` AFTER `dispatch_inner` returns, so the attach handler's set-the-writer side effect makes the wrapper see it as active and append. Tested explicitly.
+- **`session.detach` IS logged too** (last row before stopping). Same logic. The handler can't rely on the wrapper for this: by the time the wrapper observes the writer post-`dispatch_inner`, it's already cleared. Detach appends its own row explicitly before clearing. The wrapper's null-writer check then makes it a no-op. No double-logging.
+- **Append failures don't poison the response.** Wrapped in try/catch in the dispatch wrapper; logged to stderr (CLAUDE.md: stdout reserved for JSON-RPC) and discarded. A flaky session db must NOT make every RPC return an error — that's the failure mode that breaks an entire investigation. The downside is a silently-incomplete log; the upside is the agent's investigation continues. On balance: right tradeoff for a debugger.
+- **No provenance hook in this commit.** Plan §3.5 calls for `_provenance.snapshot` on every response. The rpc_log row carries the full response JSON, so when provenance lands later the snapshot id will appear in the logged response automatically — no additional plumbing required. Documented this expectation in the spec where the rpc_log is described.
+- **Method+params (not the JSON-RPC framing) is what's logged.** `id`, `jsonrpc` are connection-wide framing concerns; for replay, the canonical recipe is `(method, params)`. The id IS preserved in the request column for debug, but the framing fields are not.
+- **WAL with `synchronous=NORMAL`** — same convention as artifact store. Probes (next M3 slice) will need the same posture for their event drains.
+
+**Surprises / blockers:**
+
+- **The "newest first" test failed on first run.** Three `create()` calls inside a 10ms window collided on the same second-granularity `created_at`, and the secondary sort (uuid) is random. Fix was switching `created_at` to nanoseconds. Caught by the tests, which is why TDD matters — the bug never reached the smoke test (where it would have been hidden by a single-create scenario).
+- **`SessionStore::Writer` is a nested class, can't be forward-declared.** Initial dispatcher.h had a forward decl of `SessionStore`; that doesn't let me declare a `unique_ptr<SessionStore::Writer>` member. Pulled `session_store.h` into the dispatcher header. Dispatcher.h now has the (very thin) Writer interface visible to anyone including it; not a real ABI concern since dispatcher.h is internal.
+- **No JSON-RPC channel corruption observed.** Sqlite writes go to its files; the writer doesn't touch stdout. dup2-over-/dev/null guard not needed (which is consistent with ArtifactStore).
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **21/21 PASS in ~92s wall clock** on macOS arm64. unit_tests is now 183 cases / 1610 assertions (up from 167/1505; added 16 cases / 105 assertions across the two test files). Build is warning-clean under the project's `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion ...` flags.
+- New test IDs: `[store][session]` (10), `[store][session][error]` (1), `[dispatcher][session]` (2), `[dispatcher][session][error]` (3), plus `smoke_session` (0.17s).
+- `describe.endpoints` lists all 5 `session.*` methods (now 43 endpoints).
+- Manual: `~/.ldb` is NOT created during ctest. `LDB_STORE_ROOT=/tmp/foo build/bin/ldbd --stdio` creates `/tmp/foo/sessions/index.db` on first session.create call; the per-session `<uuid>.db` files appear under `/tmp/foo/sessions/`.
+
+**Deferred to later M3 slices:**
+
+- `session.fork({id, at_call?})` — branching investigations. Needs design around what "fork at call N" means: do we copy rows 1..N into a new db? Snapshot the inferior state? It's a checkpoint primitive that probably wants to compose with provenance.
+- `session.replay({id, until?})` — re-issuing logged calls. Needs a determinism story (per plan §3.5) — same `(method, params, snapshot)` MUST yield the same data, and snapshot isn't there yet.
+- `session.export({id})` / `session.import({path})` — `.ldbsession` tarball with a manifest. Format is its own design slice; pairs with `.ldbpack` (artifact tarball, also deferred).
+- Cross-cutting analytics on the rpc_log (e.g. "in this session, what was the slowest call?", "what build_ids did I touch?"). The schema supports them; the endpoints don't exist yet.
+
+**Next:**
+
+- **M3 probes** — `lldb_breakpoint` engine via `SBBreakpoint::SetCallback` C++ baton path (NOT Python, per the plan §13 risk note — Python callback overhead is the M3-critical risk). Now unblocked: probes capture into artifacts (already landed) and their dispatch is logged into sessions (just landed). Probes will be the largest single piece of remaining M3 work.
+- **`mem.dump_artifact({addr, len, name, format?})`** — small composition endpoint that reads memory and stores the result in one round-trip. Trivial to add now.
+- **dispatcher.cpp split** — file is now ~2050 lines (up from ~1700 last session); we're well past "should split" territory. Per-area files (`dispatcher_target.cpp`, `dispatcher_artifact.cpp`, `dispatcher_session.cpp`, ...) is the right shape. Probes will demand a new dispatcher anyway and that's the natural moment to do it.
+
+---
+
 ## 2026-05-05 (cont. 11) — M3 part 1: artifact store
 
 **Goal:** Land the artifact store — sqlite-indexed, on-disk blob store keyed by `(build_id, name)`, with the four CRUD-class endpoints (`artifact.put` / `artifact.get` / `artifact.list` / `artifact.tag`). Defer `.ldbpack` import/export, sessions, and probes to later M3 slices.

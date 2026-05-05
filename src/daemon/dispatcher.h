@@ -1,8 +1,10 @@
 #pragma once
 
 #include "protocol/jsonrpc.h"
+#include "store/session_store.h"
 
 #include <memory>
+#include <string>
 
 namespace ldb::backend { class DebuggerBackend; }
 namespace ldb::store   { class ArtifactStore; }
@@ -13,12 +15,19 @@ namespace ldb::daemon {
 // All handlers are synchronous in M0.
 class Dispatcher {
  public:
-  // Backend is required. The artifact store is optional only because
-  // the unit tests that pre-date M3 construct dispatchers without one;
-  // any artifact.* call against a null store returns -32002 (kBadState)
-  // with a deterministic "artifact store not configured" message.
+  // Backend is required. The artifact store and session store are
+  // optional only because the unit tests that pre-date M3 construct
+  // dispatchers without them; any artifact.* / session.* call against a
+  // null store returns -32002 (kBadState) with a deterministic "store
+  // not configured" message.
+  //
+  // When a session is "attached" (after session.attach), every dispatch
+  // — including the attach itself — appends a row to the session's
+  // rpc_log. The dispatcher is single-threaded today; the active writer
+  // is held in a plain unique_ptr without further locking.
   explicit Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
-                      std::shared_ptr<store::ArtifactStore> artifacts = {});
+                      std::shared_ptr<store::ArtifactStore> artifacts = {},
+                      std::shared_ptr<store::SessionStore> sessions = {});
   ~Dispatcher();
 
   protocol::Response dispatch(const protocol::Request& req);
@@ -26,6 +35,11 @@ class Dispatcher {
  private:
   std::shared_ptr<backend::DebuggerBackend> backend_;
   std::shared_ptr<store::ArtifactStore>     artifacts_;
+  std::shared_ptr<store::SessionStore>      sessions_;
+  // Set by session.attach, cleared by session.detach. While set, every
+  // dispatch result is appended to the session's rpc_log.
+  std::unique_ptr<store::SessionStore::Writer> active_session_writer_;
+  std::string active_session_id_;  // for info / debug
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
@@ -72,6 +86,16 @@ class Dispatcher {
   protocol::Response handle_artifact_get(const protocol::Request& req);
   protocol::Response handle_artifact_list(const protocol::Request& req);
   protocol::Response handle_artifact_tag(const protocol::Request& req);
+
+  protocol::Response handle_session_create(const protocol::Request& req);
+  protocol::Response handle_session_attach(const protocol::Request& req);
+  protocol::Response handle_session_detach(const protocol::Request& req);
+  protocol::Response handle_session_list(const protocol::Request& req);
+  protocol::Response handle_session_info(const protocol::Request& req);
+
+  // The actual routing logic; dispatch() wraps this with rpc-log
+  // bookkeeping when a session is attached.
+  protocol::Response dispatch_inner(const protocol::Request& req);
 };
 
 }  // namespace ldb::daemon

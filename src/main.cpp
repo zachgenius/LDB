@@ -3,6 +3,7 @@
 #include "daemon/stdio_loop.h"
 #include "ldb/version.h"
 #include "store/artifact_store.h"
+#include "store/session_store.h"
 #include "util/log.h"
 
 #include <cstdlib>
@@ -100,9 +101,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  auto root = resolve_store_root(store_root_arg);
   std::shared_ptr<ldb::store::ArtifactStore> artifacts;
   try {
-    auto root = resolve_store_root(store_root_arg);
     artifacts = std::make_shared<ldb::store::ArtifactStore>(root);
     ldb::log::debug(std::string("artifact store at ") + root.string());
   } catch (const std::exception& e) {
@@ -113,7 +114,18 @@ int main(int argc, char** argv) {
     ldb::log::warn(std::string("artifact store unavailable: ") + e.what());
   }
 
-  ldb::daemon::Dispatcher dispatcher(backend, artifacts);
+  std::shared_ptr<ldb::store::SessionStore> sessions;
+  try {
+    sessions = std::make_shared<ldb::store::SessionStore>(root);
+    ldb::log::debug(std::string("session store at ") + root.string() +
+                    "/sessions");
+  } catch (const std::exception& e) {
+    // Same reasoning as artifact store: don't fail startup. session.*
+    // returns -32002 when sessions is null.
+    ldb::log::warn(std::string("session store unavailable: ") + e.what());
+  }
+
+  ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher);

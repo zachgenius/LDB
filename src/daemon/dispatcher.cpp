@@ -4,8 +4,10 @@
 #include "ldb/version.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
+#include "store/session_store.h"
 #include "util/log.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -359,13 +361,58 @@ json artifact_row_to_list_json(const ldb::store::ArtifactRow& r) {
 // ----------------------------------------------------------------------------
 
 Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
-                       std::shared_ptr<store::ArtifactStore> artifacts)
+                       std::shared_ptr<store::ArtifactStore> artifacts,
+                       std::shared_ptr<store::SessionStore> sessions)
     : backend_(std::move(backend)),
-      artifacts_(std::move(artifacts)) {}
+      artifacts_(std::move(artifacts)),
+      sessions_(std::move(sessions)) {}
 
 Dispatcher::~Dispatcher() = default;
 
 Response Dispatcher::dispatch(const Request& req) {
+  using clock = std::chrono::steady_clock;
+  auto t0 = clock::now();
+  Response resp = dispatch_inner(req);
+  if (active_session_writer_) {
+    auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                     clock::now() - t0).count();
+    // Reconstruct the request-as-JSON so the rpc_log row is faithful
+    // to what the agent actually sent. We don't store the connection-
+    // wide envelope (jsonrpc, id, format) — those are framing, not
+    // semantically interesting for replay; method+params is the
+    // canonical recipe shape for a future session.replay slice.
+    json req_j;
+    req_j["method"] = req.method;
+    req_j["params"] = req.params;
+    if (req.id.has_value()) req_j["id"] = *req.id;
+
+    // Same with the response: store the data/error payload + ok bit,
+    // not the JSON-RPC framing fields.
+    json rsp_j;
+    rsp_j["ok"] = resp.ok;
+    if (resp.ok) {
+      rsp_j["data"] = resp.data;
+    } else {
+      json err;
+      err["code"] = static_cast<int>(resp.error_code);
+      err["message"] = resp.error_message;
+      if (resp.error_data.has_value()) err["data"] = *resp.error_data;
+      rsp_j["error"] = std::move(err);
+    }
+    try {
+      active_session_writer_->append(req.method, req_j, rsp_j, resp.ok,
+                                     static_cast<std::int64_t>(dt_us));
+    } catch (const std::exception& e) {
+      // A failed log append must not poison the response we're about
+      // to send. Log to stderr (the JSON-RPC channel is reserved for
+      // stdout per CLAUDE.md) and carry on.
+      log::warn(std::string("session log append failed: ") + e.what());
+    }
+  }
+  return resp;
+}
+
+Response Dispatcher::dispatch_inner(const Request& req) {
   try {
     if (req.method == "hello")              return handle_hello(req);
     if (req.method == "describe.endpoints") return handle_describe_endpoints(req);
@@ -412,6 +459,12 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "artifact.get")       return handle_artifact_get(req);
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
+
+    if (req.method == "session.create")     return handle_session_create(req);
+    if (req.method == "session.attach")     return handle_session_attach(req);
+    if (req.method == "session.detach")     return handle_session_detach(req);
+    if (req.method == "session.list")       return handle_session_list(req);
+    if (req.method == "session.info")       return handle_session_info(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -745,6 +798,51 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       "duplicates are no-ops). Returns the resulting full tag set.",
       json{{"id", "int64"}, {"tags", "array of string"}},
       json{{"tags", "array of string"}});
+
+  add("session.create",
+      "Create a new investigation session — a per-session sqlite db "
+      "under ${LDB_STORE_ROOT}/sessions/<uuid>.db that holds the "
+      "rpc_log of every call made while attached. Does NOT attach "
+      "automatically; follow with session.attach to start logging.",
+      json{{"name", "string"}, {"target_id", "string?"}},
+      json{{"id", "string"}, {"name", "string"},
+           {"created_at", "int64"}, {"path", "string"}});
+
+  add("session.attach",
+      "Activate a session: every subsequent rpc dispatched on this "
+      "connection — including this attach call — will be appended to "
+      "the session's rpc_log table. Replaces any prior attachment on "
+      "this connection.",
+      json{{"id", "string"}},
+      json{{"id", "string"}, {"name", "string"},
+           {"attached", "bool"}});
+
+  add("session.detach",
+      "Stop logging rpcs to the active session. The detach call "
+      "itself is logged before logging stops; subsequent rpcs are "
+      "not appended.",
+      json::object(),
+      json{{"detached", "bool"}});
+
+  add("session.list",
+      "Enumerate every session known to this store, sorted newest-"
+      "first by created_at. Each entry includes call_count (live "
+      "from the per-session rpc_log) so an agent can spot the "
+      "in-progress investigation.",
+      json::object(),
+      json{{"sessions",
+            "array of {id,name,created_at,call_count,path}"},
+           {"total", "uint"}});
+
+  add("session.info",
+      "Detailed view of one session: name, target_id (if any), "
+      "created_at, current call_count, last_call_at (or null), and "
+      "the absolute path to the per-session db.",
+      json{{"id", "string"}},
+      json{{"id", "string"}, {"name", "string"},
+           {"target_id", "string?"}, {"created_at", "int64"},
+           {"call_count", "int64"}, {"last_call_at", "int64?"},
+           {"path", "string"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -1834,6 +1932,166 @@ Response Dispatcher::handle_artifact_tag(const Request& req) {
   auto out_tags = artifacts_->add_tags(id, tags);
   json data;
   data["tags"] = out_tags;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// ----------------------------------------------------------------------------
+// session.* — investigation logging (M3 part 2)
+
+namespace {
+
+std::optional<Response>
+require_session_store(const Request& req,
+                      const std::shared_ptr<ldb::store::SessionStore>& s) {
+  if (s) return std::nullopt;
+  return protocol::make_err(req.id, ErrorCode::kBadState,
+                            "session store not configured "
+                            "(set --store-root or LDB_STORE_ROOT)");
+}
+
+json session_row_to_list_json(const ldb::store::SessionRow& r) {
+  json j;
+  j["id"]         = r.id;
+  j["name"]       = r.name;
+  if (r.target_id.has_value()) j["target_id"] = *r.target_id;
+  j["created_at"] = r.created_at;
+  j["call_count"] = r.call_count;
+  if (r.last_call_at.has_value()) j["last_call_at"] = *r.last_call_at;
+  j["path"]       = r.path;
+  return j;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_session_create(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name || name->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'name'");
+  }
+  std::optional<std::string> target_id;
+  if (auto it = req.params.find("target_id");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'target_id' must be a string");
+    }
+    target_id = it->get<std::string>();
+  }
+  auto row = sessions_->create(*name, std::move(target_id));
+  json data;
+  data["id"]         = row.id;
+  data["name"]       = row.name;
+  if (row.target_id.has_value()) data["target_id"] = *row.target_id;
+  data["created_at"] = row.created_at;
+  data["path"]       = row.path;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_session_attach(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* id = require_string(req.params, "id");
+  if (!id || id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'id'");
+  }
+  // open_writer throws backend::Error if the id doesn't exist; the
+  // outer dispatch() catch maps that to -32000.
+  auto writer = sessions_->open_writer(*id);
+  auto info = sessions_->info(*id);
+
+  // Replace any previously-active writer (the dispatcher only tracks
+  // one connection-wide attachment; an explicit re-attach swaps it).
+  active_session_writer_ = std::move(writer);
+  active_session_id_     = *id;
+
+  json data;
+  data["id"]       = *id;
+  if (info.has_value()) data["name"] = info->name;
+  data["attached"] = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_session_detach(const Request& req) {
+  // Detach is intentionally permissive: callable even when not attached
+  // and even when no SessionStore is configured (no-op true→false). This
+  // makes it safe for an agent to issue defensively at the end of an
+  // investigation without first checking state.
+  //
+  // Sequencing note: dispatch() observes active_session_writer_ AFTER
+  // this handler returns. To make the detach call itself appear as the
+  // last row in the rpc_log (a useful "stop" bookmark for replay), we
+  // append it explicitly here BEFORE clearing the writer. The
+  // dispatch() wrapper's append-after-detach would be a no-op anyway.
+  bool was_attached = static_cast<bool>(active_session_writer_);
+  if (was_attached) {
+    json req_j;
+    req_j["method"] = req.method;
+    req_j["params"] = req.params;
+    if (req.id.has_value()) req_j["id"] = *req.id;
+    json rsp_j;
+    rsp_j["ok"] = true;
+    rsp_j["data"] = json{{"detached", true}};
+    try {
+      active_session_writer_->append(req.method, req_j, rsp_j, true, 0);
+    } catch (const std::exception& e) {
+      log::warn(std::string("session log append (detach) failed: ") +
+                e.what());
+    }
+  }
+  active_session_writer_.reset();
+  active_session_id_.clear();
+  json data;
+  data["detached"] = was_attached;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_session_list(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  auto rows = sessions_->list();
+  json arr = json::array();
+  for (const auto& r : rows) arr.push_back(session_row_to_list_json(r));
+  json data;
+  data["sessions"] = std::move(arr);
+  data["total"]    = static_cast<std::int64_t>(rows.size());
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_session_info(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* id = require_string(req.params, "id");
+  if (!id || id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'id'");
+  }
+  auto row = sessions_->info(*id);
+  if (!row.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              "session not found: " + *id);
+  }
+  json data;
+  data["id"]         = row->id;
+  data["name"]       = row->name;
+  if (row->target_id.has_value()) data["target_id"] = *row->target_id;
+  data["created_at"] = row->created_at;
+  data["call_count"] = row->call_count;
+  if (row->last_call_at.has_value()) {
+    data["last_call_at"] = *row->last_call_at;
+  }
+  data["path"]       = row->path;
   return protocol::make_ok(req.id, std::move(data));
 }
 

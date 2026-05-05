@@ -29,6 +29,7 @@ set(LDB_UNIT_SOURCES
   test_fixture_sleeper.cpp
   test_artifact_store.cpp
   test_session_store.cpp
+  test_dispatcher_session_log.cpp
 )
 
 set(LDB_LIB_SOURCES
