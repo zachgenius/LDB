@@ -4,6 +4,51 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 5) — M2 kickoff: process lifecycle
+
+**Goal:** Open M2 with the smallest meaningful slice — process launch / state / continue / kill — synchronously against the structs fixture. Unblocks every subsequent dynamic-analysis endpoint (threads, frames, locals, memory).
+
+**Done:**
+
+- **9-case unit test** (`test_backend_process.cpp`, 30 assertions) covering the full lifecycle plus error paths: pre-launch state is `kNone`, `stop_at_entry=true` → `kStopped` with valid pid, continue → `kExited` with exit code in `[0,255]`, kill from stopped is terminal, continue/launch on bad target_id throws, kill on no-process is idempotent, relaunch auto-kills the prior process and the new pid differs.
+- **`launch_process` / `get_process_state` / `continue_process` / `kill_process`** added to `DebuggerBackend` and implemented in `LldbBackend`. Sync mode (already set in M0) makes Launch and Continue block until the next stop or terminal event. Stop reason populated from `SBThread::GetStopDescription()` best-effort.
+- **JSON-RPC layer**: `process.launch` / `process.state` / `process.continue` / `process.kill` with `state` exposed as a string enum (`"none"` | `"running"` | `"stopped"` | `"exited"` | `"crashed"` | `"detached"` | `"invalid"`). Each registered in `describe.endpoints`.
+- **Smoke test** (`test_process.sh`) runs the full lifecycle on the wire — including the proper error code (`-32000` `kBackendError`) for `continue` after `exited`, and the idempotency contract on `kill`.
+
+**Decisions:**
+
+- **Sync mode for the M2 first slice.** `SBDebugger::SetAsync(false)` was already set in M0; we lean into it. Async + event handling lands later when we need long-running fixtures or non-stop multi-thread scenarios. For the structs fixture (exits in <50ms) sync is correct.
+- **`stop_at_entry` defaults to true.** A debugger you can't pause is useless. Agents wanting "run to completion" can pass `stop_at_entry=false` (added but not yet smoke-tested explicitly).
+- **`launch_process` auto-kills any prior process.** The alternative (error on relaunch) requires the agent to track lifecycle state; auto-kill matches what `lldb` and `gdb` do at the prompt and is what an agent intuitively expects.
+- **State exposed as a lowercase string**, not the integer enum. LLMs read `"stopped"` more reliably than `4`. The mapping from `ProcessState` to string is centralized so we don't drift.
+
+**Surprises / blockers (both real, both fixed):**
+
+- **Homebrew LLVM 22.1.2 doesn't ship `debugserver` on macOS.** SBProcess::Launch silently failed with the unhelpful `"failed to launch or debug process"`. Apple's signed `debugserver` is shipped with the Command Line Tools at `/Library/Developer/CommandLineTools/.../debugserver`. Added `maybe_seed_apple_debugserver()` to set `LLDB_DEBUGSERVER_PATH` from a candidate list before `SBDebugger::Initialize`. Logs the path it picked or warns if it found nothing. Lookup is one-shot via `std::call_once` — must happen exactly once before init.
+- **`SBDebugger::Initialize` / `Terminate` are process-global and break under cycling.** First test passed; second test's `Launch` failed with the same generic error. Root cause: `LldbBackend` dtor called `SBDebugger::Terminate()`; the next test's ctor called `Initialize()` again; LLDB's internal state was corrupted. Fix: hoist `Initialize` into `std::call_once`; never call `Terminate` (process exit reaps it). Documented inline so the next person doesn't re-add the dtor call.
+
+**Verification:**
+
+- `ctest` → 10/10 PASS in 9.02s. unit_tests at 89 cases / ~487 assertions. (Process tests dominate the runtime — actual processes get spawned, that's expected.)
+- Manual: `process.launch` returns within ~100ms; `process.continue` blocks the expected ~50ms then returns `state="exited"` with `exit_code=184` — matches the byte-XOR computation in `structs.c::main`.
+
+**Next:**
+
+- **Threads & frames** are the natural follow-on:
+  - `thread.list` (id, name, state, pc, sp)
+  - `thread.frames` (per-thread backtrace via SBThread::GetFrameAtIndex; depth bounded by view.limit)
+  - `frame.locals` / `frame.args` / `frame.registers` (using SBValue, with view.fields for projection)
+  - All read-only for now; stepping (`step`/`next`/`finish`/`until`) lands as a separate commit.
+- **`target.attach`** (by pid) and **`target.load_core`** (postmortem) — same wire shape as `target.open` results plus `target_id`, but different SBAPI entry points. Worth doing alongside threads since debugging a core dump exercises the same thread/frame stack.
+- **A long-running fixture** is needed before async-mode tests. Something like a `read(stdin)` loop or `sleep(60)`. Add as a new fixture target alongside `ldb_fix_structs`.
+- **Memory primitives** (`mem.read`, `mem.read_cstr`, `mem.search`, `mem.regions`) — lightweight on top of `SBProcess::ReadMemory`; could land before threads if it's tactically useful.
+- **View retrofit on string.list / disasm / xref** still pending from the M1 close-out queue.
+- **Cleanup queue (still deferred):**
+  - `[INF] lldb backend initialized` log spam in unit tests (now that there's a `setenv` trace too, the noise is louder).
+  - `tests/smoke/test_type_layout.sh` per-id extraction.
+
+---
+
 ## 2026-05-05 (cont. 4) — M1 closes: view descriptors
 
 **Goal:** Land the last cross-cutting M1 feature — view descriptors — and wire onto `module.list` as the model endpoint. Per the prior session's "Next," first cut covers `fields` (projection), `limit`+`offset` (pagination), `summary` (count + sample). Defer `tabular`, `max_string`, `max_bytes`, cursor.
