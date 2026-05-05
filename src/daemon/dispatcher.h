@@ -38,6 +38,9 @@ class Dispatcher {
   protocol::Response handle_process_state(const protocol::Request& req);
   protocol::Response handle_process_continue(const protocol::Request& req);
   protocol::Response handle_process_kill(const protocol::Request& req);
+
+  protocol::Response handle_thread_list(const protocol::Request& req);
+  protocol::Response handle_thread_frames(const protocol::Request& req);
 };
 
 }  // namespace ldb::daemon

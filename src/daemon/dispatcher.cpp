@@ -71,6 +71,32 @@ const char* process_state_str(backend::ProcessState s) {
   return "invalid";
 }
 
+json thread_info_to_json(const backend::ThreadInfo& t) {
+  json j;
+  j["tid"]   = t.tid;
+  j["index"] = t.index;
+  j["state"] = process_state_str(t.state);
+  j["pc"]    = t.pc;
+  j["sp"]    = t.sp;
+  if (!t.name.empty())        j["name"]        = t.name;
+  if (!t.stop_reason.empty()) j["stop_reason"] = t.stop_reason;
+  return j;
+}
+
+json frame_info_to_json(const backend::FrameInfo& f) {
+  json j;
+  j["index"]  = f.index;
+  j["pc"]     = f.pc;
+  j["fp"]     = f.fp;
+  j["sp"]     = f.sp;
+  if (!f.function.empty()) j["function"] = f.function;
+  if (!f.module.empty())   j["module"]   = f.module;
+  if (!f.file.empty())     j["file"]     = f.file;
+  if (f.line > 0)          j["line"]     = f.line;
+  if (f.inlined)           j["inlined"]  = true;
+  return j;
+}
+
 json process_status_to_json(const backend::ProcessStatus& s) {
   json j;
   j["state"] = process_state_str(s.state);
@@ -203,6 +229,9 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "process.state")      return handle_process_state(req);
     if (req.method == "process.continue")   return handle_process_continue(req);
     if (req.method == "process.kill")       return handle_process_kill(req);
+
+    if (req.method == "thread.list")        return handle_thread_list(req);
+    if (req.method == "thread.frames")      return handle_thread_frames(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -346,6 +375,19 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"target_id", "uint64"}},
       json{{"state", "string"}, {"pid", "int"}});
 
+  add("thread.list",
+      "Enumerate threads of the target's process.",
+      json{{"target_id", "uint64"}},
+      json{{"threads",
+            "array of {tid,index,state,pc,sp,name?,stop_reason?}"}});
+
+  add("thread.frames",
+      "Backtrace a thread, innermost first. max_depth=0 means no cap.",
+      json{{"target_id", "uint64"}, {"tid", "uint64"},
+           {"max_depth", "uint?"}},
+      json{{"frames",
+            "array of {index,pc,fp,sp,function?,module?,file?,line?,inlined?}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -396,6 +438,49 @@ Response Dispatcher::handle_module_list(const Request& req) {
 
   return protocol::make_ok(req.id,
       protocol::view::apply_to_array(std::move(arr), view_spec, "modules"));
+}
+
+Response Dispatcher::handle_thread_list(const Request& req) {
+  std::uint64_t tid = 0;
+  if (!req.params.is_object() || !require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto threads = backend_->list_threads(static_cast<backend::TargetId>(tid));
+  json arr = json::array();
+  for (const auto& t : threads) arr.push_back(thread_info_to_json(t));
+  return protocol::make_ok(req.id, json{{"threads", std::move(arr)}});
+}
+
+Response Dispatcher::handle_thread_frames(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "tid", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'tid'");
+  }
+  std::uint64_t depth = 0;
+  if (auto it = req.params.find("max_depth"); it != req.params.end()) {
+    if (!require_uint(req.params, "max_depth", &depth)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'max_depth' must be a non-negative integer");
+    }
+  }
+  auto frames = backend_->list_frames(
+      static_cast<backend::TargetId>(target_id),
+      static_cast<backend::ThreadId>(tid),
+      static_cast<std::uint32_t>(depth));
+  json arr = json::array();
+  for (const auto& f : frames) arr.push_back(frame_info_to_json(f));
+  return protocol::make_ok(req.id, json{{"frames", std::move(arr)}});
 }
 
 Response Dispatcher::handle_process_launch(const Request& req) {

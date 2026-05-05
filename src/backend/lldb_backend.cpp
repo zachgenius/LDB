@@ -1069,6 +1069,137 @@ ProcessStatus LldbBackend::kill_process(TargetId tid) {
 }
 
 // ---------------------------------------------------------------------------
+// Threads & frames
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ThreadInfo to_thread_info(lldb::SBThread thr) {
+  ThreadInfo t;
+  if (!thr.IsValid()) return t;
+
+  t.tid    = thr.GetThreadID();
+  t.index  = thr.GetIndexID();
+  if (const char* nm = thr.GetName()) t.name = nm;
+  t.state  = map_state(thr.GetProcess().GetState());
+
+  if (thr.GetNumFrames() > 0) {
+    auto f0 = thr.GetFrameAtIndex(0);
+    if (f0.IsValid()) {
+      t.pc = f0.GetPC();
+      t.sp = f0.GetSP();
+    }
+  }
+
+  char buf[256];
+  size_t n = thr.GetStopDescription(buf, sizeof(buf));
+  if (n > 0) t.stop_reason.assign(buf, std::min(n, sizeof(buf) - 1));
+
+  return t;
+}
+
+FrameInfo to_frame_info(lldb::SBFrame frame, std::uint32_t index) {
+  FrameInfo f;
+  if (!frame.IsValid()) return f;
+
+  f.index = index;
+  f.pc    = frame.GetPC();
+  f.fp    = frame.GetFP();
+  f.sp    = frame.GetSP();
+
+  // Function preferred; fall back to symbol if function-level info absent
+  // (e.g. inside dyld where DWARF is sparse).
+  if (auto fn = frame.GetFunction(); fn.IsValid()) {
+    if (const char* nm = fn.GetName()) f.function = nm;
+  }
+  if (f.function.empty()) {
+    if (auto sym = frame.GetSymbol(); sym.IsValid()) {
+      if (const char* nm = sym.GetName()) f.function = nm;
+    }
+  }
+
+  if (auto m = frame.GetModule(); m.IsValid()) {
+    auto fs = m.GetFileSpec();
+    if (fs.IsValid()) {
+      char buf[4096];
+      if (fs.GetPath(buf, sizeof(buf)) > 0) f.module = buf;
+    }
+  }
+
+  if (auto le = frame.GetLineEntry(); le.IsValid()) {
+    auto fs = le.GetFileSpec();
+    if (fs.IsValid()) {
+      char buf[4096];
+      if (fs.GetPath(buf, sizeof(buf)) > 0) f.file = buf;
+    }
+    f.line = le.GetLine();
+  }
+
+  f.inlined = frame.IsInlined();
+
+  return f;
+}
+
+}  // namespace
+
+std::vector<ThreadInfo> LldbBackend::list_threads(TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) return {};
+
+  std::vector<ThreadInfo> out;
+  uint32_t n = proc.GetNumThreads();
+  out.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    auto thr = proc.GetThreadAtIndex(i);
+    if (thr.IsValid()) out.push_back(to_thread_info(thr));
+  }
+  return out;
+}
+
+std::vector<FrameInfo>
+LldbBackend::list_frames(TargetId tid, ThreadId thread_id,
+                         std::uint32_t max_depth) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) {
+    throw Error("no process");
+  }
+  auto thr = proc.GetThreadByID(thread_id);
+  if (!thr.IsValid()) {
+    throw Error("unknown thread id");
+  }
+
+  std::vector<FrameInfo> out;
+  uint32_t n = thr.GetNumFrames();
+  uint32_t cap = (max_depth == 0 || max_depth > n) ? n : max_depth;
+  out.reserve(cap);
+  for (uint32_t i = 0; i < cap; ++i) {
+    auto f = thr.GetFrameAtIndex(i);
+    if (f.IsValid()) out.push_back(to_frame_info(f, i));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;

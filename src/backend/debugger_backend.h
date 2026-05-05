@@ -145,6 +145,30 @@ struct LaunchOptions {
   std::vector<std::string> envp;   // future: env overrides
 };
 
+using ThreadId = std::uint64_t;   // SBThread::GetThreadID() — kernel tid
+
+struct ThreadInfo {
+  ThreadId      tid     = 0;
+  std::uint32_t index   = 0;       // 1-based LLDB index id
+  std::string   name;
+  ProcessState  state   = ProcessState::kInvalid;
+  std::uint64_t pc      = 0;
+  std::uint64_t sp      = 0;
+  std::string   stop_reason;
+};
+
+struct FrameInfo {
+  std::uint32_t  index   = 0;      // 0 = innermost
+  std::uint64_t  pc      = 0;
+  std::uint64_t  fp      = 0;
+  std::uint64_t  sp      = 0;
+  std::string    function;         // best-effort
+  std::string    module;           // owning module path
+  std::string    file;              // source file (empty if unavailable)
+  std::uint32_t  line   = 0;        // source line (0 if unavailable)
+  bool           inlined = false;
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -233,6 +257,18 @@ class DebuggerBackend {
   // Terminate the target's process. Idempotent: returns
   // ProcessStatus{state=kNone} when there is no process.
   virtual ProcessStatus kill_process(TargetId tid) = 0;
+
+  // --- Threads & frames -------------------------------------------------
+
+  // Enumerate threads of the target's process. Returns empty when no
+  // process is associated. Throws on invalid target_id.
+  virtual std::vector<ThreadInfo> list_threads(TargetId tid) = 0;
+
+  // Backtrace a thread, innermost frame first. max_depth=0 means no
+  // cap. Throws on invalid target_id or unknown thread id.
+  virtual std::vector<FrameInfo>
+      list_frames(TargetId tid, ThreadId thread_id,
+                  std::uint32_t max_depth) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

@@ -41,6 +41,10 @@ class LldbBackend final : public DebuggerBackend {
   ProcessStatus continue_process(TargetId tid) override;
   ProcessStatus kill_process(TargetId tid) override;
 
+  std::vector<ThreadInfo> list_threads(TargetId tid) override;
+  std::vector<FrameInfo>  list_frames(TargetId tid, ThreadId thread_id,
+                                      std::uint32_t max_depth) override;
+
   void close_target(TargetId tid) override;
 
  private:
