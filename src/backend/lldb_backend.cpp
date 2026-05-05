@@ -1,8 +1,10 @@
 #include "backend/lldb_backend.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include <lldb/API/LLDB.h>
 
@@ -362,6 +364,204 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
     m.module_path = module_path_of(sym, target, start_addr);
 
     out.push_back(std::move(m));
+  }
+
+  return out;
+}
+
+namespace {
+
+bool is_print_ascii(unsigned char c) {
+  // strings(1) treats tab as printable. We accept space..~ plus tab.
+  return c == 0x09 || (c >= 0x20 && c <= 0x7E);
+}
+
+// True if section's classified type is "data" (per our M0 classification).
+bool is_data_section(lldb::SBSection sec) {
+  switch (sec.GetSectionType()) {
+    case lldb::eSectionTypeData:
+    case lldb::eSectionTypeDataCString:
+    case lldb::eSectionTypeDataCStringPointers:
+    case lldb::eSectionTypeDataSymbolAddress:
+    case lldb::eSectionTypeData4:
+    case lldb::eSectionTypeData8:
+    case lldb::eSectionTypeData16:
+    case lldb::eSectionTypeDataPointers:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::string full_section_name(lldb::SBSection sec) {
+  // Walk up the parent chain so we get e.g. "__TEXT/__cstring" not "__cstring".
+  std::vector<std::string> parts;
+  for (auto cur = sec; cur.IsValid(); cur = cur.GetParent()) {
+    if (const char* nm = cur.GetName()) parts.emplace_back(nm);
+  }
+  std::string out;
+  for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+    if (!out.empty()) out.push_back('/');
+    out += *it;
+  }
+  return out;
+}
+
+bool module_path_matches(lldb::SBModule mod, const std::string& want) {
+  auto fs = mod.GetFileSpec();
+  if (!fs.IsValid()) return false;
+  char buf[4096];
+  if (fs.GetPath(buf, sizeof(buf)) <= 0) return false;
+  std::string path = buf;
+  if (path == want) return true;
+  // Allow basename match.
+  if (auto slash = path.rfind('/'); slash != std::string::npos) {
+    if (path.substr(slash + 1) == want) return true;
+  }
+  return false;
+}
+
+void scan_section_for_strings(lldb::SBSection sec, lldb::SBTarget target,
+                              const StringQuery& q,
+                              const std::string& module_path,
+                              std::vector<StringMatch>& out) {
+  if (!sec.IsValid()) return;
+
+  auto data = sec.GetSectionData();
+  if (!data.IsValid()) return;
+
+  size_t n = data.GetByteSize();
+  if (n == 0) return;
+
+  // SBData::ReadRawData copies into a buffer. Read the whole section
+  // (sections we care about are kilobytes, not gigabytes).
+  std::vector<unsigned char> bytes(n);
+  lldb::SBError err;
+  data.ReadRawData(err, /*offset=*/0, bytes.data(), n);
+  if (err.Fail()) return;
+
+  std::uint64_t base = sec.GetFileAddress();
+  std::string sec_name = full_section_name(sec);
+
+  size_t i = 0;
+  while (i < n) {
+    if (!is_print_ascii(bytes[i])) {
+      ++i;
+      continue;
+    }
+    size_t start = i;
+    while (i < n && is_print_ascii(bytes[i])) ++i;
+    size_t len = i - start;
+
+    if (len >= q.min_length &&
+        (q.max_length == 0 || len <= q.max_length)) {
+      StringMatch m;
+      m.text.assign(reinterpret_cast<const char*>(&bytes[start]), len);
+      m.address     = base + start;
+      m.section     = sec_name;
+      m.module_path = module_path;
+      out.push_back(std::move(m));
+    }
+
+    // Skip the terminator (NUL or non-printable byte) and continue.
+    if (i < n) ++i;
+  }
+
+  // Recurse into subsections — top-level segments (__TEXT, __DATA_CONST)
+  // are containers whose subsections (__TEXT/__cstring, ...) hold the
+  // actual bytes.
+  size_t nsub = sec.GetNumSubSections();
+  for (size_t k = 0; k < nsub; ++k) {
+    auto sub = sec.GetSubSectionAtIndex(k);
+    if (sub.IsValid()) {
+      scan_section_for_strings(sub, target, q, module_path, out);
+    }
+  }
+}
+
+void scan_module_for_strings(lldb::SBModule mod, lldb::SBTarget target,
+                             const StringQuery& q,
+                             std::vector<StringMatch>& out) {
+  if (!mod.IsValid()) return;
+
+  // Compute module path once.
+  std::string module_path;
+  {
+    auto fs = mod.GetFileSpec();
+    if (fs.IsValid()) {
+      char buf[4096];
+      if (fs.GetPath(buf, sizeof(buf)) > 0) module_path = buf;
+    }
+  }
+
+  size_t nsec = mod.GetNumSections();
+  for (size_t i = 0; i < nsec; ++i) {
+    auto sec = mod.GetSectionAtIndex(i);
+    if (!sec.IsValid()) continue;
+
+    if (!q.section_name.empty()) {
+      // Top-level + recursive descent finds the named section anywhere.
+      // Walk the tree depth-first; only scan the matching node (no
+      // siblings).
+      std::function<void(lldb::SBSection)> visit = [&](lldb::SBSection s) {
+        if (!s.IsValid()) return;
+        if (full_section_name(s) == q.section_name) {
+          scan_section_for_strings(s, target, q, module_path, out);
+          return;
+        }
+        size_t nk = s.GetNumSubSections();
+        for (size_t k = 0; k < nk; ++k) visit(s.GetSubSectionAtIndex(k));
+      };
+      visit(sec);
+      continue;
+    }
+
+    // Default: scan only "data"-classified sections (recursively).
+    std::function<void(lldb::SBSection)> visit = [&](lldb::SBSection s) {
+      if (!s.IsValid()) return;
+      if (is_data_section(s)) {
+        scan_section_for_strings(s, target, q, module_path, out);
+        // scan_section_for_strings already recurses into subsections, so
+        // we don't double-recurse here.
+        return;
+      }
+      size_t nk = s.GetNumSubSections();
+      for (size_t k = 0; k < nk; ++k) visit(s.GetSubSectionAtIndex(k));
+    };
+    visit(sec);
+  }
+}
+
+}  // namespace
+
+std::vector<StringMatch>
+LldbBackend::find_strings(TargetId tid, const StringQuery& query) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  std::vector<StringMatch> out;
+
+  uint32_t nmods = target.GetNumModules();
+  for (uint32_t mi = 0; mi < nmods; ++mi) {
+    auto mod = target.GetModuleAtIndex(mi);
+    if (!mod.IsValid()) continue;
+
+    if (query.module_path.empty()) {
+      // Default scope: main executable only (module index 0).
+      if (mi != 0) continue;
+    } else if (query.module_path != "*") {
+      if (!module_path_matches(mod, query.module_path)) continue;
+    }
+    // "*" matches all modules; fall through.
+
+    scan_module_for_strings(mod, target, query, out);
   }
 
   return out;

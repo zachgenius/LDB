@@ -78,6 +78,27 @@ struct SymbolMatch {
   std::string module_path;     // path of the owning module
 };
 
+struct StringQuery {
+  // Restrict the scan to a single module, matched by exact path or by
+  // basename. Empty (default) → main executable only. Special value
+  // "*" → every loaded module.
+  std::string module_path;
+
+  // Restrict the scan to a single section (e.g. "__TEXT/__cstring",
+  // ".rodata"). Empty (default) → all sections classified as "data".
+  std::string section_name;
+
+  std::uint32_t min_length = 4;
+  std::uint32_t max_length = 0;  // 0 = no cap
+};
+
+struct StringMatch {
+  std::string text;
+  std::uint64_t address = 0;     // file address of the first byte
+  std::string  section;          // owning section (e.g. "__TEXT/__cstring")
+  std::string  module_path;      // owning module
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -104,6 +125,13 @@ class DebuggerBackend {
   // Throws backend::Error for invalid target_id.
   virtual std::vector<SymbolMatch>
       find_symbols(TargetId tid, const SymbolQuery& query) = 0;
+
+  // Enumerate ASCII strings (printable runs) inside a target's data
+  // sections. Default scope is the main executable; the query can
+  // narrow by module / section and bound length. Throws backend::Error
+  // for invalid target_id.
+  virtual std::vector<StringMatch>
+      find_strings(TargetId tid, const StringQuery& query) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

@@ -44,6 +44,15 @@ bool parse_symbol_kind(const std::string& s, backend::SymbolKind* out) {
   return false;
 }
 
+json string_match_to_json(const backend::StringMatch& s) {
+  json j;
+  j["text"]    = s.text;
+  j["addr"]    = s.address;
+  j["section"] = s.section;
+  j["module"]  = s.module_path;
+  return j;
+}
+
 json symbol_match_to_json(const backend::SymbolMatch& s) {
   json j;
   j["name"]    = s.name;
@@ -126,6 +135,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "module.list")        return handle_module_list(req);
     if (req.method == "type.layout")        return handle_type_layout(req);
     if (req.method == "symbol.find")        return handle_symbol_find(req);
+    if (req.method == "string.list")        return handle_string_list(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -202,6 +212,14 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"matches",
             "array of {name,kind,addr,sz,module,mangled?}"}});
 
+  add("string.list",
+      "Enumerate ASCII strings (printable runs) in the target's data "
+      "sections. Default scope is the main executable.",
+      json{{"target_id", "uint64"},
+           {"min_len", "uint?"}, {"max_len", "uint?"},
+           {"section", "string?"}, {"module", "string?"}},
+      json{{"strings", "array of {text,addr,section,module}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -248,6 +266,44 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
   return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+}
+
+Response Dispatcher::handle_string_list(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+
+  backend::StringQuery q;
+  if (auto v = req.params.find("min_len"); v != req.params.end()) {
+    std::uint64_t tmp = 0;
+    if (!require_uint(req.params, "min_len", &tmp)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'min_len' must be a non-negative integer");
+    }
+    q.min_length = static_cast<std::uint32_t>(tmp);
+  }
+  if (auto v = req.params.find("max_len"); v != req.params.end()) {
+    std::uint64_t tmp = 0;
+    if (!require_uint(req.params, "max_len", &tmp)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'max_len' must be a non-negative integer");
+    }
+    q.max_length = static_cast<std::uint32_t>(tmp);
+  }
+  if (const auto* s = require_string(req.params, "section")) q.section_name = *s;
+  if (const auto* s = require_string(req.params, "module"))  q.module_path  = *s;
+
+  auto strings = backend_->find_strings(
+      static_cast<backend::TargetId>(tid), q);
+  json arr = json::array();
+  for (const auto& s : strings) arr.push_back(string_match_to_json(s));
+  return protocol::make_ok(req.id, json{{"strings", std::move(arr)}});
 }
 
 Response Dispatcher::handle_symbol_find(const Request& req) {

@@ -24,6 +24,8 @@ class LldbBackend final : public DebuggerBackend {
       find_type_layout(TargetId tid, const std::string& name) override;
   std::vector<SymbolMatch>
       find_symbols(TargetId tid, const SymbolQuery& query) override;
+  std::vector<StringMatch>
+      find_strings(TargetId tid, const StringQuery& query) override;
   void close_target(TargetId tid) override;
 
  private:

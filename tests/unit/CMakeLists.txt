@@ -9,6 +9,7 @@ set(LDB_UNIT_SOURCES
   test_protocol_jsonrpc.cpp
   test_backend_type_layout.cpp
   test_backend_symbol_find.cpp
+  test_backend_string_list.cpp
 )
 
 set(LDB_LIB_SOURCES
