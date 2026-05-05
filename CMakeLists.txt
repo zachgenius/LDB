@@ -76,6 +76,28 @@ add_library(ldb_lldb INTERFACE)
 target_include_directories(ldb_lldb SYSTEM INTERFACE "${LDB_LLDB_INCLUDE_DIR}")
 target_link_libraries(ldb_lldb INTERFACE "${LDB_LLDB_LIBRARY}")
 
+# ----- SQLite3 ------------------------------------------------------------
+#
+# Used by the artifact store (M3) — sqlite-indexed, on-disk blob store
+# at ${root}/index.db, blobs under ${root}/builds/<build-id>/artifacts/.
+# The same dep will also back sessions (M3) and any other on-disk index
+# we add later. Required, not optional — the artifact endpoints are part
+# of the canonical RPC surface from M3 onward.
+
+find_package(SQLite3 QUIET)
+if(NOT SQLite3_FOUND)
+  # macOS Homebrew installs sqlite under /opt/homebrew/opt/sqlite (the
+  # system /usr/lib/libsqlite3.dylib is also fine on darwin, but the
+  # bundled Homebrew sqlite is newer). Hint, then retry.
+  if(APPLE AND EXISTS "/opt/homebrew/opt/sqlite")
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/sqlite")
+  elseif(EXISTS "/usr/local/opt/sqlite")
+    list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/sqlite")
+  endif()
+  find_package(SQLite3 REQUIRED)
+endif()
+message(STATUS "ldb: sqlite3 ${SQLite3_VERSION} at ${SQLite3_LIBRARIES}")
+
 if(APPLE)
   # Make sure the linked dylib is found at runtime without DYLD_LIBRARY_PATH
   set(CMAKE_INSTALL_RPATH "${LDB_LLDB_ROOT}/lib")

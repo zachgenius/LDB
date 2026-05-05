@@ -6,6 +6,7 @@
 
 set(LDB_UNIT_SOURCES
   unit_main.cpp
+  test_sqlite_connectivity.cpp
   test_protocol_jsonrpc.cpp
   test_protocol_view.cpp
   test_backend_type_layout.cpp
@@ -59,6 +60,7 @@ target_link_libraries(ldb_unit_tests PRIVATE
   ldb_json
   ldb_lldb
   ldb_warnings
+  SQLite::SQLite3
 )
 
 # Fixture binaries consumed by tests at runtime. Paths are baked into
