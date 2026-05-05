@@ -4,6 +4,44 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 2) — M1 continued: string.list and disasm.{range,function}
+
+**Goal:** Continue M1 endpoint TDD per the previous session's "Next." Build out `string.list` (the rodata scanner) and the disasm pair (`disasm.range` + `disasm.function`). Both unblock `string.xref` / `xref.*` for the next push.
+
+**Done:**
+
+- **`string.list` endpoint** (commit `a895cb9`): 8-case unit test (TDD-fail first), backend `find_strings` walking module sections, raw bytes via `SBSection::GetSectionData()` + `SBData::ReadRawData()`, scanning for printable-ASCII runs (space..~ plus tab — same alphabet as `strings(1)`). Recurses into subsections so Mach-O `__TEXT/__cstring` is reachable from its `__TEXT` parent. Wire shape: `{strings:[{text,addr,section,module}]}`. Smoke test exercises default scan (finds both fixture strings), `min_len=10` (drops "DXP/1.0"), `min_len=100` (drops both), nonexistent section → empty, negative `min_len` → -32602.
+- **`disasm.range` and `disasm.function` endpoints** (commit `ba04e7e`): 7-case unit test asserting invariants rather than mnemonics (every insn within range, addresses strictly increasing, `bytes.size() == byte_size`, function ends with a ret-family insn). Backend `disassemble_range` via `ResolveFileAddress` + `ReadInstructions`. Wire layer exposes both endpoints from one backend method: `disasm.range` is a thin pass-through; `disasm.function` composes `find_symbols(kind=function)` → range → `disassemble_range`. Bytes serialized as space-separated lowercase hex.
+
+**Decisions:**
+
+- **`string.list` defaults to main executable only.** Scanning every loaded module on macOS returns the entire libSystem string table (10K+ entries) — useless for agent context. Override via `module:"*"` (all) or a path/basename. Documented in the commit and in `describe.endpoints`.
+- **Default `string.list` section selection** is anything classified as "data" (per M0's `eSectionType`-to-string mapping). Section names are slash-joined hierarchical (`__TEXT/__cstring`) so the override is unambiguous.
+- **`disasm.range` upper-bounds the count by `(end-start)`.** Assumes ≥1 byte/insn — always sufficient. On ARM64 (4 bytes/insn) we ask for 4× too many but `ReadInstructions` returns only what fits. We trim instructions whose address ≥ end_addr to handle the boundary case.
+- **`disasm.function` returns `{found:false}` for unknown names**, matching the `type.layout` precedent. Agents can branch on `found` instead of relying on errors.
+- **Bytes as hex strings, not arrays.** A 4-byte ARM64 insn is `"08 00 80 d2"` — 11 bytes — vs `[8,0,128,210]` JSON which is 13. Hex also reads naturally; arrays don't. Will revisit if/when we add CBOR (binary becomes free).
+
+**Surprises / blockers:**
+
+- **`SBInstructionList::GetSize()` return type drift.** First build produced a `-Wshorten-64-to-32` warning. Switched the loop to `size_t`, casting only at the `GetInstructionAtIndex(uint32_t)` call site. Worth grepping for similar narrowings as we add more SBAPI usage.
+- **`SBSection::GetSubSectionAtIndex` recursion blew up briefly** in `scan_module_for_strings`. Initial code recursed twice (once from `scan_section_for_strings`, once from the caller), yielding duplicated strings. Fixed by making `scan_section_for_strings` own the recursion and the caller do top-level dispatch only.
+- **`SBAddress::SetLoadAddress` vs file address semantics on a non-running target.** Both ended up identical for our case (no process, no relocation). `target.ResolveFileAddress` is the cleanest entry point and is what we used.
+
+**Verification:**
+
+- `ctest --output-on-failure` → 6/6 PASS in 1.36s:
+  - `smoke_hello`, `smoke_type_layout`, `smoke_symbol_find`, `smoke_string_list`, `smoke_disasm`, `unit_tests` (49 cases / ~325 assertions).
+- Manual: `disasm.function` on `point2_distance_sq` returns 24 ARM64 instructions, ending in `retab` (Apple's auth-ret variant — the test's `looks_like_return` correctly catches it).
+
+**Next:**
+
+- `xref.addr` and `xref.imm` — these are the substrate `string.xref` will compose on. Approach: walk `disassemble_range` over each code section, parse operand strings for hex literals + use the SBInstruction comment field where LLDB has resolved a target. Fragile; expect arch-specific edge cases. ARM64 ADRP/ADD pairs are the main pattern; LLDB's disassembler tends to annotate the resolved address in the second operand of the pair.
+- `string.xref` as a thin composition: locate string by text or address (extending `find_strings` if needed), then `xref.addr` against that address.
+- **View descriptors** are still pending. Should land on `module.list` as the model endpoint before retrofit. Suggested first-cut features: `fields` (projection), `limit` + `offset` (pagination), `summary` (count + sample). Defer `tabular`, `max_string`, `max_bytes` until needed by an actual test case.
+- Consider downgrading the `[INF] lldb backend initialized` log spam — emitted once per Catch2 test case in the unit suite. Cosmetic; not a blocker.
+
+---
+
 ## 2026-05-05 (cont.) — M1 kickoff: harness, fixture, type.layout, symbol.find
 
 **Goal:** Stand up the unit-test harness, create a static-analysis fixture binary, and TDD the first two M1 endpoints (`type.layout` and `symbol.find`). Per the prior session's plan, this is the first session running under strict TDD per `CLAUDE.md`.
