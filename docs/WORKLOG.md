@@ -4,6 +4,49 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 6) — M2: thread.list + thread.frames
+
+**Goal:** Land thread enumeration and per-thread backtrace. Together with the M2 process lifecycle, an agent can now launch a binary, observe what threads exist, and inspect each thread's stack — the foundation for every subsequent dynamic-analysis primitive.
+
+**Done:**
+
+- **9-case unit test** (`test_backend_threads.cpp`, 37 assertions) covering both endpoints. Asserts on shape and invariants rather than specific entry-point function names (which differ macOS/Linux): at least one thread, tids unique, every frame has a non-zero pc, indices are 0..N, `max_depth` caps correctly, bogus tid throws.
+- **`ThreadInfo` / `FrameInfo`** added to `DebuggerBackend` along with `list_threads` / `list_frames`. `ThreadId` aliased to `uint64` (= `SBThread::GetThreadID()`, kernel-level); LLDB's 1-based index id also exposed for human display. `list_frames` walks `SBThread::GetFrameAtIndex`; function name preferred via `SBFunction`, fallback to `SBSymbol` for dyld-style frames whose DWARF is sparse; source file/line via `SBLineEntry`.
+- **Wire layer**: `thread.list` and `thread.frames` JSON-RPC endpoints registered in `describe.endpoints`. Optional fields (name, stop_reason, file, line, inlined, module) omitted when empty so the agent's context window is bounded.
+- **Smoke test in Python** (`test_threads.py`): bash chained-stdin couldn't express the cross-request data dependency (we need `tid` from response N for request N+1, against the *same* live process). Switched to `subprocess.Popen`-driven interactive smoke. Pattern is reusable for any future test that needs to thread state across requests.
+
+**Decisions:**
+
+- **`ThreadId = SBThread::GetThreadID()` not the index id.** Kernel-level tids match what `ps`, `top`, and stack traces from elsewhere show. The 1-based index id is also exposed for human display, but lookups go through the kernel tid.
+- **`list_threads` returns empty (not throws) when there's no process.** Symmetric with `process.state` returning `kNone`. Agents differentiate "no process" from "no threads in process" via the proc state, not via this endpoint's error path.
+- **`max_depth=0` means no cap**, matching the convention from view descriptors. `max_depth=N` returns up to N frames innermost-first.
+- **Function-then-symbol fallback** in `to_frame_info` matters in dyld frames where function-level DWARF is absent. Without it, frame.function is empty for any non-app code; the symbol fallback gives the user `_dyld_start`-class names where they exist.
+- **Smoke harness gets a Python branch.** Now there are two smoke patterns: bash (chained stdin) for sequence-tests, Python (Popen) for cross-request-state tests. Both invoked uniformly via `add_test`. Worth promoting to a small `tests/smoke/_shared.py` if a third Python smoke test joins.
+
+**Surprises / blockers:**
+
+- **First smoke attempt was bash, and failed on r5.** Chained stdin meant we could capture output but couldn't feed an extracted TID back into the same conversation — the second invocation's launched process has different TIDs. Switched to Python-driven Popen interaction inside ten minutes; the test now reads each response before composing the next.
+- **`tests/CMakeLists.txt` was updated to invoke `python3 ...`** explicitly. CMake's `add_test(COMMAND ...)` with the script as the first argument failed with "Unable to find executable: ...sh" because we'd renamed but the build dir still referenced the old name; reconfigure fixed it.
+
+**Verification:**
+
+- `ctest` → 11/11 PASS in 18.91s. unit_tests is 98 cases / ~524 assertions; total includes 6 process+thread test cases that each spawn a real inferior, so wall clock grew from 9s to 19s. Acceptable for now; consider gating these behind `--include` in CI when we get to a multi-platform matrix.
+- Manual: `thread.frames` against the entry-point stop returns 1 frame on macOS arm64 (just `_dyld_start`); on Linux it'd typically be more (dyld + libc start). Either way the assertion `>=1` holds.
+
+**Next:**
+
+- **`frame.locals` / `frame.args` / `frame.registers`** — these need `SBFrame::GetVariables` (locals + args) and `SBFrame::GetRegisters` plus `SBValue` walking. SBValue is the meaty abstraction; rolling its conversion to JSON is the bulk of the work. View descriptors apply naturally (`fields` to project, `summary` to cap deep struct walks).
+- **`target.attach`** (by PID) — needed for the user's stated workflow (attach to the running `quoter` process on `192.168.191.90`). API mirrors `process.launch` at the wire layer; backend uses `SBTarget::AttachToProcessWithID`.
+- **`target.load_core`** — postmortem path. Reuses every read-only endpoint we've built (target, modules, sections, types, symbols, threads, frames). Worth doing before too long because debugging a core is *the* lowest-friction integration test for everything we have.
+- **Memory primitives** (`mem.read`, `mem.read_cstr`, `mem.search`, `mem.regions`) — light wrappers on `SBProcess::ReadMemory`. Useful immediately for the user's "extract btp_schema.xml from the buffer" pattern once we have a long-running fixture.
+- **Long-running fixture** still pending. Suggested: a small C program that opens a socket, writes a known buffer, and `pause()`s. That gives us a process to attach to AND a buffer to extract.
+- **Cleanup queue (still deferred):**
+  - `[INF] lldb backend initialized` log spam.
+  - `tests/smoke/test_type_layout.sh` per-id extraction tightening.
+  - View retrofit on string.list / disasm / xref / symbol.find / type.layout.
+
+---
+
 ## 2026-05-05 (cont. 5) — M2 kickoff: process lifecycle
 
 **Goal:** Open M2 with the smallest meaningful slice — process launch / state / continue / kill — synchronously against the structs fixture. Unblocks every subsequent dynamic-analysis endpoint (threads, frames, locals, memory).
