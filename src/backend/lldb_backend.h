@@ -20,6 +20,8 @@ class LldbBackend final : public DebuggerBackend {
 
   OpenResult open_executable(const std::string& path) override;
   std::vector<Module> list_modules(TargetId tid) override;
+  std::optional<TypeLayout>
+      find_type_layout(TargetId tid, const std::string& name) override;
   void close_target(TargetId tid) override;
 
  private:

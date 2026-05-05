@@ -190,6 +190,85 @@ std::vector<Module> LldbBackend::list_modules(TargetId tid) {
   return out;
 }
 
+std::optional<TypeLayout>
+LldbBackend::find_type_layout(TargetId tid, const std::string& name) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // FindFirstType matches "name" or "struct name" / "class name".
+  auto sb_type = target.FindFirstType(name.c_str());
+  if (!sb_type.IsValid()) {
+    return std::nullopt;
+  }
+
+  TypeLayout out;
+  if (const char* nm = sb_type.GetName()) {
+    out.name = nm;
+  } else {
+    out.name = name;
+  }
+
+  // GetByteSize returns size in bytes; SBAPI lacks a direct alignment query,
+  // so we infer alignment from the maximum field alignment requirement.
+  out.byte_size = sb_type.GetByteSize();
+
+  uint32_t nfields = sb_type.GetNumberOfFields();
+  out.fields.reserve(nfields);
+
+  std::uint64_t inferred_alignment = 1;
+
+  for (uint32_t i = 0; i < nfields; ++i) {
+    auto sb_field = sb_type.GetFieldAtIndex(i);
+    if (!sb_field.IsValid()) continue;
+
+    Field f;
+    if (const char* fname = sb_field.GetName()) f.name = fname;
+
+    auto field_type = sb_field.GetType();
+    if (field_type.IsValid()) {
+      if (const char* tn = field_type.GetName()) f.type_name = tn;
+      f.byte_size = field_type.GetByteSize();
+    }
+
+    // GetOffsetInBytes is the offset of this member from the struct start.
+    f.offset = sb_field.GetOffsetInBytes();
+
+    // Track inferred alignment as max(field_size) for primitive-shaped fields.
+    if (f.byte_size > 0 &&
+        (f.byte_size & (f.byte_size - 1)) == 0 &&     // power of two
+        f.byte_size <= 16) {                           // primitive-ish cap
+      if (f.byte_size > inferred_alignment) {
+        inferred_alignment = f.byte_size;
+      }
+    }
+
+    out.fields.push_back(std::move(f));
+  }
+
+  // Compute holes_after: bytes between the end of field i and the start of
+  // field i+1 (or the end of the struct for the last field).
+  for (size_t i = 0; i < out.fields.size(); ++i) {
+    std::uint64_t end_of_this = out.fields[i].offset + out.fields[i].byte_size;
+    std::uint64_t next_start  = (i + 1 < out.fields.size())
+                                  ? out.fields[i + 1].offset
+                                  : out.byte_size;
+    out.fields[i].holes_after = (next_start > end_of_this)
+                                  ? next_start - end_of_this
+                                  : 0;
+    out.holes_total += out.fields[i].holes_after;
+  }
+
+  out.alignment = inferred_alignment;
+  return out;
+}
+
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
   {

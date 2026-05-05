@@ -26,6 +26,28 @@ json section_to_json(const backend::Section& s) {
   return j;
 }
 
+json field_to_json(const backend::Field& f) {
+  json j;
+  j["name"]        = f.name;
+  j["type"]        = f.type_name;
+  j["off"]         = f.offset;
+  j["sz"]          = f.byte_size;
+  j["holes_after"] = f.holes_after;
+  return j;
+}
+
+json type_layout_to_json(const backend::TypeLayout& t) {
+  json j;
+  j["name"]        = t.name;
+  j["byte_size"]   = t.byte_size;
+  j["alignment"]   = t.alignment;
+  j["holes_total"] = t.holes_total;
+  json arr = json::array();
+  for (const auto& f : t.fields) arr.push_back(field_to_json(f));
+  j["fields"] = std::move(arr);
+  return j;
+}
+
 json module_to_json(const backend::Module& m) {
   json j;
   j["path"] = m.path;
@@ -73,6 +95,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "target.open")        return handle_target_open(req);
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "module.list")        return handle_module_list(req);
+    if (req.method == "type.layout")        return handle_type_layout(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -134,6 +157,13 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"target_id", "uint64"}},
       json{{"modules", "array"}});
 
+  add("type.layout",
+      "Look up a struct/class/union by name and return its memory layout",
+      json{{"target_id", "uint64"}, {"name", "string"}},
+      json{{"found", "bool"},
+           {"layout",
+            "object{name,byte_size,alignment,fields[],holes_total}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -180,6 +210,35 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
   return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+}
+
+Response Dispatcher::handle_type_layout(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'name'");
+  }
+
+  auto layout = backend_->find_type_layout(
+      static_cast<backend::TargetId>(tid), *name);
+
+  json data;
+  if (layout.has_value()) {
+    data["found"]  = true;
+    data["layout"] = type_layout_to_json(*layout);
+  } else {
+    data["found"]  = false;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 }  // namespace ldb::daemon

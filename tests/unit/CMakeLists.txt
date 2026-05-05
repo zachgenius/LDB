@@ -7,11 +7,13 @@
 set(LDB_UNIT_SOURCES
   unit_main.cpp
   test_protocol_jsonrpc.cpp
+  test_backend_type_layout.cpp
 )
 
 set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.cpp
   ${CMAKE_SOURCE_DIR}/src/util/log.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.
@@ -35,7 +37,16 @@ target_include_directories(ldb_unit_tests PRIVATE
 target_link_libraries(ldb_unit_tests PRIVATE
   ldb_catch2
   ldb_json
+  ldb_lldb
   ldb_warnings
+)
+
+# The fixture binary is consumed by tests at runtime. The path is baked
+# into the test binary via a compile-time definition; keeping it as
+# $<TARGET_FILE:...> ensures the build-system knows we depend on it.
+add_dependencies(ldb_unit_tests ldb_fix_structs)
+target_compile_definitions(ldb_unit_tests PRIVATE
+  LDB_FIXTURE_STRUCTS_PATH="$<TARGET_FILE:ldb_fix_structs>"
 )
 
 add_test(

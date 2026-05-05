@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,23 @@ struct OpenResult {
   std::vector<Module> modules;    // typically the executable itself
 };
 
+struct Field {
+  std::string name;
+  std::string type_name;          // best-effort; whatever DWARF reports
+  std::uint64_t offset = 0;       // bytes from struct start
+  std::uint64_t byte_size = 0;
+  std::uint64_t holes_after = 0;  // alignment gap before the next field
+                                  // (or before end-of-struct for the last)
+};
+
+struct TypeLayout {
+  std::string name;
+  std::uint64_t byte_size = 0;
+  std::uint64_t alignment = 0;
+  std::vector<Field> fields;
+  std::uint64_t holes_total = 0;  // sum of all internal holes (padding)
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -53,6 +71,12 @@ class DebuggerBackend {
 
   // Enumerate modules associated with a target.
   virtual std::vector<Module> list_modules(TargetId tid) = 0;
+
+  // Look up a struct/class/union by unqualified or "struct foo" name and
+  // produce its memory layout. Returns nullopt if the name is not found.
+  // Throws backend::Error for invalid target_id.
+  virtual std::optional<TypeLayout>
+      find_type_layout(TargetId tid, const std::string& name) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;
