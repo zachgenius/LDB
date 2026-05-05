@@ -58,6 +58,28 @@ std::string hex_bytes(const std::vector<std::uint8_t>& bytes) {
   return out;
 }
 
+const char* process_state_str(backend::ProcessState s) {
+  switch (s) {
+    case backend::ProcessState::kNone:     return "none";
+    case backend::ProcessState::kRunning:  return "running";
+    case backend::ProcessState::kStopped:  return "stopped";
+    case backend::ProcessState::kExited:   return "exited";
+    case backend::ProcessState::kCrashed:  return "crashed";
+    case backend::ProcessState::kDetached: return "detached";
+    case backend::ProcessState::kInvalid:  return "invalid";
+  }
+  return "invalid";
+}
+
+json process_status_to_json(const backend::ProcessStatus& s) {
+  json j;
+  j["state"] = process_state_str(s.state);
+  j["pid"]   = s.pid;
+  if (s.state == backend::ProcessState::kExited) j["exit_code"] = s.exit_code;
+  if (!s.stop_reason.empty()) j["stop_reason"] = s.stop_reason;
+  return j;
+}
+
 json xref_match_to_json(const backend::XrefMatch& x) {
   json j;
   j["addr"]     = x.address;
@@ -176,6 +198,11 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "disasm.function")    return handle_disasm_function(req);
     if (req.method == "xref.addr")          return handle_xref_addr(req);
     if (req.method == "string.xref")        return handle_string_xref(req);
+
+    if (req.method == "process.launch")     return handle_process_launch(req);
+    if (req.method == "process.state")      return handle_process_state(req);
+    if (req.method == "process.continue")   return handle_process_continue(req);
+    if (req.method == "process.kill")       return handle_process_kill(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -296,6 +323,29 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
             "array of {string:{text,addr,section,module}, "
             "xrefs:array of xref matches}"}});
 
+  add("process.launch",
+      "Spawn the target's executable as an inferior. Synchronous: "
+      "blocks until the process is stopped or has exited.",
+      json{{"target_id", "uint64"}, {"stop_at_entry", "bool?"}},
+      json{{"state", "string"}, {"pid", "int"},
+           {"stop_reason", "string?"}, {"exit_code", "int?"}});
+
+  add("process.state",
+      "Query the current state of the target's process. Returns "
+      "state=\"none\" if no process is associated.",
+      json{{"target_id", "uint64"}},
+      json{{"state", "string"}, {"pid", "int"}});
+
+  add("process.continue",
+      "Resume a stopped process. Blocks until next stop or exit.",
+      json{{"target_id", "uint64"}},
+      json{{"state", "string"}, {"pid", "int"}});
+
+  add("process.kill",
+      "Terminate the target's process. Idempotent.",
+      json{{"target_id", "uint64"}},
+      json{{"state", "string"}, {"pid", "int"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -346,6 +396,59 @@ Response Dispatcher::handle_module_list(const Request& req) {
 
   return protocol::make_ok(req.id,
       protocol::view::apply_to_array(std::move(arr), view_spec, "modules"));
+}
+
+Response Dispatcher::handle_process_launch(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  backend::LaunchOptions opts;
+  if (auto it = req.params.find("stop_at_entry"); it != req.params.end()) {
+    if (!it->is_boolean()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'stop_at_entry' must be bool");
+    }
+    opts.stop_at_entry = it->get<bool>();
+  }
+  auto status = backend_->launch_process(
+      static_cast<backend::TargetId>(tid), opts);
+  return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_process_state(const Request& req) {
+  std::uint64_t tid = 0;
+  if (!req.params.is_object() || !require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto status = backend_->get_process_state(static_cast<backend::TargetId>(tid));
+  return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_process_continue(const Request& req) {
+  std::uint64_t tid = 0;
+  if (!req.params.is_object() || !require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto status = backend_->continue_process(static_cast<backend::TargetId>(tid));
+  return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_process_kill(const Request& req) {
+  std::uint64_t tid = 0;
+  if (!req.params.is_object() || !require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto status = backend_->kill_process(static_cast<backend::TargetId>(tid));
+  return protocol::make_ok(req.id, process_status_to_json(status));
 }
 
 Response Dispatcher::handle_string_xref(const Request& req) {

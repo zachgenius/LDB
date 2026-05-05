@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <sys/stat.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <lldb/API/LLDB.h>
@@ -122,24 +125,74 @@ struct LldbBackend::Impl {
   std::atomic<TargetId> next_id{1};
 };
 
+namespace {
+
+// On macOS, Homebrew LLVM's distribution does NOT ship a debugserver
+// binary. SBProcess::Launch / Attach silently fail with "failed to
+// launch or debug process" unless LLDB_DEBUGSERVER_PATH points at a
+// signed debugserver from the Apple Command Line Tools or Xcode. We
+// auto-discover one on construction so unit tests work out of the box.
+void maybe_seed_apple_debugserver() {
+#ifdef __APPLE__
+  if (std::getenv("LLDB_DEBUGSERVER_PATH") != nullptr) return;
+
+  static const char* kCandidates[] = {
+    "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/"
+        "LLDB.framework/Versions/A/Resources/debugserver",
+    "/Applications/Xcode.app/Contents/SharedFrameworks/"
+        "LLDB.framework/Versions/A/Resources/debugserver",
+  };
+  for (const char* path : kCandidates) {
+    struct stat st;
+    if (::stat(path, &st) == 0 && (st.st_mode & S_IXUSR)) {
+      ::setenv("LLDB_DEBUGSERVER_PATH", path, /*overwrite=*/0);
+      log::info(std::string("LLDB_DEBUGSERVER_PATH=") + path);
+      return;
+    }
+  }
+  log::warn(
+      "could not find a signed debugserver; SBProcess::Launch may fail. "
+      "Install Xcode Command Line Tools or set LLDB_DEBUGSERVER_PATH.");
+#endif
+}
+
+}  // namespace
+
+namespace {
+
+// SBDebugger::Initialize / Terminate are process-global. Calling them
+// in a per-instance ctor/dtor creates Init/Terminate cycles that
+// corrupt internal state — second-and-later SBProcess::Launch calls
+// then fail mysteriously. Instead, initialize on first use and let
+// process exit reap everything.
+void ensure_lldb_initialized() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    maybe_seed_apple_debugserver();
+    lldb::SBDebugger::Initialize();
+  });
+}
+
+}  // namespace
+
 LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
-  lldb::SBDebugger::Initialize();
+  ensure_lldb_initialized();
   impl_->debugger = lldb::SBDebugger::Create();
   impl_->debugger.SetAsync(false);
   log::info("lldb backend initialized");
 }
 
 LldbBackend::~LldbBackend() {
-  if (impl_) {
-    {
-      std::lock_guard<std::mutex> lk(impl_->mu);
-      impl_->targets.clear();
-    }
-    if (impl_->debugger.IsValid()) {
-      lldb::SBDebugger::Destroy(impl_->debugger);
-    }
+  if (!impl_) return;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->targets.clear();
   }
-  lldb::SBDebugger::Terminate();
+  if (impl_->debugger.IsValid()) {
+    lldb::SBDebugger::Destroy(impl_->debugger);
+  }
+  // Deliberately do NOT call SBDebugger::Terminate() here — see comment
+  // on ensure_lldb_initialized.
 }
 
 OpenResult LldbBackend::open_executable(const std::string& path) {
@@ -854,6 +907,168 @@ LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
 
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Process lifecycle
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ProcessState map_state(lldb::StateType s) {
+  switch (s) {
+    case lldb::eStateInvalid:
+    case lldb::eStateUnloaded:    return ProcessState::kInvalid;
+    case lldb::eStateAttaching:
+    case lldb::eStateConnected:
+    case lldb::eStateLaunching:
+    case lldb::eStateRunning:
+    case lldb::eStateStepping:    return ProcessState::kRunning;
+    case lldb::eStateStopped:
+    case lldb::eStateSuspended:   return ProcessState::kStopped;
+    case lldb::eStateExited:      return ProcessState::kExited;
+    case lldb::eStateCrashed:     return ProcessState::kCrashed;
+    case lldb::eStateDetached:    return ProcessState::kDetached;
+    default:                      return ProcessState::kInvalid;
+  }
+}
+
+ProcessStatus snapshot(lldb::SBProcess proc) {
+  ProcessStatus s;
+  if (!proc.IsValid()) return s;
+  s.state = map_state(proc.GetState());
+  s.pid   = static_cast<std::int32_t>(proc.GetProcessID());
+  if (s.state == ProcessState::kExited) {
+    s.exit_code = proc.GetExitStatus();
+  }
+  if (s.state == ProcessState::kStopped) {
+    // Best-effort stop reason via the first thread's stop reason.
+    auto thr = proc.GetSelectedThread();
+    if (!thr.IsValid() && proc.GetNumThreads() > 0) {
+      thr = proc.GetThreadAtIndex(0);
+    }
+    if (thr.IsValid()) {
+      char buf[256];
+      size_t n = thr.GetStopDescription(buf, sizeof(buf));
+      if (n > 0) s.stop_reason.assign(buf, std::min(n, sizeof(buf) - 1));
+    }
+  }
+  return s;
+}
+
+}  // namespace
+
+ProcessStatus LldbBackend::launch_process(TargetId tid,
+                                          const LaunchOptions& opts) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // Replace any prior process before launching a new one.
+  auto existing = target.GetProcess();
+  if (existing.IsValid()) {
+    auto st = existing.GetState();
+    if (st != lldb::eStateExited && st != lldb::eStateDetached &&
+        st != lldb::eStateInvalid) {
+      lldb::SBError k = existing.Kill();
+      (void)k;  // best-effort
+    }
+  }
+
+  lldb::SBLaunchInfo li(/*argv=*/nullptr);
+  std::uint32_t flags = li.GetLaunchFlags();
+  if (opts.stop_at_entry) flags |= lldb::eLaunchFlagStopAtEntry;
+  li.SetLaunchFlags(flags);
+
+  // argv / env support deferred until M2 cont.
+
+  lldb::SBError err;
+  auto proc = target.Launch(li, err);
+  if (err.Fail() || !proc.IsValid()) {
+    const char* dsp = std::getenv("LLDB_DEBUGSERVER_PATH");
+    log::error(std::string("launch failed (LLDB_DEBUGSERVER_PATH=") +
+               (dsp ? dsp : "<unset>") + "): " +
+               (err.GetCString() ? err.GetCString() : "unknown"));
+    throw Error(std::string("launch failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown error"));
+  }
+
+  return snapshot(proc);
+}
+
+ProcessStatus LldbBackend::get_process_state(TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+  return snapshot(target.GetProcess());
+}
+
+ProcessStatus LldbBackend::continue_process(TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) {
+    throw Error("no process to continue");
+  }
+  auto st = proc.GetState();
+  if (st != lldb::eStateStopped && st != lldb::eStateSuspended) {
+    throw Error(std::string("process not stopped (state=") +
+                std::to_string(static_cast<int>(st)) + ")");
+  }
+  lldb::SBError err = proc.Continue();
+  if (err.Fail()) {
+    throw Error(std::string("continue failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  return snapshot(proc);
+}
+
+ProcessStatus LldbBackend::kill_process(TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) {
+    return ProcessStatus{};  // kNone
+  }
+  auto st = proc.GetState();
+  if (st == lldb::eStateExited || st == lldb::eStateDetached ||
+      st == lldb::eStateInvalid) {
+    return snapshot(proc);
+  }
+  lldb::SBError err = proc.Kill();
+  if (err.Fail()) {
+    throw Error(std::string("kill failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  return snapshot(proc);
+}
+
+// ---------------------------------------------------------------------------
 
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;

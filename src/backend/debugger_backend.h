@@ -122,6 +122,29 @@ struct StringXrefResult {
   std::vector<XrefMatch> xrefs;
 };
 
+enum class ProcessState {
+  kNone,        // no process associated with the target
+  kRunning,
+  kStopped,
+  kExited,
+  kCrashed,
+  kDetached,
+  kInvalid,     // unknown / suspended state
+};
+
+struct ProcessStatus {
+  ProcessState state = ProcessState::kNone;
+  std::int32_t pid = 0;
+  std::int32_t exit_code = 0;   // valid only when state == kExited
+  std::string  stop_reason;     // human-readable when state == kStopped
+};
+
+struct LaunchOptions {
+  bool stop_at_entry = true;
+  std::vector<std::string> argv;   // future: forward to inferior
+  std::vector<std::string> envp;   // future: env overrides
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -183,6 +206,33 @@ class DebuggerBackend {
   // found OR no xrefs. Throws backend::Error for invalid target_id.
   virtual std::vector<StringXrefResult>
       find_string_xrefs(TargetId tid, const std::string& text) = 0;
+
+  // --- Process lifecycle -------------------------------------------------
+  //
+  // M2 first slice. All operations are synchronous: launch and continue
+  // block until the next stop event or terminal state. A target may have
+  // at most one live process; relaunching kills any prior process first.
+
+  // Spawn the target's executable as an inferior process. With
+  // stop_at_entry=true the process is paused at the entry point; the
+  // returned ProcessStatus reports state==kStopped. With
+  // stop_at_entry=false the process runs until it stops or exits.
+  // Throws backend::Error for invalid target_id or launch failures.
+  virtual ProcessStatus
+      launch_process(TargetId tid, const LaunchOptions& opts) = 0;
+
+  // Report the current state of the target's associated process. If
+  // there is none, returns ProcessStatus{state=kNone}. Throws on
+  // invalid target_id.
+  virtual ProcessStatus get_process_state(TargetId tid) = 0;
+
+  // Resume a stopped process. Blocks until the next stop or terminal
+  // event. Throws if there is no process to continue.
+  virtual ProcessStatus continue_process(TargetId tid) = 0;
+
+  // Terminate the target's process. Idempotent: returns
+  // ProcessStatus{state=kNone} when there is no process.
+  virtual ProcessStatus kill_process(TargetId tid) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

@@ -33,6 +33,11 @@ class Dispatcher {
   protocol::Response handle_disasm_function(const protocol::Request& req);
   protocol::Response handle_xref_addr(const protocol::Request& req);
   protocol::Response handle_string_xref(const protocol::Request& req);
+
+  protocol::Response handle_process_launch(const protocol::Request& req);
+  protocol::Response handle_process_state(const protocol::Request& req);
+  protocol::Response handle_process_continue(const protocol::Request& req);
+  protocol::Response handle_process_kill(const protocol::Request& req);
 };
 
 }  // namespace ldb::daemon

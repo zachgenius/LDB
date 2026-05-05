@@ -14,6 +14,7 @@ set(LDB_UNIT_SOURCES
   test_backend_disasm.cpp
   test_backend_xref.cpp
   test_backend_string_xref.cpp
+  test_backend_process.cpp
 )
 
 set(LDB_LIB_SOURCES
