@@ -1,0 +1,127 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+_deps/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+.cache/
+
+# Object files / libs / executables
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.lib
+*.dll
+*.exe
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.gcda
+*.gcno
+*.gcov
+*.lcov
+*.profraw
+*.profdata
+
+# Final binaries land in build/bin/ which is already ignored above.
+# Catch any that escape into the repo root.
+/ldbd
+/ldb-probe-agent
+
+# Generated headers
+*_generated.h
+*_generated.cpp
+
+# Python (used for embedded extensions)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.python-version
+*.egg-info/
+
+# Local LDB runtime data — never commit
+.ldb/
+*.ldbpack
+*.ldbsession
+
+# Sessions/artifacts captured during dev
+runtime/
+artifacts/
+
+# Editors / IDEs
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.cache/clangd/
+.clangd
+.clang-format-ignore
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Logs / temp
+*.log
+*.tmp
+core
+core.*
+vgcore.*
+heaptrack.*
+perf.data*
+*.dSYM/
+
+# Test outputs
+Testing/
+test-results/
+*.xml.test
+
+# Coverage
+coverage/
+*.gcov
+htmlcov/
+
+# Documentation builds
+doc-build/
+html/
+latex/
+xml/
+
+# Vendor build output (we vendor json.hpp single-header; nothing else builds)
+third_party/build/
+third_party/install/
+
+# Local config overrides
+.env
+.env.local
+config.local.*
