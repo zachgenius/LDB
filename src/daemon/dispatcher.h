@@ -43,6 +43,7 @@ class Dispatcher {
   protocol::Response handle_process_kill(const protocol::Request& req);
   protocol::Response handle_process_detach(const protocol::Request& req);
   protocol::Response handle_process_save_core(const protocol::Request& req);
+  protocol::Response handle_process_step(const protocol::Request& req);
 
   protocol::Response handle_thread_list(const protocol::Request& req);
   protocol::Response handle_thread_frames(const protocol::Request& req);

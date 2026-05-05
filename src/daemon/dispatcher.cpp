@@ -292,6 +292,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "process.kill")       return handle_process_kill(req);
     if (req.method == "process.detach")     return handle_process_detach(req);
     if (req.method == "process.save_core")  return handle_process_save_core(req);
+    if (req.method == "process.step")       return handle_process_step(req);
 
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
@@ -481,6 +482,14 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       "for this process; otherwise saved=true and the file is on disk.",
       json{{"target_id", "uint64"}, {"path", "string"}},
       json{{"saved", "bool"}, {"path", "string"}});
+
+  add("process.step",
+      "Single-step the given thread. kind=in|over|out|insn maps to "
+      "SBThread::StepInto/StepOver/StepOut/StepInstruction. Synchronous: "
+      "blocks until the next stop or terminal state.",
+      json{{"target_id", "uint64"}, {"tid", "uint64"}, {"kind", "string"}},
+      json{{"state", "string"}, {"pid", "int"},
+           {"pc", "uint64?"}, {"stop_reason", "string?"}});
 
   add("thread.list",
       "Enumerate threads of the target's process.",
@@ -1004,6 +1013,65 @@ Response Dispatcher::handle_process_kill(const Request& req) {
   }
   auto status = backend_->kill_process(static_cast<backend::TargetId>(tid));
   return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+namespace {
+bool parse_step_kind(const std::string& s, backend::StepKind* out) {
+  if (s == "in")   { *out = backend::StepKind::kIn;   return true; }
+  if (s == "over") { *out = backend::StepKind::kOver; return true; }
+  if (s == "out")  { *out = backend::StepKind::kOut;  return true; }
+  if (s == "insn") { *out = backend::StepKind::kInsn; return true; }
+  return false;
+}
+}  // namespace
+
+Response Dispatcher::handle_process_step(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "tid", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'tid'");
+  }
+  const auto* kind_str = require_string(req.params, "kind");
+  if (!kind_str) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'kind'");
+  }
+  backend::StepKind kind;
+  if (!parse_step_kind(*kind_str, &kind)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'kind' must be one of: in, over, out, insn");
+  }
+
+  auto status = backend_->step_thread(
+      static_cast<backend::TargetId>(target_id),
+      static_cast<backend::ThreadId>(tid),
+      kind);
+
+  // Spec response: {state, stop_reason?, pc?}. We preserve pid since
+  // every other process.* endpoint emits it (consistency wins for
+  // agents); pc is the innermost frame's PC of the stepped thread,
+  // populated only when the post-step state is stopped.
+  json data = process_status_to_json(status);
+  if (status.state == backend::ProcessState::kStopped) {
+    auto threads = backend_->list_threads(
+        static_cast<backend::TargetId>(target_id));
+    for (const auto& t : threads) {
+      if (t.tid == tid) {
+        data["pc"] = t.pc;
+        break;
+      }
+    }
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_string_xref(const Request& req) {

@@ -150,6 +150,19 @@ struct LaunchOptions {
   std::vector<std::string> envp;   // future: env overrides
 };
 
+// What "step" means for the targeted thread. The mapping to LLDB:
+//   kIn   → SBThread::StepInto         (source-line, step into calls)
+//   kOver → SBThread::StepOver         (source-line, step over calls)
+//   kOut  → SBThread::StepOut          (run to caller's next instr)
+//   kInsn → SBThread::StepInstruction  (one machine instruction;
+//                                       step_over=false → into calls)
+enum class StepKind {
+  kIn,
+  kOver,
+  kOut,
+  kInsn,
+};
+
 using ThreadId = std::uint64_t;   // SBThread::GetThreadID() — kernel tid
 
 struct ThreadInfo {
@@ -338,6 +351,14 @@ class DebuggerBackend {
   virtual std::vector<FrameInfo>
       list_frames(TargetId tid, ThreadId thread_id,
                   std::uint32_t max_depth) = 0;
+
+  // Single-step the given thread. Synchronous: blocks until the next
+  // stop event or terminal state (sync mode is set on construction).
+  // Returns the post-step process status; caller can re-query
+  // list_threads / list_frames for the new PC. Throws backend::Error
+  // for invalid target_id, unknown thread id, or no live process.
+  virtual ProcessStatus
+      step_thread(TargetId tid, ThreadId thread_id, StepKind kind) = 0;
 
   // --- Frame values ----------------------------------------------------
   //

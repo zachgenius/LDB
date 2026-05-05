@@ -1379,6 +1379,48 @@ LldbBackend::list_frames(TargetId tid, ThreadId thread_id,
   return out;
 }
 
+ProcessStatus LldbBackend::step_thread(TargetId tid, ThreadId thread_id,
+                                       StepKind kind) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) throw Error("no process");
+  auto thr = proc.GetThreadByID(thread_id);
+  if (!thr.IsValid()) throw Error("unknown thread id");
+
+  // SBThread::Step* dispatches into the LLDB ThreadPlan stack and, with
+  // SetAsync(false) (set in the ctor), blocks until the next stop or a
+  // terminal state. The bool argument to StepInstruction is "step over
+  // calls"; we want step-into-calls semantics for "insn", so pass false.
+  switch (kind) {
+    case StepKind::kIn:
+      thr.StepInto();
+      break;
+    case StepKind::kOver:
+      thr.StepOver();
+      break;
+    case StepKind::kOut:
+      thr.StepOut();
+      break;
+    case StepKind::kInsn:
+      thr.StepInstruction(/*step_over=*/false);
+      break;
+  }
+
+  // SBThread::Step* returns void; failures surface as the post-step
+  // process state (e.g. eStateInvalid) or via the thread's stop reason.
+  // Snapshot the process and let the caller examine state / stop_reason.
+  return snapshot(proc);
+}
+
 // ---------------------------------------------------------------------------
 // Frame values: locals / args / registers
 // ---------------------------------------------------------------------------

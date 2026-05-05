@@ -4,6 +4,46 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 8) — M2 closeout: process.step
+
+**Goal:** Round out M2 process-control surface by landing `process.step` for all four step kinds (`in` / `over` / `out` / `insn`), tested unit-side and over the JSON-RPC wire, before leaving M2 functionally complete.
+
+**Done:**
+
+- **Backend interface:** added `StepKind` enum (`kIn`/`kOver`/`kOut`/`kInsn`) and `step_thread(target_id, tid, kind)` virtual to `DebuggerBackend`. Returns the post-step `ProcessStatus` so the caller can branch on `state` / `stop_reason` without an extra round-trip. `LldbBackend::step_thread` resolves target → process → thread and dispatches to `SBThread::StepInto/StepOver/StepOut/StepInstruction(false)`. Sync-mode is already on, so the call blocks until the next stop or terminal event.
+- **Wire layer:** `process.step({target_id, tid, kind})` registered in `dispatcher.cpp` and listed in `describe.endpoints` (now 31 endpoints). Returns `{state, pid, pc?, stop_reason?, exit_code?}` — `pc` is sourced from the innermost frame of the *stepped* thread when the post-step state is `stopped`. Invalid `kind` → `-32602`; bad `target_id` / `tid` → `-32000` (the typed `backend::Error` path).
+- **7-case unit test** (`tests/unit/test_backend_step.cpp`, 26 assertions): each step kind exercised against the structs fixture launched stop-at-entry, plus error paths (bad target_id, bad tid, no process). Failing-then-green cycle observed: first build failed with "no member step_thread / undeclared StepKind"; passed after the implementation landed.
+- **Python smoke test** (`tests/smoke/test_step.py`, wired with TIMEOUT 60): launches the structs fixture, walks a `insn → in → over → insn` sequence, asserts PC moved at least once across the sequence (per-call PC motion is platform-quirky on macOS arm64 inside `_dyld_start`), then re-launches and exercises the three error paths (-32602 invalid kind, -32602 missing kind, -32000 bogus tid, -32000 bogus target_id).
+
+**Decisions:**
+
+- **Step kinds are an enum, not a string passed through to LLDB.** Strings are validated at the dispatcher boundary; the backend interface is type-safe. Keeps the schema explicit and forces `StepInstruction(false)` (step-into-calls) rather than relying on a string convention an agent might get wrong.
+- **`pc` is the stepped thread's innermost frame PC**, not the process's "selected thread" PC. Multi-thread inferiors will eventually need this distinction; designing it right now costs nothing. Implementation walks `list_threads` post-step rather than calling `SBProcess::GetSelectedThread`, since the latter's selection state isn't always what the agent meant.
+- **`step_thread` returns `ProcessStatus`** — not a bespoke struct — so `process_status_to_json` is reused for the bulk of the response. The handler only adds `pc` after the fact. Keeps the JSON shape consistent with the other process.* endpoints.
+- **`StepOut` test does not assert on PC motion.** From the entry-point frame on macOS arm64 (`_dyld_start` has no real caller), LLDB legitimately reports the same PC; from a deeper frame it should advance. Test exercises the deeper-frame variant by taking a few `insn` steps first, but the assertion is only "didn't throw / state in the enum" — see "Surprises" for why a stricter assertion was rejected.
+- **PC-motion assertion in the Python smoke is across the *sequence*, not per-call.** A single `insn` step on macOS arm64 inside `_dyld_start` can land on the same PC if LLDB unwinds a thread plan internally; the across-sequence assertion is empirically reliable while still catching a regression where stepping is a no-op.
+
+**Surprises / blockers:**
+
+- **`StepOut` from `_dyld_start` returns the same PC.** First `step.kOut` test failed because I assumed StepOut would always advance or terminate; on macOS arm64 with the dyld bootstrap frame as innermost, LLDB's StepOut is effectively a no-op (no caller to return to). Diagnostic: post-step state was `kStopped` and `pc` matched `pc_before`. Fix: separate out the "advances execution" claim from the "doesn't blow up" claim — the test now exercises StepOut from a (probably) deeper frame and asserts only state validity. The contract documented in `debugger_backend.h` is "synchronous; returns post-step status," which holds.
+- **`launched_at_entry()` couldn't return `LaunchedFixture` by value** because `unique_ptr` blocks the implicit copy ctor and NRVO isn't guaranteed across our compilers. Switched to a fill-in-place `void launched_at_entry(LaunchedFixture&)` helper. Slightly less idiomatic than the patterns in the other test files (where the struct is created at the call site), but means the launched-fixture initialization stays one-line at every call.
+- **No SaveCore-style stdout corruption this time.** SBThread::Step* doesn't print to stdout, so no dup2 guard needed. Confirmed by running the smoke against a clean build with `--log-level error`: the JSON-RPC channel is intact.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **16/16 PASS in ~55s wall clock**. unit_tests dominates at 40s (now 129 cases / 1174 assertions, up from 122/1148). New tests: 7 unit cases (`[backend][step]`), 1 smoke test (`smoke_step` at 2.37s). Build is warning-clean under the project's `-Wall -Wextra -Wpedantic -Wshadow ... -Wconversion` flags.
+- Manual: `describe.endpoints` lists `process.step` (total 31 endpoints); `process.step` with `kind="sideways"` returns `-32602`; with bogus `tid` returns `-32000`. End-to-end round trip clean.
+
+**Next:**
+
+- **`value.read({path, view})`** — structured read of a typed value tree (composes `mem.read` + `type.layout` backend-side; nested unions/arrays/pointers in one round-trip). The agent-context win is large; implementation is mostly SBValue tree walking with cycle detection.
+- **`value.eval({expr, frame?})`** — LLDB expression eval. Trivial wrapper on `SBFrame::EvaluateExpression`, but needs a thought-out timeout / runaway-expression strategy before exposing a Turing-complete eval to an agent.
+- **`target.connect_remote({url})`** — round out target lifecycle. SBPlatform::ConnectRemote handles it; same wire shape as attach.
+- **Probes (M3)** — auto-resuming breakpoints with structured capture. Largest single piece of remaining work; need an artifact store to land first or they have nowhere to put captured data.
+- **Architectural watch-item still live:** dispatcher.cpp is now ~1340 lines. The split into per-area files (target / process / thread / frame / memory / static) recommended last session is overdue; one more endpoint (probes) and the file becomes hard to navigate.
+
+---
+
 ## 2026-05-05 (cont. 7) — M2 push: frame values, attach, memory, core, view retrofit
 
 **Goal:** Drive remaining M2 work to completion in one session: SBValue projection (frame.locals/args/registers), live-attach (target.create_empty + target.attach + process.detach), memory primitives (mem.read/read_cstr/regions/search), postmortem (target.load_core + process.save_core), and the M1 close-out backlog (log spam, smoke-test tightening, view retrofits on the remaining array endpoints).

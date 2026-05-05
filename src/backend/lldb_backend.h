@@ -49,6 +49,8 @@ class LldbBackend final : public DebuggerBackend {
   std::vector<ThreadInfo> list_threads(TargetId tid) override;
   std::vector<FrameInfo>  list_frames(TargetId tid, ThreadId thread_id,
                                       std::uint32_t max_depth) override;
+  ProcessStatus step_thread(TargetId tid, ThreadId thread_id,
+                            StepKind kind) override;
 
   std::vector<ValueInfo>
       list_locals(TargetId tid, ThreadId thread_id,
