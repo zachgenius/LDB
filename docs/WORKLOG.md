@@ -4,6 +4,58 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 4) — M1 closes: view descriptors
+
+**Goal:** Land the last cross-cutting M1 feature — view descriptors — and wire onto `module.list` as the model endpoint. Per the prior session's "Next," first cut covers `fields` (projection), `limit`+`offset` (pagination), `summary` (count + sample). Defer `tabular`, `max_string`, `max_bytes`, cursor.
+
+**Done:**
+
+- **`src/protocol/view.{h,cpp}`** — pure JSON-manipulation module, no LLDB. `parse_from_params(params)` reads `params["view"]` and validates every field's type, throwing `std::invalid_argument` with descriptive messages on malformed input. `apply_to_array(items, spec, items_key)` returns a JSON object of the documented shape (`{<key>: [...], total, next_offset?, summary?}`).
+- **20-case Catch2 unit test** (`test_protocol_view.cpp`, 87 assertions) covering parse errors, default behaviour, limit/offset combinations, fields projection (incl. unknown fields silently ignored), summary mode, edge cases (empty array, offset past end, non-object items pass through fields-projection unchanged).
+- **Wired into `module.list`**: handler now parses view, applies it, and returns the shaped object instead of the bare `{modules:[...]}` shape. Empty/no-view requests still get `total` so the agent can plan follow-up paging without an extra round-trip.
+- **Dispatcher outer try/catch** translates `std::invalid_argument` → kInvalidParams (-32602). View-parse errors are agent-side mistakes; mapping them to a typed error keeps the protocol contract clean.
+- **Smoke test (`test_view_module_list.sh`)**: 7 assertions covering default response (has `total`), limit=2 (`next_offset=2`), offset=1+limit=1 (`next_offset=2`), `fields=["path","uuid"]` (no `sections`/`triple`), `summary=true` (sample + summary flag), `limit=-1` → -32602, non-object view → -32602.
+
+**Decisions:**
+
+- **Parse + apply is a separate module** (`src/protocol/view.cpp`) rather than living inside the dispatcher. It's a pure JSON transform; making it its own module means it's unit-testable without LLDB and reusable across every endpoint that returns an array.
+- **`view` lives inside `params`**, not as a top-level sibling. `docs/02-ldb-mvp-plan.md §3.2` showed it top-level, but JSON-RPC 2.0 only specifies `id`/`method`/`params` at the envelope. Keeping our extension inside `params` is one less spec violation. The doc is sketchy; the parser is now the contract.
+- **`total` is always emitted.** Even on a default request that includes everything, the agent can plan ("there are 50 modules; I'll page through them") without re-asking. Costs nothing.
+- **`next_offset` only when more remain.** Its absence is the "you're done" signal; saves a few bytes per terminal page.
+- **Default summary sample size is 5** (`kSummarySampleSize`). Small enough to be a "preview"; agent can override with explicit limit. Tests assert `<=5` rather than `==5` to leave room to tune.
+- **Unknown fields in `view.fields` are silently ignored**, not an error. Agents may speculatively project across endpoint variants; failing on a stale field name would be brittle.
+
+**Surprises / blockers:**
+
+- **No real surprises.** The pure-JSON-transform design fell out cleanly; tests caught a couple of subtle bugs early (offset > items.size needed clamping; project_fields had to skip non-object items).
+- **CMake reconfigure was needed** because we added a new source file (`view.cpp`) referenced by both `src/CMakeLists.txt` and `tests/unit/CMakeLists.txt`. Standard CMake quirk; ninja's auto-rerun caught it on the second build.
+
+**Verification:**
+
+- `ctest` → 9/9 PASS in 2.27s. unit_tests at 80 cases / ~457 assertions.
+- Manual: `module.list` with `view:{fields:["path","uuid"]}` returns ~3KB instead of the 70KB+ default — the practical token-saving payoff for an agent.
+
+**Next:**
+
+- **Retrofit other endpoints** with views in priority order:
+  1. `string.list` — already volume-bounded by default scope, but pagination + summary still useful for big binaries.
+  2. `disasm.range` / `disasm.function` — large functions can produce hundreds of insns; `fields` (e.g., just mnemonic+operands) and `limit`+`offset` pay off.
+  3. `xref.addr` / `string.xref` — `summary` is especially useful when an address is referenced from many sites.
+  4. `type.layout` — `fields` to project per-field metadata (e.g., just `name,off,sz`).
+  5. `symbol.find` — `summary` helps when name is a common substring (post-introduction of glob/regex patterns).
+- **Future view features** to land when forced by a workflow:
+  - `tabular` (cols+rows for arrays of homogeneous structs — major token win).
+  - `max_string` / `max_bytes` to truncate long string and byte fields in-place.
+  - `cursor` (opaque token instead of integer offset) when pagination needs to be stable across mutations.
+- **`xref.imm`** still pending — useful for finding magic-number constants in binary.
+- **ARM64 ADRP+ADD reconstruction** in `xref.addr` — would close the gap that `string.xref`'s second detection path currently papers over.
+- **Cleanup queue (still deferred):**
+  - `tests/smoke/test_type_layout.sh` per-id extraction.
+  - `[INF] lldb backend initialized` log spam in unit tests.
+- **M1 status:** functionally complete — every "what should this endpoint do" item from `docs/02-ldb-mvp-plan.md §4.2` ships and is tested. Next major milestone is M2 (process / thread / frame / value / memory) which is materially more work than M1; consider whether to do an M1 "polish pass" first (view retrofits, log cleanup, glob patterns on symbol.find) or jump to M2.
+
+---
+
 ## 2026-05-05 (cont. 3) — M1 xref pair: xref.addr + string.xref
 
 **Goal:** Land the cross-reference primitives so the user's RE workflow ("find where `btp_schema.xml` is referenced") runs end-to-end as a single RPC.
