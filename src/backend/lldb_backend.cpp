@@ -4,10 +4,12 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -247,6 +249,43 @@ OpenResult LldbBackend::create_empty_target() {
   OpenResult res;
   res.target_id = id;
   if (const char* tr = target.GetTriple()) res.triple = tr;
+  return res;
+}
+
+OpenResult LldbBackend::load_core(const std::string& core_path) {
+  // Empty target hosts the load; SBTarget::LoadCore populates modules
+  // and frozen threads from the core file.
+  lldb::SBError err;
+  auto target = impl_->debugger.CreateTarget(
+      /*filename=*/"", /*triple=*/nullptr, /*platform_name=*/nullptr,
+      /*add_dependent_modules=*/false, err);
+  if (err.Fail() || !target.IsValid()) {
+    throw Error(std::string("CreateTarget(empty) failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+
+  lldb::SBProcess proc = target.LoadCore(core_path.c_str(), err);
+  if (err.Fail() || !proc.IsValid()) {
+    impl_->debugger.DeleteTarget(target);
+    throw Error(std::string("LoadCore failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+
+  TargetId id = impl_->next_id.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->targets.emplace(id, target);
+  }
+
+  OpenResult res;
+  res.target_id = id;
+  if (const char* tr = target.GetTriple()) res.triple = tr;
+  uint32_t n = target.GetNumModules();
+  res.modules.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    auto mod = target.GetModuleAtIndex(i);
+    if (mod.IsValid()) res.modules.push_back(convert_module(mod));
+  }
   return res;
 }
 
@@ -1165,6 +1204,45 @@ ProcessStatus LldbBackend::detach_process(TargetId tid) {
                 (err.GetCString() ? err.GetCString() : "unknown"));
   }
   return snapshot(proc);
+}
+
+bool LldbBackend::save_core(TargetId tid, const std::string& path) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) throw Error("no process to save_core");
+
+  // SBProcess::SaveCore prints per-region progress to stdout (e.g.
+  // "Saving 16384 bytes ... 0x100000000"). For ldbd that would corrupt
+  // the JSON-RPC channel. Redirect stdout to /dev/null around the call
+  // so the messages are dropped, then restore it.
+  int saved_stdout = ::dup(STDOUT_FILENO);
+  int devnull      = ::open("/dev/null", O_WRONLY);
+  if (saved_stdout >= 0 && devnull >= 0) {
+    ::dup2(devnull, STDOUT_FILENO);
+    ::close(devnull);
+  }
+
+  // Default flavor "" lets LLDB pick the right format for the platform
+  // (e.g. Mach-O on Darwin, ELF on Linux).
+  lldb::SBError err = proc.SaveCore(path.c_str());
+
+  if (saved_stdout >= 0) {
+    ::dup2(saved_stdout, STDOUT_FILENO);
+    ::close(saved_stdout);
+  }
+
+  if (err.Fail()) {
+    log::warn(std::string("SaveCore failed: ") +
+              (err.GetCString() ? err.GetCString() : "unknown"));
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

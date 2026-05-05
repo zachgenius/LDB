@@ -20,6 +20,7 @@ class LldbBackend final : public DebuggerBackend {
 
   OpenResult open_executable(const std::string& path) override;
   OpenResult create_empty_target() override;
+  OpenResult load_core(const std::string& core_path) override;
   std::vector<Module> list_modules(TargetId tid) override;
   std::optional<TypeLayout>
       find_type_layout(TargetId tid, const std::string& name) override;
@@ -43,6 +44,7 @@ class LldbBackend final : public DebuggerBackend {
   ProcessStatus kill_process(TargetId tid) override;
   ProcessStatus attach(TargetId tid, std::int32_t pid) override;
   ProcessStatus detach_process(TargetId tid) override;
+  bool save_core(TargetId tid, const std::string& path) override;
 
   std::vector<ThreadInfo> list_threads(TargetId tid) override;
   std::vector<FrameInfo>  list_frames(TargetId tid, ThreadId thread_id,

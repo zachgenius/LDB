@@ -131,5 +131,15 @@ set_tests_properties(smoke_memory PROPERTIES
   TIMEOUT 60
 )
 
+add_test(
+  NAME smoke_core
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_core.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_core PROPERTIES
+  TIMEOUT 60
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)

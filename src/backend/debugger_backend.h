@@ -223,6 +223,12 @@ class DebuggerBackend {
   // on creation failure.
   virtual OpenResult create_empty_target() = 0;
 
+  // Load a postmortem core file. Returns a fresh target whose threads
+  // are frozen at the moment of capture; the same read-only endpoints
+  // that work against a live process work here. Throws on missing /
+  // unreadable file or unsupported format.
+  virtual OpenResult load_core(const std::string& core_path) = 0;
+
   // Enumerate modules associated with a target.
   virtual std::vector<Module> list_modules(TargetId tid) = 0;
 
@@ -314,6 +320,12 @@ class DebuggerBackend {
   // over kill_process for attached processes — leaves the inferior
   // running.
   virtual ProcessStatus detach_process(TargetId tid) = 0;
+
+  // Save a core file of the target's process to [path]. Returns true
+  // on success; false if the platform doesn't implement SaveCore for
+  // the current process type (e.g. some Linux configurations).
+  // Throws backend::Error for invalid target_id or no live process.
+  virtual bool save_core(TargetId tid, const std::string& path) = 0;
 
   // --- Threads & frames -------------------------------------------------
 

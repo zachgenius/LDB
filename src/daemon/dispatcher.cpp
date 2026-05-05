@@ -275,6 +275,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "target.open")        return handle_target_open(req);
     if (req.method == "target.create_empty")return handle_target_create_empty(req);
     if (req.method == "target.attach")      return handle_target_attach(req);
+    if (req.method == "target.load_core")   return handle_target_load_core(req);
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "module.list")        return handle_module_list(req);
     if (req.method == "type.layout")        return handle_type_layout(req);
@@ -290,6 +291,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "process.continue")   return handle_process_continue(req);
     if (req.method == "process.kill")       return handle_process_kill(req);
     if (req.method == "process.detach")     return handle_process_detach(req);
+    if (req.method == "process.save_core")  return handle_process_save_core(req);
 
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
@@ -371,6 +373,14 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"target_id", "uint64"}, {"pid", "int"}},
       json{{"state", "string"}, {"pid", "int"},
            {"stop_reason", "string?"}});
+
+  add("target.load_core",
+      "Load a postmortem core file as a fresh target with frozen "
+      "threads. Same read-only endpoints (modules, threads, frames, "
+      "memory, ...) work against the resulting target.",
+      json{{"path", "string"}},
+      json{{"target_id", "uint64"}, {"triple", "string"},
+           {"modules", "array"}});
 
   add("target.close", "Drop a target",
       json{{"target_id", "uint64"}},
@@ -464,6 +474,13 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       "over process.kill for attached processes. Idempotent.",
       json{{"target_id", "uint64"}},
       json{{"state", "string"}, {"pid", "int"}});
+
+  add("process.save_core",
+      "Save a core file of the target's stopped process to a path. "
+      "Returns saved=false if the platform doesn't support core saves "
+      "for this process; otherwise saved=true and the file is on disk.",
+      json{{"target_id", "uint64"}, {"path", "string"}},
+      json{{"saved", "bool"}, {"path", "string"}});
 
   add("thread.list",
       "Enumerate threads of the target's process.",
@@ -595,6 +612,45 @@ Response Dispatcher::handle_process_detach(const Request& req) {
   }
   auto status = backend_->detach_process(static_cast<backend::TargetId>(tid));
   return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_process_save_core(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* path = require_string(req.params, "path");
+  if (!path) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'path'");
+  }
+  bool ok = backend_->save_core(static_cast<backend::TargetId>(tid), *path);
+  return protocol::make_ok(req.id, json{{"saved", ok}, {"path", *path}});
+}
+
+Response Dispatcher::handle_target_load_core(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* path = require_string(req.params, "path");
+  if (!path) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'path'");
+  }
+  auto res = backend_->load_core(*path);
+  json data;
+  data["target_id"] = res.target_id;
+  data["triple"]    = res.triple;
+  json mods = json::array();
+  for (const auto& m : res.modules) mods.push_back(module_to_json(m));
+  data["modules"] = std::move(mods);
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_target_close(const Request& req) {
