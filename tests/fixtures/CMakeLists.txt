@@ -20,3 +20,17 @@ target_compile_options(ldb_fix_structs PRIVATE
   -fno-omit-frame-pointer
   -fno-eliminate-unused-debug-types
 )
+
+# Long-running fixture used by attach + memory tests. Prints PID/marker
+# on stdout, then pause()s forever until killed or detached.
+add_executable(ldb_fix_sleeper c/sleeper.c)
+set_target_properties(ldb_fix_sleeper PROPERTIES
+  OUTPUT_NAME    sleeper
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+  C_STANDARD     11
+)
+target_compile_options(ldb_fix_sleeper PRIVATE
+  -g -O0
+  -fno-omit-frame-pointer
+  -fno-eliminate-unused-debug-types
+)

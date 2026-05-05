@@ -17,6 +17,7 @@ set(LDB_UNIT_SOURCES
   test_backend_process.cpp
   test_backend_threads.cpp
   test_backend_frame_values.cpp
+  test_fixture_sleeper.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -51,12 +52,13 @@ target_link_libraries(ldb_unit_tests PRIVATE
   ldb_warnings
 )
 
-# The fixture binary is consumed by tests at runtime. The path is baked
-# into the test binary via a compile-time definition; keeping it as
-# $<TARGET_FILE:...> ensures the build-system knows we depend on it.
-add_dependencies(ldb_unit_tests ldb_fix_structs)
+# Fixture binaries consumed by tests at runtime. Paths are baked into
+# the test binary via compile-time definitions; the $<TARGET_FILE:...>
+# generator expression ensures the build system knows we depend on them.
+add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper)
 target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_STRUCTS_PATH="$<TARGET_FILE:ldb_fix_structs>"
+  LDB_FIXTURE_SLEEPER_PATH="$<TARGET_FILE:ldb_fix_sleeper>"
 )
 
 add_test(
