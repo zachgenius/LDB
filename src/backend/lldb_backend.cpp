@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -121,11 +123,35 @@ Module convert_module(lldb::SBModule m) {
 
 // ----------------------------------------------------------------------------
 
+// Per-breakpoint callback record. The shim trampoline (see
+// lldb_breakpoint_trampoline) is invoked by LLDB's process-event
+// thread and looks the record up by (target_id, bp_id) under
+// `cb_mu`. The record is destroyed by delete_breakpoint or target
+// close; the orchestrator's "disable + drain → delete" contract
+// ensures no in-flight callback dereferences a freed record.
+struct LldbBreakpointCb {
+  TargetId            target_id = 0;
+  std::int32_t        bp_id     = 0;
+  BreakpointCallback  cb;
+  void*               baton     = nullptr;
+};
+
 struct LldbBackend::Impl {
   lldb::SBDebugger debugger;
   std::mutex mu;
   std::unordered_map<TargetId, lldb::SBTarget> targets;
   std::atomic<TargetId> next_id{1};
+
+  // Breakpoint callback registry. A separate mutex from `mu` so the
+  // hot-path lookup from LLDB's event thread doesn't contend with
+  // dispatcher-thread target operations.
+  std::mutex cb_mu;
+  // Keyed by (target_id, bp_id). Use shared_ptr so the trampoline can
+  // hold a stable handle even if the dispatcher thread is mid-erase
+  // (it can't be — the orchestrator's contract is "disable + drain
+  // before delete" — but defensive shared ownership is cheap).
+  std::map<std::pair<TargetId, std::int32_t>,
+           std::shared_ptr<LldbBreakpointCb>> bp_callbacks;
 };
 
 namespace {
@@ -2075,6 +2101,221 @@ LldbBackend::search_memory(TargetId tid, std::uint64_t start,
 }
 
 // ---------------------------------------------------------------------------
+// Breakpoints (M3 probes)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Trampoline invoked by LLDB on its process-event thread. We look up
+// the registered (callback, baton) for this (target, bp_id), build the
+// typed CallbackArgs, and dispatch. Returning true from this function
+// keeps the inferior stopped; false auto-continues. If no callback is
+// registered (e.g. mid-tear-down), default to false (auto-continue) so
+// the inferior doesn't get stuck.
+bool lldb_breakpoint_trampoline(void* baton,
+                                lldb::SBProcess& proc,
+                                lldb::SBThread& thr,
+                                lldb::SBBreakpointLocation& bp_loc) {
+  auto* shim = static_cast<LldbBreakpointCb*>(baton);
+  if (!shim || !shim->cb) return false;
+
+  BreakpointCallbackArgs args;
+  args.target_id = shim->target_id;
+  args.tid       = thr.IsValid() ? thr.GetThreadID() : 0;
+
+  if (thr.IsValid() && thr.GetNumFrames() > 0) {
+    auto frame = thr.GetFrameAtIndex(0);
+    if (frame.IsValid()) {
+      args.pc = frame.GetPC();
+      if (auto fn = frame.GetFunction(); fn.IsValid()) {
+        if (const char* nm = fn.GetName()) args.function = nm;
+      }
+      if (args.function.empty()) {
+        if (auto sym = frame.GetSymbol(); sym.IsValid()) {
+          if (const char* nm = sym.GetName()) args.function = nm;
+        }
+      }
+      if (auto le = frame.GetLineEntry(); le.IsValid()) {
+        auto fs = le.GetFileSpec();
+        if (fs.IsValid()) {
+          char buf[4096];
+          if (fs.GetPath(buf, sizeof(buf)) > 0) args.file = buf;
+        }
+        args.line = static_cast<int>(le.GetLine());
+      }
+    }
+  }
+
+  // Defensive: if the registered callback throws, don't propagate
+  // through C-linkage LLDB code (UB). Log and auto-continue.
+  try {
+    return shim->cb(shim->baton, args);
+  } catch (const std::exception& e) {
+    log::warn(std::string("breakpoint callback threw: ") + e.what());
+    return false;
+  } catch (...) {
+    log::warn("breakpoint callback threw unknown exception");
+    return false;
+  }
+  // Touch unused params to silence -Wunused-parameter on some toolchains.
+  (void)proc; (void)bp_loc;
+}
+
+}  // namespace
+
+BreakpointHandle
+LldbBackend::create_breakpoint(TargetId tid, const BreakpointSpec& spec) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  if (!spec.function.has_value() && !spec.address.has_value() &&
+      !spec.file.has_value()) {
+    throw Error("create_breakpoint: spec must set function, address, or file+line");
+  }
+
+  lldb::SBBreakpoint bp;
+  if (spec.function.has_value()) {
+    bp = target.BreakpointCreateByName(spec.function->c_str());
+  } else if (spec.address.has_value()) {
+    bp = target.BreakpointCreateByAddress(
+        static_cast<lldb::addr_t>(*spec.address));
+  } else {
+    if (!spec.line.has_value() || *spec.line <= 0) {
+      throw Error("create_breakpoint: file form requires positive 'line'");
+    }
+    bp = target.BreakpointCreateByLocation(
+        spec.file->c_str(), static_cast<std::uint32_t>(*spec.line));
+  }
+
+  if (!bp.IsValid() || bp.GetID() == LLDB_INVALID_BREAK_ID) {
+    throw Error("create_breakpoint: LLDB rejected the spec");
+  }
+
+  BreakpointHandle h;
+  h.bp_id     = static_cast<std::int32_t>(bp.GetID());
+  h.locations = static_cast<std::uint32_t>(bp.GetNumLocations());
+  return h;
+}
+
+void LldbBackend::set_breakpoint_callback(TargetId tid, std::int32_t bp_id,
+                                          BreakpointCallback cb,
+                                          void* baton) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  auto bp = target.FindBreakpointByID(bp_id);
+  if (!bp.IsValid()) throw Error("set_breakpoint_callback: unknown bp_id");
+
+  // Build / replace the registry record. We keep it in shared_ptr so
+  // the trampoline's raw pointer baton stays valid even if a future
+  // contract violation re-races a delete; for now the orchestrator
+  // guarantees disable+drain before delete.
+  auto rec = std::make_shared<LldbBreakpointCb>();
+  rec->target_id = tid;
+  rec->bp_id     = bp_id;
+  rec->cb        = std::move(cb);
+  rec->baton     = baton;
+
+  {
+    std::lock_guard<std::mutex> lk(impl_->cb_mu);
+    impl_->bp_callbacks[{tid, bp_id}] = rec;
+  }
+
+  bp.SetCallback(&lldb_breakpoint_trampoline, rec.get());
+}
+
+void LldbBackend::disable_breakpoint(TargetId tid, std::int32_t bp_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  auto bp = target.FindBreakpointByID(bp_id);
+  if (!bp.IsValid()) throw Error("disable_breakpoint: unknown bp_id");
+  bp.SetEnabled(false);
+}
+
+void LldbBackend::enable_breakpoint(TargetId tid, std::int32_t bp_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  auto bp = target.FindBreakpointByID(bp_id);
+  if (!bp.IsValid()) throw Error("enable_breakpoint: unknown bp_id");
+  bp.SetEnabled(true);
+}
+
+void LldbBackend::delete_breakpoint(TargetId tid, std::int32_t bp_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  // Drop the callback first so any racing event can't dereference a
+  // soon-to-be-deleted breakpoint's baton. SBBreakpoint::SetCallback
+  // with a nullptr fn unhooks LLDB's side. The contract is "orchestrator
+  // already disabled + drained" — this is belt-and-braces.
+  auto bp = target.FindBreakpointByID(bp_id);
+  if (bp.IsValid()) {
+    bp.SetCallback(nullptr, nullptr);
+  }
+  {
+    std::lock_guard<std::mutex> lk(impl_->cb_mu);
+    impl_->bp_callbacks.erase({tid, bp_id});
+  }
+  if (bp.IsValid()) {
+    target.BreakpointDelete(bp.GetID());
+  }
+}
+
+std::uint64_t
+LldbBackend::read_register(TargetId tid, ThreadId thread_id,
+                           std::uint32_t frame_index,
+                           const std::string& name) {
+  // Reuse resolve_frame_locked for symmetry; it throws if anything's
+  // off. Reads inside the breakpoint callback always pass frame_index=0
+  // (innermost), but we accept arbitrary indexes for completeness.
+  auto frame = resolve_frame_locked(impl_->targets, impl_->mu,
+                                    tid, thread_id, frame_index);
+  auto sets = frame.GetRegisters();
+  uint32_t ns = sets.GetSize();
+  for (uint32_t i = 0; i < ns; ++i) {
+    auto set = sets.GetValueAtIndex(i);
+    if (!set.IsValid()) continue;
+    uint32_t nr = set.GetNumChildren();
+    for (uint32_t j = 0; j < nr; ++j) {
+      auto reg = set.GetChildAtIndex(j);
+      if (!reg.IsValid()) continue;
+      const char* rn = reg.GetName();
+      if (!rn || name != rn) continue;
+      lldb::SBError err;
+      auto v = reg.GetValueAsUnsigned(err, /*fail_value=*/0);
+      if (err.Fail()) return 0;
+      return static_cast<std::uint64_t>(v);
+    }
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
@@ -2084,6 +2325,17 @@ void LldbBackend::close_target(TargetId tid) {
     if (it == impl_->targets.end()) return;
     target = it->second;
     impl_->targets.erase(it);
+  }
+  // Reap any breakpoint-callback records associated with this target.
+  // The target's SBBreakpoints go away with DeleteTarget; the records
+  // would leak otherwise. Same lock ordering as set_breakpoint_callback.
+  {
+    std::lock_guard<std::mutex> lk(impl_->cb_mu);
+    for (auto it = impl_->bp_callbacks.begin();
+         it != impl_->bp_callbacks.end(); ) {
+      if (it->first.first == tid) it = impl_->bp_callbacks.erase(it);
+      else ++it;
+    }
   }
   impl_->debugger.DeleteTarget(target);
 }

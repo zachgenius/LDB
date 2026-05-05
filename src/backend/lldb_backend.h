@@ -84,6 +84,18 @@ class LldbBackend final : public DebuggerBackend {
                     const std::vector<std::uint8_t>& needle,
                     std::uint32_t max_hits) override;
 
+  BreakpointHandle
+      create_breakpoint(TargetId tid, const BreakpointSpec& spec) override;
+  void set_breakpoint_callback(TargetId tid, std::int32_t bp_id,
+                               BreakpointCallback cb, void* baton) override;
+  void disable_breakpoint(TargetId tid, std::int32_t bp_id) override;
+  void enable_breakpoint(TargetId tid, std::int32_t bp_id) override;
+  void delete_breakpoint(TargetId tid, std::int32_t bp_id) override;
+
+  std::uint64_t read_register(TargetId tid, ThreadId thread_id,
+                              std::uint32_t frame_index,
+                              const std::string& name) override;
+
   void close_target(TargetId tid) override;
 
  private:

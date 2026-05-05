@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -262,6 +263,48 @@ struct MemorySearchHit {
   std::uint64_t address = 0;
 };
 
+// --- Breakpoints (M3 probes prep) -------------------------------------------
+//
+// `lldb_breakpoint`-engine probes (probe.create kind="lldb_breakpoint")
+// install a C++ callback on a real LLDB breakpoint via
+// SBBreakpoint::SetCallback. The plan §7.1 originally sketched
+// SetScriptCallbackBody (Python) — we use the C++ baton path instead so
+// the daemon doesn't need to embed CPython, and so probe-callback
+// overhead doesn't pay Python ↔ C++ marshaling on the hot path.
+
+struct BreakpointSpec {
+  // Exactly one of the three "where" forms must be set. The backend
+  // throws if all are unset, or none resolves to a code location.
+  std::optional<std::string>   function;
+  std::optional<std::uint64_t> address;
+  std::optional<std::string>   file;
+  std::optional<int>           line;
+};
+
+struct BreakpointHandle {
+  std::int32_t  bp_id     = 0;   // SBBreakpoint id (1-indexed when valid)
+  std::uint32_t locations = 0;   // SBBreakpoint::GetNumLocations()
+};
+
+// State the orchestrator's callback needs while the inferior is stopped
+// at the breakpoint hit. The backend resolves these at hit time and
+// hands them in; the callback should NOT call back into the dispatcher
+// (it runs on LLDB's process-event thread).
+struct BreakpointCallbackArgs {
+  TargetId      target_id    = 0;
+  ThreadId      tid          = 0;
+  std::uint32_t frame_index  = 0;     // always 0 (innermost) at hit
+  std::uint64_t pc           = 0;
+  std::string   function;              // best-effort
+  std::string   file;                  // empty if unavailable
+  int           line         = 0;      // 0 if unavailable
+};
+
+// Returning false auto-continues the inferior (typical probe path).
+// Returning true keeps it stopped — the agent picks up via process.state.
+using BreakpointCallback =
+    std::function<bool(void* baton, const BreakpointCallbackArgs&)>;
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -504,6 +547,46 @@ class DebuggerBackend {
       search_memory(TargetId tid, std::uint64_t start, std::uint64_t length,
                     const std::vector<std::uint8_t>& needle,
                     std::uint32_t max_hits) = 0;
+
+  // --- Breakpoints (M3 probes) ---------------------------------------
+  //
+  // The orchestrator owns probe lifecycle and callback batons; the
+  // backend just owns the raw SBBreakpoint and the bridge between
+  // LLDB's SBBreakpointHitCallback signature and our typed C++
+  // callback. The backend stores the callback + baton internally and
+  // reaps them on delete_breakpoint or target close.
+  //
+  // Concurrency contract:
+  //   • LLDB invokes the callback on its process-event thread, NOT on
+  //     the dispatcher thread. The callback must NOT call back into
+  //     the dispatcher or acquire dispatcher-side locks.
+  //   • Returning false from the callback auto-continues the inferior.
+  //   • Returning true keeps the inferior stopped (the agent learns
+  //     via process.state).
+  //   • The baton is owned by the caller; baton lifetime must extend
+  //     until delete_breakpoint() returns. The orchestrator enforces
+  //     "disable + drain → delete" ordering.
+
+  virtual BreakpointHandle
+      create_breakpoint(TargetId tid, const BreakpointSpec& spec) = 0;
+
+  virtual void
+      set_breakpoint_callback(TargetId tid, std::int32_t bp_id,
+                              BreakpointCallback cb, void* baton) = 0;
+
+  virtual void disable_breakpoint(TargetId tid, std::int32_t bp_id) = 0;
+  virtual void enable_breakpoint(TargetId tid, std::int32_t bp_id) = 0;
+  virtual void delete_breakpoint(TargetId tid, std::int32_t bp_id) = 0;
+
+  // Read a register from a thread's frame at the moment of a stop
+  // (typically called from inside a breakpoint callback). Returns 0 if
+  // the register is unknown or unreadable (a real "0" register and an
+  // unknown register are indistinguishable here — the orchestrator
+  // documents this as captured-as-zero rather than throwing).
+  virtual std::uint64_t
+      read_register(TargetId tid, ThreadId thread_id,
+                    std::uint32_t frame_index,
+                    const std::string& name) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;
