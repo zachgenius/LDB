@@ -7,6 +7,7 @@ set(LDBD_SOURCES
   protocol/jsonrpc.cpp
   protocol/view.cpp
   backend/lldb_backend.cpp
+  store/artifact_store.cpp
   util/log.cpp
 )
 
@@ -21,6 +22,7 @@ target_link_libraries(ldbd PRIVATE
   ldb_lldb
   ldb_json
   ldb_warnings
+  SQLite::SQLite3
 )
 
 # Project version macros

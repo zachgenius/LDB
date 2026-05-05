@@ -2,10 +2,12 @@
 #include "daemon/dispatcher.h"
 #include "daemon/stdio_loop.h"
 #include "ldb/version.h"
+#include "store/artifact_store.h"
 #include "util/log.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -15,10 +17,17 @@ namespace {
 void print_usage() {
   std::cerr <<
     "ldbd " << ldb::kVersionString << "\n"
-    "Usage: ldbd [--stdio] [--log-level debug|info|warn|error] [-h|--help]\n"
+    "Usage: ldbd [--stdio] [--log-level debug|info|warn|error]\n"
+    "            [--store-root <path>] [-h|--help]\n"
     "\n"
     "Modes:\n"
     "  --stdio    Read JSON-RPC from stdin, write responses to stdout (default)\n"
+    "\n"
+    "Storage:\n"
+    "  --store-root <path>   Directory for the artifact store (sqlite\n"
+    "                        index + on-disk blobs). Overridden by the\n"
+    "                        LDB_STORE_ROOT environment variable.\n"
+    "                        Default: $HOME/.ldb\n"
     "\n"
     "Logs go to stderr; the JSON-RPC channel is exclusive on stdout.\n";
 }
@@ -31,10 +40,29 @@ bool parse_log_level(const std::string& s, ldb::log::Level& out) {
   return false;
 }
 
+// Resolution order (first non-empty wins): env LDB_STORE_ROOT, --store-root
+// arg, $HOME/.ldb. The env var takes precedence over the CLI flag so a
+// containerized launcher can pin the path without rewriting argv. If
+// $HOME isn't set either, we fall back to a stable relative path
+// "./.ldb" rather than scribbling on /; the operator should set one
+// explicitly in that case.
+std::filesystem::path resolve_store_root(const std::string& cli_arg) {
+  if (const char* env = std::getenv("LDB_STORE_ROOT");
+      env && *env) {
+    return std::filesystem::path(env);
+  }
+  if (!cli_arg.empty()) return std::filesystem::path(cli_arg);
+  if (const char* home = std::getenv("HOME"); home && *home) {
+    return std::filesystem::path(home) / ".ldb";
+  }
+  return std::filesystem::path(".ldb");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
+  std::string store_root_arg;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -53,6 +81,8 @@ int main(int argc, char** argv) {
         return 2;
       }
       ldb::log::set_level(lvl);
+    } else if (a == "--store-root" && i + 1 < argc) {
+      store_root_arg = argv[++i];
     } else {
       std::cerr << "unknown argument: " << a << "\n\n";
       print_usage();
@@ -70,7 +100,20 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  ldb::daemon::Dispatcher dispatcher(backend);
+  std::shared_ptr<ldb::store::ArtifactStore> artifacts;
+  try {
+    auto root = resolve_store_root(store_root_arg);
+    artifacts = std::make_shared<ldb::store::ArtifactStore>(root);
+    ldb::log::debug(std::string("artifact store at ") + root.string());
+  } catch (const std::exception& e) {
+    // Don't fail startup — the daemon is useful without artifact.* if
+    // the store can't be opened (read-only homedir, full disk). The
+    // dispatcher returns -32002 (kBadState) for any artifact.* call when
+    // the store is null, so the agent gets a clear typed error.
+    ldb::log::warn(std::string("artifact store unavailable: ") + e.what());
+  }
+
+  ldb::daemon::Dispatcher dispatcher(backend, artifacts);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher);

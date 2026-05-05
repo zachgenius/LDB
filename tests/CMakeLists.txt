@@ -2,6 +2,15 @@
 # tests). Build them before any target that depends on them.
 add_subdirectory(fixtures)
 
+# Pin every test's artifact-store root inside the build directory so
+# that ldbd's default-to-${HOME}/.ldb fallback never writes to the
+# operator's home directory during testing. Tests that need a clean
+# per-run root (smoke_artifact, the unit fixture) override this with
+# their own tmpdir; tests that don't touch the store at all are
+# unaffected.
+set(LDB_TEST_STORE_ROOT "${CMAKE_BINARY_DIR}/test-store-root")
+file(MAKE_DIRECTORY "${LDB_TEST_STORE_ROOT}")
+
 # Smoke tests — end-to-end against the built ldbd binary.
 add_test(
   NAME smoke_hello
@@ -181,5 +190,25 @@ set_tests_properties(smoke_connect_remote PROPERTIES
   TIMEOUT 60
 )
 
+add_test(
+  NAME smoke_artifact
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_artifact.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_artifact PROPERTIES
+  TIMEOUT 30
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)
+
+# Apply LDB_STORE_ROOT to every test we registered above. Tests that set
+# their own value in subprocess env (smoke_artifact) override this; the
+# unit fixture uses std::filesystem::temp_directory_path() and ignores
+# the env var entirely. The point is to make absolutely sure no test —
+# present or future — silently writes to the operator's $HOME/.ldb.
+get_directory_property(_LDB_TESTS TESTS)
+foreach(_t IN LISTS _LDB_TESTS)
+  set_property(TEST ${_t} APPEND PROPERTY
+    ENVIRONMENT "LDB_STORE_ROOT=${LDB_TEST_STORE_ROOT}")
+endforeach()

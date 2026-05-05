@@ -3,10 +3,13 @@
 #include "backend/debugger_backend.h"
 #include "ldb/version.h"
 #include "protocol/view.h"
+#include "store/artifact_store.h"
 #include "util/log.h"
 
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ldb::daemon {
 
@@ -259,12 +262,106 @@ bool require_uint(const json& obj, const char* key, std::uint64_t* out) {
   return false;
 }
 
+// --- Base64 (RFC 4648, no line wrapping) ---------------------------------
+
+constexpr const char kB64Alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const std::vector<std::uint8_t>& in) {
+  std::string out;
+  out.reserve(((in.size() + 2) / 3) * 4);
+  std::size_t i = 0;
+  for (; i + 3 <= in.size(); i += 3) {
+    std::uint32_t v = (std::uint32_t{in[i]} << 16) |
+                      (std::uint32_t{in[i + 1]} << 8) |
+                      std::uint32_t{in[i + 2]};
+    out.push_back(kB64Alphabet[(v >> 18) & 0x3Fu]);
+    out.push_back(kB64Alphabet[(v >> 12) & 0x3Fu]);
+    out.push_back(kB64Alphabet[(v >>  6) & 0x3Fu]);
+    out.push_back(kB64Alphabet[v & 0x3Fu]);
+  }
+  std::size_t rem = in.size() - i;
+  if (rem == 1) {
+    std::uint32_t v = std::uint32_t{in[i]} << 16;
+    out.push_back(kB64Alphabet[(v >> 18) & 0x3Fu]);
+    out.push_back(kB64Alphabet[(v >> 12) & 0x3Fu]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (rem == 2) {
+    std::uint32_t v = (std::uint32_t{in[i]} << 16) |
+                      (std::uint32_t{in[i + 1]} << 8);
+    out.push_back(kB64Alphabet[(v >> 18) & 0x3Fu]);
+    out.push_back(kB64Alphabet[(v >> 12) & 0x3Fu]);
+    out.push_back(kB64Alphabet[(v >>  6) & 0x3Fu]);
+    out.push_back('=');
+  }
+  return out;
+}
+
+// Returns nullopt on any non-alphabet character (excluding padding) or
+// malformed length. Whitespace inside the input is rejected — the agent
+// is sending JSON-RPC, not pretty-printed PEM.
+std::optional<std::vector<std::uint8_t>>
+base64_decode(std::string_view in) {
+  if (in.size() % 4 != 0) return std::nullopt;
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + (c - 'a');
+    if (c >= '0' && c <= '9') return 52 + (c - '0');
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  std::vector<std::uint8_t> out;
+  out.reserve((in.size() / 4) * 3);
+  for (std::size_t i = 0; i < in.size(); i += 4) {
+    char c0 = in[i], c1 = in[i + 1], c2 = in[i + 2], c3 = in[i + 3];
+    int v0 = val(c0), v1 = val(c1);
+    if (v0 < 0 || v1 < 0) return std::nullopt;
+    if (c2 == '=') {
+      if (c3 != '=') return std::nullopt;
+      out.push_back(static_cast<std::uint8_t>((v0 << 2) | (v1 >> 4)));
+    } else {
+      int v2 = val(c2);
+      if (v2 < 0) return std::nullopt;
+      if (c3 == '=') {
+        out.push_back(static_cast<std::uint8_t>((v0 << 2) | (v1 >> 4)));
+        out.push_back(static_cast<std::uint8_t>(((v1 & 0xF) << 4) | (v2 >> 2)));
+      } else {
+        int v3 = val(c3);
+        if (v3 < 0) return std::nullopt;
+        out.push_back(static_cast<std::uint8_t>((v0 << 2) | (v1 >> 4)));
+        out.push_back(static_cast<std::uint8_t>(((v1 & 0xF) << 4) | (v2 >> 2)));
+        out.push_back(static_cast<std::uint8_t>(((v2 & 0x3) << 6) | v3));
+      }
+    }
+  }
+  return out;
+}
+
+// --- Artifact row → JSON (list shape: no bytes inline) -------------------
+
+json artifact_row_to_list_json(const ldb::store::ArtifactRow& r) {
+  json j;
+  j["id"]         = r.id;
+  j["build_id"]   = r.build_id;
+  j["name"]       = r.name;
+  j["sha256"]     = r.sha256;
+  j["byte_size"]  = r.byte_size;
+  if (r.format.has_value())   j["format"] = *r.format;
+  if (!r.tags.empty())        j["tags"]   = r.tags;
+  j["created_at"] = r.created_at;
+  return j;
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
 
-Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend)
-    : backend_(std::move(backend)) {}
+Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
+                       std::shared_ptr<store::ArtifactStore> artifacts)
+    : backend_(std::move(backend)),
+      artifacts_(std::move(artifacts)) {}
 
 Dispatcher::~Dispatcher() = default;
 
@@ -310,6 +407,11 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "mem.read_cstr")      return handle_mem_read_cstr(req);
     if (req.method == "mem.regions")        return handle_mem_regions(req);
     if (req.method == "mem.search")         return handle_mem_search(req);
+
+    if (req.method == "artifact.put")       return handle_artifact_put(req);
+    if (req.method == "artifact.get")       return handle_artifact_get(req);
+    if (req.method == "artifact.list")      return handle_artifact_list(req);
+    if (req.method == "artifact.tag")       return handle_artifact_tag(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -599,6 +701,50 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"address", "uint64?"}, {"length", "uint64?"},
            {"max_hits", "uint?"}},
       json{{"hits", "array of {address}"}});
+
+  add("artifact.put",
+      "Store a binary blob in the artifact store, keyed by "
+      "(build_id, name). bytes_b64 is base64-encoded. (build_id, name) "
+      "is unique — putting again with the same pair *replaces* the "
+      "prior entry (the old blob file is unlinked, the row's id "
+      "changes). format and meta are caller-supplied annotations; the "
+      "store is content-agnostic.",
+      json{{"build_id", "string"}, {"name", "string"},
+           {"bytes_b64", "string<base64>"},
+           {"format", "string?"}, {"meta", "object?"}},
+      json{{"id", "int64"}, {"sha256", "string"},
+           {"byte_size", "uint64"}, {"stored_path", "string"}});
+
+  add("artifact.get",
+      "Fetch an artifact by (build_id, name) or by id. Returns the blob "
+      "as bytes_b64; cap with view.max_bytes to preview large blobs "
+      "without pulling the full payload over the channel. truncated=true "
+      "indicates the cap was applied.",
+      json{{"build_id", "string?"}, {"name", "string?"},
+           {"id", "int64?"},
+           {"view", "object{max_bytes?}?"}},
+      json{{"bytes_b64", "string"}, {"byte_size", "uint64"},
+           {"sha256", "string"}, {"format", "string?"},
+           {"meta", "object"}, {"build_id", "string"},
+           {"name", "string"}, {"created_at", "int64"},
+           {"truncated", "bool"}});
+
+  add("artifact.list",
+      "Enumerate stored artifacts, optionally filtered by build_id "
+      "(exact match) and/or name_pattern (sqlite LIKE — '%' is multi-"
+      "char wildcard, '_' is single-char). Bytes are not included; use "
+      "artifact.get for the payload.",
+      json{{"build_id", "string?"}, {"name_pattern", "string?"}},
+      json{{"artifacts",
+            "array of {id,build_id,name,byte_size,sha256,format?,"
+            "tags?,created_at}"},
+           {"total", "uint"}});
+
+  add("artifact.tag",
+      "Add tags to an existing artifact (additive, idempotent — "
+      "duplicates are no-ops). Returns the resulting full tag set.",
+      json{{"id", "int64"}, {"tags", "array of string"}},
+      json{{"tags", "array of string"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -1462,6 +1608,232 @@ Response Dispatcher::handle_type_layout(const Request& req) {
   } else {
     data["found"]  = false;
   }
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// --- artifact.* ------------------------------------------------------------
+
+namespace {
+// Common preflight for all four artifact handlers: bail out cleanly if
+// no store is configured (e.g. unit tests pre-dating M3, or the daemon
+// somehow started without a --store-root). Returns an error response on
+// missing store; nullopt to continue.
+std::optional<Response>
+require_artifact_store(const Request& req,
+                       const std::shared_ptr<ldb::store::ArtifactStore>& s) {
+  if (s) return std::nullopt;
+  return protocol::make_err(req.id, ErrorCode::kBadState,
+                            "artifact store not configured "
+                            "(set --store-root or LDB_STORE_ROOT)");
+}
+}  // namespace
+
+Response Dispatcher::handle_artifact_put(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* build_id = require_string(req.params, "build_id");
+  if (!build_id || build_id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'build_id'");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name || name->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'name'");
+  }
+  const auto* b64 = require_string(req.params, "bytes_b64");
+  if (!b64) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'bytes_b64'");
+  }
+  auto bytes = base64_decode(*b64);
+  if (!bytes) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'bytes_b64' is not valid base64");
+  }
+
+  std::optional<std::string> format;
+  if (auto it = req.params.find("format"); it != req.params.end() &&
+                                            !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'format' must be a string");
+    }
+    format = it->get<std::string>();
+  }
+
+  json meta = json::object();
+  if (auto it = req.params.find("meta"); it != req.params.end() &&
+                                          !it->is_null()) {
+    if (!it->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'meta' must be an object");
+    }
+    meta = *it;
+  }
+
+  auto row = artifacts_->put(*build_id, *name, *bytes, std::move(format),
+                              meta);
+  json data;
+  data["id"]          = row.id;
+  data["sha256"]      = row.sha256;
+  data["byte_size"]   = row.byte_size;
+  data["stored_path"] = row.stored_path;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_get(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+
+  // Lookup mode: id, OR (build_id, name). id wins if both given.
+  std::optional<store::ArtifactRow> row;
+  if (auto it = req.params.find("id");
+      it != req.params.end() && !it->is_null()) {
+    std::int64_t id = 0;
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'id' must be an integer");
+    }
+    row = artifacts_->get_by_id(id);
+  } else {
+    const auto* build_id = require_string(req.params, "build_id");
+    const auto* name     = require_string(req.params, "name");
+    if (!build_id || !name) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "artifact.get needs either {id} or "
+                                "{build_id, name}");
+    }
+    row = artifacts_->get_by_name(*build_id, *name);
+  }
+
+  if (!row.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              "artifact not found");
+  }
+
+  // view.max_bytes caps the inline payload (preview path).
+  std::uint64_t max_bytes = 0;
+  if (auto vit = req.params.find("view");
+      vit != req.params.end() && vit->is_object()) {
+    if (auto mit = vit->find("max_bytes");
+        mit != vit->end() && !mit->is_null()) {
+      if (mit->is_number_unsigned()) {
+        max_bytes = mit->get<std::uint64_t>();
+      } else if (mit->is_number_integer()) {
+        auto v = mit->get<std::int64_t>();
+        if (v < 0) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "'view.max_bytes' must be non-negative");
+        }
+        max_bytes = static_cast<std::uint64_t>(v);
+      } else {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'view.max_bytes' must be an integer");
+      }
+    }
+  }
+
+  auto bytes = artifacts_->read_blob(*row, max_bytes);
+  bool truncated = (max_bytes != 0 &&
+                    static_cast<std::uint64_t>(bytes.size()) < row->byte_size);
+
+  json data;
+  data["bytes_b64"]  = base64_encode(bytes);
+  data["byte_size"]  = row->byte_size;
+  data["sha256"]     = row->sha256;
+  if (row->format.has_value()) data["format"] = *row->format;
+  data["meta"]       = row->meta;
+  data["build_id"]   = row->build_id;
+  data["name"]       = row->name;
+  data["created_at"] = row->created_at;
+  data["truncated"]  = truncated;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_list(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object() && !req.params.is_null()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::optional<std::string> build_id;
+  std::optional<std::string> name_pattern;
+  if (req.params.is_object()) {
+    if (auto it = req.params.find("build_id");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'build_id' must be a string");
+      }
+      build_id = it->get<std::string>();
+    }
+    if (auto it = req.params.find("name_pattern");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'name_pattern' must be a string");
+      }
+      name_pattern = it->get<std::string>();
+    }
+  }
+
+  auto rows = artifacts_->list(build_id, name_pattern);
+  json arr = json::array();
+  for (const auto& r : rows) arr.push_back(artifact_row_to_list_json(r));
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "artifacts"));
+}
+
+Response Dispatcher::handle_artifact_tag(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'id'");
+  }
+  auto tit = req.params.find("tags");
+  if (tit == req.params.end() || !tit->is_array()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing array param 'tags'");
+  }
+  std::vector<std::string> tags;
+  for (const auto& t : *tit) {
+    if (!t.is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'tags' entries must be strings");
+    }
+    tags.push_back(t.get<std::string>());
+  }
+
+  auto out_tags = artifacts_->add_tags(id, tags);
+  json data;
+  data["tags"] = out_tags;
   return protocol::make_ok(req.id, std::move(data));
 }
 

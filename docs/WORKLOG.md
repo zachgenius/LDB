@@ -4,6 +4,64 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 11) — M3 part 1: artifact store
+
+**Goal:** Land the artifact store — sqlite-indexed, on-disk blob store keyed by `(build_id, name)`, with the four CRUD-class endpoints (`artifact.put` / `artifact.get` / `artifact.list` / `artifact.tag`). Defer `.ldbpack` import/export, sessions, and probes to later M3 slices.
+
+**Done:**
+
+- **Build dep + harness expansion** (commit `ceb7898`): added `find_package(SQLite3 REQUIRED)` to the top-level CMake with a Homebrew-prefix fallback path; SDK's libsqlite3.tbd 3.51.0 resolves cleanly on this dev box. Linked into both `ldbd` and `ldb_unit_tests`. Three Catch2 cases (`[harness][sqlite]`) prove the open/close, round-trip a row, and assert compile-time vs runtime version agreement (catches header-vs-lib ABI skew). Per CLAUDE.md "harness expansion" rule — first commit on a branch when a new test surface needs a new dep.
+- **`src/store/artifact_store.{h,cpp}`** (commit on this branch): `ArtifactStore(root)` ctor creates intermediate dirs, opens `${root}/index.db`, runs migration to WAL mode + the canonical schema (artifacts + artifact_tags). `put`, `get_by_id`, `get_by_name`, `read_blob(row, max_bytes=0)`, `list(build_id?, name_pattern?)`, `add_tags(id, tags)`. Sqlite errors wrapped as `backend::Error` so the dispatcher's existing `-32000` mapping catches them. Hand-rolled SHA-256 (~150 lines, public-domain reference, validated against NIST empty-string vector in the empty-bytes test) so we don't pull OpenSSL just for hashing. Blob writes are atomic — write to `<dest>.tmp`, then `rename(2)` — so a crashed daemon never leaves a torn blob in the store.
+- **Endpoints wired in `dispatcher.cpp`**: artifact.put / get / list / tag. Constructor signature extended with `std::shared_ptr<store::ArtifactStore>` (defaulted to nullptr so the dispatcher unit tests pre-dating M3 still construct cleanly). All four handlers preflight on a null store and return `-32002 (kBadState)` with a deterministic "artifact store not configured" message rather than crashing or returning misleading not-found data. RFC-4648 base64 encode/decode lives in the dispatcher's anonymous namespace; we do *not* line-wrap on encode and reject whitespace on decode (the input is JSON-RPC, not PEM). All four registered in `describe.endpoints` (now 38 endpoints, up from 34).
+- **`main.cpp`** plumbs `--store-root <path>` and `LDB_STORE_ROOT`. Resolution order: env wins, then CLI arg, then `$HOME/.ldb`, then `./.ldb` if `$HOME` is also unset. Daemon does NOT fail startup when the store can't be opened — it logs a warning and the dispatcher returns -32002 for any artifact.* call, so the rest of the daemon stays useful. `--help` documents the precedence.
+- **Unit tests** (`tests/unit/test_artifact_store.cpp`, 11 cases / 198 assertions): put+get round-trip, get_by_id fallback, replace-on-duplicate (id changes, old file unlinked, list count stays 1), list filters (build_id exact, name_pattern LIKE), add_tags additive+idempotent, add_tags on missing id throws, read_blob max_bytes truncation (0 = unlimited; cap > size returns full blob), corrupt-blob recovery (rm the file behind the store's back, read_blob throws backend::Error), reopen-persistence, empty-bytes (sha matches the NIST empty-string vector). TmpStoreRoot fixture uses `std::filesystem::temp_directory_path() / "ldb_test_<random>"`; cleans up on destruction; **never touches `~/.ldb`**.
+- **Smoke test** (`tests/smoke/test_artifact.py`, TIMEOUT 30): describe-endpoints check, put 3 artifacts (2 builds), list-all + filter-by-build_id + filter-by-name_pattern (LIKE), get-by-name with full payload + sha verify + meta round-trip, get with `view.max_bytes=8` preview asserting `truncated=true`, get-by-id, tag (additive idempotent), error paths (missing field → -32602, bad b64 → -32602, bogus id → -32000, tag missing → -32000), replace contract over the wire (id changes, payload updated, total stays at 3). Sets `LDB_STORE_ROOT` to `tempfile.mkdtemp(...)`.
+- **Test-harness side-effect guard:** every `add_test` in `tests/CMakeLists.txt` AND `tests/unit/CMakeLists.txt` now sets `ENVIRONMENT "LDB_STORE_ROOT=${CMAKE_BINARY_DIR}/test-store-root"` so the daemon's default `$HOME/.ldb` fallback can never write to the operator's homedir during testing. Caught the first run leaking to `~/.ldb` because every smoke test that launches `ldbd` was inheriting the unset env. Tests that need a per-run isolated root (smoke_artifact, the unit fixture) override in their subprocess env / use `temp_directory_path()`.
+
+**Decisions:**
+
+- **`(build_id, name)` is the unique key, replacing on conflict.** Documented in the header and asserted by both unit and smoke tests. Replace is implemented as DELETE + INSERT (via `ON DELETE CASCADE` for tags), so the artifact id changes — surfaces "the row was rewritten" to any agent that's tracking ids. UPDATE-in-place would have been one line shorter but would lie about identity. Old blob file is unlinked before the new one is written so the store's storage usage doesn't drift.
+- **WAL mode with `synchronous=NORMAL`.** Plan §3.4 commits to WAL for sessions; same convention here so a future read-side path (probe-event drain, session log replay) can read concurrently with writes. `synchronous=NORMAL` is the standard "WAL + crash-safe enough for not-financial data" knob; FULL is overkill for "captured a memory dump." `journal_mode` stays in WAL across reopens (sqlite persists it).
+- **base64 in JSON, not a side-channel.** JSON has no native binary; base64 + an explicit `bytes_b64` field name keeps the wire honest. `view.max_bytes` lets the agent preview without pulling huge payloads back over the channel — matches the existing view-descriptor pattern. Considered: hex (4× overhead vs base64's 1.33×) and a separate framed binary channel (rejected: complicates the JSON-RPC framing for an endpoint that's not on the hot path).
+- **Hand-rolled SHA-256, no OpenSSL.** ~150 lines of public-domain reference. Validated against the NIST empty-string vector in the empty-bytes test (`e3b0c44...`). OpenSSL would have been one CMake line plus a ~3-MB transitive dep; sqlite already takes care of all the persistence we need. If a second SHA consumer joins (e.g. verifying `.ldbpack` manifests in a later M3 slice), revisit.
+- **Errors → `backend::Error`** with `-32000`. The dispatcher already maps `backend::Error` to `kBackendError`; the artifact store wrapping sqlite errors with the same exception type plumbs through with no extra glue. Param-validation errors stay `-32602` (`kInvalidParams`); "store not configured" is `-32002` (`kBadState`) — the agent can branch on the code.
+- **Store ctor doesn't fail-startup the daemon.** If the homedir is read-only or `$HOME/.ldb` is on a full disk, the daemon still serves all the other endpoints; artifact.* returns -32002 with a clear message. Failing-startup would be more "loud" but punishes operators who don't use artifacts at all.
+- **Test-harness env pinning is mandatory.** Without `LDB_STORE_ROOT` pinned per-test, every smoke launches the daemon with the default `$HOME/.ldb` fallback — silently making a directory in the operator's homedir during `ctest`. The first ctest run on this branch did exactly that. Pinning to `${CMAKE_BINARY_DIR}/test-store-root` keeps everything inside the build tree; any future test that spawns `ldbd` inherits it for free.
+- **Defer `.ldbpack` export/import.** Tarball format with manifest signing is its own design slice (per plan §8); 4 CRUD endpoints are the minimum surface for probes (M3 slice 2) to land on top of. Worklog documents this as deferred.
+
+**Surprises / blockers:**
+
+- **First run leaked to `~/.ldb`.** Manually `ls -la ~/.ldb` after the first green ctest showed `index.db` and `builds/`. Cause: every smoke test launches `ldbd` without setting `LDB_STORE_ROOT`, and the daemon's resolution order falls back to `$HOME/.ldb`. Could have papered over this by making the store creation lazy (open-on-first-use), but that just defers the symptom — the *next* test that uses artifact.* would still leak. Real fix: pin `LDB_STORE_ROOT` per-test via CMake's `ENVIRONMENT` property, applied uniformly to every `add_test` in tests/CMakeLists.txt + tests/unit/CMakeLists.txt. Caught and fixed before the commit.
+- **CMake `Impl` private with friend-namespace helpers needed `Impl` made public.** Anonymous-namespace helpers in `artifact_store.cpp` couldn't take `ArtifactStore::Impl&` while `Impl` was a private struct fwd-decl. Made `Impl` public (still opaque from the outside — only the .cpp's helpers can name it because nothing else includes the definition). Same trick the LldbBackend uses for its anon-namespace `resolve_frame_locked` helpers.
+- **`-Wsign-conversion` on the SHA-256 finalizer.** The reference code uses `int i` for the digest-write loop; project's warning level is hot, so changed to `std::size_t i` and the implicit conversions disappear.
+- **`fs::remove(path, ec)` requires lvalue error_code.** `std::error_code{}` rvalue won't bind. Trivial; fixed.
+- **No JSON-RPC channel corruption observed.** sqlite doesn't write to stdout; base64 codec is pure. Did NOT need a `dup2`-over-/dev/null guard like SaveCore / EvaluateExpression / ConnectRemote. Worth recording because the M2 closeouts established that pattern as load-bearing for stdout-chatty SBAPI calls.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **20/20 PASS in ~92s wall clock** on macOS arm64. unit_tests is now 167 cases / 1505 assertions (up from 153/1294 baseline; added 14 cases / 211 assertions: 3 sqlite harness + 11 artifact_store). Build is warning-clean under the project's `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion ...` flags.
+- New test IDs: `[harness][sqlite]` (3), `[store][artifact]` (10), `[store][artifact][error]` (2 — duplicate-id-on-throw and missing-blob-throws), plus `smoke_artifact` (0.17s).
+- Manual: `ldbd --help` documents `--store-root`; `ldbd --store-root /tmp/foo --version` exits cleanly without creating `/tmp/foo`; `~/.ldb` is NOT created during ctest.
+- describe.endpoints lists all four `artifact.*` methods (now 38 endpoints).
+- Replace-on-duplicate verified end-to-end: smoke test reads back the new payload after a second put with the same `(build_id, name)`, confirms the id changed, and asserts `total` stays at 3.
+
+**Deferred to later M3 slices:**
+
+- `.ldbpack` tarball export/import — separate slice, separate agent.
+- Sessions (sqlite WAL log + replay, plan §3.4) — independent of artifacts; can land in parallel with probes.
+- Probes (`lldb_breakpoint` engine via `SBBreakpoint::SetScriptCallbackBody`) — depends on artifacts being landed (probes capture into artifacts on `action="store_artifact"`); now unblocked.
+- Build registry (`builds` table per plan §8 sketch) — current schema doesn't surface a separate `builds` row; the artifact rows carry `build_id` directly. If/when probes need per-build metadata (`meta.json`, observed-at), that's the natural moment to add a `builds(build_id PK, path TEXT, arch TEXT, ...)` table. Open question deliberately left open.
+- Dispatcher.cpp split — file is now ~1700+ lines after artifact handlers. Will become hard to navigate after one more endpoint group; deferring as before, per-area split (`dispatcher_target.cpp`, `dispatcher_artifact.cpp`, ...) is the right shape.
+
+**Next:**
+
+- **M3 sessions** — `session.create / attach / log` per plan §3.4. Sqlite WAL-backed event log + replay. Can land independently of probes.
+- **M3 probes** — `probe.create / events / disable / remove`. Now unblocked since artifacts can absorb captured payloads. Plan §13 calls out probe-callback Python overhead as an M3-critical risk; measure early.
+- **`mem.dump_artifact({addr, len, name, format?})`** — small composition endpoint that reads memory and stores the result as an artifact in one round-trip. Trivial to add now that both sides exist.
+- **Cleanup queue:** dispatcher.cpp split (deferred since cont. 7); the `[INF]` log already debug-demoted; nothing else outstanding from M2.
+
+---
+
 ## 2026-05-05 (cont. 10) — M2 closeout: target.connect_remote
 
 **Goal:** Land the final M2-tier endpoint — `target.connect_remote({url, plugin?})` — wrapping `SBTarget::ConnectRemote` so an agent can attach to an `lldb-server` / `gdbserver` / `debugserver` over a gdb-remote-protocol port. Closes M2.

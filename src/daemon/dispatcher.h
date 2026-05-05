@@ -5,6 +5,7 @@
 #include <memory>
 
 namespace ldb::backend { class DebuggerBackend; }
+namespace ldb::store   { class ArtifactStore; }
 
 namespace ldb::daemon {
 
@@ -12,13 +13,19 @@ namespace ldb::daemon {
 // All handlers are synchronous in M0.
 class Dispatcher {
  public:
-  explicit Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend);
+  // Backend is required. The artifact store is optional only because
+  // the unit tests that pre-date M3 construct dispatchers without one;
+  // any artifact.* call against a null store returns -32002 (kBadState)
+  // with a deterministic "artifact store not configured" message.
+  explicit Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
+                      std::shared_ptr<store::ArtifactStore> artifacts = {});
   ~Dispatcher();
 
   protocol::Response dispatch(const protocol::Request& req);
 
  private:
   std::shared_ptr<backend::DebuggerBackend> backend_;
+  std::shared_ptr<store::ArtifactStore>     artifacts_;
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
@@ -60,6 +67,11 @@ class Dispatcher {
   protocol::Response handle_mem_read_cstr(const protocol::Request& req);
   protocol::Response handle_mem_regions(const protocol::Request& req);
   protocol::Response handle_mem_search(const protocol::Request& req);
+
+  protocol::Response handle_artifact_put(const protocol::Request& req);
+  protocol::Response handle_artifact_get(const protocol::Request& req);
+  protocol::Response handle_artifact_list(const protocol::Request& req);
+  protocol::Response handle_artifact_tag(const protocol::Request& req);
 };
 
 }  // namespace ldb::daemon
