@@ -10,6 +10,7 @@ set(LDB_UNIT_SOURCES
   test_backend_type_layout.cpp
   test_backend_symbol_find.cpp
   test_backend_string_list.cpp
+  test_backend_disasm.cpp
 )
 
 set(LDB_LIB_SOURCES

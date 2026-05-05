@@ -99,6 +99,15 @@ struct StringMatch {
   std::string  module_path;      // owning module
 };
 
+struct DisasmInsn {
+  std::uint64_t address  = 0;    // file address of this instruction
+  std::uint32_t byte_size = 0;
+  std::vector<std::uint8_t> bytes;
+  std::string mnemonic;          // e.g. "mov", "ldr", "ret"
+  std::string operands;          // e.g. "x0, [x1, #8]"
+  std::string comment;           // optional disassembler annotation
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -132,6 +141,14 @@ class DebuggerBackend {
   // for invalid target_id.
   virtual std::vector<StringMatch>
       find_strings(TargetId tid, const StringQuery& query) = 0;
+
+  // Disassemble file-address range [start, end). Empty result for
+  // empty/inverted ranges or unmapped addresses; not an error.
+  // Throws backend::Error for invalid target_id.
+  virtual std::vector<DisasmInsn>
+      disassemble_range(TargetId tid,
+                        std::uint64_t start_addr,
+                        std::uint64_t end_addr) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

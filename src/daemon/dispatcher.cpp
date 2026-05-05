@@ -44,6 +44,29 @@ bool parse_symbol_kind(const std::string& s, backend::SymbolKind* out) {
   return false;
 }
 
+std::string hex_bytes(const std::vector<std::uint8_t>& bytes) {
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 3);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    if (i) out.push_back(' ');
+    out.push_back(kHex[(bytes[i] >> 4) & 0xF]);
+    out.push_back(kHex[bytes[i] & 0xF]);
+  }
+  return out;
+}
+
+json disasm_insn_to_json(const backend::DisasmInsn& i) {
+  json j;
+  j["addr"]     = i.address;
+  j["sz"]       = i.byte_size;
+  j["bytes"]    = hex_bytes(i.bytes);
+  j["mnemonic"] = i.mnemonic;
+  j["operands"] = i.operands;
+  if (!i.comment.empty()) j["comment"] = i.comment;
+  return j;
+}
+
 json string_match_to_json(const backend::StringMatch& s) {
   json j;
   j["text"]    = s.text;
@@ -136,6 +159,8 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "type.layout")        return handle_type_layout(req);
     if (req.method == "symbol.find")        return handle_symbol_find(req);
     if (req.method == "string.list")        return handle_string_list(req);
+    if (req.method == "disasm.range")       return handle_disasm_range(req);
+    if (req.method == "disasm.function")    return handle_disasm_function(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -220,6 +245,22 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"section", "string?"}, {"module", "string?"}},
       json{{"strings", "array of {text,addr,section,module}"}});
 
+  add("disasm.range",
+      "Disassemble [start_addr, end_addr) and return one entry per "
+      "instruction.",
+      json{{"target_id", "uint64"},
+           {"start_addr", "uint64"}, {"end_addr", "uint64"}},
+      json{{"instructions",
+            "array of {addr,sz,bytes,mnemonic,operands,comment?}"}});
+
+  add("disasm.function",
+      "Disassemble the body of a function looked up by exact name. "
+      "Equivalent to symbol.find + disasm.range.",
+      json{{"target_id", "uint64"}, {"name", "string"}},
+      json{{"found", "bool"},
+           {"address", "uint64"}, {"byte_size", "uint64"},
+           {"instructions", "array of disasm insns"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -266,6 +307,78 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
   return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+}
+
+Response Dispatcher::handle_disasm_range(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0, start = 0, end = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "start_addr", &start)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'start_addr'");
+  }
+  if (!require_uint(req.params, "end_addr", &end)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'end_addr'");
+  }
+
+  auto insns = backend_->disassemble_range(
+      static_cast<backend::TargetId>(tid), start, end);
+  json arr = json::array();
+  for (const auto& i : insns) arr.push_back(disasm_insn_to_json(i));
+  return protocol::make_ok(req.id,
+                           json{{"instructions", std::move(arr)}});
+}
+
+Response Dispatcher::handle_disasm_function(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'name'");
+  }
+
+  // Look up the function via the existing symbol query path so this
+  // endpoint stays a thin composition.
+  backend::SymbolQuery sq;
+  sq.name = *name;
+  sq.kind = backend::SymbolKind::kFunction;
+  auto matches = backend_->find_symbols(
+      static_cast<backend::TargetId>(tid), sq);
+
+  json data;
+  if (matches.empty() || matches[0].byte_size == 0) {
+    data["found"] = false;
+    return protocol::make_ok(req.id, std::move(data));
+  }
+
+  std::uint64_t start = matches[0].address;
+  std::uint64_t end   = start + matches[0].byte_size;
+
+  auto insns = backend_->disassemble_range(
+      static_cast<backend::TargetId>(tid), start, end);
+
+  data["found"]        = true;
+  data["address"]      = start;
+  data["byte_size"]    = matches[0].byte_size;
+  json arr = json::array();
+  for (const auto& i : insns) arr.push_back(disasm_insn_to_json(i));
+  data["instructions"] = std::move(arr);
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_string_list(const Request& req) {

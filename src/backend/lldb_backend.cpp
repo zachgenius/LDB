@@ -1,7 +1,9 @@
 #include "backend/lldb_backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -562,6 +564,71 @@ LldbBackend::find_strings(TargetId tid, const StringQuery& query) {
     // "*" matches all modules; fall through.
 
     scan_module_for_strings(mod, target, query, out);
+  }
+
+  return out;
+}
+
+std::vector<DisasmInsn>
+LldbBackend::disassemble_range(TargetId tid,
+                               std::uint64_t start_addr,
+                               std::uint64_t end_addr) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  std::vector<DisasmInsn> out;
+  if (start_addr >= end_addr) return out;
+
+  // Resolve start_addr to a section-bound SBAddress so ReadInstructions
+  // can locate the bytes.
+  lldb::SBAddress base = target.ResolveFileAddress(start_addr);
+  if (!base.IsValid()) return out;
+
+  // Upper bound on instruction count: assume at least 1 byte per instruction.
+  // ReadInstructions returns at most this many even on fixed-width archs.
+  std::uint64_t span = end_addr - start_addr;
+  if (span > std::numeric_limits<std::uint32_t>::max()) {
+    span = std::numeric_limits<std::uint32_t>::max();
+  }
+  uint32_t request = static_cast<uint32_t>(span);
+
+  auto insns = target.ReadInstructions(base, request);
+  size_t n = insns.GetSize();
+  out.reserve(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    auto insn = insns.GetInstructionAtIndex(static_cast<uint32_t>(i));
+    if (!insn.IsValid()) continue;
+
+    auto a = insn.GetAddress();
+    std::uint64_t addr_val = a.IsValid() ? a.GetFileAddress() : 0;
+    if (addr_val == 0 || addr_val >= end_addr) break;
+
+    DisasmInsn di;
+    di.address   = addr_val;
+    di.byte_size = static_cast<std::uint32_t>(insn.GetByteSize());
+
+    if (const char* m = insn.GetMnemonic(target))  di.mnemonic = m;
+    if (const char* o = insn.GetOperands(target))  di.operands = o;
+    if (const char* c = insn.GetComment(target))   di.comment  = c;
+
+    auto data = insn.GetData(target);
+    if (data.IsValid()) {
+      uint8_t buf[16] = {0};
+      lldb::SBError err;
+      size_t want = std::min<size_t>(di.byte_size, sizeof(buf));
+      size_t got  = data.ReadRawData(err, /*offset=*/0, buf, want);
+      if (!err.Fail()) di.bytes.assign(buf, buf + got);
+    }
+
+    out.push_back(std::move(di));
   }
 
   return out;

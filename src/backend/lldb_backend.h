@@ -26,6 +26,10 @@ class LldbBackend final : public DebuggerBackend {
       find_symbols(TargetId tid, const SymbolQuery& query) override;
   std::vector<StringMatch>
       find_strings(TargetId tid, const StringQuery& query) override;
+  std::vector<DisasmInsn>
+      disassemble_range(TargetId tid,
+                        std::uint64_t start_addr,
+                        std::uint64_t end_addr) override;
   void close_target(TargetId tid) override;
 
  private:

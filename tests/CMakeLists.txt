@@ -41,5 +41,15 @@ set_tests_properties(smoke_string_list PROPERTIES
   TIMEOUT 30
 )
 
+add_test(
+  NAME smoke_disasm
+  COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_disasm.sh"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_disasm PROPERTIES
+  TIMEOUT 30
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)

@@ -29,6 +29,8 @@ class Dispatcher {
   protocol::Response handle_type_layout(const protocol::Request& req);
   protocol::Response handle_symbol_find(const protocol::Request& req);
   protocol::Response handle_string_list(const protocol::Request& req);
+  protocol::Response handle_disasm_range(const protocol::Request& req);
+  protocol::Response handle_disasm_function(const protocol::Request& req);
 };
 
 }  // namespace ldb::daemon
