@@ -18,6 +18,7 @@ set(LDB_UNIT_SOURCES
   test_backend_threads.cpp
   test_backend_frame_values.cpp
   test_backend_attach.cpp
+  test_backend_memory.cpp
   test_fixture_sleeper.cpp
 )
 
@@ -67,5 +68,5 @@ add_test(
   COMMAND ldb_unit_tests --reporter console::out=- --reporter junit::out=${CMAKE_BINARY_DIR}/unit-tests.xml
 )
 set_tests_properties(unit_tests PROPERTIES
-  TIMEOUT 30
+  TIMEOUT 90
 )

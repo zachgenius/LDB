@@ -76,6 +76,11 @@ struct SymbolMatch {
   std::uint64_t address = 0;   // file address (unrelocated)
   std::uint64_t byte_size = 0; // 0 if unknown
   std::string module_path;     // path of the owning module
+
+  // Runtime (relocated) address. Set when a process is loaded and the
+  // symbol's section is mapped; unset for static-only inspection.
+  // Memory primitives (mem.read, mem.read_cstr) expect this address.
+  std::optional<std::uint64_t> load_address;
 };
 
 struct StringQuery {
@@ -184,6 +189,21 @@ struct ValueInfo {
 // Maximum number of bytes serialized per ValueInfo. Keep small; agents
 // follow up with mem.read for fuller dumps.
 constexpr std::size_t kValueByteCap = 64;
+
+// Mapped region of the inferior's address space.
+struct MemoryRegion {
+  std::uint64_t base = 0;
+  std::uint64_t size = 0;
+  bool readable   = false;
+  bool writable   = false;
+  bool executable = false;
+  std::optional<std::string> name;
+};
+
+// Single hit from search_memory: byte address where the needle starts.
+struct MemorySearchHit {
+  std::uint64_t address = 0;
+};
 
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
@@ -328,6 +348,43 @@ class DebuggerBackend {
   virtual std::vector<ValueInfo>
       list_registers(TargetId tid, ThreadId thread_id,
                      std::uint32_t frame_index) = 0;
+
+  // --- Memory primitives ----------------------------------------------
+
+  // Maximum bytes returned by a single read_memory call. Beyond this
+  // the caller should chunk; or use mem.search.
+  static constexpr std::uint64_t kMemReadMax = 1 * 1024 * 1024;  // 1 MiB
+  // Default cap for read_cstring when caller passes max_len=0.
+  static constexpr std::uint32_t kMemCstrDefault = 4096;
+  // Maximum bytes scanned in a single search_memory call.
+  static constexpr std::uint64_t kMemSearchMax = 256ull * 1024 * 1024;
+  // Hard cap on hits returned regardless of caller's max_hits.
+  static constexpr std::uint32_t kMemSearchHitCap = 1024;
+
+  // Read [size] bytes from process memory at [addr]. Throws on
+  // size > kMemReadMax, invalid target_id, or read failure.
+  virtual std::vector<std::uint8_t>
+      read_memory(TargetId tid, std::uint64_t addr, std::uint64_t size) = 0;
+
+  // Read a C string at [addr], up to NUL or max_len bytes (max_len=0
+  // means kMemCstrDefault). Result excludes the NUL.
+  virtual std::string
+      read_cstring(TargetId tid, std::uint64_t addr,
+                   std::uint32_t max_len) = 0;
+
+  // Enumerate the inferior's mapped memory regions in ascending base
+  // address order. Throws on invalid target_id; returns empty when
+  // no process is associated.
+  virtual std::vector<MemoryRegion> list_regions(TargetId tid) = 0;
+
+  // Search [start, start+length) for [needle], returning up to
+  // [max_hits] matches (capped at kMemSearchHitCap). length=0 means
+  // search every readable region (intersected with kMemSearchMax).
+  // Throws on length > kMemSearchMax or invalid target_id.
+  virtual std::vector<MemorySearchHit>
+      search_memory(TargetId tid, std::uint64_t start, std::uint64_t length,
+                    const std::vector<std::uint8_t>& needle,
+                    std::uint32_t max_hits) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

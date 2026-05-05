@@ -48,6 +48,11 @@ class Dispatcher {
   protocol::Response handle_frame_locals(const protocol::Request& req);
   protocol::Response handle_frame_args(const protocol::Request& req);
   protocol::Response handle_frame_registers(const protocol::Request& req);
+
+  protocol::Response handle_mem_read(const protocol::Request& req);
+  protocol::Response handle_mem_read_cstr(const protocol::Request& req);
+  protocol::Response handle_mem_regions(const protocol::Request& req);
+  protocol::Response handle_mem_search(const protocol::Request& req);
 };
 
 }  // namespace ldb::daemon

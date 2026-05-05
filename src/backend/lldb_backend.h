@@ -58,6 +58,18 @@ class LldbBackend final : public DebuggerBackend {
       list_registers(TargetId tid, ThreadId thread_id,
                      std::uint32_t frame_index) override;
 
+  std::vector<std::uint8_t>
+      read_memory(TargetId tid, std::uint64_t addr,
+                  std::uint64_t size) override;
+  std::string
+      read_cstring(TargetId tid, std::uint64_t addr,
+                   std::uint32_t max_len) override;
+  std::vector<MemoryRegion> list_regions(TargetId tid) override;
+  std::vector<MemorySearchHit>
+      search_memory(TargetId tid, std::uint64_t start, std::uint64_t length,
+                    const std::vector<std::uint8_t>& needle,
+                    std::uint32_t max_hits) override;
+
   void close_target(TargetId tid) override;
 
  private:

@@ -83,6 +83,39 @@ json thread_info_to_json(const backend::ThreadInfo& t) {
   return j;
 }
 
+// Decode a lower-case packed-hex string into bytes. Returns nullopt on
+// any non-hex character or odd length. Used by mem.search needle.
+std::optional<std::vector<std::uint8_t>>
+hex_decode(const std::string& s) {
+  if (s.size() % 2 != 0) return std::nullopt;
+  std::vector<std::uint8_t> out;
+  out.reserve(s.size() / 2);
+  auto val = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (std::size_t i = 0; i < s.size(); i += 2) {
+    int hi = val(s[i]);
+    int lo = val(s[i + 1]);
+    if (hi < 0 || lo < 0) return std::nullopt;
+    out.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
+  }
+  return out;
+}
+
+json memory_region_to_json(const backend::MemoryRegion& r) {
+  json j;
+  j["base"] = r.base;
+  j["size"] = r.size;
+  j["r"]    = r.readable;
+  j["w"]    = r.writable;
+  j["x"]    = r.executable;
+  if (r.name.has_value()) j["name"] = *r.name;
+  return j;
+}
+
 std::string hex_lower(const std::vector<std::uint8_t>& bytes) {
   // Lower-case packed hex (no separators) — distinct from disasm's
   // space-separated rendering. Used by frame.* and mem.* endpoints.
@@ -169,6 +202,7 @@ json symbol_match_to_json(const backend::SymbolMatch& s) {
   j["sz"]      = s.byte_size;
   j["module"]  = s.module_path;
   if (!s.mangled.empty()) j["mangled"] = s.mangled;
+  if (s.load_address.has_value()) j["load_addr"] = *s.load_address;
   return j;
 }
 
@@ -263,6 +297,11 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "frame.locals")       return handle_frame_locals(req);
     if (req.method == "frame.args")         return handle_frame_args(req);
     if (req.method == "frame.registers")    return handle_frame_registers(req);
+
+    if (req.method == "mem.read")           return handle_mem_read(req);
+    if (req.method == "mem.read_cstr")      return handle_mem_read_cstr(req);
+    if (req.method == "mem.regions")        return handle_mem_regions(req);
+    if (req.method == "mem.search")         return handle_mem_search(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -460,6 +499,37 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"frame_index", "uint?"}},
       json{{"registers",
             "array of {name,type,address?,bytes?,summary?,kind}"}});
+
+  add("mem.read",
+      "Read up to 1 MiB of process memory at the given runtime address. "
+      "Returns lower-case packed hex.",
+      json{{"target_id", "uint64"}, {"address", "uint64"},
+           {"size", "uint64"}},
+      json{{"address", "uint64"}, {"bytes", "string<hex>"}});
+
+  add("mem.read_cstr",
+      "Read a NUL-terminated string at a runtime address, capped at "
+      "max_len bytes (default 4096).",
+      json{{"target_id", "uint64"}, {"address", "uint64"},
+           {"max_len", "uint?"}},
+      json{{"address", "uint64"}, {"value", "string"},
+           {"truncated", "bool"}});
+
+  add("mem.regions",
+      "Enumerate the inferior's mapped memory regions with permissions.",
+      json{{"target_id", "uint64"}},
+      json{{"regions",
+            "array of {base,size,r,w,x,name?}"}});
+
+  add("mem.search",
+      "Scan process memory for a byte pattern. Needle is either a hex "
+      "string or {text:'...'}. length=0 searches all readable regions "
+      "(capped at 256 MiB). max_hits capped at 1024.",
+      json{{"target_id", "uint64"},
+           {"needle", "string<hex>|object{text}"},
+           {"address", "uint64?"}, {"length", "uint64?"},
+           {"max_hits", "uint?"}},
+      json{{"hits", "array of {address}"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -672,6 +742,155 @@ Response Dispatcher::handle_frame_registers(const Request& req) {
       static_cast<backend::ThreadId>(p.tid),
       p.frame_index);
   return build_value_response(req, values, "registers");
+}
+
+Response Dispatcher::handle_mem_read(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0, addr = 0, size = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "address", &addr)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'address'");
+  }
+  if (!require_uint(req.params, "size", &size)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'size'");
+  }
+  auto bytes = backend_->read_memory(
+      static_cast<backend::TargetId>(tid), addr, size);
+  json data;
+  data["address"] = addr;
+  data["bytes"]   = hex_lower(bytes);
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_mem_read_cstr(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0, addr = 0, max_len = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "address", &addr)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'address'");
+  }
+  if (auto it = req.params.find("max_len"); it != req.params.end()) {
+    if (!require_uint(req.params, "max_len", &max_len)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'max_len' must be a non-negative integer");
+    }
+  }
+  auto value = backend_->read_cstring(
+      static_cast<backend::TargetId>(tid), addr,
+      static_cast<std::uint32_t>(max_len));
+  json data;
+  data["address"]   = addr;
+  data["value"]     = value;
+  // truncated == we hit max_len before NUL. The backend returns up to
+  // max_len bytes; if size == max_len we may have stopped short — flag
+  // it so the agent can ask for more.
+  std::uint32_t cap = max_len ? static_cast<std::uint32_t>(max_len)
+                              : 4096u;  // matches kMemCstrDefault
+  data["truncated"] = value.size() == cap;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_mem_regions(const Request& req) {
+  std::uint64_t tid = 0;
+  if (!req.params.is_object() || !require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  auto regions = backend_->list_regions(static_cast<backend::TargetId>(tid));
+  json arr = json::array();
+  for (const auto& r : regions) arr.push_back(memory_region_to_json(r));
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "regions"));
+}
+
+Response Dispatcher::handle_mem_search(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+
+  // needle accepts either a hex string or {"text": "..."} for ASCII.
+  std::vector<std::uint8_t> needle;
+  auto nit = req.params.find("needle");
+  if (nit == req.params.end()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing 'needle' param");
+  }
+  if (nit->is_string()) {
+    auto decoded = hex_decode(nit->get<std::string>());
+    if (!decoded) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'needle' string must be lower-case packed hex");
+    }
+    needle = std::move(*decoded);
+  } else if (nit->is_object()) {
+    auto tit = nit->find("text");
+    if (tit == nit->end() || !tit->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "needle.text must be a string");
+    }
+    auto t = tit->get<std::string>();
+    needle.assign(t.begin(), t.end());
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'needle' must be hex string or {text:'...'}");
+  }
+  if (needle.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'needle' must be non-empty");
+  }
+
+  std::uint64_t addr = 0, length = 0, max_hits = 0;
+  if (auto it = req.params.find("address"); it != req.params.end()) {
+    if (!require_uint(req.params, "address", &addr)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'address' must be a non-negative integer");
+    }
+  }
+  if (auto it = req.params.find("length"); it != req.params.end()) {
+    if (!require_uint(req.params, "length", &length)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'length' must be a non-negative integer");
+    }
+  }
+  if (auto it = req.params.find("max_hits"); it != req.params.end()) {
+    if (!require_uint(req.params, "max_hits", &max_hits)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'max_hits' must be a non-negative integer");
+    }
+  }
+
+  auto hits = backend_->search_memory(
+      static_cast<backend::TargetId>(tid), addr, length, needle,
+      static_cast<std::uint32_t>(max_hits));
+  json arr = json::array();
+  for (const auto& h : hits) {
+    json j;
+    j["address"] = h.address;
+    arr.push_back(std::move(j));
+  }
+  return protocol::make_ok(req.id, json{{"hits", std::move(arr)}});
 }
 
 Response Dispatcher::handle_process_launch(const Request& req) {

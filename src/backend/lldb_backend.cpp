@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -431,6 +432,10 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
     auto start_addr = sym.GetStartAddress();
     if (start_addr.IsValid()) {
       m.address = start_addr.GetFileAddress();
+      lldb::addr_t la = start_addr.GetLoadAddress(target);
+      if (la != LLDB_INVALID_ADDRESS) {
+        m.load_address = static_cast<std::uint64_t>(la);
+      }
     }
     auto end_addr = sym.GetEndAddress();
     if (end_addr.IsValid() && start_addr.IsValid()) {
@@ -1428,6 +1433,197 @@ LldbBackend::list_registers(TargetId tid, ThreadId thread_id,
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Memory primitives
+// ---------------------------------------------------------------------------
+
+namespace {
+
+lldb::SBProcess require_process_locked(
+    std::unordered_map<TargetId, lldb::SBTarget>& targets,
+    std::mutex& mu, TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = targets.find(tid);
+    if (it == targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) throw Error("no process");
+  return proc;
+}
+
+}  // namespace
+
+std::vector<std::uint8_t>
+LldbBackend::read_memory(TargetId tid, std::uint64_t addr,
+                         std::uint64_t size) {
+  if (size > DebuggerBackend::kMemReadMax) {
+    throw Error("read_memory: size exceeds 1 MiB cap");
+  }
+  auto proc = require_process_locked(impl_->targets, impl_->mu, tid);
+  std::vector<std::uint8_t> out(static_cast<std::size_t>(size));
+  if (size == 0) return out;
+
+  lldb::SBError err;
+  size_t got = proc.ReadMemory(static_cast<lldb::addr_t>(addr),
+                               out.data(), out.size(), err);
+  if (err.Fail()) {
+    throw Error(std::string("ReadMemory failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  out.resize(got);
+  return out;
+}
+
+std::string
+LldbBackend::read_cstring(TargetId tid, std::uint64_t addr,
+                          std::uint32_t max_len) {
+  if (max_len == 0) max_len = DebuggerBackend::kMemCstrDefault;
+  auto proc = require_process_locked(impl_->targets, impl_->mu, tid);
+
+  std::string out;
+  // Chunked read so we don't pull a whole megabyte for a 16-byte string.
+  constexpr std::size_t kChunk = 256;
+  std::vector<std::uint8_t> buf(kChunk);
+  std::uint64_t cur = addr;
+  while (out.size() < max_len) {
+    std::size_t want = std::min<std::size_t>(kChunk, max_len - out.size());
+    lldb::SBError err;
+    std::size_t got = proc.ReadMemory(static_cast<lldb::addr_t>(cur),
+                                      buf.data(), want, err);
+    if (err.Fail() || got == 0) break;
+    for (std::size_t i = 0; i < got; ++i) {
+      if (buf[i] == '\0') return out;
+      out.push_back(static_cast<char>(buf[i]));
+      if (out.size() >= max_len) return out;
+    }
+    cur += got;
+  }
+  return out;
+}
+
+std::vector<MemoryRegion>
+LldbBackend::list_regions(TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) return {};
+
+  lldb::SBMemoryRegionInfoList list = proc.GetMemoryRegions();
+  std::vector<MemoryRegion> out;
+  uint32_t n = list.GetSize();
+  out.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    lldb::SBMemoryRegionInfo info;
+    if (!list.GetMemoryRegionAtIndex(i, info)) continue;
+    MemoryRegion r;
+    r.base       = info.GetRegionBase();
+    r.size       = info.GetRegionEnd() - info.GetRegionBase();
+    r.readable   = info.IsReadable();
+    r.writable   = info.IsWritable();
+    r.executable = info.IsExecutable();
+    if (const char* nm = info.GetName(); nm && *nm) r.name = nm;
+    out.push_back(std::move(r));
+  }
+  return out;
+}
+
+namespace {
+
+// Find every occurrence of [needle] within [haystack]. Naive scan; the
+// inputs are bounded by kMemSearchMax / region size, so even an O(NM)
+// search runs within milliseconds in practice.
+void find_all(const std::uint8_t* haystack, std::size_t n,
+              const std::uint8_t* needle,   std::size_t m,
+              std::uint64_t base_addr,
+              std::vector<MemorySearchHit>& out, std::uint32_t cap) {
+  if (m == 0 || m > n) return;
+  for (std::size_t i = 0; i + m <= n && out.size() < cap; ++i) {
+    if (std::memcmp(haystack + i, needle, m) == 0) {
+      MemorySearchHit h;
+      h.address = base_addr + static_cast<std::uint64_t>(i);
+      out.push_back(h);
+    }
+  }
+}
+
+}  // namespace
+
+std::vector<MemorySearchHit>
+LldbBackend::search_memory(TargetId tid, std::uint64_t start,
+                           std::uint64_t length,
+                           const std::vector<std::uint8_t>& needle,
+                           std::uint32_t max_hits) {
+  if (length > DebuggerBackend::kMemSearchMax) {
+    throw Error("search_memory: length exceeds 256 MiB cap");
+  }
+  if (needle.empty()) return {};
+  if (max_hits == 0 || max_hits > DebuggerBackend::kMemSearchHitCap) {
+    max_hits = DebuggerBackend::kMemSearchHitCap;
+  }
+
+  // Build the list of (base, length) ranges to scan. If the caller
+  // passed length>0 we use exactly that; otherwise enumerate readable
+  // regions and intersect with kMemSearchMax to bound the total scan.
+  struct Range { std::uint64_t base; std::uint64_t len; };
+  std::vector<Range> ranges;
+  if (length > 0) {
+    ranges.push_back({start, length});
+  } else {
+    auto regions = list_regions(tid);
+    std::uint64_t budget = DebuggerBackend::kMemSearchMax;
+    for (const auto& r : regions) {
+      if (!r.readable || r.size == 0) continue;
+      if (budget == 0) break;
+      std::uint64_t take = std::min<std::uint64_t>(r.size, budget);
+      ranges.push_back({r.base, take});
+      budget -= take;
+    }
+  }
+
+  auto proc = require_process_locked(impl_->targets, impl_->mu, tid);
+  std::vector<MemorySearchHit> hits;
+  hits.reserve(std::min<std::uint32_t>(64, max_hits));
+
+  // Read in 8 MiB chunks with a (needle-1)-byte overlap so a hit
+  // straddling a chunk boundary still gets caught.
+  constexpr std::uint64_t kChunkSize = 8 * 1024 * 1024;
+  std::vector<std::uint8_t> buf;
+  for (const auto& r : ranges) {
+    if (hits.size() >= max_hits) break;
+    std::uint64_t cur = r.base;
+    std::uint64_t remaining = r.len;
+    std::uint64_t overlap = (needle.size() > 0) ? needle.size() - 1 : 0;
+    while (remaining > 0 && hits.size() < max_hits) {
+      std::uint64_t want = std::min(remaining, kChunkSize);
+      buf.assign(static_cast<std::size_t>(want), 0);
+      lldb::SBError err;
+      std::size_t got = proc.ReadMemory(
+          static_cast<lldb::addr_t>(cur), buf.data(), buf.size(), err);
+      if (err.Fail() || got == 0) {
+        // Skip unreadable region tail; advance and retry.
+        if (remaining <= kChunkSize) break;
+        cur       += kChunkSize;
+        remaining -= kChunkSize;
+        continue;
+      }
+      find_all(buf.data(), got, needle.data(), needle.size(),
+               cur, hits, max_hits);
+      if (got <= overlap || got == remaining) break;
+      cur       += got - overlap;
+      remaining -= got - overlap;
+    }
+  }
+  return hits;
 }
 
 // ---------------------------------------------------------------------------
