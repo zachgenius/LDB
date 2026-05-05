@@ -634,6 +634,118 @@ LldbBackend::disassemble_range(TargetId tid,
   return out;
 }
 
+namespace {
+
+// Search `s` for a hex literal (0x... or 0X..., optionally preceded by '#')
+// that equals `needle`. Returns true on first match.
+bool string_references_address(const std::string& s, std::uint64_t needle) {
+  if (s.empty()) return false;
+  size_t i = 0;
+  while (i < s.size()) {
+    // Locate the next "0x" / "0X".
+    size_t pos = s.find("0x", i);
+    size_t pos2 = s.find("0X", i);
+    if (pos2 != std::string::npos && (pos == std::string::npos || pos2 < pos))
+      pos = pos2;
+    if (pos == std::string::npos) return false;
+
+    // Parse hex digits after the prefix.
+    size_t hs = pos + 2;
+    std::uint64_t value = 0;
+    size_t digits = 0;
+    while (hs < s.size() && digits < 16) {
+      char c = s[hs];
+      unsigned int d;
+      if (c >= '0' && c <= '9')      d = static_cast<unsigned int>(c - '0');
+      else if (c >= 'a' && c <= 'f') d = static_cast<unsigned int>(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') d = static_cast<unsigned int>(c - 'A' + 10);
+      else                            break;
+      value = (value << 4) | d;
+      ++hs;
+      ++digits;
+    }
+    if (digits > 0 && value == needle) return true;
+    i = std::max(pos + 1, hs);
+  }
+  return false;
+}
+
+std::string function_name_at(lldb::SBTarget target, lldb::SBAddress addr) {
+  if (!addr.IsValid()) return {};
+  auto sc = target.ResolveSymbolContextForAddress(
+      addr, lldb::eSymbolContextFunction | lldb::eSymbolContextSymbol);
+  auto fn = sc.GetFunction();
+  if (fn.IsValid()) {
+    if (const char* n = fn.GetName()) return n;
+  }
+  auto sym = sc.GetSymbol();
+  if (sym.IsValid()) {
+    if (const char* n = sym.GetName()) return n;
+  }
+  return {};
+}
+
+}  // namespace
+
+std::vector<XrefMatch>
+LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  std::vector<XrefMatch> out;
+
+  // Scan only the main executable's code sections. Walking every
+  // module's code on macOS would mean disassembling all of dyld and
+  // libSystem — minutes of work, useless to the agent's question.
+  uint32_t nmods = target.GetNumModules();
+  if (nmods == 0) return out;
+  auto mod = target.GetModuleAtIndex(0);
+  if (!mod.IsValid()) return out;
+
+  std::function<void(lldb::SBSection)> visit = [&](lldb::SBSection sec) {
+    if (!sec.IsValid()) return;
+
+    if (sec.GetSectionType() == lldb::eSectionTypeCode) {
+      std::uint64_t start = sec.GetFileAddress();
+      std::uint64_t size  = sec.GetByteSize();
+      if (start != 0 && size > 0) {
+        auto insns = disassemble_range(tid, start, start + size);
+        for (const auto& i : insns) {
+          if (string_references_address(i.operands, target_addr) ||
+              string_references_address(i.comment,  target_addr)) {
+            XrefMatch m;
+            m.address   = i.address;
+            m.byte_size = i.byte_size;
+            m.mnemonic  = i.mnemonic;
+            m.operands  = i.operands;
+            m.comment   = i.comment;
+            auto sa = target.ResolveFileAddress(i.address);
+            m.function = function_name_at(target, sa);
+            out.push_back(std::move(m));
+          }
+        }
+      }
+      // Code sections may have subsections; recurse anyway in case of
+      // archs that nest (rare for real binaries).
+    }
+
+    size_t nk = sec.GetNumSubSections();
+    for (size_t k = 0; k < nk; ++k) visit(sec.GetSubSectionAtIndex(k));
+  };
+
+  size_t nsec = mod.GetNumSections();
+  for (size_t i = 0; i < nsec; ++i) visit(mod.GetSectionAtIndex(i));
+
+  return out;
+}
+
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
   {

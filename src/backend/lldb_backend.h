@@ -30,6 +30,8 @@ class LldbBackend final : public DebuggerBackend {
       disassemble_range(TargetId tid,
                         std::uint64_t start_addr,
                         std::uint64_t end_addr) override;
+  std::vector<XrefMatch>
+      xref_address(TargetId tid, std::uint64_t target_addr) override;
   void close_target(TargetId tid) override;
 
  private:

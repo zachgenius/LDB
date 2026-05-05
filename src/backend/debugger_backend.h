@@ -108,6 +108,15 @@ struct DisasmInsn {
   std::string comment;           // optional disassembler annotation
 };
 
+struct XrefMatch {
+  std::uint64_t address  = 0;    // referencing instruction's address
+  std::uint32_t byte_size = 0;
+  std::string mnemonic;
+  std::string operands;
+  std::string comment;
+  std::string function;          // owning function name (best-effort)
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -149,6 +158,15 @@ class DebuggerBackend {
       disassemble_range(TargetId tid,
                         std::uint64_t start_addr,
                         std::uint64_t end_addr) = 0;
+
+  // Find every instruction in the main executable that references
+  // `target_addr`, by scanning operand and comment strings of each
+  // disassembled instruction for the address as a hex literal. Catches
+  // direct branches reliably; ADRP+ADD reconstruction (for arm64
+  // PC-relative loads) is not yet implemented and may miss some
+  // references. Throws backend::Error for invalid target_id.
+  virtual std::vector<XrefMatch>
+      xref_address(TargetId tid, std::uint64_t target_addr) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

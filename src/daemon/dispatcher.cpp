@@ -56,6 +56,17 @@ std::string hex_bytes(const std::vector<std::uint8_t>& bytes) {
   return out;
 }
 
+json xref_match_to_json(const backend::XrefMatch& x) {
+  json j;
+  j["addr"]     = x.address;
+  j["sz"]       = x.byte_size;
+  j["mnemonic"] = x.mnemonic;
+  j["operands"] = x.operands;
+  j["function"] = x.function;
+  if (!x.comment.empty()) j["comment"] = x.comment;
+  return j;
+}
+
 json disasm_insn_to_json(const backend::DisasmInsn& i) {
   json j;
   j["addr"]     = i.address;
@@ -161,6 +172,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "string.list")        return handle_string_list(req);
     if (req.method == "disasm.range")       return handle_disasm_range(req);
     if (req.method == "disasm.function")    return handle_disasm_function(req);
+    if (req.method == "xref.addr")          return handle_xref_addr(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -261,6 +273,14 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"address", "uint64"}, {"byte_size", "uint64"},
            {"instructions", "array of disasm insns"}});
 
+  add("xref.addr",
+      "Find every instruction in the main executable that references "
+      "an address. Detects direct branches reliably; ARM64 ADRP+ADD "
+      "reconstruction is a known gap.",
+      json{{"target_id", "uint64"}, {"addr", "uint64"}},
+      json{{"matches",
+            "array of {addr,sz,mnemonic,operands,function,comment?}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -307,6 +327,27 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
   return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+}
+
+Response Dispatcher::handle_xref_addr(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0, addr = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "addr", &addr)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'addr'");
+  }
+  auto refs = backend_->xref_address(
+      static_cast<backend::TargetId>(tid), addr);
+  json arr = json::array();
+  for (const auto& r : refs) arr.push_back(xref_match_to_json(r));
+  return protocol::make_ok(req.id, json{{"matches", std::move(arr)}});
 }
 
 Response Dispatcher::handle_disasm_range(const Request& req) {
