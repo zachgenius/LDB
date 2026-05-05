@@ -24,6 +24,8 @@ class Dispatcher {
   protocol::Response handle_hello(const protocol::Request& req);
   protocol::Response handle_describe_endpoints(const protocol::Request& req);
   protocol::Response handle_target_open(const protocol::Request& req);
+  protocol::Response handle_target_create_empty(const protocol::Request& req);
+  protocol::Response handle_target_attach(const protocol::Request& req);
   protocol::Response handle_module_list(const protocol::Request& req);
   protocol::Response handle_target_close(const protocol::Request& req);
   protocol::Response handle_type_layout(const protocol::Request& req);
@@ -38,6 +40,7 @@ class Dispatcher {
   protocol::Response handle_process_state(const protocol::Request& req);
   protocol::Response handle_process_continue(const protocol::Request& req);
   protocol::Response handle_process_kill(const protocol::Request& req);
+  protocol::Response handle_process_detach(const protocol::Request& req);
 
   protocol::Response handle_thread_list(const protocol::Request& req);
   protocol::Response handle_thread_frames(const protocol::Request& req);

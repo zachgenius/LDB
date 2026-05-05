@@ -17,6 +17,7 @@ set(LDB_UNIT_SOURCES
   test_backend_process.cpp
   test_backend_threads.cpp
   test_backend_frame_values.cpp
+  test_backend_attach.cpp
   test_fixture_sleeper.cpp
 )
 

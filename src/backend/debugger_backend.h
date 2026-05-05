@@ -197,6 +197,12 @@ class DebuggerBackend {
   // Create a target from a binary on disk; no process is spawned.
   virtual OpenResult open_executable(const std::string& path) = 0;
 
+  // Create a target with no associated executable. Used as the host
+  // for target.attach by PID (where the inferior's image is discovered
+  // from the kernel) and for target.load_core. Throws backend::Error
+  // on creation failure.
+  virtual OpenResult create_empty_target() = 0;
+
   // Enumerate modules associated with a target.
   virtual std::vector<Module> list_modules(TargetId tid) = 0;
 
@@ -273,6 +279,21 @@ class DebuggerBackend {
   // Terminate the target's process. Idempotent: returns
   // ProcessStatus{state=kNone} when there is no process.
   virtual ProcessStatus kill_process(TargetId tid) = 0;
+
+  // Attach to a running process by kernel pid. The target should
+  // typically be an empty target (see create_empty_target); when the
+  // target has a known executable, LLDB still validates the pid maps
+  // to that image.
+  // Sync semantics: blocks until the inferior is stopped on attach.
+  // Throws backend::Error on invalid target_id or attach failure
+  // (bad pid, permissions, debugserver missing on macOS).
+  virtual ProcessStatus attach(TargetId tid, std::int32_t pid) = 0;
+
+  // Detach from the target's process. Idempotent: returns
+  // ProcessStatus{state=kNone} when there is no process. Preferred
+  // over kill_process for attached processes — leaves the inferior
+  // running.
+  virtual ProcessStatus detach_process(TargetId tid) = 0;
 
   // --- Threads & frames -------------------------------------------------
 

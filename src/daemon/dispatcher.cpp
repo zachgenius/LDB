@@ -239,6 +239,8 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "hello")              return handle_hello(req);
     if (req.method == "describe.endpoints") return handle_describe_endpoints(req);
     if (req.method == "target.open")        return handle_target_open(req);
+    if (req.method == "target.create_empty")return handle_target_create_empty(req);
+    if (req.method == "target.attach")      return handle_target_attach(req);
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "module.list")        return handle_module_list(req);
     if (req.method == "type.layout")        return handle_type_layout(req);
@@ -253,6 +255,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "process.state")      return handle_process_state(req);
     if (req.method == "process.continue")   return handle_process_continue(req);
     if (req.method == "process.kill")       return handle_process_kill(req);
+    if (req.method == "process.detach")     return handle_process_detach(req);
 
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
@@ -315,6 +318,20 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   add("target.open", "Create a target from a binary on disk (no process)",
       json{{"path", "string"}},
       json{{"target_id", "uint64"}, {"triple", "string"}, {"modules", "array"}});
+
+  add("target.create_empty",
+      "Create a target with no associated executable. Used as host for "
+      "target.attach by pid and (later) target.load_core.",
+      json::object(),
+      json{{"target_id", "uint64"}, {"triple", "string"},
+           {"modules", "array"}});
+
+  add("target.attach",
+      "Attach to a running process by pid. Synchronous: blocks until "
+      "the inferior is stopped on attach.",
+      json{{"target_id", "uint64"}, {"pid", "int"}},
+      json{{"state", "string"}, {"pid", "int"},
+           {"stop_reason", "string?"}});
 
   add("target.close", "Drop a target",
       json{{"target_id", "uint64"}},
@@ -403,6 +420,12 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"target_id", "uint64"}},
       json{{"state", "string"}, {"pid", "int"}});
 
+  add("process.detach",
+      "Detach from the target's process, leaving it running. Preferred "
+      "over process.kill for attached processes. Idempotent.",
+      json{{"target_id", "uint64"}},
+      json{{"state", "string"}, {"pid", "int"}});
+
   add("thread.list",
       "Enumerate threads of the target's process.",
       json{{"target_id", "uint64"}},
@@ -462,6 +485,46 @@ Response Dispatcher::handle_target_open(const Request& req) {
   for (const auto& m : res.modules) mods.push_back(module_to_json(m));
   data["modules"] = std::move(mods);
   return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_target_create_empty(const Request& req) {
+  // No params required; ignore stray fields. Used as the host target
+  // for target.attach by pid and target.load_core.
+  auto res = backend_->create_empty_target();
+  json data;
+  data["target_id"] = res.target_id;
+  data["triple"]    = res.triple;
+  data["modules"]   = json::array();
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_target_attach(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0, pid_u = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "pid", &pid_u)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'pid'");
+  }
+  auto status = backend_->attach(static_cast<backend::TargetId>(tid),
+                                 static_cast<std::int32_t>(pid_u));
+  return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_process_detach(const Request& req) {
+  std::uint64_t tid = 0;
+  if (!req.params.is_object() || !require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto status = backend_->detach_process(static_cast<backend::TargetId>(tid));
+  return protocol::make_ok(req.id, process_status_to_json(status));
 }
 
 Response Dispatcher::handle_target_close(const Request& req) {

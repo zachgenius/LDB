@@ -226,6 +226,29 @@ OpenResult LldbBackend::open_executable(const std::string& path) {
   return res;
 }
 
+OpenResult LldbBackend::create_empty_target() {
+  // Empty path → SBTarget with no associated executable. Required so
+  // target.attach by pid has a target to attach against; the inferior's
+  // modules become available after the attach completes.
+  lldb::SBError err;
+  auto target = impl_->debugger.CreateTarget(
+      /*filename=*/"", /*triple=*/nullptr, /*platform_name=*/nullptr,
+      /*add_dependent_modules=*/false, err);
+  if (err.Fail() || !target.IsValid()) {
+    throw Error(std::string("CreateTarget(empty) failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  TargetId id = impl_->next_id.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->targets.emplace(id, target);
+  }
+  OpenResult res;
+  res.target_id = id;
+  if (const char* tr = target.GetTriple()) res.triple = tr;
+  return res;
+}
+
 std::vector<Module> LldbBackend::list_modules(TargetId tid) {
   lldb::SBTarget target;
   {
@@ -1063,6 +1086,77 @@ ProcessStatus LldbBackend::kill_process(TargetId tid) {
   lldb::SBError err = proc.Kill();
   if (err.Fail()) {
     throw Error(std::string("kill failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  return snapshot(proc);
+}
+
+ProcessStatus LldbBackend::attach(TargetId tid, std::int32_t pid) {
+  // pid<=0 has special behaviour in LLDB (0 may pick the most recent
+  // attached process; <0 is undefined). Reject up front so the agent
+  // gets a typed error instead of silent surprising behaviour.
+  if (pid <= 0) {
+    throw Error("attach: pid must be a positive integer");
+  }
+
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // If a prior process exists, refuse to clobber it; the agent must
+  // explicitly detach or kill first. Different from launch_process,
+  // which is documented as auto-killing prior processes — attach is
+  // typically the start of a new investigation against an existing
+  // inferior, so silently nuking what's there is the wrong default.
+  if (auto existing = target.GetProcess(); existing.IsValid()) {
+    auto st = existing.GetState();
+    if (st != lldb::eStateExited && st != lldb::eStateDetached &&
+        st != lldb::eStateInvalid) {
+      throw Error("target already has a live process; detach or kill first");
+    }
+  }
+
+  auto listener = impl_->debugger.GetListener();
+  lldb::SBError err;
+  auto proc = target.AttachToProcessWithID(
+      listener, static_cast<lldb::pid_t>(pid), err);
+  if (err.Fail() || !proc.IsValid()) {
+    const char* dsp = std::getenv("LLDB_DEBUGSERVER_PATH");
+    log::error(std::string("attach failed (LLDB_DEBUGSERVER_PATH=") +
+               (dsp ? dsp : "<unset>") + "): " +
+               (err.GetCString() ? err.GetCString() : "unknown"));
+    throw Error(std::string("attach failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  return snapshot(proc);
+}
+
+ProcessStatus LldbBackend::detach_process(TargetId tid) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) return ProcessStatus{};  // kNone
+  auto st = proc.GetState();
+  if (st == lldb::eStateExited || st == lldb::eStateDetached ||
+      st == lldb::eStateInvalid) {
+    return snapshot(proc);
+  }
+  lldb::SBError err = proc.Detach();
+  if (err.Fail()) {
+    throw Error(std::string("detach failed: ") +
                 (err.GetCString() ? err.GetCString() : "unknown"));
   }
   return snapshot(proc);
