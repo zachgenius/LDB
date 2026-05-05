@@ -4,6 +4,55 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 7) — M2 push: frame values, attach, memory, core, view retrofit
+
+**Goal:** Drive remaining M2 work to completion in one session: SBValue projection (frame.locals/args/registers), live-attach (target.create_empty + target.attach + process.detach), memory primitives (mem.read/read_cstr/regions/search), postmortem (target.load_core + process.save_core), and the M1 close-out backlog (log spam, smoke-test tightening, view retrofits on the remaining array endpoints).
+
+**Done:**
+
+- **`frame.locals` / `frame.args` / `frame.registers`** (commit `c981c51`). `ValueInfo` carries name/type/optional address/bytes (capped at `kValueByteCap=64`) /summary/kind. Bytes serialized as lower-case packed hex via a new `hex_lower` helper, distinct from disasm's space-separated form. 6-case Catch2 + Python smoke (test_frame_values.py).
+- **Sleeper fixture** (commit `1fb8ade`): long-running C program that prints `PID=<n> READY=LDB_SLEEPER_MARKER_v1` on stdout then `pause()`s. Wired into `tests/fixtures/CMakeLists.txt` as `ldb_fix_sleeper`; path baked into the unit-test target via `LDB_FIXTURE_SLEEPER_PATH`. Includes a fork+exec smoke test of the binary itself (the harness expansion gets its own minimal test, per project rules).
+- **`target.create_empty` / `target.attach` / `process.detach`** (commit `03da0a6`). attach refuses to clobber a live process (different from launch_process which auto-relaunches). Backend rejects pid<=0 because LLDB's AttachToProcessWithID quirks on pid=0. detach is idempotent, mirroring kill_process. 5-case unit + Python smoke.
+- **Memory primitives** (commit `136f562`): mem.read (1 MiB cap), mem.read_cstr (chunked 256-byte reads, default 4096-byte cap), mem.regions (passes through view::apply_to_array), mem.search (8 MiB chunks with needle-1 byte overlap so cross-boundary hits aren't missed; 256 MiB scan cap; max_hits capped at 1024). Needle accepts hex string or `{text:'...'}`. 8-case unit + Python smoke.
+- **`target.load_core` / `process.save_core`** (commit `621ef67`): postmortem path. **Critical fix**: SBProcess::SaveCore writes per-region progress to stdout — that would corrupt the JSON-RPC channel on ldbd. save_core dup2()s /dev/null over STDOUT_FILENO around the call and restores after. 3-case unit + Python smoke.
+- **Log demotion** (commit `e98d9b2`): `[INF] lldb backend initialized` and `LLDB_DEBUGSERVER_PATH=...` moved to debug level. Test stderr is now quiet under `--log-level error`.
+- **`test_type_layout.sh` per-id extraction** (commit `6569210`): adopted the `get_resp` pattern from `test_symbol_find.sh` so cross-line substring matches can't false-positive.
+- **View retrofit** (commit `3dc1b2c`) on every previously-bare array endpoint: thread.list, thread.frames, string.list, disasm.range, disasm.function, xref.addr, string.xref, symbol.find, type.layout. type.layout's view applies to `layout.fields` specifically with sibling `fields_total` / `fields_next_offset` / `fields_summary` keys so the layout object's existing keys aren't shadowed. New unit test `test_dispatcher_view_retrofit.cpp` drives symbol.find through the full Dispatcher and asserts both the `total` envelope (always emitted) and that view.fields actually drops other keys.
+
+**Decisions:**
+
+- **Memory ops take RUNTIME (load) addresses.** SymbolMatch grew an optional `load_address` populated when the module's section is mapped into a live process. JSON exposes it as `load_addr`. The pre-existing `address` (file address) is preserved for static-only callers (xref, disasm). Without this, the cstring test failed because we'd been resolving a pointer at the unrelocated file address — works for non-PIE but not for the macOS arm64 fixture build, which is always PIE.
+- **Sleeper-attach beats stop-at-entry for memory tests.** Stop-at-entry on macOS arm64 stops in `_dyld_start` BEFORE the binary's `__DATA` pointers (k_marker, k_schema_name) have been fixed up by dyld, so the pointer values stored there are still file addresses, not load addresses, and dereferencing them lands in unmapped memory. Attaching to a `pause()`'d sleeper guarantees relocations are complete. The mem.read range/error tests stay on the structs fixture (stop-at-entry) since they don't dereference relocated pointers.
+- **Sibling endpoint `target.create_empty`, not implicit empty target on attach.** Cleaner state machine: agent holds an explicit `target_id` for the attach context, and the same target_id can host successive attach/detach cycles or a load_core. Documented in describe.endpoints.
+- **save_core returns bool, not throws, on platform-unsupported.** Some Linux configurations refuse SaveCore for sysctl reasons; agent should branch on `saved=false` rather than catch error. Invalid target_id and "no process" still throw — those are caller bugs, not platform limitations.
+- **kValueByteCap = 64 for frame.* bytes**. Keeps agent context bounded; agents read more via mem.read with the value's address. Smaller-than-typical-cache-line so we always see something useful for primitives without bloating registers-of-AVX-512.
+- **Unit test `unit_tests` TIMEOUT bumped 30s → 90s.** Suite now spawns ~12 inferiors (process tests, frame tests, attach tests, memory tests, core tests); wall clock is ~33s on M-series macOS arm64.
+
+**Surprises / blockers:**
+
+- **SaveCore writes to stdout.** Caught by accidentally seeing "Saving 16384 bytes ..." lines mixed with Catch2 output. Critical because ldbd reserves stdout for JSON-RPC; an agent calling save_core would see corrupted frames. dup2-over-/dev/null around the call is the surgical fix; documented at the call site so the next person doesn't remove it.
+- **PIE + stop_at_entry initially confused the cstring test** (see Decisions above). Diagnostic: the read returned 8 bytes that decoded to a non-zero pointer, but read_cstring at that pointer returned empty — meaning the pointer pointed somewhere unmapped at that point in dyld's lifetime. Sleeper-attach made it obvious because then the pointer dereference Just Worked.
+- **Impl was private in LldbBackend.** Anonymous-namespace helpers in lldb_backend.cpp can't take `LldbBackend::Impl&` directly. Worked around in two helpers (resolve_frame_locked, require_process_locked) by passing the targets map + mutex by reference instead. Slightly ugly but doesn't perforate the PIMPL contract; refactor target if a third helper joins.
+- **Initial attach test's "bad pid" case attached to the previously-detached process** because LLDB's AttachToProcessWithID silently picks the most-recent pid when given 0. Surfaced as a test failure where pid=0 unexpectedly succeeded. Fix: backend rejects pid<=0 up front so the agent gets a typed error instead of silent surprising behaviour.
+
+**Verification:**
+
+- `ctest` → 15/15 PASS in ~47s. unit_tests is 122 cases / 1148 assertions (up from 98/524 last session). Smoke surface: hello, type_layout, symbol_find (with view retrofit assertions), string_list, disasm, xref_addr, string_xref, view_module_list, process, threads, frame_values, attach, memory, core. Manual: `ldbd --stdio --log-level error` is now silent on stderr until something interesting happens.
+- Worth flagging for the next session: the 33s unit_tests wall clock is still acceptable for local dev but starts to feel long. If we add many more `[live]` cases, consider gating them behind a CMake option (`LDB_LIVE_TESTS=ON`) so a fast `[unit]`-only path stays under 5s.
+
+**Next:**
+
+- **`process.connect_remote`** to round out the §4.1 target lifecycle. SBPlatform::ConnectRemote handles it; same wire shape as attach but with a URL.
+- **Stepping**: `process.step({kind: "in"|"over"|"out"|"insn"})`. SBThread::StepInto / StepOver / StepOut / StepInstruction. Mostly bookkeeping at the wire level.
+- **`value.read({path, view})`** — structured read of a typed value tree. Composes mem.read + type.layout but with the typed walk done backend-side so nested unions/arrays/pointers come back in one round-trip. Enables the agent's "give me everything in this struct" without N round-trips for sub-fields.
+- **`value.eval({expr, frame?})`** — LLDB expression eval. Trivial wrapper on SBFrame::EvaluateExpression. Mostly a question of how to bound runaway expressions (timeout? compile-only mode?).
+- **`mem.dump_artifact`** — combines mem.read with the artifact store (M3). Defer until artifact store lands.
+- **M2 closeout candidates if we want to ship M2 cleanly**: connect_remote, step. Probes / artifacts / sessions are M3.
+- **Cleanup queue** — empty for now. The `[INF]` log spam is fixed; the type_layout smoke is tightened; the view retrofit is comprehensive. M1 closeout is done.
+- **Architectural watch-item**: the dispatcher.cpp file is approaching 1500 lines with all these handlers; consider splitting into per-area files (target/process/thread/frame/memory/static) before adding probes. Not urgent yet but the next 3-4 endpoints will push the threshold.
+
+---
+
 ## 2026-05-05 (cont. 6) — M2: thread.list + thread.frames
 
 **Goal:** Land thread enumeration and per-thread backtrace. Together with the M2 process lifecycle, an agent can now launch a binary, observe what threads exist, and inspect each thread's stack — the foundation for every subsequent dynamic-analysis primitive.
