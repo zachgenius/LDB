@@ -61,5 +61,15 @@ set_tests_properties(smoke_xref_addr PROPERTIES
   TIMEOUT 30
 )
 
+add_test(
+  NAME smoke_string_xref
+  COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_string_xref.sh"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_string_xref PROPERTIES
+  TIMEOUT 30
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)

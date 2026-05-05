@@ -746,6 +746,115 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
   return out;
 }
 
+std::vector<StringXrefResult>
+LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
+  // Sanity-check the target up front (throws on invalid).
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (impl_->targets.find(tid) == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+  }
+
+  // Step 1: locate strings whose text matches exactly. Default scope =
+  // main executable.
+  StringQuery sq;
+  // No min_length restriction so empty-string and short matches still
+  // surface; we filter on exact text below.
+  sq.min_length = static_cast<std::uint32_t>(
+      text.empty() ? 1 : text.size());
+  sq.max_length = static_cast<std::uint32_t>(text.size());
+  auto candidates = find_strings(tid, sq);
+
+  std::vector<StringMatch> matching;
+  matching.reserve(candidates.size());
+  for (auto& c : candidates) {
+    if (c.text == text) matching.push_back(std::move(c));
+  }
+  if (matching.empty()) return {};
+
+  // Step 2: build the LLDB-annotated needle (e.g. "btp_schema.xml" with
+  // surrounding quotes — that's the form LLDB emits in instruction
+  // comments).
+  const std::string quoted_needle = "\"" + text + "\"";
+
+  std::vector<StringXrefResult> out;
+  out.reserve(matching.size());
+
+  for (const auto& sm : matching) {
+    StringXrefResult r;
+    r.string = sm;
+
+    // Address-based xrefs (catches x86-64 direct loads, etc.).
+    auto addr_hits = xref_address(tid, sm.address);
+    r.xrefs.insert(r.xrefs.end(),
+                   std::make_move_iterator(addr_hits.begin()),
+                   std::make_move_iterator(addr_hits.end()));
+
+    // Comment-text xrefs: scan main exe's code for instructions whose
+    // comment carries the quoted string. This is what LLDB produces
+    // for ARM64 PIE ADRP+ADD pairs.
+    {
+      lldb::SBTarget target;
+      {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        target = impl_->targets.at(tid);
+      }
+      uint32_t nmods = target.GetNumModules();
+      if (nmods > 0) {
+        auto mod = target.GetModuleAtIndex(0);
+        if (mod.IsValid()) {
+          std::function<void(lldb::SBSection)> visit =
+              [&](lldb::SBSection sec) {
+            if (!sec.IsValid()) return;
+            if (sec.GetSectionType() == lldb::eSectionTypeCode) {
+              std::uint64_t start = sec.GetFileAddress();
+              std::uint64_t size  = sec.GetByteSize();
+              if (start != 0 && size > 0) {
+                auto insns = disassemble_range(tid, start, start + size);
+                for (const auto& i : insns) {
+                  if (i.comment.find(quoted_needle) != std::string::npos) {
+                    XrefMatch m;
+                    m.address   = i.address;
+                    m.byte_size = i.byte_size;
+                    m.mnemonic  = i.mnemonic;
+                    m.operands  = i.operands;
+                    m.comment   = i.comment;
+                    auto sa = target.ResolveFileAddress(i.address);
+                    m.function = function_name_at(target, sa);
+                    r.xrefs.push_back(std::move(m));
+                  }
+                }
+              }
+            }
+            size_t nk = sec.GetNumSubSections();
+            for (size_t k = 0; k < nk; ++k) visit(sec.GetSubSectionAtIndex(k));
+          };
+          size_t nsec = mod.GetNumSections();
+          for (size_t i = 0; i < nsec; ++i) visit(mod.GetSectionAtIndex(i));
+        }
+      }
+    }
+
+    // Dedupe by instruction address — both detection paths can hit the
+    // same insn (e.g. an ADRP+ADD pair on arm64 where the operand of
+    // ADD is `#0xa40` but LLDB has resolved the comment to "btp_schema").
+    std::sort(r.xrefs.begin(), r.xrefs.end(),
+              [](const XrefMatch& a, const XrefMatch& b) {
+                return a.address < b.address;
+              });
+    auto last = std::unique(r.xrefs.begin(), r.xrefs.end(),
+                            [](const XrefMatch& a, const XrefMatch& b) {
+                              return a.address == b.address;
+                            });
+    r.xrefs.erase(last, r.xrefs.end());
+
+    out.push_back(std::move(r));
+  }
+
+  return out;
+}
+
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
   {

@@ -117,6 +117,11 @@ struct XrefMatch {
   std::string function;          // owning function name (best-effort)
 };
 
+struct StringXrefResult {
+  StringMatch string;
+  std::vector<XrefMatch> xrefs;
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -167,6 +172,17 @@ class DebuggerBackend {
   // references. Throws backend::Error for invalid target_id.
   virtual std::vector<XrefMatch>
       xref_address(TargetId tid, std::uint64_t target_addr) = 0;
+
+  // Find xrefs to every instance of an exact-text string in the main
+  // executable. Combines two detection paths to handle both x86-64
+  // direct loads (operand carries the address as a hex literal) and
+  // arm64 PIE ADRP+ADD pairs (LLDB annotates the second insn's
+  // comment with the resolved string in quotes).
+  // Returns a result per matching StringMatch; each carries the
+  // string and the xrefs to its address. Empty result = string not
+  // found OR no xrefs. Throws backend::Error for invalid target_id.
+  virtual std::vector<StringXrefResult>
+      find_string_xrefs(TargetId tid, const std::string& text) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

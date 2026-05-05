@@ -173,6 +173,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "disasm.range")       return handle_disasm_range(req);
     if (req.method == "disasm.function")    return handle_disasm_function(req);
     if (req.method == "xref.addr")          return handle_xref_addr(req);
+    if (req.method == "string.xref")        return handle_string_xref(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -281,6 +282,15 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"matches",
             "array of {addr,sz,mnemonic,operands,function,comment?}"}});
 
+  add("string.xref",
+      "Find xrefs to an exact-text string. Combines address-hex "
+      "detection (x86-64 direct loads) with LLDB comment-text "
+      "matching (ARM64 ADRP+ADD pairs).",
+      json{{"target_id", "uint64"}, {"text", "string"}},
+      json{{"results",
+            "array of {string:{text,addr,section,module}, "
+            "xrefs:array of xref matches}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -327,6 +337,37 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
   return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+}
+
+Response Dispatcher::handle_string_xref(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* text = require_string(req.params, "text");
+  if (!text) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'text'");
+  }
+
+  auto results = backend_->find_string_xrefs(
+      static_cast<backend::TargetId>(tid), *text);
+
+  json arr = json::array();
+  for (const auto& r : results) {
+    json one;
+    one["string"] = string_match_to_json(r.string);
+    json xrefs = json::array();
+    for (const auto& x : r.xrefs) xrefs.push_back(xref_match_to_json(x));
+    one["xrefs"] = std::move(xrefs);
+    arr.push_back(std::move(one));
+  }
+  return protocol::make_ok(req.id, json{{"results", std::move(arr)}});
 }
 
 Response Dispatcher::handle_xref_addr(const Request& req) {
