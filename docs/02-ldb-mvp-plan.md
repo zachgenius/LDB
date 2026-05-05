@@ -367,17 +367,25 @@ Two engines, one event shape:
 
 ### 7.1 `lldb_breakpoint` engine
 
-`SBBreakpoint::SetScriptCallbackBody` accepts a Python source string. We embed a small Python helper that:
+**MVP decision (cont. 13, M3 part 3): C++ baton, NOT Python script callback.**
 
-```python
-def __ldb_probe_cb_<id>(frame, bp_loc, internal_dict):
-    # captures registers, reads memory, posts event over a unix socket
-    # back to ldbd, returns False to auto-continue
-    ...
-    return False
-```
+We use `SBBreakpoint::SetCallback(SBBreakpointHitCallback fn, void* baton)` — a C++ function pointer with a typed baton — rather than `SBBreakpoint::SetScriptCallbackBody(python_source)`. Reasons:
 
-The unix socket goes to a thread inside `ldbd` that drains events into the per-probe ring buffer.
+1. **No CPython embed.** The Python path forces the daemon to embed CPython + pybind11 (or LLDB's `lldb` Python module) for one feature. That's a large build-system swing — Apple-signed Python framework on macOS, distro-specific `libpython3.x.so` on Linux, ABI compatibility concerns across LLDB versions. Avoiding it keeps the daemon a single self-contained binary.
+2. **No marshaling on the hot path.** §13 calls out "probe-callback Python in LLDB is the M3-critical risk" — the failure mode is per-hit Python ↔ C++ data marshaling, GIL acquisition, and interpreter startup latency. The C++ baton path makes the cost a function pointer call.
+3. **Single-author MVP.** The Python path's value is "user-authored extension scripts" (an operator writes their own probe-side filter logic). For MVP the daemon is the only callback author. Extension scripting is post-MVP polish; when it lands, `SetScriptCallbackBody` becomes a *second* path alongside the C++ one, not a replacement.
+
+The orchestrator (`src/probes/probe_orchestrator.{h,cpp}`) owns the probe table and per-probe ring buffers. The backend (`LldbBackend`) owns a small registry of `(target_id, bp_id) → (callback, baton)` records and a TU-local trampoline that LLDB calls on its process-event thread. The trampoline builds typed `BreakpointCallbackArgs`, dispatches into the user callback, and returns its bool (false → auto-continue, true → stop).
+
+Concurrency contract is documented at the orchestrator and backend interfaces:
+
+- The trampoline runs on LLDB's event thread, NOT the dispatcher thread.
+- The callback must NOT call back into the dispatcher or take dispatcher-side locks.
+- The orchestrator's `remove(probe_id)` is "disable + delete on the backend (which unhooks LLDB) + erase the table entry." LLDB serializes callback invocations per-bp; once `disable_breakpoint` returns no further fire is possible. Misuse of this ordering can race-free the baton.
+
+Per-probe events live in an in-memory ring buffer (default cap 1024 events). Sqlite-backed durability is deferred — probe events are typically captured fresh per investigation, and the M3 session log already records the probe.create / probe.events RPCs, so a future replay slice can recreate state without dedicated persistence.
+
+**Future Python path (deferred):** when extension scripting lands as a separate slice, `SetScriptCallbackBody` becomes available alongside the C++ path; the agent picks per-probe via `kind: "lldb_breakpoint"` (current C++ path) vs. a new `kind: "lldb_breakpoint_python"`. Until then, agents that want filtering can issue follow-up `probe.events` calls and filter client-side.
 
 For low-rate functions this is fine. We measure overhead in CI.
 

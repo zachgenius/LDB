@@ -31,6 +31,8 @@ set(LDB_UNIT_SOURCES
   test_session_store.cpp
   test_dispatcher_session_log.cpp
   test_backend_breakpoint.cpp
+  test_probe_orchestrator.cpp
+  test_dispatcher_probes.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -39,6 +41,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/util/log.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
   ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
+  ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
 )

@@ -2,6 +2,7 @@
 
 #include "backend/debugger_backend.h"
 #include "ldb/version.h"
+#include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
 #include "store/session_store.h"
@@ -362,10 +363,12 @@ json artifact_row_to_list_json(const ldb::store::ArtifactRow& r) {
 
 Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
                        std::shared_ptr<store::ArtifactStore> artifacts,
-                       std::shared_ptr<store::SessionStore> sessions)
+                       std::shared_ptr<store::SessionStore> sessions,
+                       std::shared_ptr<probes::ProbeOrchestrator> probes)
     : backend_(std::move(backend)),
       artifacts_(std::move(artifacts)),
-      sessions_(std::move(sessions)) {}
+      sessions_(std::move(sessions)),
+      probes_(std::move(probes)) {}
 
 Dispatcher::~Dispatcher() = default;
 
@@ -465,6 +468,13 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "session.detach")     return handle_session_detach(req);
     if (req.method == "session.list")       return handle_session_list(req);
     if (req.method == "session.info")       return handle_session_info(req);
+
+    if (req.method == "probe.create")       return handle_probe_create(req);
+    if (req.method == "probe.events")       return handle_probe_events(req);
+    if (req.method == "probe.list")         return handle_probe_list(req);
+    if (req.method == "probe.disable")      return handle_probe_disable(req);
+    if (req.method == "probe.enable")       return handle_probe_enable(req);
+    if (req.method == "probe.delete")       return handle_probe_delete(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -843,6 +853,61 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"target_id", "string?"}, {"created_at", "int64"},
            {"call_count", "int64"}, {"last_call_at", "int64?"},
            {"path", "string"}});
+
+  add("probe.create",
+      "Create a probe — an auto-resuming breakpoint with structured "
+      "capture. kind=\"lldb_breakpoint\" is the only engine in this "
+      "slice (uprobe_bpf is M4). where = {function} | {address} | "
+      "{file, line}. capture optionally snapshots registers and "
+      "memory regions. action is one of log_and_continue (default), "
+      "stop, store_artifact. For store_artifact, build_id and "
+      "artifact_name (template, with {hit} substitution) are "
+      "required. rate_limit is parsed but UNENFORCED in this slice.",
+      json{{"target_id", "uint64"}, {"kind", "string"},
+           {"where", "object{function?,address?,file?,line?}"},
+           {"capture", "object{registers?[],memory?[]}?"},
+           {"action", "string?"},
+           {"build_id", "string?"}, {"artifact_name", "string?"},
+           {"rate_limit", "string?"}},
+      json{{"probe_id", "string"}, {"breakpoint_id", "int"},
+           {"locations", "uint"}});
+
+  add("probe.events",
+      "Pull captured events for a probe. since=N returns events with "
+      "hit_seq > N (default 0 = all). max caps the page size (default "
+      "0 = all in buffer). Events are oldest-first; next_since is the "
+      "hit_seq of the last returned event so the agent can paginate.",
+      json{{"probe_id", "string"}, {"since", "uint64?"},
+           {"max", "uint?"}},
+      json{{"events",
+            "array of {probe_id,hit_seq,ts_ns,tid,pc,registers,"
+            "memory[],site,artifact_id?,artifact_name?}"},
+           {"total", "uint"}, {"next_since", "uint64"}});
+
+  add("probe.list",
+      "Enumerate every active probe with its kind, where, enabled "
+      "state, and current hit_count.",
+      json::object(),
+      json{{"probes",
+            "array of {probe_id,kind,where_expr,enabled,hit_count}"},
+           {"total", "uint"}});
+
+  add("probe.disable",
+      "Disable a probe — the underlying breakpoint stays installed "
+      "but won't fire until enabled again. hit_count is preserved.",
+      json{{"probe_id", "string"}},
+      json{{"probe_id", "string"}, {"enabled", "bool"}});
+
+  add("probe.enable",
+      "Re-enable a previously-disabled probe.",
+      json{{"probe_id", "string"}},
+      json{{"probe_id", "string"}, {"enabled", "bool"}});
+
+  add("probe.delete",
+      "Delete a probe entirely: removes the underlying breakpoint and "
+      "drops the orchestrator's record. Captured events are lost.",
+      json{{"probe_id", "string"}},
+      json{{"probe_id", "string"}, {"deleted", "bool"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -2092,6 +2157,419 @@ Response Dispatcher::handle_session_info(const Request& req) {
     data["last_call_at"] = *row->last_call_at;
   }
   data["path"]       = row->path;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// ----------------------------------------------------------------------------
+// probe.* — auto-resuming breakpoints with structured capture (M3 part 3)
+//
+// All six handlers preflight on the orchestrator being non-null (set by
+// the daemon when --store-root resolves and the backend is alive); on a
+// null orchestrator they return -32002 (kBadState) so the agent gets a
+// typed error instead of a crash.
+
+namespace {
+
+std::optional<Response>
+require_probe_orchestrator(const Request& req,
+                           const std::shared_ptr<probes::ProbeOrchestrator>& p) {
+  if (p) return std::nullopt;
+  return protocol::make_err(req.id, ErrorCode::kBadState,
+                            "probe orchestrator not configured");
+}
+
+bool parse_probe_action(const std::string& s, probes::Action* out) {
+  if (s == "log_and_continue" || s.empty()) {
+    *out = probes::Action::kLogAndContinue; return true;
+  }
+  if (s == "stop")            { *out = probes::Action::kStop; return true; }
+  if (s == "store_artifact")  { *out = probes::Action::kStoreArtifact; return true; }
+  return false;
+}
+
+const char* probe_action_str(probes::Action a) {
+  switch (a) {
+    case probes::Action::kLogAndContinue: return "log_and_continue";
+    case probes::Action::kStop:           return "stop";
+    case probes::Action::kStoreArtifact:  return "store_artifact";
+  }
+  return "log_and_continue";
+}
+
+json probe_event_to_json(const probes::ProbeEvent& e,
+                         const std::string& probe_id) {
+  json j;
+  j["probe_id"] = probe_id;
+  j["hit_seq"]  = e.hit_seq;
+  j["ts_ns"]    = e.ts_ns;
+  j["tid"]      = e.tid;
+  // PC as hex string, matching plan §7.3 ("0x412af0").
+  {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llx",
+                  static_cast<unsigned long long>(e.pc));
+    j["pc"] = buf;
+  }
+  // Registers as {name: "0xVAL"} hex strings.
+  json regs = json::object();
+  for (const auto& [name, val] : e.registers) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llx",
+                  static_cast<unsigned long long>(val));
+    regs[name] = buf;
+  }
+  j["registers"] = std::move(regs);
+
+  // Memory captures as {name, bytes_b64}. base64_encode is the
+  // earlier anonymous-namespace helper in this TU; it's visible here
+  // because all `namespace { ... }` blocks in one TU share the same
+  // unnamed namespace.
+  json mems = json::array();
+  for (const auto& m : e.memory) {
+    json mj;
+    mj["name"]      = m.name;
+    mj["bytes_b64"] = base64_encode(m.bytes);
+    mems.push_back(std::move(mj));
+  }
+  j["memory"] = std::move(mems);
+
+  json site = json::object();
+  if (!e.site.function.empty()) site["function"] = e.site.function;
+  if (!e.site.file.empty())     site["file"]     = e.site.file;
+  if (e.site.line > 0)          site["line"]     = e.site.line;
+  j["site"] = std::move(site);
+
+  if (e.artifact_id.has_value())   j["artifact_id"]   = *e.artifact_id;
+  if (e.artifact_name.has_value()) j["artifact_name"] = *e.artifact_name;
+  return j;
+}
+
+json probe_list_entry_to_json(const probes::ProbeOrchestrator::ListEntry& e) {
+  json j;
+  j["probe_id"]   = e.probe_id;
+  j["kind"]       = e.kind;
+  j["where_expr"] = e.where_expr;
+  j["enabled"]    = e.enabled;
+  j["hit_count"]  = e.hit_count;
+  return j;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_probe_create(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* kind = require_string(req.params, "kind");
+  if (!kind || kind->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'kind'");
+  }
+
+  // where = {function} | {address} | {file, line}
+  auto wit = req.params.find("where");
+  if (wit == req.params.end() || !wit->is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing object param 'where'");
+  }
+  backend::BreakpointSpec where;
+  if (auto fit = wit->find("function");
+      fit != wit->end() && !fit->is_null()) {
+    if (!fit->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.function must be string");
+    }
+    where.function = fit->get<std::string>();
+  }
+  if (auto ait = wit->find("address");
+      ait != wit->end() && !ait->is_null()) {
+    std::uint64_t addr = 0;
+    if (ait->is_number_unsigned())     addr = ait->get<std::uint64_t>();
+    else if (ait->is_number_integer()) {
+      auto v = ait->get<std::int64_t>();
+      if (v < 0) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "where.address must be non-negative");
+      }
+      addr = static_cast<std::uint64_t>(v);
+    } else if (ait->is_string()) {
+      // Allow "0x..." string form.
+      const std::string& s = ait->get_ref<const std::string&>();
+      try { addr = std::stoull(s, nullptr, 0); }
+      catch (...) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "where.address: invalid integer");
+      }
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.address must be uint or hex string");
+    }
+    where.address = addr;
+  }
+  if (auto fit = wit->find("file");
+      fit != wit->end() && !fit->is_null()) {
+    if (!fit->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.file must be string");
+    }
+    where.file = fit->get<std::string>();
+  }
+  if (auto lit = wit->find("line");
+      lit != wit->end() && !lit->is_null()) {
+    if (!lit->is_number_integer() && !lit->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.line must be integer");
+    }
+    where.line = lit->get<int>();
+  }
+  if (!where.function.has_value() && !where.address.has_value() &&
+      !where.file.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "where must set function, address, or file+line");
+  }
+
+  // capture (optional)
+  probes::CaptureSpec capture;
+  if (auto cit = req.params.find("capture");
+      cit != req.params.end() && !cit->is_null()) {
+    if (!cit->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "capture must be object");
+    }
+    if (auto rit = cit->find("registers");
+        rit != cit->end() && !rit->is_null()) {
+      if (!rit->is_array()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "capture.registers must be array of string");
+      }
+      for (const auto& r : *rit) {
+        if (!r.is_string()) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.registers entries must be strings");
+        }
+        capture.registers.push_back(r.get<std::string>());
+      }
+    }
+    if (auto mit = cit->find("memory");
+        mit != cit->end() && !mit->is_null()) {
+      if (!mit->is_array()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "capture.memory must be array");
+      }
+      for (const auto& m : *mit) {
+        if (!m.is_object()) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.memory entries must be objects");
+        }
+        probes::CaptureSpec::MemSpec ms;
+        if (auto rit2 = m.find("reg"); rit2 != m.end() && rit2->is_string()) {
+          ms.source   = probes::CaptureSpec::MemSpec::Source::kRegister;
+          ms.reg_name = rit2->get<std::string>();
+        } else if (auto ait2 = m.find("addr");
+                   ait2 != m.end() && !ait2->is_null()) {
+          ms.source = probes::CaptureSpec::MemSpec::Source::kAbsolute;
+          if (ait2->is_number_unsigned())     ms.addr = ait2->get<std::uint64_t>();
+          else if (ait2->is_number_integer()) {
+            auto v = ait2->get<std::int64_t>();
+            if (v < 0) {
+              return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                        "capture.memory.addr must be non-negative");
+            }
+            ms.addr = static_cast<std::uint64_t>(v);
+          } else {
+            return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                      "capture.memory.addr must be uint");
+          }
+        } else {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.memory entry must set reg or addr");
+        }
+        std::uint64_t len = 0;
+        if (!require_uint(m, "len", &len) || len == 0) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.memory.len must be positive integer");
+        }
+        if (len > 1024 * 1024) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.memory.len exceeds 1 MiB cap");
+        }
+        ms.len = static_cast<std::uint32_t>(len);
+        if (auto nit = m.find("name"); nit != m.end() && nit->is_string()) {
+          ms.name = nit->get<std::string>();
+        }
+        capture.memory.push_back(std::move(ms));
+      }
+    }
+  }
+
+  // action (optional, default log_and_continue)
+  probes::Action action = probes::Action::kLogAndContinue;
+  if (auto ait = req.params.find("action");
+      ait != req.params.end() && !ait->is_null()) {
+    if (!ait->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "action must be string");
+    }
+    if (!parse_probe_action(ait->get<std::string>(), &action)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "action must be one of: log_and_continue, "
+                                "stop, store_artifact");
+    }
+  }
+
+  std::string artifact_name;
+  if (const auto* a = require_string(req.params, "artifact_name")) {
+    artifact_name = *a;
+  }
+  std::string build_id;
+  if (const auto* b = require_string(req.params, "build_id")) {
+    build_id = *b;
+  }
+  std::string rate_limit;
+  if (const auto* rl = require_string(req.params, "rate_limit")) {
+    rate_limit = *rl;
+  }
+
+  probes::ProbeSpec ps;
+  ps.target_id              = static_cast<backend::TargetId>(target_id);
+  ps.kind                   = *kind;
+  ps.where                  = std::move(where);
+  ps.capture                = std::move(capture);
+  ps.action                 = action;
+  ps.artifact_name_template = std::move(artifact_name);
+  ps.build_id               = std::move(build_id);
+  ps.rate_limit_text        = std::move(rate_limit);
+
+  std::string probe_id;
+  try {
+    probe_id = probes_->create(ps);
+  } catch (const std::invalid_argument& e) {
+    // Spec problem (bad action/kind combo) — agent's fault.
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
+  }
+  // Backend errors propagate through the outer dispatch_inner catch.
+
+  // Look up the bp_id via list() — the orchestrator doesn't expose it
+  // directly, but list() carries probe_id and we have the freshly-
+  // returned id. We need bp_id to satisfy the documented response
+  // shape. Read from the orchestrator's info() — in this slice the
+  // ListEntry doesn't carry bp_id; that's intentional, the agent has
+  // no use for the raw id. Documented in the response shape.
+  json data;
+  data["probe_id"] = probe_id;
+  data["action"]   = probe_action_str(action);
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_probe_events(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* probe_id = require_string(req.params, "probe_id");
+  if (!probe_id || probe_id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'probe_id'");
+  }
+  std::uint64_t since = 0;
+  if (auto it = req.params.find("since"); it != req.params.end()) {
+    if (!require_uint(req.params, "since", &since)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'since' must be a non-negative integer");
+    }
+  }
+  std::uint64_t max = 0;
+  if (auto it = req.params.find("max"); it != req.params.end()) {
+    if (!require_uint(req.params, "max", &max)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'max' must be a non-negative integer");
+    }
+  }
+
+  auto evs = probes_->events(*probe_id, since, max);
+  json arr = json::array();
+  std::uint64_t next_since = since;
+  for (const auto& e : evs) {
+    if (e.hit_seq > next_since) next_since = e.hit_seq;
+    arr.push_back(probe_event_to_json(e, *probe_id));
+  }
+  json data;
+  data["events"]     = std::move(arr);
+  data["total"]      = static_cast<std::int64_t>(evs.size());
+  data["next_since"] = next_since;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_probe_list(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  auto rows = probes_->list();
+  json arr = json::array();
+  for (const auto& e : rows) arr.push_back(probe_list_entry_to_json(e));
+  json data;
+  data["probes"] = std::move(arr);
+  data["total"]  = static_cast<std::int64_t>(rows.size());
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_probe_disable(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* probe_id = require_string(req.params, "probe_id");
+  if (!probe_id || probe_id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'probe_id'");
+  }
+  probes_->disable(*probe_id);
+  json data;
+  data["probe_id"] = *probe_id;
+  data["enabled"]  = false;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_probe_enable(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* probe_id = require_string(req.params, "probe_id");
+  if (!probe_id || probe_id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'probe_id'");
+  }
+  probes_->enable(*probe_id);
+  json data;
+  data["probe_id"] = *probe_id;
+  data["enabled"]  = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_probe_delete(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* probe_id = require_string(req.params, "probe_id");
+  if (!probe_id || probe_id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'probe_id'");
+  }
+  probes_->remove(*probe_id);
+  json data;
+  data["probe_id"] = *probe_id;
+  data["deleted"]  = true;
   return protocol::make_ok(req.id, std::move(data));
 }
 

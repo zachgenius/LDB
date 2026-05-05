@@ -7,6 +7,7 @@ set(LDBD_SOURCES
   protocol/jsonrpc.cpp
   protocol/view.cpp
   backend/lldb_backend.cpp
+  probes/probe_orchestrator.cpp
   store/artifact_store.cpp
   store/session_store.cpp
   util/log.cpp

@@ -8,6 +8,7 @@
 
 namespace ldb::backend { class DebuggerBackend; }
 namespace ldb::store   { class ArtifactStore; }
+namespace ldb::probes  { class ProbeOrchestrator; }
 
 namespace ldb::daemon {
 
@@ -27,15 +28,17 @@ class Dispatcher {
   // is held in a plain unique_ptr without further locking.
   explicit Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
                       std::shared_ptr<store::ArtifactStore> artifacts = {},
-                      std::shared_ptr<store::SessionStore> sessions = {});
+                      std::shared_ptr<store::SessionStore> sessions = {},
+                      std::shared_ptr<probes::ProbeOrchestrator> probes = {});
   ~Dispatcher();
 
   protocol::Response dispatch(const protocol::Request& req);
 
  private:
-  std::shared_ptr<backend::DebuggerBackend> backend_;
-  std::shared_ptr<store::ArtifactStore>     artifacts_;
-  std::shared_ptr<store::SessionStore>      sessions_;
+  std::shared_ptr<backend::DebuggerBackend>    backend_;
+  std::shared_ptr<store::ArtifactStore>        artifacts_;
+  std::shared_ptr<store::SessionStore>         sessions_;
+  std::shared_ptr<probes::ProbeOrchestrator>   probes_;
   // Set by session.attach, cleared by session.detach. While set, every
   // dispatch result is appended to the session's rpc_log.
   std::unique_ptr<store::SessionStore::Writer> active_session_writer_;
@@ -92,6 +95,13 @@ class Dispatcher {
   protocol::Response handle_session_detach(const protocol::Request& req);
   protocol::Response handle_session_list(const protocol::Request& req);
   protocol::Response handle_session_info(const protocol::Request& req);
+
+  protocol::Response handle_probe_create(const protocol::Request& req);
+  protocol::Response handle_probe_events(const protocol::Request& req);
+  protocol::Response handle_probe_list(const protocol::Request& req);
+  protocol::Response handle_probe_disable(const protocol::Request& req);
+  protocol::Response handle_probe_enable(const protocol::Request& req);
+  protocol::Response handle_probe_delete(const protocol::Request& req);
 
   // The actual routing logic; dispatch() wraps this with rpc-log
   // bookkeeping when a session is attached.

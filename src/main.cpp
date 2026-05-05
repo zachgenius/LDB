@@ -2,6 +2,7 @@
 #include "daemon/dispatcher.h"
 #include "daemon/stdio_loop.h"
 #include "ldb/version.h"
+#include "probes/probe_orchestrator.h"
 #include "store/artifact_store.h"
 #include "store/session_store.h"
 #include "util/log.h"
@@ -125,7 +126,15 @@ int main(int argc, char** argv) {
     ldb::log::warn(std::string("session store unavailable: ") + e.what());
   }
 
-  ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions);
+  // Probe orchestrator. The orchestrator owns the table of active
+  // probes and their callbacks; it depends on the backend (for the
+  // breakpoint hooks) and optionally on the artifact store (for
+  // action=store_artifact). Construction is infallible — the
+  // orchestrator's lifecycle is purely in-memory in this slice.
+  auto probes = std::make_shared<ldb::probes::ProbeOrchestrator>(
+      backend, artifacts);
+
+  ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher);
