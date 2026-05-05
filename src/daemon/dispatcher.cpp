@@ -26,6 +26,35 @@ json section_to_json(const backend::Section& s) {
   return j;
 }
 
+const char* symbol_kind_str(backend::SymbolKind k) {
+  switch (k) {
+    case backend::SymbolKind::kAny:      return "any";
+    case backend::SymbolKind::kFunction: return "function";
+    case backend::SymbolKind::kVariable: return "variable";
+    case backend::SymbolKind::kOther:    return "other";
+  }
+  return "other";
+}
+
+bool parse_symbol_kind(const std::string& s, backend::SymbolKind* out) {
+  if (s == "any" || s.empty())   { *out = backend::SymbolKind::kAny;      return true; }
+  if (s == "function")           { *out = backend::SymbolKind::kFunction; return true; }
+  if (s == "variable")           { *out = backend::SymbolKind::kVariable; return true; }
+  if (s == "other")              { *out = backend::SymbolKind::kOther;    return true; }
+  return false;
+}
+
+json symbol_match_to_json(const backend::SymbolMatch& s) {
+  json j;
+  j["name"]    = s.name;
+  j["kind"]    = symbol_kind_str(s.kind);
+  j["addr"]    = s.address;
+  j["sz"]      = s.byte_size;
+  j["module"]  = s.module_path;
+  if (!s.mangled.empty()) j["mangled"] = s.mangled;
+  return j;
+}
+
 json field_to_json(const backend::Field& f) {
   json j;
   j["name"]        = f.name;
@@ -96,6 +125,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "module.list")        return handle_module_list(req);
     if (req.method == "type.layout")        return handle_type_layout(req);
+    if (req.method == "symbol.find")        return handle_symbol_find(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -164,6 +194,14 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"layout",
             "object{name,byte_size,alignment,fields[],holes_total}"}});
 
+  add("symbol.find",
+      "Find symbols by exact name; optionally filtered by kind "
+      "(function|variable|other|any)",
+      json{{"target_id", "uint64"}, {"name", "string"},
+           {"kind", "string?"}},
+      json{{"matches",
+            "array of {name,kind,addr,sz,module,mangled?}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -210,6 +248,40 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
   return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+}
+
+Response Dispatcher::handle_symbol_find(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'name'");
+  }
+
+  backend::SymbolQuery q;
+  q.name = *name;
+  if (auto kit = req.params.find("kind"); kit != req.params.end()) {
+    if (!kit->is_string() ||
+        !parse_symbol_kind(kit->get<std::string>(), &q.kind)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'kind' must be one of: "
+                                "any, function, variable, other");
+    }
+  }
+
+  auto matches = backend_->find_symbols(
+      static_cast<backend::TargetId>(tid), q);
+  json arr = json::array();
+  for (const auto& m : matches) arr.push_back(symbol_match_to_json(m));
+  return protocol::make_ok(req.id, json{{"matches", std::move(arr)}});
 }
 
 Response Dispatcher::handle_type_layout(const Request& req) {

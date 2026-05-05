@@ -22,6 +22,8 @@ class LldbBackend final : public DebuggerBackend {
   std::vector<Module> list_modules(TargetId tid) override;
   std::optional<TypeLayout>
       find_type_layout(TargetId tid, const std::string& name) override;
+  std::vector<SymbolMatch>
+      find_symbols(TargetId tid, const SymbolQuery& query) override;
   void close_target(TargetId tid) override;
 
  private:

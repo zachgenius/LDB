@@ -269,6 +269,104 @@ LldbBackend::find_type_layout(TargetId tid, const std::string& name) {
   return out;
 }
 
+namespace {
+
+SymbolKind classify_symbol(lldb::SymbolType t) {
+  switch (t) {
+    case lldb::eSymbolTypeCode:
+    case lldb::eSymbolTypeResolver:
+    case lldb::eSymbolTypeTrampoline:
+      return SymbolKind::kFunction;
+    case lldb::eSymbolTypeData:
+    case lldb::eSymbolTypeObjectFile:  // some Mach-O globals show as Data/Object
+    case lldb::eSymbolTypeReExported:
+      return SymbolKind::kVariable;
+    default:
+      return SymbolKind::kOther;
+  }
+}
+
+bool kind_matches(SymbolKind want, SymbolKind got) {
+  return want == SymbolKind::kAny || want == got;
+}
+
+std::string module_path_of(lldb::SBSymbol /*sym*/, lldb::SBTarget target,
+                           lldb::SBAddress addr) {
+  // SBSymbol doesn't expose a module pointer directly in our LLDB version.
+  // Resolve via the symbol's address → SBSymbolContext → SBModule.
+  if (!addr.IsValid()) return {};
+  auto sc = target.ResolveSymbolContextForAddress(
+      addr, lldb::eSymbolContextModule);
+  auto m = sc.GetModule();
+  if (!m.IsValid()) return {};
+  auto fs = m.GetFileSpec();
+  if (!fs.IsValid()) return {};
+  char buf[4096];
+  if (fs.GetPath(buf, sizeof(buf)) > 0) return buf;
+  return {};
+}
+
+}  // namespace
+
+std::vector<SymbolMatch>
+LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // FindSymbols searches all modules — function symbols, data symbols,
+  // weak/exported, etc. We post-filter by SymbolKind.
+  auto sblist = target.FindSymbols(query.name.c_str());
+
+  std::vector<SymbolMatch> out;
+  out.reserve(sblist.GetSize());
+
+  uint32_t n = sblist.GetSize();
+  for (uint32_t i = 0; i < n; ++i) {
+    auto ctx = sblist.GetContextAtIndex(i);
+    auto sym = ctx.GetSymbol();
+    if (!sym.IsValid()) continue;
+
+    // Match by display name. SBSymbolContextList.FindSymbols may include
+    // partial / unrelated hits; reject anything where the name differs.
+    const char* name = sym.GetName();
+    if (!name || query.name != name) continue;
+
+    SymbolKind kind = classify_symbol(sym.GetType());
+    if (!kind_matches(query.kind, kind)) continue;
+
+    SymbolMatch m;
+    m.name = name;
+    if (const char* mn = sym.GetMangledName()) {
+      if (m.name != mn) m.mangled = mn;
+    }
+    m.kind = kind;
+
+    auto start_addr = sym.GetStartAddress();
+    if (start_addr.IsValid()) {
+      m.address = start_addr.GetFileAddress();
+    }
+    auto end_addr = sym.GetEndAddress();
+    if (end_addr.IsValid() && start_addr.IsValid()) {
+      auto e = end_addr.GetFileAddress();
+      auto s = start_addr.GetFileAddress();
+      if (e > s) m.byte_size = e - s;
+    }
+
+    m.module_path = module_path_of(sym, target, start_addr);
+
+    out.push_back(std::move(m));
+  }
+
+  return out;
+}
+
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
   {

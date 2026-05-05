@@ -57,6 +57,27 @@ struct TypeLayout {
   std::uint64_t holes_total = 0;  // sum of all internal holes (padding)
 };
 
+enum class SymbolKind {
+  kAny,        // wildcard for queries; never returned in results
+  kFunction,
+  kVariable,
+  kOther,      // anything else LLDB reports (labels, indirect, weak)
+};
+
+struct SymbolQuery {
+  std::string name;            // exact name match for now; glob/regex later
+  SymbolKind  kind = SymbolKind::kAny;
+};
+
+struct SymbolMatch {
+  std::string name;
+  std::string mangled;         // empty if same as name
+  SymbolKind  kind = SymbolKind::kOther;
+  std::uint64_t address = 0;   // file address (unrelocated)
+  std::uint64_t byte_size = 0; // 0 if unknown
+  std::string module_path;     // path of the owning module
+};
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -77,6 +98,12 @@ class DebuggerBackend {
   // Throws backend::Error for invalid target_id.
   virtual std::optional<TypeLayout>
       find_type_layout(TargetId tid, const std::string& name) = 0;
+
+  // Find symbols matching the query. Currently exact-name; pattern
+  // support comes later. Empty result = no matches; not an error.
+  // Throws backend::Error for invalid target_id.
+  virtual std::vector<SymbolMatch>
+      find_symbols(TargetId tid, const SymbolQuery& query) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;
