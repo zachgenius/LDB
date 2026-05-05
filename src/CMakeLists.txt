@@ -8,6 +8,7 @@ set(LDBD_SOURCES
   protocol/view.cpp
   backend/lldb_backend.cpp
   store/artifact_store.cpp
+  store/session_store.cpp
   util/log.cpp
 )
 
