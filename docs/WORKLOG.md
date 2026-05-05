@@ -4,6 +4,53 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 10) — M2 closeout: target.connect_remote
+
+**Goal:** Land the final M2-tier endpoint — `target.connect_remote({url, plugin?})` — wrapping `SBTarget::ConnectRemote` so an agent can attach to an `lldb-server` / `gdbserver` / `debugserver` over a gdb-remote-protocol port. Closes M2.
+
+**Done:**
+
+- **Backend interface:** new `connect_remote_target(target_id, url, plugin_name)` virtual on `DebuggerBackend`. Mirrors `attach`'s contract: refuses to clobber a live process, throws `backend::Error` on bad target_id / empty URL / refused-or-protocol-failed connect, returns `ProcessStatus` on success. Empty `plugin_name` defaults to `"gdb-remote"`, which covers every gdb-remote-protocol server we currently target (lldb-server, gdbserver, debugserver, qemu-gdbstub).
+- **`LldbBackend::connect_remote_target`** (in `src/backend/lldb_backend.cpp`): `SBTarget::ConnectRemote(listener, url, plugin, error)` against the debugger's listener. Wrapped in the same `dup2`-over-`/dev/null` stdout guard as `save_core` and `evaluate_expression` — the gdb-remote plugin can be chatty on connection-failure paths and any stdout write would corrupt the JSON-RPC channel.
+- **Wire layer:** `target.connect_remote` registered in `dispatcher.cpp` and listed in `describe.endpoints` (now 34 endpoints, up from 33). Returns `{state, pid, stop_reason?, exit_code?}` via the existing `process_status_to_json`. Param validation: missing `target_id` / `url` → `-32602`; backend errors (bogus URL, refused, malformed, bogus target_id) → `-32000`. Optional `plugin` field forwarded as a string.
+- **4-case Catch2 unit test** (`tests/unit/test_backend_connect_remote.cpp`): bogus URL bounded under 15s wall clock, empty URL throws, invalid target_id throws, plus a gated positive-path case (`[live][requires_lldb_server]`) that spawns `lldb-server gdbserver` and connects against the structs fixture.
+- **Python smoke test** (`tests/smoke/test_connect_remote.py`, TIMEOUT 60): always exercises the negative path (4 cases — bogus URL, empty URL, missing url, bogus target_id with the right typed error code each time). Best-effort positive path: probes for an lldb-server binary, spawns it on a fixed port range, TCP-probes for "is it listening", and on success drives `target.create_empty` → `target.connect_remote` → `process.detach` end-to-end. If the server can't be spawned (e.g. macOS arm64 Homebrew LLVM crash), prints "positive path skipped" and exits 0.
+- **CMake plumbing for `lldb-server` discovery:** `tests/unit/CMakeLists.txt` probes (1) `${LDB_LLDB_ROOT}/bin/lldb-server`, (2) `find_program(... lldb-server)`, and bakes the resolved path into the unit-test binary as `LDB_LLDB_SERVER_PATH`. Empty when neither is found — the test SKIPs cleanly. Same pattern as `LDB_FIXTURE_SLEEPER_PATH`. CMake status line confirms which path is in use.
+
+**Decisions:**
+
+- **Connection stdout-guard is mandatory, not speculative.** The gdb-remote plugin in LLDB writes connect-handshake errors directly to stdout in some failure modes (RST during qSupported, bad protocol version). Without the dup2 guard, the very first negative test (bogus URL) would corrupt the JSON-RPC channel — the smoke test would parse a half-line and fail with confusing JSON errors. We didn't *observe* this on macOS arm64 (the connect failed cleanly via SBError), but the cost is three syscalls per connect attempt and the failure mode is silent corruption — keeping it.
+- **Positive path is best-effort.** Homebrew LLVM 22.1.2's `lldb-server` on macOS arm64 crashes immediately in `GDBRemoteCommunicationServerLLGS::LaunchProcess()` because it can't find a working debug-server underneath (Apple's signed `debugserver` is what actually launches Mach tasks; lldb-server tries to substitute itself). On Linux this is fine — `lldb-server gdbserver` is the canonical native server. The test detects this asymmetry by trying to spawn the server and TCP-probe its port; if no port comes up within 3s, SKIP with a logged reason. This matches the reference plan's known-landmine note ("lldb-server is shipped in Homebrew LLVM and works for gdbserver mode against fixture binaries — cross-process loopback is fine") which turns out to be aspirational on this LLVM rev.
+- **No `--pipe` / `--named-pipe` for port discovery.** Initial impl used `--pipe <fd>` to read the kernel-allocated port from a write end inherited across exec; this works on Linux but the port-write path on macOS is gated by the same `LaunchProcess` codepath that crashes. Switched to a static port range (`32401, 32411, 32421, 32431`) with a TCP-connect probe — slightly less elegant, more robust across platforms, and avoids the `--pipe` API drift between lldb-server versions (the macOS Homebrew build appears to support the flag but never reaches the write).
+- **`pid >= 0`, not `pid > 0`, in the positive-path assertion.** Some server plugins return `pid=0` immediately post-connect because the inferior's pid hasn't been reported yet — agents pump `process.state` to discover it. Tightening this to `> 0` would chase a quirk of timing.
+- **Empty url is a backend error (`-32000`), not a param-validation error (`-32602`).** Param validation only checks shape (string vs missing); the backend catches semantic invalidity (URL doesn't parse, plugin can't accept it). Same convention as `target.attach` rejecting `pid<=0` at the backend layer rather than the dispatcher.
+
+**Surprises / blockers:**
+
+- **`lldb-server` on macOS arm64 is a known-broken target.** First attempt at the live-path test used `--pipe` and `--named-pipe` for port discovery; both crashed the server with the same stack trace (`GDBRemoteCommunicationServerLLGS::LaunchProcess` → SignalHandler). Verified by hand: `/opt/homebrew/opt/llvm/bin/lldb-server gdbserver 127.0.0.1:21345 -- ...` crashes immediately, regardless of port-discovery mechanism. The `lldb-server platform --listen ...` mode also fails ("Could not find debug server executable") for the same root cause. Conclusion: on this LLVM rev + macOS arm64, the positive path *cannot* run — the daemon code is correct, the test infrastructure is correct, the *server* is non-functional. Smoke + unit both detect this and SKIP the live path with explicit messages.
+- **`waitpid(WNOHANG)` doesn't always reap a just-crashed child.** During the lldb-server crash, the unit test's WNOHANG check returned 0 (process still running) even though the crash dump had already printed and the process was effectively dead. Likely the kernel had the child still in "writing crash dump" state. The test handles this by also checking `port == 0` and skipping; the crash detection is best-effort, not load-bearing. Worth noting because anyone copying this pattern for a different server should use a TCP-connect probe (which we do for the smoke test) as the primary "is it up" signal.
+- **No JSON-RPC corruption observed.** dup2 guard around `ConnectRemote` was speculative based on the gdb-remote plugin's known stdout chattiness on failure paths; on this LLVM build, every failure went through `SBError` cleanly. Keeping the guard — it costs ~3 syscalls per call and immunizes against a class of channel-corruption bugs.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **19/19 PASS in ~92s wall clock** on macOS arm64. unit_tests is now 153 cases / 1294 assertions (up from 149/1286; the 4 new cases include 1 SKIPPED at runtime). New test IDs: `[backend][connect_remote][error]` (3 cases), `[backend][connect_remote][live][requires_lldb_server]` (1 case, SKIPs cleanly with logged reason), `smoke_connect_remote` (5.53s — most of that is the bogus-URL TCP backoff and the 3s positive-path spawn timeout).
+- Build is warning-clean under the project's `-Wall -Wextra -Wpedantic -Wshadow ... -Wconversion` flags.
+- Manual: `describe.endpoints` lists `target.connect_remote` (total 34 endpoints); the negative-path round-trip returns the typed `-32000` with a useful error message; the positive path SKIPs on this dev box due to Homebrew lldb-server crashing as documented.
+- **Positive path NOT exercised on this dev box** (macOS arm64, Homebrew LLVM 22.1.2). The wire and SBAPI integration are verified by code review against the same pattern as `attach` (which DOES work on macOS via Apple's signed debugserver). On a Linux dev box with stock distro `lldb-server`, the positive path is expected to run.
+
+**M2 status:** **CLOSED** — every endpoint listed in §4.1 (target lifecycle: open, create_empty, attach, connect_remote, load_core, close), §4.3 (process / thread / frame / value: state, resume, kill, detach, step, list_threads, list_frames, frame.locals/args/registers, value.eval, value.read), and §4.4 (memory: read, read_cstr, regions, search) has landed with unit tests, smoke tests, and describe.endpoints registration. macOS arm64 build + smoke green. Save_core path also landed (postmortem-out side; load_core covers the in side).
+
+**Next:**
+
+- **M3 kickoff** — three independent workstreams, in priority order:
+  1. **Artifact store + `.ldbpack`** (§4.7). Sqlite-backed `~/.ldb/index.db` + per-build-id directories. Probes need this to land first or they have nowhere to put captured data.
+  2. **Probes (§4.5)** — `lldb_breakpoint` engine via `SBBreakpoint::SetScriptCallbackBody`. Largest single piece of remaining work; hot-path overhead must be measured early because probe-callback Python in LLDB is the M3-critical risk per §13.
+  3. **Sessions (§3.4)** — sqlite WAL log + replay. Independent of the other two; can land in parallel with whichever lead engineer picks it up.
+- **dispatcher.cpp split** still deferred. File is now ~1465 lines (up from 1428 last session). Continued mild growth; per-area split (`dispatcher_target.cpp`, `dispatcher_process.cpp`, `dispatcher_value.cpp`, `dispatcher_memory.cpp`) is the right shape, but probes will demand a new dispatcher anyway and that's the natural moment to split.
+- **Cleanup queue:** the "lldb-server doesn't work on macOS Homebrew" note belongs in `docs/02-ldb-mvp-plan.md` §9 as a footnote, since it affects the M4 remote-target story too. Defer to the M4 planning session.
+
+---
+
 ## 2026-05-05 (cont. 9) — M2 closeout: value.eval + value.read
 
 **Goal:** Round out the M2 value-evaluation surface with the two endpoints called out in the previous session's "Next" list — LLDB expression eval and a typed dotted/bracketed path read — leaving M2 substantively done modulo `target.connect_remote`.

@@ -378,6 +378,20 @@ class DebuggerBackend {
   // running.
   virtual ProcessStatus detach_process(TargetId tid) = 0;
 
+  // Connect to a remote debug server (lldb-server, gdbserver,
+  // debugserver, qemu-gdbstub, ...) over its gdb-remote-protocol
+  // endpoint. [url] is whatever SBTarget::ConnectRemote accepts:
+  // "connect://host:port" or "host:port" (LLDB tolerates both).
+  // [plugin_name] selects the connection plugin; empty string means
+  // "gdb-remote", which covers every server we currently target.
+  // Sync semantics: blocks until the server reports a stable post-
+  // connect state (typically stopped) or fails. Throws backend::Error
+  // on invalid target_id, malformed URL, refused connection, or
+  // post-connect protocol failure.
+  virtual ProcessStatus
+      connect_remote_target(TargetId tid, const std::string& url,
+                            const std::string& plugin_name) = 0;
+
   // Save a core file of the target's process to [path]. Returns true
   // on success; false if the platform doesn't implement SaveCore for
   // the current process type (e.g. some Linux configurations).

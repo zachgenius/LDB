@@ -44,6 +44,9 @@ class LldbBackend final : public DebuggerBackend {
   ProcessStatus kill_process(TargetId tid) override;
   ProcessStatus attach(TargetId tid, std::int32_t pid) override;
   ProcessStatus detach_process(TargetId tid) override;
+  ProcessStatus connect_remote_target(TargetId tid,
+                                      const std::string& url,
+                                      const std::string& plugin_name) override;
   bool save_core(TargetId tid, const std::string& path) override;
 
   std::vector<ThreadInfo> list_threads(TargetId tid) override;

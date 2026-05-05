@@ -1209,6 +1209,69 @@ ProcessStatus LldbBackend::detach_process(TargetId tid) {
   return snapshot(proc);
 }
 
+ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
+                                                 const std::string& url,
+                                                 const std::string& plugin_name) {
+  if (url.empty()) {
+    throw Error("connect_remote: url must not be empty");
+  }
+
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // Mirror attach's policy: refuse to clobber a live process. The
+  // operator must explicitly detach/kill before re-connecting.
+  if (auto existing = target.GetProcess(); existing.IsValid()) {
+    auto st = existing.GetState();
+    if (st != lldb::eStateExited && st != lldb::eStateDetached &&
+        st != lldb::eStateInvalid) {
+      throw Error("target already has a live process; detach or kill first");
+    }
+  }
+
+  // Default plugin is gdb-remote, which handles lldb-server, gdbserver,
+  // debugserver, qemu-gdbstub, and friends. Empty plugin_name → default.
+  const char* plugin = plugin_name.empty() ? "gdb-remote" : plugin_name.c_str();
+
+  // SBTarget::ConnectRemote occasionally writes connection-failure
+  // diagnostics to stdout (the gdb-remote plugin's chatty path). For
+  // ldbd that would corrupt the JSON-RPC channel. dup2-over-/dev/null
+  // around the call, same pattern as save_core / evaluate_expression.
+  int saved_stdout = ::dup(STDOUT_FILENO);
+  int devnull      = ::open("/dev/null", O_WRONLY);
+  if (saved_stdout >= 0 && devnull >= 0) {
+    ::dup2(devnull, STDOUT_FILENO);
+    ::close(devnull);
+  }
+
+  lldb::SBListener listener = impl_->debugger.GetListener();
+  lldb::SBError err;
+  auto proc = target.ConnectRemote(listener, url.c_str(), plugin, err);
+
+  if (saved_stdout >= 0) {
+    ::dup2(saved_stdout, STDOUT_FILENO);
+    ::close(saved_stdout);
+  }
+
+  if (err.Fail() || !proc.IsValid()) {
+    throw Error(std::string("connect_remote failed: ") +
+                (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+
+  // ConnectRemote may return with the process in eStateConnected (which
+  // map_state coerces to kRunning); some plugins immediately report
+  // stopped. Either is a valid post-connect state. The caller can pump
+  // get_process_state / list_threads to discover more.
+  return snapshot(proc);
+}
+
 bool LldbBackend::save_core(TargetId tid, const std::string& path) {
   lldb::SBTarget target;
   {

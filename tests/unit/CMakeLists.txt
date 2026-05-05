@@ -21,6 +21,7 @@ set(LDB_UNIT_SOURCES
   test_backend_value_eval.cpp
   test_backend_value_read.cpp
   test_backend_attach.cpp
+  test_backend_connect_remote.cpp
   test_backend_memory.cpp
   test_backend_core.cpp
   test_dispatcher_view_retrofit.cpp
@@ -67,6 +68,33 @@ add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper)
 target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_STRUCTS_PATH="$<TARGET_FILE:ldb_fix_structs>"
   LDB_FIXTURE_SLEEPER_PATH="$<TARGET_FILE:ldb_fix_sleeper>"
+)
+
+# lldb-server path for the connect_remote positive-path test. Discovery
+# order matches the runtime fallback in the test:
+#   1. ${LDB_LLDB_ROOT}/bin/lldb-server (the same prefix we link liblldb
+#      against — Homebrew LLVM ships it).
+#   2. find_program(... lldb-server) — anywhere on PATH.
+# If neither found, define the macro to empty string; the test SKIPs
+# the live case at runtime with a logged reason.
+set(LDB_LLDB_SERVER_BIN "")
+if(LDB_LLDB_ROOT AND EXISTS "${LDB_LLDB_ROOT}/bin/lldb-server")
+  set(LDB_LLDB_SERVER_BIN "${LDB_LLDB_ROOT}/bin/lldb-server")
+else()
+  find_program(LDB_LLDB_SERVER_FOUND lldb-server)
+  if(LDB_LLDB_SERVER_FOUND)
+    set(LDB_LLDB_SERVER_BIN "${LDB_LLDB_SERVER_FOUND}")
+  endif()
+endif()
+if(LDB_LLDB_SERVER_BIN)
+  message(STATUS "ldb: lldb-server at ${LDB_LLDB_SERVER_BIN} "
+                 "(connect_remote positive path enabled)")
+else()
+  message(STATUS "ldb: lldb-server not found — connect_remote positive path "
+                 "will SKIP at runtime")
+endif()
+target_compile_definitions(ldb_unit_tests PRIVATE
+  LDB_LLDB_SERVER_PATH="${LDB_LLDB_SERVER_BIN}"
 )
 
 add_test(

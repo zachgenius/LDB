@@ -275,6 +275,8 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "target.open")        return handle_target_open(req);
     if (req.method == "target.create_empty")return handle_target_create_empty(req);
     if (req.method == "target.attach")      return handle_target_attach(req);
+    if (req.method == "target.connect_remote")
+      return handle_target_connect_remote(req);
     if (req.method == "target.load_core")   return handle_target_load_core(req);
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "module.list")        return handle_module_list(req);
@@ -375,6 +377,17 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       "Attach to a running process by pid. Synchronous: blocks until "
       "the inferior is stopped on attach.",
       json{{"target_id", "uint64"}, {"pid", "int"}},
+      json{{"state", "string"}, {"pid", "int"},
+           {"stop_reason", "string?"}});
+
+  add("target.connect_remote",
+      "Connect to a remote debug server (lldb-server, gdbserver, "
+      "debugserver, qemu-gdbstub) over its gdb-remote-protocol "
+      "endpoint. URL forms accepted: \"connect://host:port\" or "
+      "\"host:port\". plugin defaults to \"gdb-remote\". Synchronous: "
+      "blocks until the connect handshake completes or fails.",
+      json{{"target_id", "uint64"}, {"url", "string"},
+           {"plugin", "string?"}},
       json{{"state", "string"}, {"pid", "int"},
            {"stop_reason", "string?"}});
 
@@ -640,6 +653,33 @@ Response Dispatcher::handle_target_attach(const Request& req) {
   }
   auto status = backend_->attach(static_cast<backend::TargetId>(tid),
                                  static_cast<std::int32_t>(pid_u));
+  return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_target_connect_remote(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* url = require_string(req.params, "url");
+  if (!url) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'url'");
+  }
+  // plugin is optional; default empty → backend uses "gdb-remote".
+  std::string plugin;
+  if (auto it = req.params.find("plugin");
+      it != req.params.end() && it->is_string()) {
+    plugin = it->get<std::string>();
+  }
+
+  auto status = backend_->connect_remote_target(
+      static_cast<backend::TargetId>(tid), *url, plugin);
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 

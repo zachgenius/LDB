@@ -26,6 +26,7 @@ class Dispatcher {
   protocol::Response handle_target_open(const protocol::Request& req);
   protocol::Response handle_target_create_empty(const protocol::Request& req);
   protocol::Response handle_target_attach(const protocol::Request& req);
+  protocol::Response handle_target_connect_remote(const protocol::Request& req);
   protocol::Response handle_target_load_core(const protocol::Request& req);
   protocol::Response handle_module_list(const protocol::Request& req);
   protocol::Response handle_target_close(const protocol::Request& req);
