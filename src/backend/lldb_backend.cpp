@@ -149,7 +149,7 @@ void maybe_seed_apple_debugserver() {
     struct stat st;
     if (::stat(path, &st) == 0 && (st.st_mode & S_IXUSR)) {
       ::setenv("LLDB_DEBUGSERVER_PATH", path, /*overwrite=*/0);
-      log::info(std::string("LLDB_DEBUGSERVER_PATH=") + path);
+      log::debug(std::string("LLDB_DEBUGSERVER_PATH=") + path);
       return;
     }
   }
@@ -182,7 +182,10 @@ LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
   ensure_lldb_initialized();
   impl_->debugger = lldb::SBDebugger::Create();
   impl_->debugger.SetAsync(false);
-  log::info("lldb backend initialized");
+  // One-line trace per backend instance is useful for debugging client
+  // setup but not for steady-state operation; demoted to debug so
+  // --log-level error and the unit-test default (info) stay quiet.
+  log::debug("lldb backend initialized");
 }
 
 LldbBackend::~LldbBackend() {
