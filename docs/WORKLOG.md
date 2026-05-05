@@ -4,6 +4,45 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 9) — M2 closeout: value.eval + value.read
+
+**Goal:** Round out the M2 value-evaluation surface with the two endpoints called out in the previous session's "Next" list — LLDB expression eval and a typed dotted/bracketed path read — leaving M2 substantively done modulo `target.connect_remote`.
+
+**Done:**
+
+- **`value.eval`** (commit `fcebd38`) — wraps `SBFrame::EvaluateExpression` behind a new backend interface (`EvalOptions` / `EvalResult` / `evaluate_expression`). Defaults: 250ms timeout, ignore breakpoints, don't try-all-threads, unwind on error. Eval failure (compile / runtime / timeout) returns `{error:'...'}` as *data*; bad target/tid/frame_index throws. dup2-over-/dev/null guard around `EvaluateExpression` because the LLDB expression evaluator occasionally writes diagnostics to stdout (would corrupt the JSON-RPC channel — same pattern as `save_core`). 7-case Catch2 unit test (39 assertions) including a runaway-loop expression bounded by a 100ms timeout asserting wall-clock <5s. Python smoke (`test_value_eval.py`, TIMEOUT 60).
+- **`value.read`** (commit `e657b04`) — frame-relative dotted/bracketed path traversal. Hand-rolled tokenizer in lldb_backend.cpp accepts `ident`, `.name`, `[uint]`; tokenizer errors and missing-member / out-of-range-index errors are returned as data. Identifier resolution tries `frame.FindVariable` (locals/args), `frame.FindValue` (globals visible from CU), then `SBTarget::FindGlobalVariables` (target-wide). The third stage is the load-bearing fallback — at `_dyld_start` on macOS arm64, the main module's globals aren't visible from frame scope but they ARE reachable target-wide. Resolved value carries its immediate children for one-shot struct/array introspection. 13-case Catch2 unit test, Python smoke (`test_value_read.py`, TIMEOUT 60). structs.c fixture grew `g_arr[4]` (referenced in main) to anchor the indexed-path test.
+- **describe.endpoints** now lists `value.eval` and `value.read` (total 33 endpoints; up from 31).
+
+**Decisions:**
+
+- **Eval failure is data, not error.** An agent inspecting an unknown binary will frequently issue exploratory expressions ("does `g_state` have a `flag` member?"); the agent doesn't want compile errors to look like transport failures, because then it can't tell "the daemon broke" from "my expression was wrong." Same logic for `value.read` path-resolution failures. Bad target/tid/frame_index, by contrast, IS the agent's bug and surfaces as a typed `-32000`.
+- **Default eval timeout is 250ms.** Bumped beyond the 100ms used in the test (test wants a tight bound to assert promptness; production wants headroom for real expressions that legitimately call into the inferior). Caller bumps `timeout_us` for known-expensive expressions.
+- **Path tokenizer lives in `lldb_backend.cpp`'s anonymous namespace, not a new module.** It's ~80 lines and used only by `read_value_path`. Adding a `path/` directory now would be premature — extracting if a second consumer joins.
+- **Target-wide global fallback is mandatory.** Initial implementation only used frame-scoped lookup and tests passed in random order but failed when isolated — race-condition-style flakiness. Diagnostic: every test launches its own fixture, and at `_dyld_start` only dyld's CU is in frame scope. The first test occasionally won due to LLDB's symbol cache warming up across the test binary's lifetime; isolating the failing test exposed the bug. `SBTarget::FindGlobalVariables` is a one-call resolution across all modules and removes the order-dependence.
+- **`children` is opt-in via shape, not opt-out via view.** When the resolved value has no children (a primitive), the field is omitted; when it does, it's always emitted. The view mechanism is overkill for what's effectively a single-step expansion; agents wanting more depth re-issue `value.read` with a deeper path. If we ever want bounded recursion, that becomes its own option (e.g. `view.depth=2`).
+- **Two commits, not one.** The shared plumbing (frame resolution, ValueInfo) was already in place from the M2 frame-values commit; the eval and read paths only share the boilerplate of "resolve frame, do thing." Splitting kept each commit's scope tight: eval is one virtual method, one handler, one describe entry; read adds the path tokenizer, the multi-stage identifier resolver, the children walk, and one fixture line. The split also serves bisection — if a future regression isolates to one of the two endpoints, the bad commit is unambiguous.
+
+**Surprises / blockers:**
+
+- **Globals invisible from `_dyld_start` frame scope.** First red on the value.read tests; spent ~10min on a diagnostic Catch2 case that printed `r.error` for each path before realizing the lookup needed a target-wide fallback. Worth flagging because the same trap applies to any future endpoint that wants to resolve a name to a typed SBValue from a stop-at-entry frame.
+- **Tests passed in random order, failed when isolated.** Catch2's randomized test order surfaced this as "13 cases, 7 pass, 6 fail" — and the 6 weren't the same set on every run. Initial reaction was "that can't be right." Quick-and-dirty fix: re-run the failing test alone, observed it failed deterministically, then realized the passing tests were piggybacking on prior global resolutions. Concrete reminder that test isolation matters here; the current tests use fresh `LldbBackend` per case and that's what surfaced the bug.
+- **No SaveCore-style stdout corruption observed by accident** — the dup2 guard around `EvaluateExpression` was speculative based on the SaveCore precedent. Whether LLDB actually writes there in practice depends on which SBExpressionOptions you set; the guard costs ~3 syscalls per eval and removes a class of channel-corruption bugs. Keeping it.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **18/18 PASS in ~81s wall clock**. unit_tests is 149 cases / 1286 assertions (up from 129/1174). New: `[backend][value][eval]` (7 cases), `[backend][value][read]` (13 cases), `smoke_value_eval` (1.42s), `smoke_value_read` (1.31s). Build is warning-clean.
+- Manual: `describe.endpoints` lists both methods; round-trip eval of `1+2` returns the expected summary; round-trip read of `g_origin` returns children with `x`/`y` populated; round-trip read of `g_origin.no_such_field` returns `{error:"no member 'no_such_field' on value of type 'point2'"}` data with `ok=true`.
+
+**Next:**
+
+- **`target.connect_remote({url})`** — the last M2-tier endpoint. `SBPlatform::ConnectRemote` plus the same wire shape as `target.attach`. Pure plumbing; should be a small commit.
+- **M3 work** opens here: probes (auto-resuming breakpoints with structured capture) need the artifact store to land first or they have nowhere to put captured data. Sessions (sqlite-backed RPC log + replay) are independent and can land in parallel.
+- **dispatcher.cpp is now ~1500 lines.** Worklog flagged this last session at 1340; we're solidly in "should split" territory now. One more endpoint and the file becomes hard to navigate. Recommended split: per-area files (`dispatcher_target.cpp`, `dispatcher_process.cpp`, `dispatcher_value.cpp`, etc.) sharing a small `handlers.h` for the common helpers (`require_string`, `parse_frame_params`, `value_info_to_json`). Don't preemptively refactor in this commit — it's its own logical change.
+- **Cleanup queue:** still empty. M2 ends as-clean as M1 did.
+
+---
+
 ## 2026-05-05 (cont. 8) — M2 closeout: process.step
 
 **Goal:** Round out M2 process-control surface by landing `process.step` for all four step kinds (`in` / `over` / `out` / `insn`), tested unit-side and over the JSON-RPC wire, before leaving M2 functionally complete.
