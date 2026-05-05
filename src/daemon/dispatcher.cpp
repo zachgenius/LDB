@@ -83,6 +83,30 @@ json thread_info_to_json(const backend::ThreadInfo& t) {
   return j;
 }
 
+std::string hex_lower(const std::vector<std::uint8_t>& bytes) {
+  // Lower-case packed hex (no separators) — distinct from disasm's
+  // space-separated rendering. Used by frame.* and mem.* endpoints.
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (auto b : bytes) {
+    out.push_back(kHex[(b >> 4) & 0xF]);
+    out.push_back(kHex[b & 0xF]);
+  }
+  return out;
+}
+
+json value_info_to_json(const backend::ValueInfo& v) {
+  json j;
+  j["name"] = v.name;
+  j["type"] = v.type;
+  if (v.address.has_value())  j["address"] = *v.address;
+  if (!v.bytes.empty())       j["bytes"]   = hex_lower(v.bytes);
+  if (v.summary.has_value())  j["summary"] = *v.summary;
+  if (v.kind.has_value())     j["kind"]    = *v.kind;
+  return j;
+}
+
 json frame_info_to_json(const backend::FrameInfo& f) {
   json j;
   j["index"]  = f.index;
@@ -232,6 +256,10 @@ Response Dispatcher::dispatch(const Request& req) {
 
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
+
+    if (req.method == "frame.locals")       return handle_frame_locals(req);
+    if (req.method == "frame.args")         return handle_frame_args(req);
+    if (req.method == "frame.registers")    return handle_frame_registers(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -388,6 +416,28 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"frames",
             "array of {index,pc,fp,sp,function?,module?,file?,line?,inlined?}"}});
 
+  add("frame.locals",
+      "Local variables in scope at a frame. Bytes capped at 64; agents "
+      "follow up with mem.read for fuller dumps.",
+      json{{"target_id", "uint64"}, {"tid", "uint64"},
+           {"frame_index", "uint?"}},
+      json{{"locals",
+            "array of {name,type,address?,bytes?,summary?,kind}"}});
+
+  add("frame.args",
+      "Function arguments visible at a frame.",
+      json{{"target_id", "uint64"}, {"tid", "uint64"},
+           {"frame_index", "uint?"}},
+      json{{"args",
+            "array of {name,type,address?,bytes?,summary?,kind}"}});
+
+  add("frame.registers",
+      "All register sets at a frame, flattened.",
+      json{{"target_id", "uint64"}, {"tid", "uint64"},
+           {"frame_index", "uint?"}},
+      json{{"registers",
+            "array of {name,type,address?,bytes?,summary?,kind}"}});
+
   json data;
   data["endpoints"] = std::move(eps);
   return protocol::make_ok(req.id, std::move(data));
@@ -481,6 +531,84 @@ Response Dispatcher::handle_thread_frames(const Request& req) {
   json arr = json::array();
   for (const auto& f : frames) arr.push_back(frame_info_to_json(f));
   return protocol::make_ok(req.id, json{{"frames", std::move(arr)}});
+}
+
+namespace {
+
+// Common parameter parsing for the three frame.* endpoints.
+struct FrameParams {
+  std::uint64_t target_id   = 0;
+  std::uint64_t tid         = 0;
+  std::uint32_t frame_index = 0;
+};
+
+// Returns nullopt on success; on failure returns the error response.
+std::optional<Response>
+parse_frame_params(const Request& req, FrameParams* out) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  if (!require_uint(req.params, "target_id", &out->target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "tid", &out->tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'tid'");
+  }
+  if (auto it = req.params.find("frame_index"); it != req.params.end()) {
+    std::uint64_t tmp = 0;
+    if (!require_uint(req.params, "frame_index", &tmp)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'frame_index' must be a non-negative integer");
+    }
+    out->frame_index = static_cast<std::uint32_t>(tmp);
+  }
+  return std::nullopt;
+}
+
+Response build_value_response(const Request& req,
+                              const std::vector<backend::ValueInfo>& values,
+                              const char* items_key) {
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  json arr = json::array();
+  for (const auto& v : values) arr.push_back(value_info_to_json(v));
+  return protocol::make_ok(
+      req.id, protocol::view::apply_to_array(std::move(arr), view_spec,
+                                             items_key));
+}
+
+}  // namespace
+
+Response Dispatcher::handle_frame_locals(const Request& req) {
+  FrameParams p;
+  if (auto err = parse_frame_params(req, &p)) return *err;
+  auto values = backend_->list_locals(
+      static_cast<backend::TargetId>(p.target_id),
+      static_cast<backend::ThreadId>(p.tid),
+      p.frame_index);
+  return build_value_response(req, values, "locals");
+}
+
+Response Dispatcher::handle_frame_args(const Request& req) {
+  FrameParams p;
+  if (auto err = parse_frame_params(req, &p)) return *err;
+  auto values = backend_->list_args(
+      static_cast<backend::TargetId>(p.target_id),
+      static_cast<backend::ThreadId>(p.tid),
+      p.frame_index);
+  return build_value_response(req, values, "args");
+}
+
+Response Dispatcher::handle_frame_registers(const Request& req) {
+  FrameParams p;
+  if (auto err = parse_frame_params(req, &p)) return *err;
+  auto values = backend_->list_registers(
+      static_cast<backend::TargetId>(p.target_id),
+      static_cast<backend::ThreadId>(p.tid),
+      p.frame_index);
+  return build_value_response(req, values, "registers");
 }
 
 Response Dispatcher::handle_process_launch(const Request& req) {

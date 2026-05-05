@@ -169,6 +169,22 @@ struct FrameInfo {
   bool           inlined = false;
 };
 
+// SBValue projection — a local, an argument, or a register snapshot.
+// Bytes are bounded (kValueByteCap) to keep agent context budgets sane;
+// callers needing a full readout use mem.read against `address`.
+struct ValueInfo {
+  std::string                     name;        // empty for nameless values
+  std::string                     type;        // "<unknown>" if unresolvable
+  std::optional<std::uint64_t>    address;     // load addr; unset if invalid
+  std::vector<std::uint8_t>       bytes;       // up to kValueByteCap bytes
+  std::optional<std::string>      summary;     // SBValue::GetSummary || GetValue
+  std::optional<std::string>      kind;        // "local"|"arg"|"register"
+};
+
+// Maximum number of bytes serialized per ValueInfo. Keep small; agents
+// follow up with mem.read for fuller dumps.
+constexpr std::size_t kValueByteCap = 64;
+
 // Errors are reported via exceptions of type backend::Error.
 struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -269,6 +285,28 @@ class DebuggerBackend {
   virtual std::vector<FrameInfo>
       list_frames(TargetId tid, ThreadId thread_id,
                   std::uint32_t max_depth) = 0;
+
+  // --- Frame values ----------------------------------------------------
+  //
+  // Three SBValue-walking endpoints over a single frame:
+  //   list_locals     — function-scope locals (DWARF DW_TAG_variable)
+  //   list_args       — function arguments (DW_TAG_formal_parameter)
+  //   list_registers  — every register set's registers, flattened
+  //
+  // All three throw backend::Error on invalid target_id, unknown thread,
+  // or out-of-range frame index. Bytes are clamped to kValueByteCap.
+
+  virtual std::vector<ValueInfo>
+      list_locals(TargetId tid, ThreadId thread_id,
+                  std::uint32_t frame_index) = 0;
+
+  virtual std::vector<ValueInfo>
+      list_args(TargetId tid, ThreadId thread_id,
+                std::uint32_t frame_index) = 0;
+
+  virtual std::vector<ValueInfo>
+      list_registers(TargetId tid, ThreadId thread_id,
+                     std::uint32_t frame_index) = 0;
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;

@@ -45,6 +45,16 @@ class LldbBackend final : public DebuggerBackend {
   std::vector<FrameInfo>  list_frames(TargetId tid, ThreadId thread_id,
                                       std::uint32_t max_depth) override;
 
+  std::vector<ValueInfo>
+      list_locals(TargetId tid, ThreadId thread_id,
+                  std::uint32_t frame_index) override;
+  std::vector<ValueInfo>
+      list_args(TargetId tid, ThreadId thread_id,
+                std::uint32_t frame_index) override;
+  std::vector<ValueInfo>
+      list_registers(TargetId tid, ThreadId thread_id,
+                     std::uint32_t frame_index) override;
+
   void close_target(TargetId tid) override;
 
  private:

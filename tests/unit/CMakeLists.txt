@@ -16,6 +16,7 @@ set(LDB_UNIT_SOURCES
   test_backend_string_xref.cpp
   test_backend_process.cpp
   test_backend_threads.cpp
+  test_backend_frame_values.cpp
 )
 
 set(LDB_LIB_SOURCES

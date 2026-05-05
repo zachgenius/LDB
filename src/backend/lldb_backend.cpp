@@ -1200,6 +1200,143 @@ LldbBackend::list_frames(TargetId tid, ThreadId thread_id,
 }
 
 // ---------------------------------------------------------------------------
+// Frame values: locals / args / registers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+ValueInfo to_value_info(lldb::SBValue v, const char* kind) {
+  ValueInfo out;
+
+  if (const char* nm = v.GetName()) out.name = nm;
+  if (const char* tn = v.GetTypeName()) {
+    out.type = tn;
+  } else {
+    out.type = "<unknown>";
+  }
+
+  lldb::addr_t addr = v.GetLoadAddress();
+  if (addr != LLDB_INVALID_ADDRESS) {
+    out.address = static_cast<std::uint64_t>(addr);
+  }
+
+  // Best-effort byte snapshot. SBValue::GetData returns a copy of the
+  // value's bytes (regardless of where it lives). Cap at kValueByteCap.
+  lldb::SBError err;
+  auto data = v.GetData();
+  if (data.IsValid()) {
+    size_t avail = data.GetByteSize();
+    if (avail > 0) {
+      size_t want = std::min<size_t>(avail, kValueByteCap);
+      std::vector<std::uint8_t> buf(want);
+      size_t got = data.ReadRawData(err, /*offset=*/0, buf.data(), want);
+      if (!err.Fail() && got > 0) {
+        buf.resize(got);
+        out.bytes = std::move(buf);
+      }
+    }
+  }
+
+  if (const char* sm = v.GetSummary()) {
+    out.summary = sm;
+  } else if (const char* val = v.GetValue()) {
+    out.summary = val;
+  }
+
+  if (kind) out.kind = kind;
+  return out;
+}
+
+std::vector<ValueInfo>
+collect_variables(lldb::SBFrame frame, bool args, bool locals,
+                  const char* kind) {
+  // GetVariables(arguments, locals, statics, in_scope_only)
+  auto values = frame.GetVariables(args, locals,
+                                   /*statics=*/false,
+                                   /*in_scope_only=*/true);
+  std::vector<ValueInfo> out;
+  uint32_t n = values.GetSize();
+  out.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    auto v = values.GetValueAtIndex(i);
+    if (v.IsValid()) out.push_back(to_value_info(v, kind));
+  }
+  return out;
+}
+
+}  // namespace
+
+namespace {
+
+// Body shared by list_locals / list_args / list_registers: resolve
+// (target, thread, frame) → SBFrame, throwing typed errors on misses.
+lldb::SBFrame resolve_frame_locked(
+    std::unordered_map<TargetId, lldb::SBTarget>& targets,
+    std::mutex& mu, TargetId tid, ThreadId thread_id,
+    std::uint32_t frame_index) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = targets.find(tid);
+    if (it == targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) throw Error("no process");
+  auto thr = proc.GetThreadByID(thread_id);
+  if (!thr.IsValid()) throw Error("unknown thread id");
+  if (frame_index >= thr.GetNumFrames()) {
+    throw Error("frame index out of range");
+  }
+  auto frame = thr.GetFrameAtIndex(frame_index);
+  if (!frame.IsValid()) throw Error("invalid frame");
+  return frame;
+}
+
+}  // namespace
+
+std::vector<ValueInfo>
+LldbBackend::list_locals(TargetId tid, ThreadId thread_id,
+                         std::uint32_t frame_index) {
+  auto frame = resolve_frame_locked(impl_->targets, impl_->mu,
+                                    tid, thread_id, frame_index);
+  return collect_variables(frame, /*args=*/false, /*locals=*/true, "local");
+}
+
+std::vector<ValueInfo>
+LldbBackend::list_args(TargetId tid, ThreadId thread_id,
+                       std::uint32_t frame_index) {
+  auto frame = resolve_frame_locked(impl_->targets, impl_->mu,
+                                    tid, thread_id, frame_index);
+  return collect_variables(frame, /*args=*/true, /*locals=*/false, "arg");
+}
+
+std::vector<ValueInfo>
+LldbBackend::list_registers(TargetId tid, ThreadId thread_id,
+                            std::uint32_t frame_index) {
+  auto frame = resolve_frame_locked(impl_->targets, impl_->mu,
+                                    tid, thread_id, frame_index);
+
+  // Registers are exposed as a list of register sets (GPR, FPR, vector,
+  // exception). Flatten into one vector — agents project via view.fields.
+  auto sets = frame.GetRegisters();
+  std::vector<ValueInfo> out;
+  uint32_t ns = sets.GetSize();
+  for (uint32_t i = 0; i < ns; ++i) {
+    auto set = sets.GetValueAtIndex(i);
+    if (!set.IsValid()) continue;
+    uint32_t nr = set.GetNumChildren();
+    for (uint32_t j = 0; j < nr; ++j) {
+      auto reg = set.GetChildAtIndex(j);
+      if (reg.IsValid()) out.push_back(to_value_info(reg, "register"));
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
