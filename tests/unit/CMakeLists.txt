@@ -20,6 +20,7 @@ set(LDB_UNIT_SOURCES
   test_backend_attach.cpp
   test_backend_memory.cpp
   test_backend_core.cpp
+  test_dispatcher_view_retrofit.cpp
   test_fixture_sleeper.cpp
 )
 
@@ -28,6 +29,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/view.cpp
   ${CMAKE_SOURCE_DIR}/src/util/log.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
+  ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.

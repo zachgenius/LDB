@@ -685,10 +685,12 @@ Response Dispatcher::handle_thread_list(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint param 'target_id'");
   }
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto threads = backend_->list_threads(static_cast<backend::TargetId>(tid));
   json arr = json::array();
   for (const auto& t : threads) arr.push_back(thread_info_to_json(t));
-  return protocol::make_ok(req.id, json{{"threads", std::move(arr)}});
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "threads"));
 }
 
 Response Dispatcher::handle_thread_frames(const Request& req) {
@@ -713,13 +715,15 @@ Response Dispatcher::handle_thread_frames(const Request& req) {
                                 "'max_depth' must be a non-negative integer");
     }
   }
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto frames = backend_->list_frames(
       static_cast<backend::TargetId>(target_id),
       static_cast<backend::ThreadId>(tid),
       static_cast<std::uint32_t>(depth));
   json arr = json::array();
   for (const auto& f : frames) arr.push_back(frame_info_to_json(f));
-  return protocol::make_ok(req.id, json{{"frames", std::move(arr)}});
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "frames"));
 }
 
 namespace {
@@ -1018,6 +1022,7 @@ Response Dispatcher::handle_string_xref(const Request& req) {
                               "missing string param 'text'");
   }
 
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto results = backend_->find_string_xrefs(
       static_cast<backend::TargetId>(tid), *text);
 
@@ -1030,7 +1035,8 @@ Response Dispatcher::handle_string_xref(const Request& req) {
     one["xrefs"] = std::move(xrefs);
     arr.push_back(std::move(one));
   }
-  return protocol::make_ok(req.id, json{{"results", std::move(arr)}});
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "results"));
 }
 
 Response Dispatcher::handle_xref_addr(const Request& req) {
@@ -1047,11 +1053,13 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint param 'addr'");
   }
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto refs = backend_->xref_address(
       static_cast<backend::TargetId>(tid), addr);
   json arr = json::array();
   for (const auto& r : refs) arr.push_back(xref_match_to_json(r));
-  return protocol::make_ok(req.id, json{{"matches", std::move(arr)}});
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "matches"));
 }
 
 Response Dispatcher::handle_disasm_range(const Request& req) {
@@ -1073,12 +1081,14 @@ Response Dispatcher::handle_disasm_range(const Request& req) {
                               "missing uint param 'end_addr'");
   }
 
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto insns = backend_->disassemble_range(
       static_cast<backend::TargetId>(tid), start, end);
   json arr = json::array();
   for (const auto& i : insns) arr.push_back(disasm_insn_to_json(i));
   return protocol::make_ok(req.id,
-                           json{{"instructions", std::move(arr)}});
+      protocol::view::apply_to_array(std::move(arr), view_spec,
+                                     "instructions"));
 }
 
 Response Dispatcher::handle_disasm_function(const Request& req) {
@@ -1120,9 +1130,20 @@ Response Dispatcher::handle_disasm_function(const Request& req) {
   data["found"]        = true;
   data["address"]      = start;
   data["byte_size"]    = matches[0].byte_size;
+  // Apply view to the instructions array so large functions can be
+  // paged or projected. The wrapping object also gets a "total" /
+  // "next_offset" / "summary" — at the cost of a slightly different
+  // wire shape from the bare {instructions:[]} when no view is given.
+  // Empty Spec still emits "total"; agents can rely on it.
+  auto view_spec = protocol::view::parse_from_params(req.params);
   json arr = json::array();
   for (const auto& i : insns) arr.push_back(disasm_insn_to_json(i));
-  data["instructions"] = std::move(arr);
+  json paged = protocol::view::apply_to_array(
+      std::move(arr), view_spec, "instructions");
+  data["instructions"]      = std::move(paged["instructions"]);
+  data["total"]             = paged["total"];
+  if (paged.contains("next_offset")) data["next_offset"] = paged["next_offset"];
+  if (paged.contains("summary"))     data["summary"]     = paged["summary"];
   return protocol::make_ok(req.id, std::move(data));
 }
 
@@ -1157,11 +1178,13 @@ Response Dispatcher::handle_string_list(const Request& req) {
   if (const auto* s = require_string(req.params, "section")) q.section_name = *s;
   if (const auto* s = require_string(req.params, "module"))  q.module_path  = *s;
 
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto strings = backend_->find_strings(
       static_cast<backend::TargetId>(tid), q);
   json arr = json::array();
   for (const auto& s : strings) arr.push_back(string_match_to_json(s));
-  return protocol::make_ok(req.id, json{{"strings", std::move(arr)}});
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "strings"));
 }
 
 Response Dispatcher::handle_symbol_find(const Request& req) {
@@ -1191,11 +1214,13 @@ Response Dispatcher::handle_symbol_find(const Request& req) {
     }
   }
 
+  auto view_spec = protocol::view::parse_from_params(req.params);
   auto matches = backend_->find_symbols(
       static_cast<backend::TargetId>(tid), q);
   json arr = json::array();
   for (const auto& m : matches) arr.push_back(symbol_match_to_json(m));
-  return protocol::make_ok(req.id, json{{"matches", std::move(arr)}});
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "matches"));
 }
 
 Response Dispatcher::handle_type_layout(const Request& req) {
@@ -1220,7 +1245,20 @@ Response Dispatcher::handle_type_layout(const Request& req) {
   json data;
   if (layout.has_value()) {
     data["found"]  = true;
-    data["layout"] = type_layout_to_json(*layout);
+    json layout_j = type_layout_to_json(*layout);
+    // Apply view (fields, limit, offset, summary) to the layout's
+    // fields array. Useful for projecting big structs to just
+    // {name, off, sz}, or for paging huge unions.
+    auto view_spec = protocol::view::parse_from_params(req.params);
+    json paged = protocol::view::apply_to_array(
+        std::move(layout_j["fields"]), view_spec, "fields");
+    layout_j["fields"]            = std::move(paged["fields"]);
+    layout_j["fields_total"]      = paged["total"];
+    if (paged.contains("next_offset"))
+      layout_j["fields_next_offset"] = paged["next_offset"];
+    if (paged.contains("summary"))
+      layout_j["fields_summary"]     = paged["summary"];
+    data["layout"] = std::move(layout_j);
   } else {
     data["found"]  = false;
   }

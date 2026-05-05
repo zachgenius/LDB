@@ -16,6 +16,7 @@ REQUESTS=$(cat <<EOF
 {"jsonrpc":"2.0","id":"r5","method":"symbol.find","params":{"target_id":1,"name":"point2_distance_sq","kind":"variable"}}
 {"jsonrpc":"2.0","id":"r6","method":"symbol.find","params":{"target_id":1,"name":"definitely_not_a_thing"}}
 {"jsonrpc":"2.0","id":"r7","method":"symbol.find","params":{"target_id":1,"name":"main","kind":"banana"}}
+{"jsonrpc":"2.0","id":"r8","method":"symbol.find","params":{"target_id":1,"name":"point2_distance_sq","view":{"fields":["name","kind"]}}}
 EOF
 )
 
@@ -30,7 +31,7 @@ fail() {
 
 LINES=0
 while IFS= read -r _; do LINES=$((LINES + 1)); done <<< "$OUTPUT"
-[[ "$LINES" -eq 7 ]] || fail "expected 7 response lines, got $LINES"
+[[ "$LINES" -eq 8 ]] || fail "expected 8 response lines, got $LINES"
 
 # Extract one response line by id. nlohmann::json serializes with keys
 # in alphabetical order, so per-id lines have a stable shape.
@@ -58,5 +59,17 @@ R6=$(get_resp r6)
 R7=$(get_resp r7)
 [[ "$R7" == *'"ok":false'*    ]] || fail "r7: expected ok=false"
 [[ "$R7" == *'"code":-32602'* ]] || fail "r7: expected kInvalidParams (-32602)"
+
+# r8: view.fields=["name","kind"] should drop addr / sz / module from
+# each match (proves view projection ran on this previously-bare
+# endpoint), and "total" should appear at the response level.
+R8=$(get_resp r8)
+[[ "$R8" == *'"ok":true'*                   ]] || fail "r8: expected ok=true"
+[[ "$R8" == *'"name":"point2_distance_sq"'* ]] || fail "r8: missing name in projected match"
+[[ "$R8" == *'"kind":"function"'*           ]] || fail "r8: missing kind in projected match"
+[[ "$R8" == *'"addr":'*                     ]] && fail "r8: 'addr' should be projected out"
+[[ "$R8" == *'"sz":'*                       ]] && fail "r8: 'sz' should be projected out"
+[[ "$R8" == *'"module":'*                   ]] && fail "r8: 'module' should be projected out"
+[[ "$R8" == *'"total":'*                    ]] || fail "r8: missing 'total' from view envelope"
 
 echo "symbol.find smoke test PASSED ($LINES responses)"
