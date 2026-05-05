@@ -71,5 +71,15 @@ set_tests_properties(smoke_string_xref PROPERTIES
   TIMEOUT 30
 )
 
+add_test(
+  NAME smoke_view_module_list
+  COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_module_list.sh"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_view_module_list PROPERTIES
+  TIMEOUT 30
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)

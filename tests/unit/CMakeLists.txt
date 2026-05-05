@@ -7,6 +7,7 @@
 set(LDB_UNIT_SOURCES
   unit_main.cpp
   test_protocol_jsonrpc.cpp
+  test_protocol_view.cpp
   test_backend_type_layout.cpp
   test_backend_symbol_find.cpp
   test_backend_string_list.cpp
@@ -17,6 +18,7 @@ set(LDB_UNIT_SOURCES
 
 set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.cpp
+  ${CMAKE_SOURCE_DIR}/src/protocol/view.cpp
   ${CMAKE_SOURCE_DIR}/src/util/log.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
 )

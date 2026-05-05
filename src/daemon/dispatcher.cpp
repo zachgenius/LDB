@@ -2,8 +2,10 @@
 
 #include "backend/debugger_backend.h"
 #include "ldb/version.h"
+#include "protocol/view.h"
 #include "util/log.h"
 
+#include <stdexcept>
 #include <utility>
 
 namespace ldb::daemon {
@@ -179,6 +181,9 @@ Response Dispatcher::dispatch(const Request& req) {
                               "unknown method: " + req.method);
   } catch (const backend::Error& e) {
     return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  } catch (const std::invalid_argument& e) {
+    // Parameter / view validation errors — agent's fault, not ours.
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
   } catch (const std::exception& e) {
     log::error(std::string("internal error in handler: ") + e.what());
     return protocol::make_err(req.id, ErrorCode::kInternalError, e.what());
@@ -333,10 +338,14 @@ Response Dispatcher::handle_module_list(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint param 'target_id'");
   }
+  auto view_spec = protocol::view::parse_from_params(req.params);
+
   auto mods = backend_->list_modules(static_cast<backend::TargetId>(tid));
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
-  return protocol::make_ok(req.id, json{{"modules", std::move(arr)}});
+
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "modules"));
 }
 
 Response Dispatcher::handle_string_xref(const Request& req) {
