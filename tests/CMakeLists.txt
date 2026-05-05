@@ -161,5 +161,15 @@ set_tests_properties(smoke_value_eval PROPERTIES
   TIMEOUT 60
 )
 
+add_test(
+  NAME smoke_value_read
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_value_read.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_value_read PROPERTIES
+  TIMEOUT 60
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)

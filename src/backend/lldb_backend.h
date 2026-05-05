@@ -65,6 +65,9 @@ class LldbBackend final : public DebuggerBackend {
                                  std::uint32_t frame_index,
                                  const std::string& expr,
                                  const EvalOptions& opts) override;
+  ReadResult read_value_path(TargetId tid, ThreadId thread_id,
+                             std::uint32_t frame_index,
+                             const std::string& path) override;
 
   std::vector<std::uint8_t>
       read_memory(TargetId tid, std::uint64_t addr,

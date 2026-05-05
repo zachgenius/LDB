@@ -46,6 +46,9 @@ const char *const k_protocol_name = "DXP/1.0";
 struct point2          g_origin         = { 0, 0 };
 struct dxp_login_frame g_login_template = { 0xDEADBEEFu, 0xCAFEBABE12345678ULL };
 
+/* Small int array — value.read indexed-path-traversal fixture. */
+int g_arr[4] = { 10, 20, 30, 40 };
+
 /* Functions — symbol.find / disasm targets. */
 int point2_distance_sq(const struct point2 *a, const struct point2 *b) {
     int dx = a->x - b->x;
@@ -63,8 +66,11 @@ int main(void) {
     volatile const char *p2 = k_protocol_name;
     (void)p1; (void)p2;
 
+    volatile int sum = g_arr[0] + g_arr[1] + g_arr[2] + g_arr[3];
+
     return (s.value & 0xFF)
          ^ (d & 0xFF)
          ^ (int)(g_login_template.magic & 0xFFu)
-         ^ (int)(g_login_template.sid & 0xFFu);
+         ^ (int)(g_login_template.sid & 0xFFu)
+         ^ (sum & 0xFF);
 }

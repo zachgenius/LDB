@@ -302,6 +302,7 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "frame.registers")    return handle_frame_registers(req);
 
     if (req.method == "value.eval")         return handle_value_eval(req);
+    if (req.method == "value.read")         return handle_value_read(req);
 
     if (req.method == "mem.read")           return handle_mem_read(req);
     if (req.method == "mem.read_cstr")      return handle_mem_read_cstr(req);
@@ -539,6 +540,20 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"frame_index", "uint?"}, {"expr", "string"},
            {"timeout_us", "uint64?"}},
       json{{"value", "object{name,type,address?,bytes?,summary?,kind}?"},
+           {"error", "string?"}});
+
+  add("value.read",
+      "Resolve a frame-relative dotted/bracketed path "
+      "(e.g. `g_origin.x`, `arr[3].field`) to a typed value. Path "
+      "resolution failures (parser error, no member, unknown root) "
+      "return {error:'...'} data. Bad target/tid/frame_index throw. "
+      "Returns the resolved value plus its immediate children for "
+      "one-shot struct/array introspection.",
+      json{{"target_id", "uint64"}, {"tid", "uint64"},
+           {"frame_index", "uint?"}, {"path", "string"}},
+      json{{"value", "object{name,type,address?,bytes?,summary?,kind}?"},
+           {"children",
+            "array of {name,type,address?,bytes?,summary?,kind}?"},
            {"error", "string?"}});
 
   add("mem.read",
@@ -854,6 +869,36 @@ Response Dispatcher::handle_value_eval(const Request& req) {
   json data;
   if (result.ok) {
     data["value"] = value_info_to_json(result.value);
+  } else {
+    data["error"] = result.error;
+  }
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_value_read(const Request& req) {
+  FrameParams p;
+  if (auto err = parse_frame_params(req, &p)) return *err;
+  const auto* path = require_string(req.params, "path");
+  if (!path) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'path'");
+  }
+
+  auto result = backend_->read_value_path(
+      static_cast<backend::TargetId>(p.target_id),
+      static_cast<backend::ThreadId>(p.tid),
+      p.frame_index, *path);
+
+  json data;
+  if (result.ok) {
+    data["value"] = value_info_to_json(result.value);
+    if (!result.children.empty()) {
+      json arr = json::array();
+      for (const auto& c : result.children) {
+        arr.push_back(value_info_to_json(c));
+      }
+      data["children"] = std::move(arr);
+    }
   } else {
     data["error"] = result.error;
   }

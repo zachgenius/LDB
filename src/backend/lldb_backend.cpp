@@ -1559,7 +1559,7 @@ LldbBackend::list_registers(TargetId tid, ThreadId thread_id,
 }
 
 // ---------------------------------------------------------------------------
-// Expression eval (value.eval)
+// Expression eval (value.eval) and typed path read (value.read)
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1578,6 +1578,131 @@ lldb::SBExpressionOptions make_expr_options(const EvalOptions& o) {
   sbo.SetTryAllThreads(false);
   sbo.SetUnwindOnError(true);
   return sbo;
+}
+
+// Tokenize a value path like "g_arr[2].name.sub[0]" into its sequence
+// of accessors. Returns nullopt on malformed input, with `err` filled
+// in. Empty input is malformed.
+struct PathToken {
+  enum class Kind { kIdent, kField, kIndex };
+  Kind          kind = Kind::kIdent;
+  std::string   name;   // for kIdent / kField
+  std::uint32_t index = 0;  // for kIndex
+};
+
+bool parse_value_path(const std::string& path,
+                      std::vector<PathToken>& out, std::string& err) {
+  out.clear();
+  if (path.empty()) {
+    err = "empty path";
+    return false;
+  }
+  std::size_t i = 0, n = path.size();
+  auto is_ident_start = [](char c) {
+    return (c == '_') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+  };
+  auto is_ident_cont = [&](char c) {
+    return is_ident_start(c) || (c >= '0' && c <= '9');
+  };
+
+  // Leading identifier.
+  if (!is_ident_start(path[i])) {
+    err = "path must start with identifier";
+    return false;
+  }
+  std::size_t j = i;
+  while (j < n && is_ident_cont(path[j])) ++j;
+  PathToken root;
+  root.kind = PathToken::Kind::kIdent;
+  root.name = path.substr(i, j - i);
+  out.push_back(std::move(root));
+  i = j;
+
+  // Trailing accessors.
+  while (i < n) {
+    if (path[i] == '.') {
+      ++i;
+      if (i >= n || !is_ident_start(path[i])) {
+        err = "expected field name after '.'";
+        return false;
+      }
+      j = i;
+      while (j < n && is_ident_cont(path[j])) ++j;
+      PathToken t;
+      t.kind = PathToken::Kind::kField;
+      t.name = path.substr(i, j - i);
+      out.push_back(std::move(t));
+      i = j;
+    } else if (path[i] == '[') {
+      ++i;
+      if (i >= n || path[i] < '0' || path[i] > '9') {
+        err = "expected unsigned integer after '['";
+        return false;
+      }
+      std::uint64_t v = 0;
+      while (i < n && path[i] >= '0' && path[i] <= '9') {
+        v = v * 10 + static_cast<std::uint64_t>(path[i] - '0');
+        if (v > std::numeric_limits<std::uint32_t>::max()) {
+          err = "array index too large";
+          return false;
+        }
+        ++i;
+      }
+      if (i >= n || path[i] != ']') {
+        err = "missing closing ']'";
+        return false;
+      }
+      ++i;
+      PathToken t;
+      t.kind = PathToken::Kind::kIndex;
+      t.index = static_cast<std::uint32_t>(v);
+      out.push_back(std::move(t));
+    } else {
+      err = std::string("unexpected character '") + path[i] +
+            "' in path";
+      return false;
+    }
+  }
+  return true;
+}
+
+// Resolve the leftmost identifier of a path against a frame. Tries
+// frame-local lookup first (FindVariable for locals/args; FindValue
+// for globals visible from the frame's CU), then falls back to a
+// target-wide global search across all modules. The fallback matters
+// when stop-at-entry leaves the innermost frame in `_dyld_start`,
+// where the main module's globals are out of frame scope but still
+// fully described by DWARF and reachable via the target.
+lldb::SBValue resolve_root_identifier(lldb::SBFrame frame,
+                                      const std::string& name) {
+  auto v = frame.FindVariable(name.c_str());
+  if (v.IsValid()) return v;
+  v = frame.FindValue(name.c_str(), lldb::eValueTypeVariableGlobal);
+  if (v.IsValid()) return v;
+  v = frame.FindValue(name.c_str(), lldb::eValueTypeVariableStatic);
+  if (v.IsValid()) return v;
+
+  // Fallback: target-wide global search. SBTarget::FindGlobalVariables
+  // walks every module's debug info; first match wins.
+  auto target = frame.GetThread().GetProcess().GetTarget();
+  auto vlist = target.FindGlobalVariables(name.c_str(), /*max_matches=*/1);
+  if (vlist.GetSize() > 0) {
+    auto g = vlist.GetValueAtIndex(0);
+    if (g.IsValid()) return g;
+  }
+  return lldb::SBValue();
+}
+
+// Walk children for the immediate level. Skips synthetic / invalid.
+std::vector<ValueInfo> collect_immediate_children(lldb::SBValue v) {
+  std::vector<ValueInfo> out;
+  uint32_t n = v.GetNumChildren();
+  out.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    auto c = v.GetChildAtIndex(i);
+    if (c.IsValid()) out.push_back(to_value_info(c, nullptr));
+  }
+  return out;
 }
 
 }  // namespace
@@ -1627,6 +1752,71 @@ LldbBackend::evaluate_expression(TargetId tid, ThreadId thread_id,
 
   result.ok    = true;
   result.value = to_value_info(v, "eval");
+  return result;
+}
+
+ReadResult
+LldbBackend::read_value_path(TargetId tid, ThreadId thread_id,
+                             std::uint32_t frame_index,
+                             const std::string& path) {
+  auto frame = resolve_frame_locked(impl_->targets, impl_->mu,
+                                    tid, thread_id, frame_index);
+
+  ReadResult result;
+  std::vector<PathToken> tokens;
+  std::string parse_err;
+  if (!parse_value_path(path, tokens, parse_err)) {
+    result.ok    = false;
+    result.error = "malformed path: " + parse_err;
+    return result;
+  }
+
+  // Token 0 is always an identifier (parser enforces).
+  lldb::SBValue cur = resolve_root_identifier(frame, tokens[0].name);
+  if (!cur.IsValid()) {
+    result.ok    = false;
+    result.error = "unknown identifier: " + tokens[0].name;
+    return result;
+  }
+
+  for (std::size_t i = 1; i < tokens.size(); ++i) {
+    const auto& t = tokens[i];
+    lldb::SBValue next;
+    if (t.kind == PathToken::Kind::kField) {
+      next = cur.GetChildMemberWithName(t.name.c_str());
+      if (!next.IsValid()) {
+        result.ok    = false;
+        result.error = "no member '" + t.name + "' on value of type '" +
+                       (cur.GetTypeName() ? cur.GetTypeName() : "<unknown>") +
+                       "'";
+        return result;
+      }
+    } else if (t.kind == PathToken::Kind::kIndex) {
+      // GetChildAtIndex with synthetic_allowed=true so pointer-to-array
+      // expressions and SBValueObject synthetic providers (vector<T>,
+      // etc.) walk uniformly.
+      next = cur.GetChildAtIndex(t.index, lldb::eDynamicCanRunTarget,
+                                 /*can_create_synthetic=*/true);
+      if (!next.IsValid()) {
+        result.ok    = false;
+        result.error = "index " + std::to_string(t.index) +
+                       " out of range for value of type '" +
+                       (cur.GetTypeName() ? cur.GetTypeName() : "<unknown>") +
+                       "'";
+        return result;
+      }
+    } else {
+      // Defensive — parser only emits kField / kIndex after token 0.
+      result.ok    = false;
+      result.error = "internal: unexpected token kind";
+      return result;
+    }
+    cur = next;
+  }
+
+  result.ok       = true;
+  result.value    = to_value_info(cur, nullptr);
+  result.children = collect_immediate_children(cur);
   return result;
 }
 

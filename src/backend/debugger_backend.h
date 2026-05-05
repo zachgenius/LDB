@@ -226,6 +226,27 @@ struct EvalResult {
   ValueInfo   value;
 };
 
+// --- Typed value-path read --------------------------------------------------
+//
+// Result envelope for read_value_path: a frame-relative dotted/indexed
+// path traversal. Path resolution failure (no member, malformed token,
+// unknown root identifier) returns ok=false with a non-empty error so
+// the agent can branch. Bad target/tid/frame_index throws backend::Error
+// (same contract as frame.locals).
+//
+// `children` holds the immediate children of the resolved value when
+// it's a struct/array/pointer-to-aggregate. Pre-fetching one level
+// saves a round-trip for the agent's "give me everything in this
+// struct" pattern. Children are ValueInfo so they carry name+type+
+// summary the same way; the agent then re-issues value.read with a
+// deeper path if it wants to keep walking.
+struct ReadResult {
+  bool                    ok = false;
+  std::string             error;
+  ValueInfo               value;
+  std::vector<ValueInfo>  children;
+};
+
 // Mapped region of the inferior's address space.
 struct MemoryRegion {
   std::uint64_t base = 0;
@@ -419,6 +440,19 @@ class DebuggerBackend {
                           std::uint32_t frame_index,
                           const std::string& expr,
                           const EvalOptions& opts) = 0;
+
+  // Resolve a dotted/bracketed [path] relative to the given frame. The
+  // leftmost ident is looked up via SBFrame::FindVariable (locals,
+  // args) with a fallback to FindValue for globals; subsequent ".name"
+  // and "[N]" tokens walk the SBValue tree. Path-resolution failure
+  // (parser error, missing member, unknown root) returns
+  // ReadResult.ok=false with a descriptive error message — *not* a
+  // thrown exception. Throws backend::Error only for invalid
+  // target_id, unknown thread, or out-of-range frame_index.
+  virtual ReadResult
+      read_value_path(TargetId tid, ThreadId thread_id,
+                      std::uint32_t frame_index,
+                      const std::string& path) = 0;
 
   // --- Memory primitives ----------------------------------------------
 

@@ -53,6 +53,7 @@ class Dispatcher {
   protocol::Response handle_frame_registers(const protocol::Request& req);
 
   protocol::Response handle_value_eval(const protocol::Request& req);
+  protocol::Response handle_value_read(const protocol::Request& req);
 
   protocol::Response handle_mem_read(const protocol::Request& req);
   protocol::Response handle_mem_read_cstr(const protocol::Request& req);
