@@ -4,6 +4,45 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-05 (cont. 3) — M1 xref pair: xref.addr + string.xref
+
+**Goal:** Land the cross-reference primitives so the user's RE workflow ("find where `btp_schema.xml` is referenced") runs end-to-end as a single RPC.
+
+**Done:**
+
+- **`xref.addr` endpoint** (commit `669e80a`): Walk the main executable's code sections, disassemble each via `disassemble_range`, scan operand and comment strings for the target address as a hex literal. Owning function resolved via `ResolveSymbolContextForAddress`. Catches direct branches (BL/BR on arm64, CALL on x86) where LLDB renders the resolved target into the operand. Documented gap: ARM64 ADRP+ADD pairs whose individual operands don't carry the full address. 5-case unit test, smoke test asserts ≥1 hit attributed to `main` for the address of `point2_distance_sq`.
+- **`string.xref` endpoint** (commit `4eb4050`): Combines the address-hex path (via `xref_address`) with a new comment-text path that scans for the string in quotes (`"btp_schema.xml"`) — exactly the form LLDB emits when it has resolved an ARM64 ADRP+ADD pair. Both paths feed one xrefs vector, deduped by instruction address. 6-case unit test (including dedup), smoke test runs the user's actual workflow.
+
+**Decisions:**
+
+- **Two detection paths for `string.xref`, not one.** The address-hex match catches x86-64 direct loads / function pointers; the comment-text match catches ARM64 PIE ADRP+ADD pairs. Either alone leaves a major arch with broken results. Combined, we get the headline workflow working on the project's primary platforms.
+- **Dedup by instruction address.** Both paths can hit the same insn — explicit `std::unique` after sort to enforce the contract. Tested.
+- **No `xref.imm` endpoint yet.** It would scan for arbitrary immediate values (not just addresses). Useful for finding magic-number constants and shift amounts but not blocking; defer until a workflow demands it.
+- **No ADRP+ADD reconstruction in `xref.addr`.** Could add it (decode ADRP imm21 → page, ADD imm12 → offset, sum) but `string.xref` already gets the right answer via the comment-text path. Document the gap; revisit when something needs `xref.addr` against a string address (not text).
+- **`string.xref` runs `find_strings` with `min_length=max_length=text.size()` to narrow** the scan upfront, then exact-match-filters in C++. Avoids returning the whole exe's strings to be dropped client-side. Cheap.
+
+**Surprises / blockers:**
+
+- **None major.** The combined-detection design fell out of looking at LLDB's actual disasm output for `main` before writing the test. Worth noting: bias toward "see what the data actually looks like" before committing to detection logic, especially for fragile heuristics.
+- **Smoke test setup-output extraction** uses `python3 -c '...json.loads...'` to pull the function address from the first request's response, then injects it into the second request. Slightly awkward bash but more robust than parsing JSON in pure bash. Worth keeping a lightweight helper in mind if more smoke tests need this pattern.
+
+**Verification:**
+
+- `ctest` → 8/8 PASS in 1.97s. unit_tests at 60 cases / ~370 assertions.
+- Manual end-to-end: from a clean `target.open` of the fixture, a single `string.xref({text:"btp_schema.xml"})` returns the ADRP+ADD pair in `main` with correct function attribution. This is the user's stated workflow §5.
+
+**Next:**
+
+- **View descriptors** on `module.list` as the model. Most useful first-cut features: `fields` (projection), `limit`+`offset` (pagination), `summary` (count + sample). Defer `tabular`, `max_string`, `max_bytes` until a test forces them. Once the pattern is set on `module.list`, retrofit `string.list` (default scope already controls volume but pagination still useful) and the xref endpoints.
+- Optional follow-ups (not urgent):
+  - `xref.imm` for immediate values (magic numbers, shift amounts).
+  - ARM64 ADRP+ADD reconstruction inside `xref.addr` so it works for string addresses without going through `string.xref`. Not needed for the documented workflow.
+  - The `[INF] lldb backend initialized` log spam (still emitted once per Catch2 test case).
+- Cleanup deferred:
+  - `tests/smoke/test_type_layout.sh` per-id extraction (still uses the looser glob pattern that happens to pass by ordering luck).
+
+---
+
 ## 2026-05-05 (cont. 2) — M1 continued: string.list and disasm.{range,function}
 
 **Goal:** Continue M1 endpoint TDD per the previous session's "Next." Build out `string.list` (the rodata scanner) and the disasm pair (`disasm.range` + `disasm.function`). Both unblock `string.xref` / `xref.*` for the next push.
