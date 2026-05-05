@@ -84,6 +84,7 @@ class Dispatcher {
   protocol::Response handle_mem_read_cstr(const protocol::Request& req);
   protocol::Response handle_mem_regions(const protocol::Request& req);
   protocol::Response handle_mem_search(const protocol::Request& req);
+  protocol::Response handle_mem_dump_artifact(const protocol::Request& req);
 
   protocol::Response handle_artifact_put(const protocol::Request& req);
   protocol::Response handle_artifact_get(const protocol::Request& req);

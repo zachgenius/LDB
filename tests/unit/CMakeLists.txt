@@ -33,6 +33,7 @@ set(LDB_UNIT_SOURCES
   test_backend_breakpoint.cpp
   test_probe_orchestrator.cpp
   test_dispatcher_probes.cpp
+  test_dispatcher_mem_dump.cpp
 )
 
 set(LDB_LIB_SOURCES

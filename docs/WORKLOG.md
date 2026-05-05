@@ -4,6 +4,51 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 14) — M3 closeout: mem.dump_artifact
+
+**Goal:** Ship the last §4.4 endpoint to close out M3 core scope. `mem.dump_artifact({target_id, addr, len, build_id, name, format?, meta?})` reads `len` bytes at `addr` from the live target and persists them under `(build_id, name)` in the artifact store, returning `{artifact_id, byte_size, sha256, name}`. Pure composition of the existing `read_memory` and `ArtifactStore::put` paths — no new backend or store APIs.
+
+**Done:**
+
+- **Endpoint** `Dispatcher::handle_mem_dump_artifact` in `src/daemon/dispatcher.cpp`. Validates `target_id` / `addr` / `len` (uint), `build_id` / `name` (non-empty string), optional `format` (string) and `meta` (object). Preflights on null artifact store via the existing `require_artifact_store` helper → `-32002` (kBadState). Param errors → `-32602` (kInvalidParams). Backend `read_memory` throws `backend::Error` for invalid `target_id` and `len > 1 MiB` (the existing `kMemReadMax` cap in the LldbBackend) — surfaces uniformly as `-32000` (kBackendError) via the dispatch wrapper's existing catch. Result projects `ArtifactRow` to the four-field shape from the plan; the four-field projection is intentionally tight (full row is reachable via `artifact.get` if the agent wants metadata). Registered in `describe.endpoints` (now 50, up from 49) with full param/return docstrings.
+- **Header** declares `handle_mem_dump_artifact` in the mem.* group of `src/daemon/dispatcher.h`. Implementation lives after `handle_artifact_tag` so the anon-namespace `require_artifact_store` is in scope (anon namespaces in the same TU merge, but C++ still requires the symbol to be defined before use).
+- **6 Catch2 cases** (`tests/unit/test_dispatcher_mem_dump.cpp`, 125 assertions): live happy-path on the sleeper (g_counter 8-byte dump → assert id>0, sha is 64 lower-hex, byte_size==8, fresh `mem.read` matches stored sha, `artifact.get` round-trips format+meta); replace-on-duplicate (id changes); 7 missing-/empty-field permutations → `-32602`; null store → `-32002`; bad `target_id` → `-32000`; oversize `len` (2 MiB) → `-32000`. The TmpStoreRoot fixture mirrors the artifact-store / probe / session test pattern; sleeper attach mirrors `test_backend_memory.cpp` (PIE relocation gotcha — stop-at-entry on macOS arm64 produces unrelocated globals, so we attach to a freshly-spawned sleeper instead).
+- **Smoke test** (`tests/smoke/test_mem_dump.py`, TIMEOUT 60): describe-endpoints check, attach to sleeper, dump 8 bytes at `k_marker`'s load address, assert sha is 64 hex chars + `mem.read` at the same addr produces matching bytes + `artifact.get` round-trips the blob with format/meta intact, replace re-dump (id changes), three error paths (missing `len` → -32602, bogus `target_id` → -32000, oversize `len` → -32000). Wired into `tests/CMakeLists.txt` with `TIMEOUT 60` and the standard `LDB_STORE_ROOT` env from the directory-wide foreach.
+
+**Decisions:**
+
+- **No backend changes.** mem.dump_artifact is documented in the plan as a "composition endpoint" (§4.4 calls it "read + store as artifact in one call"); the backend's `read_memory` already enforces the 1 MiB cap, and `ArtifactStore::put` already handles atomic write + sha + replace-on-duplicate. Adding a backend method would have meant a second code path with the same semantics.
+- **Param shape: `addr` and `len`, NOT `address` and `size`.** The plan §4.4 row uses `{addr, len, name, format?}`; `mem.read` uses `{address, size}` because that endpoint pre-dates the plan's M3 naming convention. Two options: rename mem.read's params (breaks existing clients incl. our smoke tests), or accept that mem.dump_artifact uses the plan's names. Picked the second — the cost is a one-line note in the smoke test that translates `mem.read`'s `address`/`size` to `mem.dump_artifact`'s `addr`/`len`, vs breaking every existing dispatcher consumer.
+- **Response field is `artifact_id`, not `id`.** Plan spec calls it `artifact_id`. Worth honoring; `artifact.put` returns `id` which is fine in that endpoint's local context, but disambiguating in the composition endpoint avoids confusion with future "request id" or "session id" fields. The agent-visible discrepancy with `artifact.put` is documented in the dispatcher endpoint description.
+- **Empty `build_id` / `name` rejected as -32602.** Mirrors `artifact.put`'s contract. An empty key would survive `ArtifactStore::put` (sqlite happily stores it), but it'd be a footgun: a subsequent `artifact.get({build_id:"", name:""})` would silently retrieve some random earlier mistake. Cheap to reject up front.
+- **Backend `read_memory` is called BEFORE `ArtifactStore::put`.** If the read fails, no row is written; if the read succeeds but the store write fails, the bytes are lost (the agent retries the dump). Alternative was a write-then-rollback pattern; rejected because it adds a load-bearing failure path for a case (sqlite errors mid-put) that already throws backend::Error and propagates correctly. The current ordering is the natural one.
+- **Header declares the prototype in the mem.* group; the implementation lives after `handle_artifact_tag`.** Keeps the header readable per topic. The .cpp ordering has to come after the anon-namespace `require_artifact_store` definition so the helper is visible — unnamed namespaces merge across the TU, but the symbol still needs to be declared above its first use.
+
+**Surprises / blockers:**
+
+- **None.** Every test passed first attempt after wiring the handler. The TDD cycle was clean: 6 cases failed with `-32601` (kMethodNotFound) before implementation, all 6 passed after; full ctest stayed green.
+- **No JSON-RPC channel corruption observed.** Neither `read_memory` nor `ArtifactStore::put` chatters on stdout; the `dup2`-over-`/dev/null` guard pattern from `save_core` / `evaluate_expression` / `connect_remote` isn't needed here.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **23/23 PASS in ~114s wall clock** on macOS arm64. unit_tests is now 211 cases / 1855 assertions (added 6 cases / 125 assertions). Build is warning-clean under `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion ...`.
+- New test IDs: `[dispatcher][mem][dump][live]` (2 cases), `[dispatcher][mem][dump][error]` (4 cases), plus `smoke_mem_dump` (1.35s).
+- `describe.endpoints` lists `mem.dump_artifact` (now 50 endpoints total).
+
+**M3 status:** core CRUD shipped (artifacts, sessions, probes, mem.dump_artifact). Plan §4.4 fully implemented.
+
+**M3 polish DEFERRED for user review:**
+
+- `session.fork` — depends on snapshot/provenance system (plan §3.5).
+- `session.replay` — depends on provenance for determinism check.
+- `session.export` / `session.import` — needs `.ldbsession` tarball format design.
+- `.ldbpack` tarball format — manifest schema + signing model unspecified.
+- `dispatcher.cpp` split — mechanical refactor, ~2660 lines after this commit, high blast radius, prefer human review.
+
+**Next session pickup:** Decide M3 polish vs M4 (SSH transport, lldb-server platform, typed observers, BPF probe engine). Either path is unblocked.
+
+---
+
 ## 2026-05-06 (cont. 13) — M3 part 3: probes (lldb_breakpoint engine, C++ baton)
 
 **Goal:** Land the probe orchestrator + the lldb_breakpoint engine. Six endpoints — probe.create / events / list / disable / enable / delete. Auto-resuming breakpoints with structured register/memory capture, three actions (log_and_continue, stop, store_artifact), in-memory ring buffer per probe. Replaces strace for low-rate / app-level / semantic probes. Uses the C++ baton path (`SBBreakpoint::SetCallback`), NOT the Python script callback (`SetScriptCallbackBody`).

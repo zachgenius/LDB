@@ -457,6 +457,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "mem.read_cstr")      return handle_mem_read_cstr(req);
     if (req.method == "mem.regions")        return handle_mem_regions(req);
     if (req.method == "mem.search")         return handle_mem_search(req);
+    if (req.method == "mem.dump_artifact")  return handle_mem_dump_artifact(req);
 
     if (req.method == "artifact.put")       return handle_artifact_put(req);
     if (req.method == "artifact.get")       return handle_artifact_get(req);
@@ -764,6 +765,20 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"address", "uint64?"}, {"length", "uint64?"},
            {"max_hits", "uint?"}},
       json{{"hits", "array of {address}"}});
+
+  add("mem.dump_artifact",
+      "Read [len] bytes at [addr] from the live target and store them "
+      "as an artifact under (build_id, name) in one round-trip. "
+      "Composes mem.read + artifact.put; same 1 MiB cap as mem.read "
+      "(oversize → -32000). format and meta are forwarded to the store. "
+      "Re-using (build_id, name) replaces the prior entry per the "
+      "artifact.put contract (artifact_id changes).",
+      json{{"target_id", "uint64"}, {"addr", "uint64"},
+           {"len", "uint64"}, {"build_id", "string"},
+           {"name", "string"},
+           {"format", "string?"}, {"meta", "object?"}},
+      json{{"artifact_id", "int64"}, {"byte_size", "uint64"},
+           {"sha256", "string"}, {"name", "string"}});
 
   add("artifact.put",
       "Store a binary blob in the artifact store, keyed by "
@@ -1997,6 +2012,78 @@ Response Dispatcher::handle_artifact_tag(const Request& req) {
   auto out_tags = artifacts_->add_tags(id, tags);
   json data;
   data["tags"] = out_tags;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// mem.dump_artifact — pure composition of mem.read + artifact.put.
+// Reads [len] bytes at [addr] from the live target and persists them to
+// the artifact store under (build_id, name). Same 1 MiB cap as mem.read
+// (enforced by the backend; oversize requests surface as -32000). Errors
+// mirror the constituent endpoints: bad target_id / oversize / read
+// failure → -32000, missing-or-invalid params → -32602, store missing
+// → -32002.
+Response Dispatcher::handle_mem_dump_artifact(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0, addr = 0, len = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  if (!require_uint(req.params, "addr", &addr)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'addr'");
+  }
+  if (!require_uint(req.params, "len", &len)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'len'");
+  }
+  const auto* build_id = require_string(req.params, "build_id");
+  if (!build_id || build_id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'build_id'");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name || name->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'name'");
+  }
+
+  std::optional<std::string> format;
+  if (auto it = req.params.find("format"); it != req.params.end() &&
+                                            !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'format' must be a string");
+    }
+    format = it->get<std::string>();
+  }
+
+  json meta = json::object();
+  if (auto it = req.params.find("meta"); it != req.params.end() &&
+                                          !it->is_null()) {
+    if (!it->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'meta' must be an object");
+    }
+    meta = *it;
+  }
+
+  // Backend enforces the 1 MiB read cap; bad target_id / read failure /
+  // oversize all surface here as backend::Error → -32000.
+  auto bytes = backend_->read_memory(
+      static_cast<backend::TargetId>(tid), addr, len);
+
+  auto row = artifacts_->put(*build_id, *name, bytes, std::move(format),
+                              meta);
+  json data;
+  data["artifact_id"] = row.id;
+  data["byte_size"]   = row.byte_size;
+  data["sha256"]      = row.sha256;
+  data["name"]        = row.name;
   return protocol::make_ok(req.id, std::move(data));
 }
 
