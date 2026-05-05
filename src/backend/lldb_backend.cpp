@@ -1559,6 +1559,78 @@ LldbBackend::list_registers(TargetId tid, ThreadId thread_id,
 }
 
 // ---------------------------------------------------------------------------
+// Expression eval (value.eval)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build SBExpressionOptions from our EvalOptions. The non-default flags
+// matter: SetTryAllThreads(false) prevents the JIT from running other
+// threads to satisfy a function call inside the expression — that's a
+// silent side effect we don't want. SetIgnoreBreakpoints(true) keeps
+// the eval from triggering a probe and re-entering the dispatcher.
+lldb::SBExpressionOptions make_expr_options(const EvalOptions& o) {
+  lldb::SBExpressionOptions sbo;
+  sbo.SetTimeoutInMicroSeconds(static_cast<uint32_t>(
+      std::min<std::uint64_t>(o.timeout_us,
+                              std::numeric_limits<std::uint32_t>::max())));
+  sbo.SetIgnoreBreakpoints(true);
+  sbo.SetTryAllThreads(false);
+  sbo.SetUnwindOnError(true);
+  return sbo;
+}
+
+}  // namespace
+
+EvalResult
+LldbBackend::evaluate_expression(TargetId tid, ThreadId thread_id,
+                                 std::uint32_t frame_index,
+                                 const std::string& expr,
+                                 const EvalOptions& opts) {
+  auto frame = resolve_frame_locked(impl_->targets, impl_->mu,
+                                    tid, thread_id, frame_index);
+
+  EvalResult result;
+  auto sbo = make_expr_options(opts);
+
+  // SBFrame::EvaluateExpression occasionally writes diagnostics to
+  // stdout (e.g. "<expr> contained errors"); ldbd reserves stdout for
+  // JSON-RPC, so redirect around the call. Same pattern as save_core.
+  int saved_stdout = ::dup(STDOUT_FILENO);
+  int devnull      = ::open("/dev/null", O_WRONLY);
+  if (saved_stdout >= 0 && devnull >= 0) {
+    ::dup2(devnull, STDOUT_FILENO);
+    ::close(devnull);
+  }
+
+  lldb::SBValue v = frame.EvaluateExpression(expr.c_str(), sbo);
+
+  if (saved_stdout >= 0) {
+    ::dup2(saved_stdout, STDOUT_FILENO);
+    ::close(saved_stdout);
+  }
+
+  // SBValue carries the eval error via GetError(). Note that
+  // IsValid() may still be true on a soft error (e.g. timeout returns
+  // an error-bearing value), so we always check the error first.
+  lldb::SBError err = v.GetError();
+  if (err.Fail()) {
+    result.ok    = false;
+    result.error = err.GetCString() ? err.GetCString() : "evaluation failed";
+    return result;
+  }
+  if (!v.IsValid()) {
+    result.ok    = false;
+    result.error = "evaluation produced no value";
+    return result;
+  }
+
+  result.ok    = true;
+  result.value = to_value_info(v, "eval");
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Memory primitives
 // ---------------------------------------------------------------------------
 

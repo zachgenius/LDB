@@ -203,6 +203,29 @@ struct ValueInfo {
 // follow up with mem.read for fuller dumps.
 constexpr std::size_t kValueByteCap = 64;
 
+// --- Expression evaluation -------------------------------------------------
+//
+// Tunables for evaluate_expression. Defaults are chosen so a hostile
+// expression can't hang the daemon: 250ms is generous for any
+// arithmetic eval, tight enough to bound a runaway loop. Agents bump
+// the budget for expressions that legitimately call into the inferior.
+
+struct EvalOptions {
+  std::uint64_t timeout_us = 250'000;  // 250 ms default
+};
+
+// Result envelope for evaluate_expression.
+//   ok=true  → `value` is populated; `error` is empty.
+//   ok=false → `error` is the LLDB compile/runtime/timeout message;
+//              `value` is unspecified. This branch is *data*, not an
+//              exception — the caller wants to surface "expression did
+//              not compile" without a transport-level error.
+struct EvalResult {
+  bool        ok = false;
+  std::string error;
+  ValueInfo   value;
+};
+
 // Mapped region of the inferior's address space.
 struct MemoryRegion {
   std::uint64_t base = 0;
@@ -381,6 +404,21 @@ class DebuggerBackend {
   virtual std::vector<ValueInfo>
       list_registers(TargetId tid, ThreadId thread_id,
                      std::uint32_t frame_index) = 0;
+
+  // Evaluate [expr] in the context of (target, thread, frame). Eval
+  // failures (compile error, runtime trap, timeout) are returned as
+  // EvalResult.error with ok=false — *not* thrown — so the agent can
+  // surface "expression did not compile" without a transport-level
+  // error. Throws backend::Error only for invalid target_id, unknown
+  // thread, or out-of-range frame_index.
+  // The expression evaluator is configured to ignore breakpoints and
+  // not run other threads (no spurious side effects on sibling
+  // threads). Caller-provided timeout bounds runaway expressions.
+  virtual EvalResult
+      evaluate_expression(TargetId tid, ThreadId thread_id,
+                          std::uint32_t frame_index,
+                          const std::string& expr,
+                          const EvalOptions& opts) = 0;
 
   // --- Memory primitives ----------------------------------------------
 

@@ -18,6 +18,7 @@ set(LDB_UNIT_SOURCES
   test_backend_threads.cpp
   test_backend_step.cpp
   test_backend_frame_values.cpp
+  test_backend_value_eval.cpp
   test_backend_attach.cpp
   test_backend_memory.cpp
   test_backend_core.cpp

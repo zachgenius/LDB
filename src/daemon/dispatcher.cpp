@@ -301,6 +301,8 @@ Response Dispatcher::dispatch(const Request& req) {
     if (req.method == "frame.args")         return handle_frame_args(req);
     if (req.method == "frame.registers")    return handle_frame_registers(req);
 
+    if (req.method == "value.eval")         return handle_value_eval(req);
+
     if (req.method == "mem.read")           return handle_mem_read(req);
     if (req.method == "mem.read_cstr")      return handle_mem_read_cstr(req);
     if (req.method == "mem.regions")        return handle_mem_regions(req);
@@ -525,6 +527,19 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"frame_index", "uint?"}},
       json{{"registers",
             "array of {name,type,address?,bytes?,summary?,kind}"}});
+
+  add("value.eval",
+      "Evaluate a C/C++ expression in the context of (target, tid, "
+      "frame_index). Compile/runtime/timeout failures are returned as "
+      "{error:'...'} data, NOT as JSON-RPC errors. Default timeout is "
+      "250ms; bump via `timeout_us` for expressions that legitimately "
+      "call into the inferior. The evaluator ignores breakpoints and "
+      "won't run sibling threads (no spurious side effects).",
+      json{{"target_id", "uint64"}, {"tid", "uint64"},
+           {"frame_index", "uint?"}, {"expr", "string"},
+           {"timeout_us", "uint64?"}},
+      json{{"value", "object{name,type,address?,bytes?,summary?,kind}?"},
+           {"error", "string?"}});
 
   add("mem.read",
       "Read up to 1 MiB of process memory at the given runtime address. "
@@ -811,6 +826,38 @@ Response Dispatcher::handle_frame_registers(const Request& req) {
       static_cast<backend::ThreadId>(p.tid),
       p.frame_index);
   return build_value_response(req, values, "registers");
+}
+
+Response Dispatcher::handle_value_eval(const Request& req) {
+  FrameParams p;
+  if (auto err = parse_frame_params(req, &p)) return *err;
+  const auto* expr = require_string(req.params, "expr");
+  if (!expr) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'expr'");
+  }
+  backend::EvalOptions opts;
+  if (auto it = req.params.find("timeout_us"); it != req.params.end()) {
+    std::uint64_t to = 0;
+    if (!require_uint(req.params, "timeout_us", &to)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'timeout_us' must be a non-negative integer");
+    }
+    if (to > 0) opts.timeout_us = to;
+  }
+
+  auto result = backend_->evaluate_expression(
+      static_cast<backend::TargetId>(p.target_id),
+      static_cast<backend::ThreadId>(p.tid),
+      p.frame_index, *expr, opts);
+
+  json data;
+  if (result.ok) {
+    data["value"] = value_info_to_json(result.value);
+  } else {
+    data["error"] = result.error;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_mem_read(const Request& req) {
