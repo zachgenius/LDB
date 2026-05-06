@@ -172,6 +172,26 @@ class SessionStore {
 
   DiffResult diff_logs(std::string_view a_id, std::string_view b_id);
 
+  // Tier 3 §9 — bucket a session's rpc_log rows by `params.target_id`.
+  //
+  // Walks the log in seq-ascending order; each row whose stored
+  // request_json carries `params.target_id` as a non-negative integer
+  // contributes to the bucket for that id. Rows without target_id (e.g.
+  // hello, describe.endpoints, session.* themselves) and rows with
+  // malformed JSON / non-integer target_id are silently skipped — the
+  // function is a best-effort post-hoc inventory, not a parser
+  // conformance check.
+  //
+  // Output is sorted ascending by target_id. Throws backend::Error if
+  // the session id is unknown.
+  struct TargetBucket {
+    std::uint64_t  target_id  = 0;
+    std::int64_t   call_count = 0;
+    std::int64_t   first_seq  = 0;
+    std::int64_t   last_seq   = 0;
+  };
+  std::vector<TargetBucket> extract_target_ids(std::string_view id);
+
   // Open a per-session writer. The Writer holds its own sqlite handle
   // to the <uuid>.db; multiple Writers on the same id are allowed and
   // both can append (WAL handles it), but the dispatcher only ever

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -656,6 +657,54 @@ SessionStore::diff_logs(std::string_view a_id, std::string_view b_id) {
     }
     out.entries.push_back(std::move(e));
   }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 §9 — extract_target_ids
+//
+// Re-uses the existing read_log path (handles "id not found" → throws,
+// open-readonly + WAL-friendly). Per-row, parse the stored request_json
+// defensively: malformed JSON, missing/non-object params, missing or
+// non-integer target_id all collapse to "row contributes nothing" rather
+// than throwing — we don't want one weird row to poison an inventory
+// query.
+
+std::vector<SessionStore::TargetBucket>
+SessionStore::extract_target_ids(std::string_view id) {
+  auto rows = read_log(id);
+  // Use std::map so the final iteration is sorted ascending by target_id.
+  std::map<std::uint64_t, TargetBucket> buckets;
+  for (const auto& r : rows) {
+    nlohmann::json parsed;
+    try {
+      parsed = nlohmann::json::parse(r.request_json);
+    } catch (const std::exception&) {
+      continue;  // malformed JSON — skip
+    }
+    if (!parsed.is_object()) continue;
+    auto pit = parsed.find("params");
+    if (pit == parsed.end() || !pit->is_object()) continue;
+    auto tit = pit->find("target_id");
+    if (tit == pit->end()) continue;
+    if (!tit->is_number_integer() && !tit->is_number_unsigned()) {
+      // Float / string / null — not the documented integer shape.
+      continue;
+    }
+    // Reject negative integers (TargetId is uint64).
+    if (tit->is_number_integer() && tit->get<std::int64_t>() < 0) continue;
+    std::uint64_t tid = tit->get<std::uint64_t>();
+    auto& b = buckets[tid];
+    if (b.call_count == 0) {
+      b.target_id = tid;
+      b.first_seq = r.seq;
+    }
+    b.call_count += 1;
+    b.last_seq    = r.seq;
+  }
+  std::vector<TargetBucket> out;
+  out.reserve(buckets.size());
+  for (auto& [_, b] : buckets) out.push_back(std::move(b));
   return out;
 }
 
