@@ -4,6 +4,56 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 23) — M5 part 6: cores-only provenance + replay determinism gate
+
+**Goal:** Ship `_provenance.snapshot` on every response (cores-only per dc01e5f) plus a replayable test corpus that enforces the (method, params, snapshot) → byte-identical contract.
+
+**Done:**
+
+- **`src/util/sha256.{h,cpp}`** — extracted the public-domain SHA-256 that lived inside `store/artifact_store.cpp` (TU-private since M3) and `store/pack.cpp` (TU-private since M5 part 5) into a single shared module. Three call surfaces: `Sha256` class for streaming / chunked input, one-shot `sha256_hex(bytes|view)`, and `sha256_file_hex(path)` that streams a file in 64 KiB chunks (the path the cores-only provenance hot path takes, since cores can be hundreds of MB and we shouldn't materialize them in RAM). `artifact_store.cpp` and `pack.cpp` both forward to the shared helper now; their public surfaces stayed unchanged so dependents still see `ldb::store::sha256_hex`. Verified against NIST short-message vectors (empty, "abc", 56-byte block-boundary "abcdbcde…nopq"), plus a streaming-vs-one-shot consistency check at 1-byte / 7-byte / 64-byte chunk granularity.
+- **`DebuggerBackend::snapshot_for_target(TargetId)`** — new pure-virtual on the backend interface. Returns the cores-only provenance string for a target: `"core:<lowercase-hex-sha256>"` for core-loaded targets, `"live"` for targets with an attached process, `"none"` for unknown / target-without-process. **Best-effort** — the dispatcher calls this on every response and a thrown exception would poison the response, so the contract explicitly forbids throws.
+- **`LldbBackend::load_core` SHA-256 caching.** Streams the core file through `util::sha256_file_hex` BEFORE calling `SBTarget::LoadCore`, then caches the lower-hex digest on a per-target `Impl::core_sha256` map. Two ordering reasons: (a) hashing a fresh-on-disk file is more robust than racing whatever LLDB is doing with mmap, (b) if the file is unreadable we surface a focused `load_core: open failed` error before LLDB logs something less informative. `close_target` drops the cached entry alongside the SBTarget so the post-close `snapshot_for_target` returns `"none"` rather than a stale hash.
+- **`src/protocol/provenance.{h,cpp}`** — new helper module mirroring the cost-preview shape. `compute(snapshot)` returns `{snapshot, deterministic}` where `deterministic` is true iff the snapshot starts with `"core:"`. Single source of truth for the determinism rule — both serialize_response and stdio_loop's CBOR path call this helper rather than open-coding the prefix check.
+- **`Response::provenance_snapshot`** — new field on the JSON-RPC `Response` struct, defaulting to `"none"`. The dispatcher's `dispatch()` decorates every response (after the inner handler returns) by calling `backend.snapshot_for_target(target_id)` where `target_id` is extracted from `req.params` if present and integer-typed. Errors are NOT decorated — `_provenance` only attaches to a *result*.
+- **Wire embedding.** `protocol::serialize_response` (line-delimited JSON) and `daemon::stdio_loop::response_to_json` (the CBOR path) both emit `_provenance` next to `_cost` on ok responses. Strictly additive: `_cost.bytes` still counts `data.dump().size()` and remains unchanged. Errors carry neither.
+- **`tests/smoke/test_provenance_replay.py`** — the deterministic-protocol gate. Generates a core file at runtime via `process.save_core` (skips cleanly if `save_core` is unsupported on the platform). Spawns daemon #1, loads the core, captures `(method, params, data, snapshot)` for 7 deterministic calls (`hello`, `describe.endpoints`, `module.list`, `mem.regions`, `thread.list`, `string.list` with bounded scope, `symbol.find{name=main}`). Spawns a fresh daemon #2 (cross-process), issues the same calls, asserts byte-for-byte identity of every `data` payload AND of every `_provenance.snapshot`. The cross-process portion is the heart of the gate.
+- **Unit tests** (TDD red→green throughout):
+  - `tests/unit/test_util_sha256.cpp` — 6 cases / 11 assertions covering NIST vectors, streaming chunk sizes, file-streaming vs buffer-hash equivalence, open-failure error path.
+  - `tests/unit/test_protocol_provenance.cpp` — 9 cases / 27 assertions covering the pure helper (core: → deterministic, live/none → not), defensive cases (`"core"`, `"core:"` empty payload), and integration via `serialize_response` (ok → `_provenance` present; error → absent; `_cost.bytes` unaffected).
+  - `tests/unit/test_backend_provenance.cpp` — 5 cases (4 `[live]`-gated) covering `snapshot_for_target` for unknown tid, target-without-process, live attached process, core-loaded target (digest matches independently-computed `sha256_file_hex`), and the close_target → "none" transition. Plus the `load_core(missing)` non-cache path.
+
+**Decisions:**
+
+- **`target.load_core` itself reports `snapshot: "none"`, not the new core's hash.** The request has no `target_id` (the target is being minted by this very call), so at dispatch time the dispatcher's `extract_target_id` correctly returns 0 → `snapshot_for_target(0)` returns `"none"`. Every FOLLOW-UP call carries the cached `core:<hash>`. Honest semantics — the snapshot is "what state did this response come from?", and the load_core call's response is constructed from the file system + LLDB init, not from any pre-existing inferior state. The smoke test pins this contract: load_core's snapshot is `"none"`, the immediately-following `module.list` carries `"core:..."`.
+- **Hash file BEFORE LLDB sees it.** Two reasons spelled out above. The alternative (post-LoadCore hashing) would race LLDB's mmap and would also miss the "file was modified mid-load" case. Since SHA-256 is fast (a few hundred MB/s on a modern x86_64 box) and load_core is already on the cold path, the cost is invisible.
+- **Determinism rule lives in `provenance::is_deterministic`, not at every emission site.** Keeps the rule grep-able. If post-MVP work extends the snapshot grammar (e.g. `"snap:<id>"` for a future live snapshot model), the bool flips for the new prefix here and nowhere else.
+- **No-target endpoints get `"none"`, not their own sentinel.** `hello`, `describe.endpoints`, the various `session.*` / `artifact.*` endpoints — all consult `extract_target_id(params) == 0` → `snapshot_for_target(0)` → `"none"`. Cleanly uniform: every response has the same `_provenance` shape; the determinism flag captures the "should an agent expect byte-identical replay?" question regardless of why it's false.
+- **Errors are NOT decorated with `_provenance` (absent on error responses).** Mirrors the `_cost` rule. An error didn't consult any inferior state, so attaching a snapshot to it would be misleading. The smoke test confirms `_cost` and `_provenance` are both absent on a `-32601` method-not-found.
+- **Run-time core generation, not check-in.** A sleeper core is ~80 KB on this Linux x86_64 box. We generate via `process.save_core` at smoke-test time rather than committing a binary fixture: keeps the repo clean, ensures the test always runs against a core that matches THIS build's `liblldb`, and the runtime cost is negligible (~150 ms wall on this box). If `save_core` ever fails (some Linux configs without `CAP_SYS_PTRACE`, ASan-instrumented LLDB, etc.) the test SKIPs cleanly with a documented reason — provenance plumbing still ships.
+- **Single SHA-256 implementation across the codebase.** Extraction wasn't strictly required (the cores-only path could have inlined another copy), but the project now has THREE consumers: artifact-store row hashes, .ldbpack manifest hashes, core-file snapshot hashes. Keeping three byte-identical copies in sync is a maintenance footgun. Verified the extracted code byte-matches all three former call paths via the existing artifact-store and pack unit tests (which both passed unmodified after the refactor).
+
+**Surprises / blockers:**
+
+- **`snapshot_for_target` is best-effort and MUST NOT throw.** Dispatcher calls it on every response; a thrown exception would replace the inner handler's response with a generic kInternalError. Coded defensively: the implementation degrades to `"none"` on any unexpected condition (target gone mid-call, SBProcess invalid, etc.), and the dispatcher wraps the call in a try/catch that also degrades to `"none"`. Belt and suspenders — best-effort metadata is exactly the place to pay double for safety.
+- **`target.load_core` snapshot is `"none"`, surprised the test on first run.** The first draft of the smoke test asserted `load_core`'s response carried `"core:..."`. Failed on first run (got `"none"`). Right answer: the dispatcher extracts target_id from request params, and `load_core` doesn't carry one. Fixed the test to use `module.list` as the snapshot oracle and to assert `"none"` on `load_core` itself. Documented the contract in the test docstring.
+- **No master-vs-worktree leak.** `git status` clean except for files I touched on the worktree branch; checked mid-session and at end.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **35/35 PASS in 14.20 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 33/33 → +1 for `smoke_provenance_replay`; +13 cases in `unit_tests` from the three new test files.)
+  - `smoke_provenance_replay`: 0.38 s — generates an ~80 KB core, runs 8 RPCs against each of two daemons, byte-diffs.
+  - `unit_tests`: 14.10 s. **+19 cases / +57 assertions** for the SHA-256 utility, protocol provenance helper, backend snapshot.
+- Build warning-clean (only the pre-existing nlohmann-json `-Wnull-dereference` from GCC 13).
+- Stdout discipline preserved: no new `cout` calls; provenance is purely a response-decoration field.
+- Existing tests are strictly additive — every prior assertion still holds. `_cost` shape unchanged (verified explicitly in `serialize_response: _cost.bytes unaffected by _provenance`). Cross-process determinism gate confirmed with byte-identical responses across two fresh daemon processes.
+- `build/bin/ldbd --version` → 0.1.0.
+
+**Sibling slice:** none — this slice closes M5 part 6.
+
+**Next:** Cut MVP tag.
+
+---
+
 ## 2026-05-06 (cont. 21) — M5 part 4: ldb CLI
 
 **Goal:** Ship the operator-facing `ldb` command-line client (plan §11 M5: "thin client, mainly for humans / scripts"). Spawn `ldbd` as a child, fetch the catalog, dispatch one method, print the response. Schema-driven param parsing so new endpoints don't need CLI updates.

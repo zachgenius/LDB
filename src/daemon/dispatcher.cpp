@@ -381,10 +381,49 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
 
 Dispatcher::~Dispatcher() = default;
 
+namespace {
+
+// Extract target_id from request params, when present and integer-typed.
+// Returns 0 (the never-issued sentinel) if absent or wrong type — the
+// backend's snapshot_for_target will then return "none".
+backend::TargetId extract_target_id(const json& params) {
+  if (!params.is_object()) return 0;
+  auto it = params.find("target_id");
+  if (it == params.end()) return 0;
+  if (!it->is_number_unsigned() && !it->is_number_integer()) return 0;
+  // Negative values can't be a valid TargetId — coerce via the unsigned
+  // type and let snapshot_for_target return "none" for the unknown id.
+  try {
+    return it->get<backend::TargetId>();
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Decorate `resp` with the cores-only `_provenance.snapshot` per plan
+// §3.5. Best-effort: a thrown exception inside snapshot_for_target
+// degrades to "none" rather than poisoning the whole response.
+void decorate_provenance(Response& resp,
+                         backend::DebuggerBackend* backend,
+                         const Request& req) {
+  if (!resp.ok || !backend) return;
+  backend::TargetId tid = extract_target_id(req.params);
+  std::string snap;
+  try {
+    snap = backend->snapshot_for_target(tid);
+  } catch (...) {
+    snap = "none";
+  }
+  resp.provenance_snapshot = std::move(snap);
+}
+
+}  // namespace
+
 Response Dispatcher::dispatch(const Request& req) {
   using clock = std::chrono::steady_clock;
   auto t0 = clock::now();
   Response resp = dispatch_inner(req);
+  decorate_provenance(resp, backend_.get(), req);
   if (active_session_writer_) {
     auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
                      clock::now() - t0).count();

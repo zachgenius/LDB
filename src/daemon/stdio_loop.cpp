@@ -2,6 +2,7 @@
 
 #include "protocol/cost.h"
 #include "protocol/jsonrpc.h"
+#include "protocol/provenance.h"
 #include "protocol/transport.h"
 #include "util/log.h"
 
@@ -57,6 +58,10 @@ protocol::json response_to_json(const protocol::Response& r) {
     // Cost-preview metadata (plan §3.2). Mirrors serialize_response —
     // present only on successful responses; computed against `data`.
     j["_cost"] = protocol::cost::compute_cost(r.data);
+    // Provenance metadata (plan §3.5, cores-only MVP). Mirrors
+    // serialize_response — alongside `_cost`, never inside it.
+    j["_provenance"] =
+        protocol::provenance::compute(r.provenance_snapshot);
   } else {
     protocol::json err;
     err["code"] = static_cast<int>(r.error_code);

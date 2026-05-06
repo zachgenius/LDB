@@ -25,6 +25,7 @@
 #include <lldb/API/LLDB.h>
 
 #include "util/log.h"
+#include "util/sha256.h"
 
 namespace ldb::backend {
 
@@ -154,6 +155,11 @@ struct LldbBackend::Impl {
   std::unordered_map<TargetId,
                      std::vector<std::unique_ptr<DebuggerBackend::TargetResource>>>
       target_resources;
+  // SHA-256 of the core file backing each core-loaded target (lowercase
+  // hex). Populated once by load_core; consumed by snapshot_for_target
+  // to produce the cores-only `_provenance.snapshot` value per plan §3.5.
+  // Absent for targets that weren't created via load_core.
+  std::unordered_map<TargetId, std::string> core_sha256;
   std::atomic<TargetId> next_id{1};
 
   // Breakpoint callback registry. A separate mutex from `mu` so the
@@ -303,6 +309,22 @@ OpenResult LldbBackend::create_empty_target() {
 }
 
 OpenResult LldbBackend::load_core(const std::string& core_path) {
+  // SHA-256 the core BEFORE handing it to LLDB. Two reasons:
+  //   1. Hashing a fresh-on-disk file (closed by us) is more robust
+  //      than racing whatever LLDB is doing with mmap / partial reads.
+  //   2. If the file isn't readable we throw a focused
+  //      "load_core: sha256_file_hex failed" error before LLDB has a
+  //      chance to log a less-informative message.
+  // Streaming hash; the file is read once in 64 KiB chunks. For multi-
+  // hundred-MB cores this is the only memory cost the daemon takes on
+  // load_core that wasn't already there.
+  std::string core_hex;
+  try {
+    core_hex = ::ldb::util::sha256_file_hex(core_path);
+  } catch (const std::exception& e) {
+    throw Error(std::string("load_core: ") + e.what());
+  }
+
   // Empty target hosts the load; SBTarget::LoadCore populates modules
   // and frozen threads from the core file.
   lldb::SBError err;
@@ -325,6 +347,7 @@ OpenResult LldbBackend::load_core(const std::string& core_path) {
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->targets.emplace(id, target);
+    impl_->core_sha256.emplace(id, std::move(core_hex));
   }
 
   OpenResult res;
@@ -2623,6 +2646,7 @@ void LldbBackend::close_target(TargetId tid) {
       resources = std::move(rit->second);
       impl_->target_resources.erase(rit);
     }
+    impl_->core_sha256.erase(tid);
   }
   // Reap any breakpoint-callback records associated with this target.
   // The target's SBBreakpoints go away with DeleteTarget; the records
@@ -2639,6 +2663,47 @@ void LldbBackend::close_target(TargetId tid) {
   // Drop resources in reverse-attach order. Tearing down LAST so the
   // SBTarget delete doesn't try to talk to a dead remote first.
   while (!resources.empty()) resources.pop_back();
+}
+
+std::string LldbBackend::snapshot_for_target(TargetId tid) {
+  // Cores-only MVP per plan §3.5. Best-effort metadata: if anything
+  // unusual happens (target gone mid-call, SBProcess invalid) we
+  // degrade to "none" rather than throw — the dispatcher calls this on
+  // every successful response and a thrown exception would poison it.
+  lldb::SBTarget target;
+  std::string core_hex;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (auto it = impl_->core_sha256.find(tid);
+        it != impl_->core_sha256.end()) {
+      core_hex = it->second;
+    }
+    auto tit = impl_->targets.find(tid);
+    if (tit == impl_->targets.end()) {
+      // Unknown target_id (or one we already closed). The cached hash
+      // would have been erased on close, so this branch always returns
+      // "none".
+      return "none";
+    }
+    target = tit->second;
+  }
+  if (!core_hex.empty()) {
+    return "core:" + core_hex;
+  }
+  // Live target → live process attached → "live"; otherwise (target
+  // exists but no process: e.g. target.open without launch/attach) →
+  // "none".
+  if (target.IsValid()) {
+    auto proc = target.GetProcess();
+    if (proc.IsValid()) {
+      auto state = proc.GetState();
+      if (state != lldb::eStateInvalid && state != lldb::eStateUnloaded &&
+          state != lldb::eStateExited && state != lldb::eStateDetached) {
+        return "live";
+      }
+    }
+  }
+  return "none";
 }
 
 void LldbBackend::attach_target_resource(

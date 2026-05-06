@@ -1,6 +1,7 @@
 #include "protocol/jsonrpc.h"
 
 #include "protocol/cost.h"
+#include "protocol/provenance.h"
 
 #include <stdexcept>
 
@@ -55,6 +56,10 @@ std::string serialize_response(const Response& r) {
     // errors are short and don't benefit. Computed against the data
     // payload — bytes is the exact serialized size of `data`.
     j["_cost"] = cost::compute_cost(r.data);
+    // Provenance metadata, plan §3.5 (cores-only MVP). Same shape
+    // alongside `_cost`; never inside it, so `_cost.bytes` stays the
+    // exact serialized length of `data`.
+    j["_provenance"] = provenance::compute(r.provenance_snapshot);
   } else {
     json err;
     err["code"] = static_cast<int>(r.error_code);

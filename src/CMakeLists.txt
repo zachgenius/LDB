@@ -6,6 +6,7 @@ set(LDBD_SOURCES
   daemon/dispatcher.cpp
   protocol/jsonrpc.cpp
   protocol/cost.cpp
+  protocol/provenance.cpp
   protocol/transport.cpp
   protocol/view.cpp
   backend/lldb_backend.cpp
@@ -23,6 +24,7 @@ set(LDBD_SOURCES
   observers/net_igmp.cpp
   observers/exec_allowlist.cpp
   util/log.cpp
+  util/sha256.cpp
 )
 
 add_executable(ldbd ${LDBD_SOURCES})
