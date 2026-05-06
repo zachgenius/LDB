@@ -1,0 +1,4 @@
+0 /dev/null
+1 /home/zach/Develop/LDB/tests/fixtures/text/proc_fds_self.txt
+2 /dev/null
+3 /proc/331033/fd

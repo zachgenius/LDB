@@ -4,6 +4,62 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 17) — M4 part 3: typed observers (proc + net)
+
+**Goal:** Land the four lowest-friction `observer.*` endpoints called for by §4.6 of the plan — `observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets`. These replace the §4.6 `run_host_command` foot-gun with allowlisted, typed JSON. Local-vs-remote routing is parameterized: `host?` absent ⇒ `local_exec` on the daemon's own machine, `host?` present ⇒ `ssh_exec` over M4-1's SSH transport.
+
+**Done:**
+
+- **`src/transport/local_exec.{h,cpp}`** — popen-style local subprocess primitive that mirrors `ssh_exec`'s `ExecOptions`/`ExecResult` shape so observer endpoints route through one or the other transport without rewriting the pump. `posix_spawnp` + pipes + deadline-driven `poll()` loop (lifted from `ssh.cpp`'s `run_pumped`); SIGPIPE installed once via `std::call_once`. Stdout is ALWAYS piped — never inherited — so the child can't ever leak a byte to ldbd's JSON-RPC channel. Throws `backend::Error` only on spawn-side failure (exec not found, posix_spawn rc != 0, pipe creation); subprocess exit / timeout / cap-overflow are reflected in the result.
+- **`src/observers/observers.h`** — public structs + entry points. Each entry-point function takes `std::optional<transport::SshHost> remote` and dispatches to local_exec when nullopt, ssh_exec otherwise. Pure parsers (`parse_proc_fds`, `parse_proc_maps`, `parse_proc_status`, `parse_ss_tunap`) are exposed for unit tests so the parsing layer is testable with no subprocess at all.
+- **`src/observers/proc.cpp`** — three endpoints:
+  - `proc.fds`: `find /proc/<pid>/fd -mindepth 1 -maxdepth 1 -printf '%f %l\n'`. Atomic-per-entry; race-vanished entries (fd closed between readdir and readlink) silently skip per the plan's "best-effort" contract. Type classifier infers `socket | pipe | anon | file | other` from the link target prefix.
+  - `proc.maps`: `cat /proc/<pid>/maps` → `{start,end,perm,offset,dev,inode,path?}`. The path field is "everything after the inode column" so `/path with spaces/binary` survives. Anonymous regions (no path) come through with `path` absent.
+  - `proc.status`: `cat /proc/<pid>/status` → typed subset (name/pid/ppid/state/uid/gid/threads/vm_*/fd_size) plus `raw_fields[]` for the rare agent that needs more. Zombie processes (`State: Z`) parse cleanly with absent VmRSS/VmSize.
+- **`src/observers/net_sockets.cpp`** — `ss -tunap` parser. Substring filter on `"<proto> <local> <peer> <state>"` is applied POST-PARSE; the filter string is NEVER passed to ss to avoid any chance of shell-meta interpretation. `users:(("name",pid=N,fd=M))` extraction takes the first tuple and ignores subsequent ones.
+- **Allowlist contract**: pid is validated as a positive int before any subprocess spawns (`require_positive_pid` in dispatcher, with a backend-side double-check in `observers::*::fetch_*`). `ssh_exec` already shell-quotes argv so the integer never reaches a shell; the only operator-supplied strings on the wire are `host` (passed verbatim as ssh target) and `filter` (parsed locally).
+- **Dispatcher wiring** (`dispatcher.cpp`): `observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets` registered in routing AND `describe.endpoints` (55 endpoints, up from 51). Param validation → -32602; transport / non-zero exit → -32000 via the existing `backend::Error` catch. Array-returning endpoints go through `view::apply_to_array` so `view: {limit, offset, fields, summary}` works against `fds` / `regions` / `sockets`. Status returns a single object (no view paging — it's a fixed scalar shape).
+- **Tests** (TDD red→green):
+  - `tests/unit/test_observers_parsers.cpp` — 11 cases / parser-only, fed canned input from `tests/fixtures/text/proc_maps_self.txt` / `proc_status_pid1.txt` / `ss_tunap.txt` / `proc_fds_self.txt` (all CAPTURED LIVE on this Pop!_OS box at TDD time and committed).
+  - `tests/unit/test_observers_live.cpp` — 6 cases live against `getpid()`. Gated on `std::filesystem::exists("/proc/self/status")` so the suite SKIPs cleanly off-Linux when we get to v0.3.
+  - `tests/smoke/test_observer.py` — describe-endpoints, param validation (missing/negative/zero/string pid), live local proc.* against `ldbd.pid`, view paging on `proc.maps` (limit + offset + next_offset), bogus pid → -32000, net.sockets all-then-tcp filter check. Wired into `tests/CMakeLists.txt` with TIMEOUT 30.
+- **`requires_target` flag**: tweaked in describe.endpoints — observer.* endpoints don't require a debuggable target (they're host-side, like artifact.* / session.*), so the heuristic now also excludes `observer.*`.
+
+**Decisions:**
+
+- **`local_exec` as a separate primitive (not a "ssh-or-local" branch inside `ssh_exec`).** Both call sites need the SAME pump shape but completely different spawn argv (no ssh, no shell quoting, no remote port forwarding). Forking the implementation keeps the local hot path lean — no ssh process at all when host is local — and avoids leaking ssh-specific options like `BatchMode=yes` into the local case. Same `ExecOptions`/`ExecResult` shape so the observers route via a one-line `if (remote.has_value())`.
+- **Allowlist boundary at the C++ layer, not the wire**. The dispatcher rejects bad pids before the function runs; `observers::fetch_*` re-checks. The transport never sees an operator-supplied shell string (only argv elements that ssh shell-quotes for us). Keeping the validation in BOTH places is defense in depth — if a future RPC adds a new caller path that bypasses the dispatcher's check, the backend stays safe.
+- **Filter applied post-parse, not via `ss -tunap STATE`/etc.** `ss` itself supports state filters (`ss -tunap state listening`), but exposing those would either grow the on-the-wire schema (more typed enums) or require shelling out to ss with operator strings. Substring-on-flat-line is good enough for the agent's "show me the tcp listen sockets" workflow and adds zero attack surface.
+- **`raw_fields[]` in proc.status**. The full /proc/<pid>/status has ~50 keys and grows with every kernel release. Surfacing the typed subset keeps the wire shape stable; raw_fields keeps the long tail accessible without an extra round-trip. (Same idea as `module.list`'s sections array — exhaust the typed view, fall back to bytes.)
+- **`find ... -printf '%f %l\n'` over `cat /proc/PID/fd/*`**. The latter doesn't even work — `*` glob expansion of fd dir entries, then cat reads each fd's pointed-at content, not the link target. The former is one syscall per fd inside a single readdir, matches the kernel's atomicity, and gives us "fd target" pre-formatted on stdout.
+- **`SshHost` from observer's `host` param: just `out.host = h`**. We don't accept port / ssh_options at the observer endpoint level — that's deferred. Agents who need them can configure ssh-side via `~/.ssh/config` (a Host stanza per target). Keeps the wire schema minimal until we know what extras agents actually need.
+
+**Surprises / blockers:**
+
+- **First red→green attempt failed because `backend::Error` wasn't included in `test_observers_live.cpp`** — the WARN/SKIP path catches it. Fixed by adding `#include "backend/debugger_backend.h"` (no surprise; just had to remember the indirect include).
+- **No surprises in the parsers** — the canned fixtures from this box (cat-of-cat's-own /proc/self/maps, systemd's /proc/1/status) parsed cleanly first try. The `path with whitespace` synthetic case did require careful greedy split (first 5 columns absolute, remainder = path with trailing-WS-stripped), which the test caught.
+- **Path-with-spaces in /proc/PID/maps**: I almost did `split(line)` and pulled the path as token[5], which would silently break on `/tmp/dir with space/binary`. The test case caught this because I wrote it before the impl.
+- **`ss` behavior**: confirmed via the ss_tunap.txt capture that the `Process` column starts with `users:(("..."pid=N,fd=M))` only when the user has visibility — non-root callers see nothing for sshd, NetworkManager, etc. Parser tolerates absent `users:` (pid/comm/fd just stay nullopt).
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **25/25 PASS in 23.79s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 24/24 → +1 for `smoke_observer`.)
+  - `smoke_observer`: 0.16s (live local proc.* + net.sockets exercised against ldbd's own pid).
+  - `unit_tests`: 13.68s (244 cases / 3375 assertions; was 227/1844 — +17 cases, +1531 assertions; the assertion delta is mostly the live-proc tests doing N-fd loops on ldbd's actual fd table, plus new parser fixtures).
+- All `[live][proc]` and `[live][net]` cases EXERCISED on this box (it's Linux with /proc, has `find`, has `ss`).
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` noise from GCC 13).
+- Stdout-discipline preserved: smoke test reads JSON-RPC line-by-line and got every response, no spurious bytes from `find`/`cat`/`ss` bleeding into ldbd's stdout.
+- `build/bin/ldbd --version` → 0.1.0 (binary still links and runs).
+
+**Deferred:**
+- **`observer.net.igmp({})`** — small parser, would clutter the `net_sockets.cpp` module. Worth its own slice if/when an agent needs it; nothing in M4-3 is gated on it.
+- **`observer.net.tcpdump({iface, bpf, count, snaplen})`** — streaming live-capture model. Different shape entirely (long-lived subprocess, structured-per-packet stream events). Warrants its own milestone-level slice; could share infra with M4-4's BPF probe engine.
+- **`observer.exec({cmd, allowlisted})`** — the §4.6 escape hatch. Needs an operator-configured allowlist design slice (where do we read the allowlist from? per-host or global? wildcards or exact match?) before it can ship safely. Current four endpoints cover the §5 reference workflow's `observer.proc.fds({pid:31415})` — the only observer the MVP acceptance test calls.
+
+**Next:** M4 part 4 — BPF probe engine via bpftrace shellout (`probe.create kind="uprobe_bpf"` per §4.5). The transport surface is now complete: ssh_exec for one-shot host commands, ssh_tunneled_command for daemon-style remote agents, local_exec for the daemon-host equivalent. M4-4 spawns `bpftrace` (or our own libbpf-based agent eventually) on the target via SSH and structures its stdout into the same probe-event JSON shape M3's `lldb_breakpoint` engine produces.
+
+---
+
 ## 2026-05-06 (cont. 16) — M4 part 2: target.connect_remote_ssh
 
 **Goal:** Land the end-to-end remote-debug endpoint that ties M4-1's SSH transport to the existing `connect_remote_target` LLDB pathway. The operator's `ldbd` runs locally, the target host runs `lldb-server gdbserver`, the agent issues one RPC and gets a debuggable target.

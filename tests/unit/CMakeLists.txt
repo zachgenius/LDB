@@ -37,6 +37,8 @@ set(LDB_UNIT_SOURCES
   test_transport_ssh.cpp
   test_transport_ssh_tunneled.cpp
   test_backend_connect_remote_ssh.cpp
+  test_observers_parsers.cpp
+  test_observers_live.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -50,6 +52,8 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/ssh.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/local_exec.cpp
+  ${CMAKE_SOURCE_DIR}/src/observers/proc.cpp
+  ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.
@@ -85,6 +89,7 @@ add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper)
 target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_STRUCTS_PATH="$<TARGET_FILE:ldb_fix_structs>"
   LDB_FIXTURE_SLEEPER_PATH="$<TARGET_FILE:ldb_fix_sleeper>"
+  LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
 )
 
 # lldb-server path for the connect_remote positive-path test. Discovery

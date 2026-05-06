@@ -1,0 +1,25 @@
+5e9692cfa000-5e9692cfc000 r--p 00000000 103:03 73007242                  /usr/bin/cat
+5e9692cfc000-5e9692d01000 r-xp 00002000 103:03 73007242                  /usr/bin/cat
+5e9692d01000-5e9692d03000 r--p 00007000 103:03 73007242                  /usr/bin/cat
+5e9692d03000-5e9692d04000 r--p 00008000 103:03 73007242                  /usr/bin/cat
+5e9692d04000-5e9692d05000 rw-p 00009000 103:03 73007242                  /usr/bin/cat
+5e96c124e000-5e96c126f000 rw-p 00000000 00:00 0                          [heap]
+7791b0800000-7791b170d000 r--p 00000000 103:03 73142762                  /usr/lib/locale/locale-archive
+7791b1800000-7791b1828000 r--p 00000000 103:03 73160125                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7791b1828000-7791b19b0000 r-xp 00028000 103:03 73160125                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7791b19b0000-7791b19ff000 r--p 001b0000 103:03 73160125                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7791b19ff000-7791b1a03000 r--p 001fe000 103:03 73160125                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7791b1a03000-7791b1a05000 rw-p 00202000 103:03 73160125                  /usr/lib/x86_64-linux-gnu/libc.so.6
+7791b1a05000-7791b1a12000 rw-p 00000000 00:00 0 
+7791b1a2e000-7791b1a53000 rw-p 00000000 00:00 0 
+7791b1a66000-7791b1a68000 rw-p 00000000 00:00 0 
+7791b1a68000-7791b1a6c000 r--p 00000000 00:00 0                          [vvar]
+7791b1a6c000-7791b1a6e000 r--p 00000000 00:00 0                          [vvar_vclock]
+7791b1a6e000-7791b1a70000 r-xp 00000000 00:00 0                          [vdso]
+7791b1a70000-7791b1a71000 r--p 00000000 103:03 73159532                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7791b1a71000-7791b1a9c000 r-xp 00001000 103:03 73159532                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7791b1a9c000-7791b1aa6000 r--p 0002c000 103:03 73159532                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7791b1aa6000-7791b1aa8000 r--p 00036000 103:03 73159532                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7791b1aa8000-7791b1aaa000 rw-p 00038000 103:03 73159532                  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffce3ebd000-7ffce3ede000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]

@@ -2,6 +2,7 @@
 
 #include "backend/debugger_backend.h"
 #include "ldb/version.h"
+#include "observers/observers.h"
 #include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
@@ -9,6 +10,8 @@
 #include "util/log.h"
 
 #include <chrono>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -479,6 +482,11 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "probe.enable")       return handle_probe_enable(req);
     if (req.method == "probe.delete")       return handle_probe_delete(req);
 
+    if (req.method == "observer.proc.fds")    return handle_observer_proc_fds(req);
+    if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
+    if (req.method == "observer.proc.status") return handle_observer_proc_status(req);
+    if (req.method == "observer.net.sockets") return handle_observer_net_sockets(req);
+
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
   } catch (const backend::Error& e) {
@@ -516,9 +524,18 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
     e["summary"] = summary;
     e["params"] = params;
     e["returns"] = returns;
-    e["requires_target"] = (std::string(name) != "hello" &&
-                            std::string(name) != "describe.endpoints" &&
-                            std::string(name) != "target.open");
+    // Observer / artifact / session endpoints don't take a target_id —
+    // they're host-side or store-side. The requires_target flag is
+    // informational and answers "do I need a live target before
+    // calling?" The original heuristic (everything except hello /
+    // describe / target.open) is wrong for these new shapes, but we
+    // keep it for back-compat and add explicit exclusions here as the
+    // catalog grows.
+    auto n = std::string(name);
+    e["requires_target"] = (n != "hello" &&
+                            n != "describe.endpoints" &&
+                            n != "target.open" &&
+                            n.rfind("observer.", 0) != 0);
     eps.push_back(std::move(e));
   };
 
@@ -943,6 +960,53 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       "drops the orchestrator's record. Captured events are lost.",
       json{{"probe_id", "string"}},
       json{{"probe_id", "string"}, {"deleted", "bool"}});
+
+  add("observer.proc.fds",
+      "Enumerate /proc/<pid>/fd of the target host. Each entry is the "
+      "fd number, its readlink target, and a coarse type "
+      "(\"socket\"|\"pipe\"|\"anon\"|\"file\"|\"other\"). When `host` is "
+      "absent the daemon's own host is queried via local_exec; when "
+      "present the call is dispatched over ssh_exec to that host. "
+      "Argv is hardcoded (find /proc/<pid>/fd -printf); pid is "
+      "validated as a positive integer before any subprocess spawns.",
+      json{{"pid", "int"}, {"host", "string?"}},
+      json{{"fds", "array of {fd,target,type}"}, {"total", "uint"}});
+
+  add("observer.proc.maps",
+      "Read /proc/<pid>/maps from the target host and return parsed "
+      "regions: {start,end,perm,offset,dev,inode,path?}. Same "
+      "local-vs-remote dispatch as observer.proc.fds. Path may contain "
+      "spaces; we split greedily on the first 5 columns and take the "
+      "remainder as the path.",
+      json{{"pid", "int"}, {"host", "string?"}},
+      json{{"regions", "array of {start,end,perm,offset,dev,inode,path?}"},
+           {"total", "uint"}});
+
+  add("observer.proc.status",
+      "Read /proc/<pid>/status from the target host and return a "
+      "parsed subset (name, pid, ppid, state, uid, gid, threads, "
+      "vm_rss_kb?, vm_size_kb?, vm_peak_kb?, fd_size?). Zombie "
+      "processes parse cleanly with absent VmRSS/VmSize. The full "
+      "key/value list is also exposed in raw_fields for the rare "
+      "agent that needs more.",
+      json{{"pid", "int"}, {"host", "string?"}},
+      json{{"name", "string"}, {"pid", "int?"}, {"ppid", "int?"},
+           {"state", "string"}, {"uid", "uint?"}, {"gid", "uint?"},
+           {"threads", "uint?"}, {"vm_rss_kb", "uint64?"},
+           {"vm_size_kb", "uint64?"}, {"vm_peak_kb", "uint64?"},
+           {"fd_size", "uint64?"},
+           {"raw_fields", "array of {key,value}"}});
+
+  add("observer.net.sockets",
+      "Run `ss -tunap` on the target host and return parsed socket "
+      "rows: {proto, state, local, peer, pid?, comm?, fd?}. The "
+      "`filter` param is applied POST-PARSE as a substring match "
+      "against \"<proto> <local> <peer> <state>\" — it is NEVER passed "
+      "to ss to avoid any chance of shell-meta interpretation.",
+      json{{"host", "string?"}, {"filter", "string?"}},
+      json{{"sockets",
+            "array of {proto,state,local,peer,pid?,comm?,fd?}"},
+           {"total", "uint"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -2749,6 +2813,188 @@ Response Dispatcher::handle_probe_delete(const Request& req) {
   data["probe_id"] = *probe_id;
   data["deleted"]  = true;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+// ---- observer.* handlers ------------------------------------------------
+//
+// All four endpoints share the same plumbing:
+//   1. validate the params (pid is positive int; host is optional string),
+//   2. translate `host` → optional<transport::SshHost>,
+//   3. call into observers::fetch_*,
+//   4. shape the result into JSON (arrays go through view::apply_to_array
+//      so the standard {limit, offset, fields, summary} controls work).
+//
+// observers::* throws backend::Error on transport failure / non-zero
+// remote exit / parse failure; the dispatcher's catch translates to
+// kBackendError. Param-validation errors stay in the handler so they
+// surface as kInvalidParams.
+
+namespace {
+
+// Convert the dispatcher's "host?" param into the optional<SshHost>
+// expected by the observers. Empty string ≡ absent. host.port and
+// host.ssh_options are deferred to a future slice — agents who need
+// them will hit observer.* endpoints with `host` set to a config-key
+// in their ~/.ssh/config.
+std::optional<ldb::transport::SshHost>
+observer_host_from_params(const json& params) {
+  auto it = params.find("host");
+  if (it == params.end() || !it->is_string()) return std::nullopt;
+  std::string h = it->get<std::string>();
+  if (h.empty()) return std::nullopt;
+  ldb::transport::SshHost out;
+  out.host = std::move(h);
+  return out;
+}
+
+// Validate "pid" param. Returns nullopt + an error response on failure.
+// Negative / zero pid → -32602 (caller invariant).
+std::optional<protocol::Response>
+require_positive_pid(const protocol::Request& req, std::int32_t* out) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  auto it = req.params.find("pid");
+  if (it == req.params.end()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing int param 'pid'");
+  }
+  if (it->is_number_integer()) {
+    auto v = it->get<std::int64_t>();
+    if (v <= 0 || v > std::numeric_limits<std::int32_t>::max()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'pid' must be a positive int32");
+    }
+    *out = static_cast<std::int32_t>(v);
+    return std::nullopt;
+  }
+  if (it->is_number_unsigned()) {
+    auto v = it->get<std::uint64_t>();
+    if (v == 0 ||
+        v > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'pid' must be a positive int32");
+    }
+    *out = static_cast<std::int32_t>(v);
+    return std::nullopt;
+  }
+  return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                            "param 'pid' must be an integer");
+}
+
+json fd_entry_to_json(const ldb::observers::FdEntry& e) {
+  json j;
+  j["fd"]     = e.fd;
+  j["target"] = e.target;
+  j["type"]   = e.type;
+  return j;
+}
+
+json maps_region_to_json(const ldb::observers::MapsRegion& r) {
+  json j;
+  j["start"]  = r.start;
+  j["end"]    = r.end;
+  j["perm"]   = r.perm;
+  j["offset"] = r.offset;
+  j["dev"]    = r.dev;
+  j["inode"]  = r.inode;
+  if (r.path.has_value()) j["path"] = *r.path;
+  return j;
+}
+
+json proc_status_to_json_obs(const ldb::observers::ProcStatus& s) {
+  json j;
+  j["name"]  = s.name;
+  if (s.pid.has_value())        j["pid"]        = *s.pid;
+  if (s.ppid.has_value())       j["ppid"]       = *s.ppid;
+  j["state"] = s.state;
+  if (s.uid.has_value())        j["uid"]        = *s.uid;
+  if (s.gid.has_value())        j["gid"]        = *s.gid;
+  if (s.threads.has_value())    j["threads"]    = *s.threads;
+  if (s.vm_rss_kb.has_value())  j["vm_rss_kb"]  = *s.vm_rss_kb;
+  if (s.vm_size_kb.has_value()) j["vm_size_kb"] = *s.vm_size_kb;
+  if (s.vm_peak_kb.has_value()) j["vm_peak_kb"] = *s.vm_peak_kb;
+  if (s.fd_size.has_value())    j["fd_size"]    = *s.fd_size;
+  json raw = json::array();
+  for (const auto& kv : s.raw_fields) {
+    json e;
+    e["key"]   = kv.first;
+    e["value"] = kv.second;
+    raw.push_back(std::move(e));
+  }
+  j["raw_fields"] = std::move(raw);
+  return j;
+}
+
+json socket_entry_to_json(const ldb::observers::SocketEntry& s) {
+  json j;
+  j["proto"] = s.proto;
+  j["state"] = s.state;
+  j["local"] = s.local;
+  j["peer"]  = s.peer;
+  if (s.pid.has_value())  j["pid"]  = *s.pid;
+  if (s.comm.has_value()) j["comm"] = *s.comm;
+  if (s.fd.has_value())   j["fd"]   = *s.fd;
+  return j;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_observer_proc_fds(const Request& req) {
+  std::int32_t pid = 0;
+  if (auto e = require_positive_pid(req, &pid)) return *e;
+  auto remote = observer_host_from_params(req.params);
+  auto view_spec = protocol::view::parse_from_params(req.params);
+
+  auto r = ldb::observers::fetch_proc_fds(remote, pid);
+  json arr = json::array();
+  for (const auto& e : r.fds) arr.push_back(fd_entry_to_json(e));
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "fds"));
+}
+
+Response Dispatcher::handle_observer_proc_maps(const Request& req) {
+  std::int32_t pid = 0;
+  if (auto e = require_positive_pid(req, &pid)) return *e;
+  auto remote = observer_host_from_params(req.params);
+  auto view_spec = protocol::view::parse_from_params(req.params);
+
+  auto r = ldb::observers::fetch_proc_maps(remote, pid);
+  json arr = json::array();
+  for (const auto& reg : r.regions) arr.push_back(maps_region_to_json(reg));
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "regions"));
+}
+
+Response Dispatcher::handle_observer_proc_status(const Request& req) {
+  std::int32_t pid = 0;
+  if (auto e = require_positive_pid(req, &pid)) return *e;
+  auto remote = observer_host_from_params(req.params);
+
+  auto r = ldb::observers::fetch_proc_status(remote, pid);
+  return protocol::make_ok(req.id, proc_status_to_json_obs(r));
+}
+
+Response Dispatcher::handle_observer_net_sockets(const Request& req) {
+  // No required params; both host and filter are optional.
+  std::optional<ldb::transport::SshHost> remote;
+  std::string filter;
+  if (req.params.is_object()) {
+    remote = observer_host_from_params(req.params);
+    if (auto it = req.params.find("filter");
+        it != req.params.end() && it->is_string()) {
+      filter = it->get<std::string>();
+    }
+  }
+  auto view_spec = protocol::view::parse_from_params(
+      req.params.is_object() ? req.params : json::object());
+
+  auto r = ldb::observers::fetch_net_sockets(remote, filter);
+  json arr = json::array();
+  for (const auto& s : r.sockets) arr.push_back(socket_entry_to_json(s));
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "sockets"));
 }
 
 }  // namespace ldb::daemon

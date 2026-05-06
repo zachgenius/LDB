@@ -1,0 +1,49 @@
+Netid State  Recv-Q Send-Q                  Local Address:Port    Peer Address:Port Process                             
+udp   UNCONN 0      0                          127.0.0.54:53           0.0.0.0:*                                        
+udp   UNCONN 0      0                       127.0.0.53%lo:53           0.0.0.0:*                                        
+udp   ESTAB  0      0              192.168.101.135%wlp9s0:68     192.168.101.1:67                                       
+udp   ESTAB  0      0      10.186.136.100%enx323e48ab03da:68      10.186.136.1:67                                       
+udp   UNCONN 0      0                           127.0.0.1:323          0.0.0.0:*                                        
+udp   UNCONN 0      0                             0.0.0.0:5353         0.0.0.0:*                                        
+udp   UNCONN 0      0              192.168.101.135%wlp9s0:9993         0.0.0.0:*                                        
+udp   UNCONN 0      0      10.186.136.100%enx323e48ab03da:9993         0.0.0.0:*                                        
+udp   UNCONN 0      0                             0.0.0.0:37742        0.0.0.0:*                                        
+udp   UNCONN 0      0              192.168.101.135%wlp9s0:42004        0.0.0.0:*                                        
+udp   UNCONN 0      0      10.186.136.100%enx323e48ab03da:42004        0.0.0.0:*                                        
+udp   UNCONN 0      0              192.168.101.135%wlp9s0:46237        0.0.0.0:*                                        
+udp   UNCONN 0      0      10.186.136.100%enx323e48ab03da:46237        0.0.0.0:*                                        
+udp   UNCONN 0      0                               [::1]:323             [::]:*                                        
+udp   UNCONN 0      0                                [::]:5353            [::]:*                                        
+udp   UNCONN 0      0                                [::]:43218           [::]:*                                        
+tcp   LISTEN 0      4096                       127.0.0.54:53           0.0.0.0:*                                        
+tcp   LISTEN 0      1                             0.0.0.0:52301        0.0.0.0:*     users:(("nc",pid=287663,fd=3))     
+tcp   LISTEN 0      4096                    127.0.0.53%lo:53           0.0.0.0:*                                        
+tcp   LISTEN 0      4096                        127.0.0.1:631          0.0.0.0:*                                        
+tcp   LISTEN 0      8                           127.0.0.1:57759        0.0.0.0:*     users:(("python3",pid=288121,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:60813        0.0.0.0:*     users:(("python3",pid=293226,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:53779        0.0.0.0:*     users:(("python3",pid=306174,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:55689        0.0.0.0:*     users:(("python3",pid=310912,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:53001        0.0.0.0:*     users:(("python3",pid=303009,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:41791        0.0.0.0:*     users:(("python3",pid=324518,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:41425        0.0.0.0:*     users:(("python3",pid=329248,fd=3))
+tcp   LISTEN 0      5                             0.0.0.0:9993         0.0.0.0:*                                        
+tcp   LISTEN 0      128                         127.0.0.1:37291        0.0.0.0:*     users:(("ssh",pid=266822,fd=4))    
+tcp   LISTEN 0      8                           127.0.0.1:39449        0.0.0.0:*     users:(("python3",pid=320106,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:40293        0.0.0.0:*     users:(("python3",pid=315546,fd=3))
+tcp   LISTEN 0      8                           127.0.0.1:34607        0.0.0.0:*     users:(("python3",pid=299736,fd=3))
+tcp   LISTEN 0      4096                          0.0.0.0:22           0.0.0.0:*                                        
+tcp   LISTEN 0      8                           127.0.0.1:35035        0.0.0.0:*     users:(("python3",pid=296493,fd=3))
+tcp   ESTAB  0      0                     192.168.101.135:34368  34.149.66.137:443   users:(("claude",pid=208593,fd=40))
+tcp   ESTAB  0      0                     192.168.101.135:50376  34.149.66.137:443   users:(("claude",pid=190304,fd=19))
+tcp   ESTAB  0      0                     192.168.101.135:34240  160.79.104.10:443   users:(("claude",pid=190304,fd=17))
+tcp   ESTAB  0      0                     192.168.101.135:35594  160.79.104.10:443   users:(("claude",pid=208593,fd=17))
+tcp   ESTAB  0      0                     192.168.101.135:35966  160.79.104.10:443   users:(("claude",pid=208593,fd=41))
+tcp   ESTAB  0      0                     192.168.101.135:35978  160.79.104.10:443   users:(("claude",pid=208593,fd=42))
+tcp   ESTAB  0      0                     192.168.101.135:54120  160.79.104.10:443   users:(("claude",pid=190304,fd=18))
+tcp   ESTAB  0      0                     192.168.101.135:57010  160.79.104.10:443   users:(("claude",pid=208593,fd=39))
+tcp   ESTAB  0      0                     192.168.191.142:22    192.168.191.39:59042                                    
+tcp   LISTEN 0      4096                            [::1]:631             [::]:*                                        
+tcp   LISTEN 0      5                                   *:9993               *:*                                        
+tcp   LISTEN 0      4096                             [::]:22              [::]:*                                        
+tcp   ESTAB  0      0                               [::1]:47080          [::1]:22    users:(("ssh",pid=266822,fd=3))    
+tcp   ESTAB  0      0                               [::1]:22             [::1]:47080                                    
