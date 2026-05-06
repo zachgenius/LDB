@@ -103,6 +103,22 @@ class ArtifactStore {
   std::vector<std::string> add_tags(std::int64_t id,
                                      const std::vector<std::string>& tags);
 
+  // Import an artifact from a `.ldbpack` archive (M5 part 5). Bypasses
+  // the hashing + timestamp behavior of put() — the supplied [sha256]
+  // and [created_at] are used verbatim, the supplied [tags] are
+  // attached. If a row already exists for (build_id, name) and
+  // [overwrite] is false, throws; if true, the prior row + blob are
+  // replaced. Returns the new row.
+  ArtifactRow import_artifact(std::string_view build_id,
+                              std::string_view name,
+                              const std::vector<std::uint8_t>& bytes,
+                              std::string_view sha256,
+                              std::optional<std::string> format,
+                              const nlohmann::json& meta,
+                              const std::vector<std::string>& tags,
+                              std::int64_t created_at,
+                              bool overwrite);
+
   // Resolve the configured store root (post-canonicalization). Useful
   // for tests and the --help output.
   const std::filesystem::path& root() const noexcept;

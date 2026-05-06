@@ -84,6 +84,16 @@ target_link_libraries(ldb_lldb INTERFACE "${LDB_LLDB_LIBRARY}")
 # we add later. Required, not optional — the artifact endpoints are part
 # of the canonical RPC surface from M3 onward.
 
+# ----- zlib ---------------------------------------------------------------
+#
+# Used by store/pack.{h,cpp} (M5 part 5) — `.ldbpack` is gzip+tar. zlib
+# is on every Linux/macOS dev box; libllvm pulls it transitively too,
+# but we add an explicit find_package so the dep is intentional and
+# CMake reports it at configure time.
+
+find_package(ZLIB REQUIRED)
+message(STATUS "ldb: zlib ${ZLIB_VERSION_STRING} at ${ZLIB_LIBRARIES}")
+
 find_package(SQLite3 QUIET)
 if(NOT SQLite3_FOUND)
   # macOS Homebrew installs sqlite under /opt/homebrew/opt/sqlite (the

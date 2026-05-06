@@ -368,6 +368,129 @@ std::vector<SessionRow> SessionStore::list() {
   return out;
 }
 
+void SessionStore::import_session(std::string_view id,
+                                  std::string_view name,
+                                  std::optional<std::string> target_id,
+                                  std::int64_t created_at_ns,
+                                  const std::vector<ImportRow>& rows,
+                                  bool overwrite) {
+  namespace fs = std::filesystem;
+  std::lock_guard<std::mutex> lk(impl_->mu);
+
+  // Does this id already live in the index?
+  bool already_exists = false;
+  std::string existing_path;
+  {
+    auto stmt = prepare_or_throw(impl_->index_db,
+        "SELECT path FROM sessions WHERE id = ?1;");
+    sqlite3_bind_text(stmt.get(), 1, id.data(),
+                      static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+      already_exists = true;
+      auto p = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+      if (p) existing_path = p;
+    } else if (rc != SQLITE_DONE) {
+      throw_sqlite(impl_->index_db, "import_session: pre-check");
+    }
+  }
+  if (already_exists && !overwrite) {
+    throw backend::Error("session_store.import_session: id already exists: "
+                         + std::string(id));
+  }
+
+  fs::path session_path = impl_->sessions_dir / (std::string(id) + ".db");
+  if (already_exists) {
+    auto del = prepare_or_throw(impl_->index_db,
+        "DELETE FROM sessions WHERE id = ?1;");
+    sqlite3_bind_text(del.get(), 1, id.data(),
+                      static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(del.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->index_db, "import_session: delete prior index row");
+    }
+    std::error_code ec;
+    if (!existing_path.empty()) fs::remove(existing_path, ec);
+    fs::remove(session_path, ec);
+  }
+
+  // Build a fresh per-session db.
+  sqlite3* sdb = nullptr;
+  int rc = sqlite3_open(session_path.c_str(), &sdb);
+  if (rc != SQLITE_OK) {
+    std::string m = "sqlite open ";
+    m.append(session_path.string());
+    m.append(": ");
+    m.append(sdb ? sqlite3_errmsg(sdb) : sqlite3_errstr(rc));
+    if (sdb) sqlite3_close(sdb);
+    throw backend::Error(m);
+  }
+  try {
+    migrate_session_db(sdb, name, target_id, created_at_ns);
+    if (!rows.empty()) {
+      exec_or_throw(sdb, "BEGIN IMMEDIATE;");
+      try {
+        auto ins = prepare_or_throw(sdb,
+            "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
+            "                    duration_us) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+        for (const auto& r : rows) {
+          sqlite3_reset(ins.get());
+          sqlite3_clear_bindings(ins.get());
+          sqlite3_bind_int64(ins.get(), 1, r.ts_ns);
+          sqlite3_bind_text (ins.get(), 2, r.method.c_str(),
+                             static_cast<int>(r.method.size()),
+                             SQLITE_TRANSIENT);
+          sqlite3_bind_text (ins.get(), 3, r.request_json.c_str(),
+                             static_cast<int>(r.request_json.size()),
+                             SQLITE_TRANSIENT);
+          sqlite3_bind_text (ins.get(), 4, r.response_json.c_str(),
+                             static_cast<int>(r.response_json.size()),
+                             SQLITE_TRANSIENT);
+          sqlite3_bind_int  (ins.get(), 5, r.ok ? 1 : 0);
+          sqlite3_bind_int64(ins.get(), 6, r.duration_us);
+          if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+            throw_sqlite(sdb, "import_session: rpc_log insert");
+          }
+        }
+        exec_or_throw(sdb, "COMMIT;");
+      } catch (...) {
+        exec_or_throw(sdb, "ROLLBACK;");
+        throw;
+      }
+    }
+  } catch (...) {
+    sqlite3_close(sdb);
+    std::error_code ec;
+    fs::remove(session_path, ec);
+    throw;
+  }
+  sqlite3_close(sdb);
+
+  // Insert the index row.
+  auto ins = prepare_or_throw(impl_->index_db,
+      "INSERT INTO sessions(id, name, target_id, created_at, path) "
+      "VALUES(?1, ?2, ?3, ?4, ?5);");
+  sqlite3_bind_text(ins.get(), 1, id.data(),
+                    static_cast<int>(id.size()), SQLITE_TRANSIENT);
+  std::string name_s(name);
+  sqlite3_bind_text(ins.get(), 2, name_s.c_str(),
+                    static_cast<int>(name_s.size()), SQLITE_TRANSIENT);
+  if (target_id.has_value()) {
+    sqlite3_bind_text(ins.get(), 3, target_id->c_str(),
+                      static_cast<int>(target_id->size()),
+                      SQLITE_TRANSIENT);
+  } else {
+    sqlite3_bind_null(ins.get(), 3);
+  }
+  sqlite3_bind_int64(ins.get(), 4, static_cast<sqlite3_int64>(created_at_ns));
+  std::string ps = session_path.string();
+  sqlite3_bind_text(ins.get(), 5, ps.c_str(),
+                    static_cast<int>(ps.size()), SQLITE_TRANSIENT);
+  if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+    throw_sqlite(impl_->index_db, "import_session: insert index");
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 struct SessionStore::Writer::Impl {

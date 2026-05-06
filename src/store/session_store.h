@@ -99,6 +99,39 @@ class SessionStore {
   class Writer;
   std::unique_ptr<Writer> open_writer(std::string_view id);
 
+  // Import-side of `.ldbpack` (M5 part 5). One row in the rpc_log of an
+  // imported session. Created and persisted by import_session below.
+  // Times are inherited from the source session; we don't restamp them.
+  struct ImportRow {
+    std::int64_t  ts_ns        = 0;
+    std::string   method;
+    std::string   request_json;
+    std::string   response_json;
+    bool          ok           = true;
+    std::int64_t  duration_us  = 0;
+  };
+
+  // import_session — used by `pack::unpack` to materialize a session
+  // from a `.ldbpack` archive into this store. Behavior:
+  //
+  //   • [id] is the imported session's UUID. We preserve it (so cross-
+  //     pack references remain stable).
+  //   • If [overwrite] is false and the id already exists, throws
+  //     backend::Error. If true, the existing row is dropped and the
+  //     per-session db is replaced.
+  //   • Writes a fresh per-session db at ${root}/sessions/<id>.db with
+  //     the canonical meta + rpc_log schema, populated with [rows].
+  //   • Inserts (or replaces) the index row.
+  //
+  // Note: this bypasses the normal create() / Writer::append() path —
+  // it's the dual of the export side, not a general "ingest log."
+  void import_session(std::string_view id,
+                      std::string_view name,
+                      std::optional<std::string> target_id,
+                      std::int64_t created_at_ns,
+                      const std::vector<ImportRow>& rows,
+                      bool overwrite);
+
   // Resolve the configured root (post-canonicalization). Useful for
   // tests and the --help output.
   const std::filesystem::path& root() const noexcept;

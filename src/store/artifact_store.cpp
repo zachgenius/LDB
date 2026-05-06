@@ -564,6 +564,145 @@ ArtifactStore::list(std::optional<std::string> build_id,
   return out;
 }
 
+ArtifactRow
+ArtifactStore::import_artifact(std::string_view build_id,
+                               std::string_view name,
+                               const std::vector<std::uint8_t>& bytes,
+                               std::string_view sha256,
+                               std::optional<std::string> format,
+                               const nlohmann::json& meta,
+                               const std::vector<std::string>& tags,
+                               std::int64_t created_at,
+                               bool overwrite) {
+  namespace fs = std::filesystem;
+  std::lock_guard<std::mutex> lk(impl_->mu);
+
+  // Conflict check.
+  std::string existing_path;
+  bool exists = false;
+  {
+    auto sel = impl_->prepare(
+        "SELECT stored_path FROM artifacts "
+        "WHERE build_id = ?1 AND name = ?2;");
+    sqlite3_bind_text(sel.get(), 1, build_id.data(),
+                      static_cast<int>(build_id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(sel.get(), 2, name.data(),
+                      static_cast<int>(name.size()), SQLITE_TRANSIENT);
+    int rc = sqlite3_step(sel.get());
+    if (rc == SQLITE_ROW) {
+      exists = true;
+      auto sp = reinterpret_cast<const char*>(
+          sqlite3_column_text(sel.get(), 0));
+      if (sp) existing_path = sp;
+    } else if (rc != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "import_artifact: pre-check");
+    }
+  }
+  if (exists && !overwrite) {
+    throw backend::Error("artifact_store.import_artifact: already exists: "
+                         + std::string(build_id) + "/" + std::string(name));
+  }
+  if (exists) {
+    auto del = impl_->prepare(
+        "DELETE FROM artifacts WHERE build_id = ?1 AND name = ?2;");
+    sqlite3_bind_text(del.get(), 1, build_id.data(),
+                      static_cast<int>(build_id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(del.get(), 2, name.data(),
+                      static_cast<int>(name.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(del.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "import_artifact: delete prior");
+    }
+    std::error_code ec;
+    if (!existing_path.empty()) fs::remove(existing_path, ec);
+  }
+
+  // sha256 may be empty if the producer didn't declare it; recompute
+  // in that case so the new row carries something meaningful.
+  std::string sha;
+  if (!sha256.empty()) {
+    sha = std::string(sha256);
+  } else {
+    sha = sha256_hex(bytes);
+  }
+  std::string fmt_str  = format.value_or("");
+  std::string meta_str = meta.is_null() ? std::string("{}") : meta.dump();
+
+  std::int64_t new_id = 0;
+  {
+    auto ins = impl_->prepare(
+        "INSERT INTO artifacts(build_id, name, sha256, byte_size, format, "
+        "                      meta, created_at, stored_path) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, '');");
+    sqlite3_bind_text(ins.get(), 1, build_id.data(),
+                      static_cast<int>(build_id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins.get(), 2, name.data(),
+                      static_cast<int>(name.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins.get(), 3, sha.c_str(),
+                      static_cast<int>(sha.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins.get(), 4,
+                       static_cast<sqlite3_int64>(bytes.size()));
+    if (format.has_value()) {
+      sqlite3_bind_text(ins.get(), 5, fmt_str.c_str(),
+                        static_cast<int>(fmt_str.size()), SQLITE_TRANSIENT);
+    } else {
+      sqlite3_bind_null(ins.get(), 5);
+    }
+    sqlite3_bind_text(ins.get(), 6, meta_str.c_str(),
+                      static_cast<int>(meta_str.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins.get(), 7, static_cast<sqlite3_int64>(created_at));
+    if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "import_artifact: insert");
+    }
+    new_id = sqlite3_last_insert_rowid(impl_->db);
+  }
+
+  fs::path blob = impl_->root / "builds" / std::string(build_id)
+                                / "artifacts" / std::to_string(new_id);
+  write_blob_atomic(blob, bytes);
+
+  {
+    auto upd = impl_->prepare(
+        "UPDATE artifacts SET stored_path = ?1 WHERE id = ?2;");
+    auto p = blob.string();
+    sqlite3_bind_text(upd.get(), 1, p.c_str(),
+                      static_cast<int>(p.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(upd.get(), 2, new_id);
+    if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "import_artifact: update stored_path");
+    }
+  }
+
+  // Tags — same INSERT OR IGNORE pattern as add_tags().
+  if (!tags.empty()) {
+    auto ins = impl_->prepare(
+        "INSERT OR IGNORE INTO artifact_tags(artifact_id, tag) "
+        "VALUES(?1, ?2);");
+    for (const auto& t : tags) {
+      sqlite3_reset(ins.get());
+      sqlite3_clear_bindings(ins.get());
+      sqlite3_bind_int64(ins.get(), 1, new_id);
+      sqlite3_bind_text(ins.get(), 2, t.c_str(),
+                        static_cast<int>(t.size()), SQLITE_TRANSIENT);
+      if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+        throw_sqlite(impl_->db, "import_artifact: tag insert");
+      }
+    }
+  }
+
+  ArtifactRow r;
+  r.id          = new_id;
+  r.build_id    = std::string(build_id);
+  r.name        = std::string(name);
+  r.sha256      = std::move(sha);
+  r.byte_size   = bytes.size();
+  r.format      = std::move(format);
+  r.meta        = meta.is_null() ? nlohmann::json::object() : meta;
+  r.tags        = tags;
+  r.created_at  = created_at;
+  r.stored_path = blob.string();
+  return r;
+}
+
 std::vector<std::string>
 ArtifactStore::add_tags(std::int64_t id,
                         const std::vector<std::string>& tags) {

@@ -13,6 +13,7 @@ set(LDBD_SOURCES
   probes/bpftrace_engine.cpp
   store/artifact_store.cpp
   store/session_store.cpp
+  store/pack.cpp
   transport/ssh.cpp
   transport/local_exec.cpp
   transport/streaming_exec.cpp
@@ -36,6 +37,7 @@ target_link_libraries(ldbd PRIVATE
   ldb_json
   ldb_warnings
   SQLite::SQLite3
+  ZLIB::ZLIB
 )
 
 # Project version macros
