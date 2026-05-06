@@ -196,6 +196,17 @@ inline void reset_live_state_locked(LiveSnapshotState& st) {
   st.digests_valid = false;
 }
 
+// Subscribe the backend's module-load listener to a target's broadcaster
+// (slice 1c). Called from attach/launch/connect so snapshot_for_target
+// can later drain dlopen events synchronously.
+inline void subscribe_modules_loaded(lldb::SBListener& listener,
+                                     lldb::SBTarget target) {
+  if (!listener.IsValid() || !target.IsValid()) return;
+  listener.StartListeningForEvents(
+      target.GetBroadcaster(),
+      static_cast<std::uint32_t>(lldb::SBTarget::eBroadcastBitModulesLoaded));
+}
+
 }  // namespace
 
 struct LldbBackend::Impl {
@@ -220,6 +231,21 @@ struct LldbBackend::Impl {
   // detach / kill / close_target. Guarded by `mu`.
   std::unordered_map<TargetId, LiveSnapshotState> live_state;
   std::atomic<TargetId> next_id{1};
+
+  // Dedicated SBListener for module-load notifications (slice 1c —
+  // closes the dlopen-without-resume gap from the 1b reviewer). On
+  // attach/launch we subscribe each target's broadcaster to
+  // SBTarget::eBroadcastBitModulesLoaded; snapshot_for_target drains
+  // any pending events synchronously before computing layout_digest,
+  // so a dlopen between two snapshots invalidates the cache and the
+  // second snapshot's layout_digest reflects the new module set.
+  //
+  // Synchronous drain (rather than a background listener thread)
+  // avoids the lifetime hazards the 1b worker flagged: no thread to
+  // join on dtor, no risk of receiving an event for a target that
+  // was just closed. The cost is a small amount of work on each
+  // snapshot_for_target call, which is dwarfed by the digest hash.
+  lldb::SBListener module_listener;
 
   // Breakpoint callback registry. A separate mutex from `mu` so the
   // hot-path lookup from LLDB's event thread doesn't contend with
@@ -287,6 +313,10 @@ LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
   ensure_lldb_initialized();
   impl_->debugger = lldb::SBDebugger::Create();
   impl_->debugger.SetAsync(false);
+  // Module-load listener (slice 1c). Created up front and reused for
+  // every target's broadcaster — synchronous drain in
+  // snapshot_for_target means we never block on it.
+  impl_->module_listener = lldb::SBListener("ldb.modules_loaded");
   // One-line trace per backend instance is useful for debugging client
   // setup but not for steady-state operation; demoted to debug so
   // --log-level error and the unit-test default (info) stay quiet.
@@ -1339,6 +1369,7 @@ ProcessStatus LldbBackend::launch_process(TargetId tid,
     std::lock_guard<std::mutex> lk(impl_->mu);
     reset_live_state_locked(impl_->live_state[tid]);
   }
+  subscribe_modules_loaded(impl_->module_listener, target);
   return snapshot(proc);
 }
 
@@ -1470,6 +1501,7 @@ ProcessStatus LldbBackend::attach(TargetId tid, std::int32_t pid) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     reset_live_state_locked(impl_->live_state[tid]);
   }
+  subscribe_modules_loaded(impl_->module_listener, target);
   return snapshot(proc);
 }
 
@@ -1592,6 +1624,7 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
     std::lock_guard<std::mutex> lk(impl_->mu);
     reset_live_state_locked(impl_->live_state[tid]);
   }
+  subscribe_modules_loaded(impl_->module_listener, target);
   return snapshot(proc);
 }
 
@@ -3071,6 +3104,68 @@ bool process_is_live(lldb::SBProcess proc) {
 
 }  // namespace
 
+// Drain pending module-load events from `module_listener` and invalidate
+// the layout cache of any target whose broadcaster fired. Called from
+// snapshot_for_target before computing layout_digest so a dlopen between
+// snapshots is reflected in the very next snapshot string (slice 1c —
+// closes the dlopen-without-resume gap from the 1b reviewer).
+//
+// Synchronous drain (rather than a background thread) sidesteps the
+// listener-lifetime hazards the 1b worker flagged. Cost is bounded:
+// dlopen events are infrequent and we drain every snapshot call.
+//
+// Caller MUST hold impl_->mu (we mutate live_state).
+void LldbBackend::drain_module_events_locked() {
+  auto& listener = impl_->module_listener;
+  if (!listener.IsValid()) return;
+  lldb::SBEvent ev;
+  while (listener.GetNextEvent(ev)) {
+    // Find which target's broadcaster matches; invalidate that
+    // target's layout cache. SBEvent::BroadcasterMatchesRef is the
+    // documented matcher; we use SBTarget::EventIsTargetEvent /
+    // GetTargetFromEvent first as a fast path, then fall back.
+    bool matched = false;
+    if (lldb::SBTarget::EventIsTargetEvent(ev)) {
+      auto evt_target = lldb::SBTarget::GetTargetFromEvent(ev);
+      if (evt_target.IsValid()) {
+        for (auto& [tid, tgt] : impl_->targets) {
+          if (tgt.IsValid() &&
+              tgt.GetBroadcaster().GetName() != nullptr &&
+              evt_target.GetBroadcaster().GetName() != nullptr &&
+              std::string_view(tgt.GetBroadcaster().GetName()) ==
+                  std::string_view(evt_target.GetBroadcaster().GetName())) {
+            // Multiple targets can in principle share a broadcaster
+            // name; double-check via BroadcasterMatchesRef.
+            if (ev.BroadcasterMatchesRef(tgt.GetBroadcaster())) {
+              auto it = impl_->live_state.find(tid);
+              if (it != impl_->live_state.end()) {
+                it->second.digests_valid = false;
+                it->second.layout_digest.clear();
+                // reg_digest stays — registers don't change on dlopen.
+              }
+              matched = true;
+            }
+          }
+        }
+      }
+    }
+    if (!matched) {
+      // Generic fallback: walk targets and find a broadcaster match.
+      for (auto& [tid, tgt] : impl_->targets) {
+        if (!tgt.IsValid()) continue;
+        if (ev.BroadcasterMatchesRef(tgt.GetBroadcaster())) {
+          auto it = impl_->live_state.find(tid);
+          if (it != impl_->live_state.end()) {
+            it->second.digests_valid = false;
+            it->second.layout_digest.clear();
+          }
+          break;
+        }
+      }
+    }
+  }
+}
+
 std::string LldbBackend::snapshot_for_target(TargetId tid) {
   // Best-effort metadata: if anything unusual happens (target gone
   // mid-call, SBProcess invalid) we degrade to "none" rather than
@@ -3119,6 +3214,10 @@ std::string LldbBackend::snapshot_for_target(TargetId tid) {
   std::string bp_hex;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
+    // Drain pending dlopen events first — a module-load between two
+    // snapshot calls must invalidate the cached layout digest for that
+    // target (slice 1c).
+    drain_module_events_locked();
     auto& st = impl_->live_state[tid];  // value-init on first sight
     if (!st.digests_valid) {
       st.reg_digest    = compute_reg_digest(proc);

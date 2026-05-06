@@ -34,3 +34,20 @@ target_compile_options(ldb_fix_sleeper PRIVATE
   -fno-omit-frame-pointer
   -fno-eliminate-unused-debug-types
 )
+
+# Slice 1c dlopen-invalidation fixture. Attaches before any DSO
+# beyond libc/libdl is loaded; the harness signals it via SIGUSR1 to
+# trigger the dlopen of libpthread, then re-observes the snapshot's
+# layout_digest.
+add_executable(ldb_fix_dlopener c/dlopener.c)
+set_target_properties(ldb_fix_dlopener PROPERTIES
+  OUTPUT_NAME    dlopener
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+  C_STANDARD     11
+)
+target_compile_options(ldb_fix_dlopener PRIVATE
+  -g -O0
+  -fno-omit-frame-pointer
+  -fno-eliminate-unused-debug-types
+)
+target_link_libraries(ldb_fix_dlopener PRIVATE dl)

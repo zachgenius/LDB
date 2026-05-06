@@ -109,6 +109,12 @@ class LldbBackend final : public DebuggerBackend {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  // Drain module-load events from impl_->module_listener and invalidate
+  // the layout cache of any target whose broadcaster fired. Must be
+  // called with impl_->mu held. Slice 1c — see comment in
+  // lldb_backend.cpp.
+  void drain_module_events_locked();
 };
 
 }  // namespace ldb::backend
