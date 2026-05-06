@@ -14,6 +14,7 @@ set(LDBD_SOURCES
   probes/probe_orchestrator.cpp
   probes/bpftrace_engine.cpp
   store/artifact_store.cpp
+  store/recipe_store.cpp
   store/session_store.cpp
   store/pack.cpp
   transport/ssh.cpp

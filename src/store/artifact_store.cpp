@@ -591,6 +591,50 @@ ArtifactStore::import_artifact(std::string_view build_id,
   return r;
 }
 
+bool ArtifactStore::remove(std::int64_t id) {
+  namespace fs = std::filesystem;
+  std::lock_guard<std::mutex> lk(impl_->mu);
+
+  // Capture stored_path (so we can unlink the blob) and verify the row
+  // exists in one shot. If absent, return false — idempotent semantics
+  // for the recipe.delete caller.
+  std::string stored_path;
+  bool exists = false;
+  {
+    auto sel = impl_->prepare(
+        "SELECT stored_path FROM artifacts WHERE id = ?1;");
+    sqlite3_bind_int64(sel.get(), 1, id);
+    int rc = sqlite3_step(sel.get());
+    if (rc == SQLITE_ROW) {
+      exists = true;
+      auto sp = reinterpret_cast<const char*>(
+          sqlite3_column_text(sel.get(), 0));
+      if (sp) stored_path = sp;
+    } else if (rc != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "remove: select");
+    }
+  }
+  if (!exists) return false;
+
+  // Delete the index row first; ON DELETE CASCADE drops artifact_tags.
+  // Only after the row is gone do we unlink the blob — if the unlink
+  // fails (e.g. permissions), the blob may dangle but the index is
+  // consistent and a future remove() / put() can recover.
+  {
+    auto del = impl_->prepare("DELETE FROM artifacts WHERE id = ?1;");
+    sqlite3_bind_int64(del.get(), 1, id);
+    if (sqlite3_step(del.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "remove: delete");
+    }
+  }
+  if (!stored_path.empty()) {
+    std::error_code ec;
+    fs::remove(stored_path, ec);
+    // Best-effort: a missing file is fine (caller may have rm'd it).
+  }
+  return true;
+}
+
 std::vector<std::string>
 ArtifactStore::add_tags(std::int64_t id,
                         const std::vector<std::string>& tags) {

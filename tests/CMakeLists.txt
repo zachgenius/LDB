@@ -219,6 +219,15 @@ set_tests_properties(smoke_session PROPERTIES
 )
 
 add_test(
+  NAME smoke_recipe
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_recipe PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_probe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe.py"
           "$<TARGET_FILE:ldbd>"

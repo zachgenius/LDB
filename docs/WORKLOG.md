@@ -49,6 +49,48 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 - Tier 2 §5 (native libbpf probe agent) is `⏭ deferred` per the run plan ("no measurement evidence the bpftrace shellout is too slow").
 - Once the daemon grows a push-based event channel, revisit the polling-based `stopped`/`exited` emission in `on_continue` and remove the 5s cap.
 - An `ldb-vscode` extension package (separate slice) would point VS Code at `ldb-dap` automatically and let the user pick "type: ldb" in launch.json without manual `settings.json` editing.
+## 2026-05-07 — post-v0.1 §6: probe recipes (Tier 2)
+
+**Goal:** Ship recipes — named, parameterized RPC sequences extracted
+from session logs and replayable. Storage as `format: "recipe-v1"`
+artifact; agent-facing surface is the six `recipe.*` endpoints plus
+the `artifact.delete` sibling for GC.
+
+**Done:**
+- `feat(store): ArtifactStore::remove + artifact.delete endpoint (Tier 2 §6 prep)` — `1f30b21` on this worktree. `ArtifactStore::remove(id)` drops the row (CASCADE drops tags), unlinks the on-disk blob best-effort, returns true/false rather than throwing on unknown ids. The `artifact.delete` dispatcher entry is a thin wrapper. Tests: 4 new unit cases (round-trip remove, idempotent on unknown id, tolerates missing blob) + smoke trail in `tests/smoke/test_artifact.py` (delete + get-after-delete + idempotent-delete + total-count-drops + bogus-param).
+- `feat(recipes): recipe storage as recipe-v1 artifact + parameter substitution (Tier 2 §6)` — `d29082c`. New `src/store/recipe_store.{h,cpp}` (~280 LOC) with `Recipe`, `RecipeCall`, `RecipeParameter`, `RecipeStore` (façade over `ArtifactStore`), and `substitute_params()`. The recipe envelope is a compact JSON doc stored as the artifact's bytes; meta carries `{recipe_name, description, call_count, parameter_count}` so `list()` doesn't need to read every blob. The "_recipes" build_id keeps recipes addressable and out of normal artifact namespace. 10 unit cases.
+- `feat(recipes): recipe.create / .from_session / .list / .get / .run / .delete endpoints (Tier 2 §6)` — `aa4e546`. Six dispatcher handlers, all routed through `RecipeStore` constructed inline per-call against `artifacts_`. `recipe.run` re-enters `dispatch_inner` per sub-call (skips the per-dispatch session log appender — sub-calls aren't user RPCs). `recipe.from_session` reads the source session via `SessionStore::read_log` (new method), strips the default cosmetic / introspection / session-mgmt set, and emits the surviving calls in seq order. The `describe.endpoints` catalog grows by 6 with proper JSON Schema for params/returns. End-to-end smoke test `tests/smoke/test_recipe.py` covers create + from_session + run with substitution + run with default + run with missing-required + delete + idempotent-delete + 4 negative paths.
+- `docs/08-probe-recipes.md` (new, this commit) — recipe envelope shape, substitution model, error policy, extraction filters, two replay examples, and the closed done-criteria checklist.
+
+**Decisions:**
+- **Storage as a recipe-v1 artifact, not a new sqlite table.** Reuses build-ID-keyed addressing, `.ldbpack` portability, and `artifact.delete` as the GC primitive. The cost is one filtered list query in `RecipeStore::list()`. The "_recipes" synthetic build-id keeps the recipe namespace separate from real binaries' artifacts; the "recipe:" name prefix is a second guard against name collisions.
+- **Whole-string-match parameter substitution.** Substring substitution (`"prefix-{name}-suffix"`) and JSONPath targeting are explicit v0.5 follow-ups. The MVP shape covers the typical case (an entire param value is a substituted token) at zero parser-complexity cost. Documented in `docs/08-probe-recipes.md §Parameter substitution` and inline in the `recipe_store.h` header.
+- **Unknown placeholder names are literals, not errors.** `"{not_a_slot}"` with no matching declared slot passes through verbatim. The alternative would force every recipe author to declare every brace-string they ever write; that's a footgun.
+- **Auto-detection of repeated values during `from_session` deferred.** The brief explicitly allowed deferral; the produced recipe is a literal-replay body with zero slots. The agent re-creates via `recipe.create` to templatize. Marked v0.5 in the doc and worklog.
+- **Stop-on-first-error in `recipe.run`.** A failing `target.open` invalidates every downstream call; continuing wastes RPCs and pollutes the response array. The wrapper itself returns `ok=true` — the failure is per-call. The caller examines `responses[-1]` for the failure. Substitution failures count: an unsupplied required slot fails entry 0 with -32602 before any RPC is dispatched.
+- **`recipe.delete` type-checks the artifact format.** A caller who passes an arbitrary artifact id gets `deleted=false` (idempotent semantic) rather than a wider artifact-store delete. `artifact.delete` is the unchecked sibling for the rare case where the agent really does want to drop a non-recipe by id.
+- **`SessionStore::read_log` is new, not a duplication of `pack.cpp`.** `pack.cpp` does its own sqlite reads inside an export pipeline; recipe.from_session needs a query-only reader with seq-range filtering. Adding the public method keeps the dispatcher out of raw sqlite and gives a future `session.replay` slice (Tier 3) the same primitive. Read-only `sqlite3_open_v2` so we don't conflict with an in-flight Writer.
+- **`RecipeStore` is constructed inline per-handler, not a Dispatcher field.** A façade with one borrowed pointer; no shared lifetime tangle. The Dispatcher constructor signature stays unchanged.
+- **`recipe.run` sub-calls go through `dispatch_inner`, not `dispatch`.** Avoids the per-dispatch session-log appender — sub-calls aren't user-level RPCs and shouldn't pollute the rpc_log of an enclosing session. This also avoids re-entrancy on `active_session_writer_`.
+- **Deferred:** auto-detect parameter slots during `from_session`, recipe versioning beyond `-v1`, recipe diffing, schema-typed slot defaults (only `null` / value pass-through today).
+
+**Surprises / blockers:**
+- **`recipe.from_session` filter semantics.** First implementation stripped the default set unconditionally; smoke test exposed that with `include_methods` set the caller wants control. Settled on: `include_methods` overrides the default strip set (the caller has explicit intent), `exclude_methods` always composes. Documented in the doc + the dispatcher comment block.
+- **`recipe.run` empty-array case.** With zero calls the loop is a no-op and `responses=[]`, `total=0`. Acceptable — `recipe.create` rejects empty `calls`, so this path is only reachable through a bug elsewhere; not worth a special check.
+
+**Verification:**
+- `cmake --build build && ctest --test-dir build --output-on-failure`
+  → **42/42 PASS in ~31s** at HEAD on the worktree (41 → 42, the new entry is `smoke_recipe`; the unit_tests bag grew by 14 cases — 4 new artifact-store remove cases, 10 new recipe-store cases). Build warning-clean against `/opt/llvm-22` (only third_party `nlohmann/json.hpp` warnings, which are pre-existing).
+- TDD trail per commit:
+  - Commit 1: `test_artifact_store.cpp` `remove` cases were added before the implementation; build failed with "no member named 'remove'"; implementation followed; green.
+  - Commit 2: `test_recipe_store.cpp` was added in the same commit as `recipe_store.cpp`; the harness expansion exception in `CLAUDE.md` covers this (no Catch2 file → cmake refuses to configure → can't have a "test fails first then green" cycle without the source file existing). Verified each case: 56 assertions, 10 cases, all green.
+  - Commit 3: `tests/smoke/test_recipe.py` checks `describe.endpoints` for the 6 recipe.* methods first; with no dispatcher routing the test would fail at that gate. Routing + handlers follow; green.
+
+**Sibling slice:** §4 (DAP shim) in a parallel agent's worktree — untouched.
+
+**Deferred:** auto-detect parameter slots during `recipe.from_session`, recipe versioning beyond `-v1`, recipe diffing, slot-type validation at substitution time, substring substitution syntax, JSONPath-style `replaces` targeting.
+
+**Next:** §4 review/merge gate (whatever the sibling agent produced), then Tier 3 §7 (artifact knowledge graph — typed relations) is the natural successor since recipes already store a graph of "this recipe produced these artifacts" implicitly.
 
 ---
 

@@ -336,3 +336,48 @@ TEST_CASE("artifact_store: empty bytes are allowed",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   CHECK(s.read_blob(r).empty());
 }
+
+// Tier 2 §6 (probe recipes) prep: ArtifactStore::remove drops a row
+// AND its on-disk blob AND its tags (FK CASCADE). Recipes will pile up
+// and need a clean delete path; rather than have the recipe layer do
+// raw sqlite, we expose the operation here and reuse it.
+TEST_CASE("artifact_store: remove drops row, blob, and cascades tags",
+          "[store][artifact]") {
+  TmpStoreRoot t;
+  ArtifactStore s(t.root);
+  auto r = s.put("b", "n", bytes_from("payload"),
+                 std::string("recipe-v1"), nlohmann::json{{"k", "v"}});
+  s.add_tags(r.id, {"alpha", "beta"});
+  REQUIRE(fs::exists(r.stored_path));
+  REQUIRE(s.get_by_id(r.id).has_value());
+
+  CHECK(s.remove(r.id) == true);
+
+  CHECK_FALSE(fs::exists(r.stored_path));
+  CHECK_FALSE(s.get_by_id(r.id).has_value());
+  CHECK(s.list(std::nullopt, std::nullopt).empty());
+}
+
+TEST_CASE("artifact_store: remove on missing id returns false",
+          "[store][artifact]") {
+  // No throw — recipe.delete needs an idempotent semantic.
+  TmpStoreRoot t;
+  ArtifactStore s(t.root);
+  CHECK(s.remove(999'999) == false);
+}
+
+TEST_CASE("artifact_store: remove tolerates missing on-disk blob",
+          "[store][artifact]") {
+  // A previously-corrupt store (blob removed out-of-band) must still let
+  // us delete the dangling row; otherwise we have no way to GC it.
+  TmpStoreRoot t;
+  ArtifactStore s(t.root);
+  auto r = s.put("b", "n", bytes_from("p"), std::nullopt,
+                 nlohmann::json::object());
+  std::error_code ec;
+  fs::remove(r.stored_path, ec);
+  REQUIRE_FALSE(fs::exists(r.stored_path));
+
+  CHECK(s.remove(r.id) == true);
+  CHECK_FALSE(s.get_by_id(r.id).has_value());
+}

@@ -10,6 +10,7 @@
 #include "protocol/view.h"
 #include "store/artifact_store.h"
 #include "store/pack.h"
+#include "store/recipe_store.h"
 #include "store/session_store.h"
 #include "transport/ssh.h"
 #include "util/log.h"
@@ -514,6 +515,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "artifact.get")       return handle_artifact_get(req);
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
+    if (req.method == "artifact.delete")    return handle_artifact_delete(req);
     if (req.method == "artifact.export")    return handle_artifact_export(req);
     if (req.method == "artifact.import")    return handle_artifact_import(req);
 
@@ -524,6 +526,13 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "session.info")       return handle_session_info(req);
     if (req.method == "session.export")     return handle_session_export(req);
     if (req.method == "session.import")     return handle_session_import(req);
+
+    if (req.method == "recipe.create")       return handle_recipe_create(req);
+    if (req.method == "recipe.from_session") return handle_recipe_from_session(req);
+    if (req.method == "recipe.list")         return handle_recipe_list(req);
+    if (req.method == "recipe.get")          return handle_recipe_get(req);
+    if (req.method == "recipe.run")          return handle_recipe_run(req);
+    if (req.method == "recipe.delete")       return handle_recipe_delete(req);
 
     if (req.method == "probe.create")       return handle_probe_create(req);
     if (req.method == "probe.events")       return handle_probe_events(req);
@@ -1187,6 +1196,18 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
       obj({{"tags", arr_of(str())}}, {"tags"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
+  add("artifact.delete",
+      "Delete an artifact by id: drops the row, cascades its tags, and "
+      "unlinks the on-disk blob. Idempotent — deleting an already-gone id "
+      "returns deleted=false (not an error). The recipe.delete endpoint "
+      "is the high-level wrapper for recipe-format artifacts.",
+      obj({{"id", int_()}}, {"id"}),
+      obj({
+          {"id",      int_()},
+          {"deleted", bool_()},
+      }, {"id", "deleted"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
   // ============== session.* ==============
 
   add("session.create",
@@ -1349,6 +1370,140 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
             {"policy",   str()},
         }, {"imported", "skipped", "policy"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "high");
+  }
+
+  // ============== recipe.* (Tier 2 §6) ==============
+
+  {
+    auto recipe_param_schema = obj({
+        {"name",    str()},
+        {"type",    enum_str({"string", "integer"})},
+        {"default", obj_open()},   // typed value or null
+    }, {"name"});
+
+    auto recipe_call_schema = obj({
+        {"method", str()},
+        {"params", obj_open("Params object — STRING values matching "
+                            "\"{slot}\" are substituted at recipe.run.")},
+    }, {"method"});
+
+    auto recipe_summary_schema = obj({
+        {"recipe_id",  int_()},
+        {"name",       str()},
+        {"description",str()},
+        {"call_count", int_()},
+        {"created_at", int_()},
+    }, {"recipe_id", "name", "call_count", "created_at"});
+
+    add("recipe.create",
+        "Create a named, parameterized recipe — a reusable RPC sequence "
+        "the agent can replay against fresh inputs. Storage is a "
+        "`recipe-v1` artifact under build_id \"_recipes\"; the recipe_id "
+        "IS the artifact id, so artifact.delete is a valid GC path. "
+        "Parameter substitution is whole-string-match: a STRING value "
+        "in calls[].params equal to \"{slot}\" is replaced with the "
+        "caller's parameter value at recipe.run time.",
+        obj({
+            {"name",        str()},
+            {"description", str()},
+            {"calls",       arr_of(recipe_call_schema)},
+            {"parameters",  arr_of(recipe_param_schema)},
+        }, {"name", "calls"}),
+        obj({
+            {"recipe_id",  int_()},
+            {"name",       str()},
+            {"call_count", int_()},
+        }, {"recipe_id", "name", "call_count"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+    add("recipe.from_session",
+        "Extract a recipe from a session's rpc_log. Filters by "
+        "include_methods / exclude_methods / since_seq / until_seq; "
+        "the default strip-set drops cosmetic / introspection / "
+        "session-mgmt calls. Auto-detection of parameter slots is "
+        "deferred to v0.5; the produced recipe has no slots — call "
+        "recipe.create with parameters to templatize.",
+        obj({
+            {"source_session_id", str()},
+            {"name",              str()},
+            {"description",       str()},
+            {"filter", obj({
+                {"include_methods", arr_of(str())},
+                {"exclude_methods", arr_of(str())},
+                {"since_seq",       int_()},
+                {"until_seq",       int_()},
+            })},
+        }, {"source_session_id", "name"}),
+        obj({
+            {"recipe_id",  int_()},
+            {"name",       str()},
+            {"call_count", int_()},
+        }, {"recipe_id", "name", "call_count"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+    add("recipe.list",
+        "Enumerate every recipe known to this store, ascending id. "
+        "Each entry is a summary — call recipe.get for the full body.",
+        obj({}),
+        obj({
+            {"recipes", arr_of(recipe_summary_schema)},
+            {"total",   int_()},
+        }, {"recipes", "total"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+    add("recipe.get",
+        "Full body of one recipe: parameters and calls, in storage "
+        "order. The calls' params still carry the \"{slot}\" "
+        "placeholders — substitution happens at recipe.run.",
+        obj({{"recipe_id", int_()}}, {"recipe_id"}),
+        obj({
+            {"recipe_id",  int_()},
+            {"name",       str()},
+            {"description",str()},
+            {"call_count", int_()},
+            {"created_at", int_()},
+            {"parameters", arr_of(recipe_param_schema)},
+            {"calls",      arr_of(recipe_call_schema)},
+        }, {"recipe_id", "name", "call_count", "parameters", "calls"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+    add("recipe.run",
+        "Replay a recipe with caller-supplied parameter values. Each "
+        "call is dispatched in storage order; on the FIRST error the "
+        "run stops and returns responses up to and including the "
+        "failure. responses[].seq is 1-based; responses[].method "
+        "mirrors the recipe entry. A missing required parameter "
+        "surfaces as ok=false with kInvalidParams BEFORE any RPC is "
+        "dispatched.",
+        obj({
+            {"recipe_id",  int_()},
+            {"parameters", obj_open(
+                "Map of slot-name → value. Strings and integers are "
+                "the only typed values supported in MVP.")},
+        }, {"recipe_id"}),
+        obj({
+            {"responses", arr_of(obj({
+                {"seq",    int_()},
+                {"method", str()},
+                {"ok",     bool_()},
+                {"data",   obj_open()},
+                {"error",  obj_open()},
+            }, {"seq", "method", "ok"}))},
+            {"total", int_()},
+        }, {"responses", "total"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "unbounded");
+
+    add("recipe.delete",
+        "Drop a recipe by id. Idempotent — deleting an already-gone "
+        "recipe returns deleted=false (not an error). Equivalent to "
+        "artifact.delete on the underlying recipe-v1 artifact, but "
+        "with type-check that refuses non-recipe ids.",
+        obj({{"recipe_id", int_()}}, {"recipe_id"}),
+        obj({
+            {"recipe_id", int_()},
+            {"deleted",   bool_()},
+        }, {"recipe_id", "deleted"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
   }
 
   // ============== probe.* ==============
@@ -2795,6 +2950,38 @@ Response Dispatcher::handle_artifact_tag(const Request& req) {
   return protocol::make_ok(req.id, std::move(data));
 }
 
+// Tier 2 §6 prep: artifact.delete is the GC sibling to artifact.put.
+// Recipes will pile up — without a delete path the only way to remove
+// one is editing the sqlite db by hand. Idempotent: deleting an
+// already-gone id returns {deleted:false} (not an error).
+Response Dispatcher::handle_artifact_delete(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'id'");
+  }
+  bool deleted = artifacts_->remove(id);
+  json data;
+  data["id"]      = id;
+  data["deleted"] = deleted;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
 // mem.dump_artifact — pure composition of mem.read + artifact.put.
 // Reads [len] bytes at [addr] from the live target and persists them to
 // the artifact store under (build_id, name). Same 1 MiB cap as mem.read
@@ -3249,6 +3436,477 @@ Response Dispatcher::handle_artifact_import(const Request& req) {
   // (sessions in the pack, if any, are imported too — matches the
   // simpler "import everything" semantics).
   return handle_session_import(req);
+}
+
+// ----------------------------------------------------------------------------
+// recipe.* — named, parameterized RPC sequences (Tier 2 §6).
+//
+// Recipes promote replayable session traces to first-class objects:
+// extract a useful sequence from one investigation's rpc_log, give it
+// a name and parameter slots, and run it as a single call against new
+// targets / addresses / paths.
+//
+// Storage is a `recipe-v1` artifact (see store/recipe_store.{h,cpp})
+// so we get sqlite indexing, `.ldbpack` portability, and a single
+// delete path (artifact.delete) for free.
+
+namespace {
+
+ldb::store::RecipeParameter
+parse_recipe_parameter(const json& j, std::string* err) {
+  ldb::store::RecipeParameter slot;
+  if (!j.is_object()) {
+    *err = "recipe parameter must be an object";
+    return slot;
+  }
+  auto nit = j.find("name");
+  if (nit == j.end() || !nit->is_string() ||
+      nit->get<std::string>().empty()) {
+    *err = "recipe parameter missing non-empty 'name'";
+    return slot;
+  }
+  slot.name = nit->get<std::string>();
+
+  auto tit = j.find("type");
+  if (tit != j.end() && !tit->is_null()) {
+    if (!tit->is_string()) {
+      *err = "recipe parameter 'type' must be a string";
+      return slot;
+    }
+    slot.type = tit->get<std::string>();
+  } else {
+    slot.type = "string";
+  }
+  if (slot.type != "string" && slot.type != "integer") {
+    *err = "recipe parameter 'type' must be \"string\" or \"integer\"";
+    return slot;
+  }
+
+  auto dit = j.find("default");
+  if (dit != j.end() && !dit->is_null()) {
+    slot.default_value = *dit;
+  }
+  return slot;
+}
+
+ldb::store::RecipeCall
+parse_recipe_call(const json& j, std::string* err) {
+  ldb::store::RecipeCall call;
+  if (!j.is_object()) {
+    *err = "recipe call must be an object";
+    return call;
+  }
+  auto mit = j.find("method");
+  if (mit == j.end() || !mit->is_string() ||
+      mit->get<std::string>().empty()) {
+    *err = "recipe call missing non-empty 'method'";
+    return call;
+  }
+  call.method = mit->get<std::string>();
+  auto pit = j.find("params");
+  if (pit != j.end() && !pit->is_null()) {
+    call.params = *pit;
+  } else {
+    call.params = json::object();
+  }
+  return call;
+}
+
+json recipe_to_summary_json(const ldb::store::Recipe& r) {
+  json j;
+  j["recipe_id"]  = r.id;
+  j["name"]       = r.name;
+  if (r.description.has_value()) j["description"] = *r.description;
+  j["call_count"] = static_cast<std::int64_t>(r.calls.size());
+  j["created_at"] = r.created_at;
+  return j;
+}
+
+json recipe_to_full_json(const ldb::store::Recipe& r) {
+  json j = recipe_to_summary_json(r);
+  json params = json::array();
+  for (const auto& p : r.parameters) {
+    json one;
+    one["name"] = p.name;
+    one["type"] = p.type;
+    if (p.default_value.has_value()) one["default"] = *p.default_value;
+    params.push_back(std::move(one));
+  }
+  j["parameters"] = std::move(params);
+  json calls = json::array();
+  for (const auto& c : r.calls) {
+    json one;
+    one["method"] = c.method;
+    one["params"] = c.params;
+    calls.push_back(std::move(one));
+  }
+  j["calls"] = std::move(calls);
+  return j;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_recipe_create(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name || name->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'name'");
+  }
+  std::optional<std::string> description;
+  if (auto it = req.params.find("description");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'description' must be a string");
+    }
+    description = it->get<std::string>();
+  }
+  auto cit = req.params.find("calls");
+  if (cit == req.params.end() || !cit->is_array() || cit->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty array param 'calls'");
+  }
+  std::vector<ldb::store::RecipeCall> calls;
+  calls.reserve(cit->size());
+  for (const auto& c : *cit) {
+    std::string err;
+    auto call = parse_recipe_call(c, &err);
+    if (!err.empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+    }
+    calls.push_back(std::move(call));
+  }
+  std::vector<ldb::store::RecipeParameter> parameters;
+  if (auto pit = req.params.find("parameters");
+      pit != req.params.end() && !pit->is_null()) {
+    if (!pit->is_array()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'parameters' must be an array");
+    }
+    parameters.reserve(pit->size());
+    for (const auto& p : *pit) {
+      std::string err;
+      auto slot = parse_recipe_parameter(p, &err);
+      if (!err.empty()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+      }
+      parameters.push_back(std::move(slot));
+    }
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  auto r = rs.create(*name, std::move(description),
+                     std::move(parameters), std::move(calls));
+  json data;
+  data["recipe_id"]  = r.id;
+  data["name"]       = r.name;
+  data["call_count"] = static_cast<std::int64_t>(r.calls.size());
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_from_session(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* sid = require_string(req.params, "source_session_id");
+  if (!sid || sid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param "
+                              "'source_session_id'");
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name || name->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'name'");
+  }
+  std::optional<std::string> description;
+  if (auto it = req.params.find("description");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'description' must be a string");
+    }
+    description = it->get<std::string>();
+  }
+
+  // Filter parameters. include_methods + exclude_methods are mutually
+  // composable; since_seq / until_seq are seq-bounds that map directly
+  // to SessionStore::read_log.
+  std::vector<std::string> include;
+  std::vector<std::string> exclude;
+  std::int64_t since_seq = 0;
+  std::int64_t until_seq = 0;
+  if (auto fit = req.params.find("filter");
+      fit != req.params.end() && !fit->is_null()) {
+    if (!fit->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'filter' must be an object");
+    }
+    auto str_array = [&](const char* key, std::vector<std::string>* out)
+        -> std::optional<Response> {
+      auto it = fit->find(key);
+      if (it == fit->end() || it->is_null()) return std::nullopt;
+      if (!it->is_array()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            std::string("'filter.") + key + "' must be an array");
+      }
+      for (const auto& el : *it) {
+        if (!el.is_string()) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+              std::string("'filter.") + key + "' entries must be strings");
+        }
+        out->push_back(el.get<std::string>());
+      }
+      return std::nullopt;
+    };
+    if (auto e = str_array("include_methods", &include)) return *e;
+    if (auto e = str_array("exclude_methods", &exclude)) return *e;
+    if (auto it = fit->find("since_seq");
+        it != fit->end() && !it->is_null()) {
+      if (!it->is_number_integer() && !it->is_number_unsigned()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'filter.since_seq' must be an integer");
+      }
+      since_seq = it->get<std::int64_t>();
+    }
+    if (auto it = fit->find("until_seq");
+        it != fit->end() && !it->is_null()) {
+      if (!it->is_number_integer() && !it->is_number_unsigned()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'filter.until_seq' must be an integer");
+      }
+      until_seq = it->get<std::int64_t>();
+    }
+  }
+
+  auto rows = sessions_->read_log(*sid, since_seq, until_seq);
+  // Strip the cosmetic / introspection / session-mgmt calls. Anything
+  // in the include list bypasses the strip; otherwise drop both
+  // the default strip-set and any caller-supplied excludes.
+  const auto& default_strip = ldb::store::recipe_default_strip_methods();
+  std::vector<ldb::store::RecipeCall> calls;
+  for (const auto& row : rows) {
+    if (!row.ok) continue;  // Failed calls aren't worth replaying.
+    bool in_include = include.empty() ||
+        std::find(include.begin(), include.end(), row.method) != include.end();
+    if (!in_include) continue;
+    bool in_exclude =
+        std::find(exclude.begin(), exclude.end(), row.method) != exclude.end();
+    if (in_exclude) continue;
+    if (include.empty()) {
+      // include not specified — apply the default strip set.
+      bool default_strip_hit =
+          std::find(default_strip.begin(), default_strip.end(), row.method)
+            != default_strip.end();
+      if (default_strip_hit) continue;
+    }
+
+    ldb::store::RecipeCall call;
+    call.method = row.method;
+    // The persisted request_json is the {method, params, id} shape from
+    // dispatch(); we only want params for replay.
+    try {
+      auto req_j = json::parse(row.request_json);
+      if (req_j.is_object() && req_j.contains("params")) {
+        call.params = req_j["params"];
+      } else {
+        call.params = json::object();
+      }
+    } catch (...) {
+      call.params = json::object();
+    }
+    calls.push_back(std::move(call));
+  }
+  if (calls.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "no calls remain after filtering — nothing to extract");
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  // No parameters auto-detected — this is an explicit v0.5 follow-up.
+  // Caller can re-create the recipe with parameters via recipe.create
+  // after inspecting the extracted body.
+  auto r = rs.create(*name, std::move(description), {}, std::move(calls));
+  json data;
+  data["recipe_id"]  = r.id;
+  data["name"]       = r.name;
+  data["call_count"] = static_cast<std::int64_t>(r.calls.size());
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_list(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  ldb::store::RecipeStore rs(*artifacts_);
+  auto recipes = rs.list();
+  json arr = json::array();
+  for (const auto& r : recipes) arr.push_back(recipe_to_summary_json(r));
+  json data;
+  data["recipes"] = std::move(arr);
+  data["total"]   = static_cast<std::int64_t>(recipes.size());
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_get(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("recipe_id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'recipe_id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'recipe_id'");
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  auto r = rs.get(id);
+  if (!r.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              "recipe not found: " + std::to_string(id));
+  }
+  return protocol::make_ok(req.id, recipe_to_full_json(*r));
+}
+
+Response Dispatcher::handle_recipe_delete(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("recipe_id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'recipe_id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'recipe_id'");
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  bool deleted = rs.remove(id);
+  json data;
+  data["recipe_id"] = id;
+  data["deleted"]   = deleted;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_run(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("recipe_id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'recipe_id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'recipe_id'");
+  }
+  json caller_args = json::object();
+  if (auto it = req.params.find("parameters");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'parameters' must be an object");
+    }
+    caller_args = *it;
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  auto r = rs.get(id);
+  if (!r.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              "recipe not found: " + std::to_string(id));
+  }
+
+  // Stop-on-first-error policy. The brief asks for either stop or
+  // continue; stop matches the typical investigation workflow (a
+  // failed target.open invalidates every downstream call) and gives
+  // the agent a clean truncation point. Document the policy in
+  // returns: callers can examine `responses[-1]` to see what failed.
+  json responses = json::array();
+  std::int64_t seq = 0;
+  for (const auto& call : r->calls) {
+    ++seq;
+    auto sub = ldb::store::substitute_params(call.params, r->parameters,
+                                              caller_args);
+    if (!sub.ok) {
+      json entry;
+      entry["seq"]    = seq;
+      entry["method"] = call.method;
+      entry["ok"]     = false;
+      json err;
+      err["code"]    = static_cast<int>(ErrorCode::kInvalidParams);
+      err["message"] = sub.error;
+      entry["error"] = std::move(err);
+      responses.push_back(std::move(entry));
+      break;
+    }
+
+    Request sub_req;
+    sub_req.id     = std::nullopt;  // sub-calls don't need their own ids
+    sub_req.method = call.method;
+    sub_req.params = std::move(sub.params);
+    Response sub_resp = dispatch_inner(sub_req);
+
+    json entry;
+    entry["seq"]    = seq;
+    entry["method"] = call.method;
+    entry["ok"]     = sub_resp.ok;
+    if (sub_resp.ok) {
+      entry["data"] = sub_resp.data;
+    } else {
+      json err;
+      err["code"]    = static_cast<int>(sub_resp.error_code);
+      err["message"] = sub_resp.error_message;
+      if (sub_resp.error_data.has_value()) {
+        err["data"] = *sub_resp.error_data;
+      }
+      entry["error"] = std::move(err);
+    }
+    bool failed = !sub_resp.ok;
+    responses.push_back(std::move(entry));
+    if (failed) break;
+  }
+
+  json data;
+  data["responses"] = std::move(responses);
+  data["total"]     = data["responses"].size();
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 // ----------------------------------------------------------------------------

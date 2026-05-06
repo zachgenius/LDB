@@ -63,12 +63,14 @@ def main():
             if not cond: failures.append(msg)
 
         try:
-            # describe.endpoints must list the four artifact.* methods.
+            # describe.endpoints must list the artifact.* methods, including
+            # artifact.delete (Tier 2 §6 prep).
             r0 = call("describe.endpoints")
             expect(r0["ok"], f"describe.endpoints: {r0}")
             methods = {e["method"] for e in r0["data"]["endpoints"]}
             for m in ("artifact.put", "artifact.get",
-                      "artifact.list", "artifact.tag"):
+                      "artifact.list", "artifact.tag",
+                      "artifact.delete"):
                 expect(m in methods, f"missing endpoint: {m}")
 
             # --- put ----------------------------------------------------
@@ -240,6 +242,36 @@ def main():
             rl_post = call("artifact.list", {})
             expect(rl_post["data"]["total"] == 3,
                    f"replace shouldn't grow total: {rl_post['data']}")
+
+            # --- delete -------------------------------------------------
+            # The replacement we just did has a fresh id; capture it so we
+            # can drop it cleanly.
+            replaced_id = rr["data"]["id"]
+            rd = call("artifact.delete", {"id": replaced_id})
+            expect(rd["ok"], f"artifact.delete: {rd}")
+            expect(rd["data"]["deleted"] is True,
+                   f"delete should report true: {rd['data']}")
+
+            # Get-after-delete should fail.
+            rd_after = call("artifact.get", {"id": replaced_id})
+            expect(not rd_after["ok"],
+                   f"get post-delete should fail: {rd_after}")
+
+            # Delete again is idempotent (deleted=False).
+            rd_again = call("artifact.delete", {"id": replaced_id})
+            expect(rd_again["ok"] and rd_again["data"]["deleted"] is False,
+                   f"delete idempotent: {rd_again}")
+
+            # Total drops by one.
+            rl_post_del = call("artifact.list", {})
+            expect(rl_post_del["data"]["total"] == 2,
+                   f"delete should drop total to 2: {rl_post_del['data']}")
+
+            # Bogus param: id missing.
+            rd_bad = call("artifact.delete", {})
+            expect(not rd_bad["ok"] and
+                   rd_bad.get("error", {}).get("code") == -32602,
+                   f"delete missing id: {rd_bad}")
         finally:
             try:
                 proc.stdin.close()

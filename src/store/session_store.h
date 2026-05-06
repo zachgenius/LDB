@@ -91,6 +91,26 @@ class SessionStore {
   // the natural "what was I just doing" order).
   std::vector<SessionRow> list();
 
+  // Tier 2 §6: one rpc_log row read back from a session's per-db.
+  // recipe.from_session walks these to extract a recipe body.
+  struct LogRow {
+    std::int64_t  seq         = 0;
+    std::int64_t  ts_ns       = 0;
+    std::string   method;
+    std::string   request_json;     // compact JSON as written by Writer::append
+    std::string   response_json;
+    bool          ok          = true;
+    std::int64_t  duration_us = 0;
+  };
+
+  // Read the rpc_log of a session in seq-ascending order. Optional
+  // half-open [since_seq, until_seq) range filter (since_seq=0 means
+  // from the beginning; until_seq=0 means to the end). Throws
+  // backend::Error if the session id doesn't exist.
+  std::vector<LogRow> read_log(std::string_view id,
+                                std::int64_t since_seq = 0,
+                                std::int64_t until_seq = 0);
+
   // Open a per-session writer. The Writer holds its own sqlite handle
   // to the <uuid>.db; multiple Writers on the same id are allowed and
   // both can append (WAL handles it), but the dispatcher only ever

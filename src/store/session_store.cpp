@@ -376,6 +376,80 @@ std::vector<SessionRow> SessionStore::list() {
   return out;
 }
 
+std::vector<SessionStore::LogRow>
+SessionStore::read_log(std::string_view id,
+                       std::int64_t since_seq,
+                       std::int64_t until_seq) {
+  std::filesystem::path session_path;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto stmt = prepare_or_throw(impl_->index_db,
+        "SELECT path FROM sessions WHERE id = ?1;");
+    sqlite3_bind_text(stmt.get(), 1, id.data(),
+                      static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE) {
+      throw backend::Error("session_store.read_log: no such id: " +
+                           std::string(id));
+    }
+    if (rc != SQLITE_ROW) throw_sqlite(impl_->index_db, "read_log");
+    auto p = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    session_path = p ? p : "";
+  }
+  // Open read-only — read_log is a query path; the writer (if any) holds
+  // its own handle and WAL lets us read concurrently without contention.
+  sqlite3* db = nullptr;
+  int rc = sqlite3_open_v2(session_path.c_str(), &db,
+                           SQLITE_OPEN_READONLY, nullptr);
+  if (rc != SQLITE_OK) {
+    if (db) sqlite3_close(db);
+    throw backend::Error("session_store.read_log: open " +
+                         session_path.string());
+  }
+  std::string sql =
+      "SELECT seq, ts_ns, method, request, response, ok, duration_us "
+      "FROM rpc_log";
+  bool has_since = (since_seq > 0);
+  bool has_until = (until_seq > 0);
+  if (has_since || has_until) sql += " WHERE";
+  if (has_since)               sql += " seq >= ?1";
+  if (has_since && has_until)  sql += " AND";
+  if (has_until)               sql += has_since ? " seq < ?2" : " seq < ?1";
+  sql += " ORDER BY seq ASC;";
+
+  auto stmt = prepare_or_throw(db, sql);
+  int bind_idx = 1;
+  if (has_since) sqlite3_bind_int64(stmt.get(), bind_idx++, since_seq);
+  if (has_until) sqlite3_bind_int64(stmt.get(), bind_idx++, until_seq);
+
+  std::vector<LogRow> out;
+  for (;;) {
+    int step = sqlite3_step(stmt.get());
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      sqlite3_close(db);
+      throw_sqlite(db, "read_log step");
+    }
+    LogRow r;
+    r.seq         = sqlite3_column_int64(stmt.get(), 0);
+    r.ts_ns       = sqlite3_column_int64(stmt.get(), 1);
+    auto m        = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt.get(), 2));
+    auto req      = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt.get(), 3));
+    auto rsp      = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt.get(), 4));
+    r.method       = m   ? m   : "";
+    r.request_json = req ? req : "{}";
+    r.response_json= rsp ? rsp : "{}";
+    r.ok           = sqlite3_column_int(stmt.get(), 5) != 0;
+    r.duration_us  = sqlite3_column_int64(stmt.get(), 6);
+    out.push_back(std::move(r));
+  }
+  sqlite3_close(db);
+  return out;
+}
+
 void SessionStore::import_session(std::string_view id,
                                   std::string_view name,
                                   std::optional<std::string> target_id,
