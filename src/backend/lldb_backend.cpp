@@ -230,6 +230,12 @@ struct LldbBackend::Impl {
   // bumped by continue_process / step_thread, invalidated by
   // detach / kill / close_target. Guarded by `mu`.
   std::unordered_map<TargetId, LiveSnapshotState> live_state;
+  // Tier 3 §9 — per-target labels. `labels` maps target_id → label;
+  // `label_owners` is the inverse (label → target_id) used to enforce
+  // string uniqueness in O(1). Both protected by `mu` (no second mutex
+  // — the dispatcher is single-threaded today and the maps are tiny).
+  std::unordered_map<TargetId, std::string>      labels;
+  std::unordered_map<std::string, TargetId>      label_owners;
   std::atomic<TargetId> next_id{1};
 
   // Dedicated SBListener for module-load notifications (slice 1c —
@@ -2812,6 +2818,11 @@ void LldbBackend::close_target(TargetId tid) {
     }
     impl_->core_sha256.erase(tid);
     impl_->live_state.erase(tid);
+    // §9 — drop the label so its string becomes available for reuse.
+    if (auto lit = impl_->labels.find(tid); lit != impl_->labels.end()) {
+      impl_->label_owners.erase(lit->second);
+      impl_->labels.erase(lit);
+    }
   }
   // Reap any breakpoint-callback records associated with this target.
   // The target's SBBreakpoints go away with DeleteTarget; the records
@@ -2828,6 +2839,104 @@ void LldbBackend::close_target(TargetId tid) {
   // Drop resources in reverse-attach order. Tearing down LAST so the
   // SBTarget delete doesn't try to talk to a dead remote first.
   while (!resources.empty()) resources.pop_back();
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3 §9 — multi-binary inventory.
+
+std::vector<TargetInfo> LldbBackend::list_targets() {
+  // Snapshot the (id, target, label) tuples under the lock; query LLDB
+  // for the per-target metadata (triple, executable path, has_process)
+  // OUTSIDE the lock — those calls reach into LLDB and we'd rather not
+  // hold `mu` across them.
+  struct Pin {
+    TargetId tid;
+    lldb::SBTarget target;
+    std::optional<std::string> label;
+  };
+  std::vector<Pin> pinned;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    pinned.reserve(impl_->targets.size());
+    for (const auto& [tid, tgt] : impl_->targets) {
+      Pin p{tid, tgt, std::nullopt};
+      if (auto it = impl_->labels.find(tid); it != impl_->labels.end()) {
+        p.label = it->second;
+      }
+      pinned.push_back(std::move(p));
+    }
+  }
+
+  std::vector<TargetInfo> out;
+  out.reserve(pinned.size());
+  for (auto& p : pinned) {
+    TargetInfo ti;
+    ti.target_id = p.tid;
+    ti.label     = std::move(p.label);
+    if (p.target.IsValid()) {
+      if (const char* tr = p.target.GetTriple()) ti.triple = tr;
+      // Executable path via SBTarget::GetExecutable() → SBFileSpec.
+      // Same shape as convert_module's path read; absent for empty /
+      // core-only targets.
+      auto file = p.target.GetExecutable();
+      if (file.IsValid()) {
+        char buf[4096];
+        if (file.GetPath(buf, sizeof(buf)) > 0) ti.path = buf;
+      }
+      auto proc = p.target.GetProcess();
+      if (proc.IsValid()) {
+        auto state = proc.GetState();
+        ti.has_process = state != lldb::eStateInvalid &&
+                         state != lldb::eStateUnloaded &&
+                         state != lldb::eStateExited &&
+                         state != lldb::eStateDetached;
+      }
+    }
+    out.push_back(std::move(ti));
+  }
+  // Stable order — sort by ascending target_id so the agent can rely on
+  // a deterministic enumeration.
+  std::sort(out.begin(), out.end(),
+            [](const TargetInfo& a, const TargetInfo& b) {
+              return a.target_id < b.target_id;
+            });
+  return out;
+}
+
+void LldbBackend::label_target(TargetId tid, std::string label) {
+  if (label.empty()) {
+    throw Error("label_target: label must be non-empty");
+  }
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  if (impl_->targets.find(tid) == impl_->targets.end()) {
+    throw Error("label_target: unknown target_id");
+  }
+  // Conflict: label string already owned by someone else.
+  if (auto own = impl_->label_owners.find(label);
+      own != impl_->label_owners.end() && own->second != tid) {
+    throw Error("label_target: label \"" + label +
+                "\" already taken by target_id " +
+                std::to_string(own->second));
+  }
+  // Same target re-labelling: free the old name first so the new one
+  // can replace it cleanly.
+  if (auto it = impl_->labels.find(tid); it != impl_->labels.end()) {
+    if (it->second == label) return;  // self-relabel, no-op
+    impl_->label_owners.erase(it->second);
+    it->second = label;
+    impl_->label_owners[label] = tid;
+    return;
+  }
+  impl_->labels.emplace(tid, label);
+  impl_->label_owners.emplace(std::move(label), tid);
+}
+
+std::optional<std::string> LldbBackend::get_target_label(TargetId tid) {
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  if (auto it = impl_->labels.find(tid); it != impl_->labels.end()) {
+    return it->second;
+  }
+  return std::nullopt;
 }
 
 namespace {

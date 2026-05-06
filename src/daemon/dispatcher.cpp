@@ -489,6 +489,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
       return handle_target_connect_remote_ssh(req);
     if (req.method == "target.load_core")   return handle_target_load_core(req);
     if (req.method == "target.close")       return handle_target_close(req);
+    if (req.method == "target.list")        return handle_target_list(req);
+    if (req.method == "target.label")       return handle_target_label(req);
     if (req.method == "module.list")        return handle_module_list(req);
     if (req.method == "type.layout")        return handle_type_layout(req);
     if (req.method == "symbol.find")        return handle_symbol_find(req);
@@ -541,6 +543,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "session.export")     return handle_session_export(req);
     if (req.method == "session.import")     return handle_session_import(req);
     if (req.method == "session.diff")       return handle_session_diff(req);
+    if (req.method == "session.targets")    return handle_session_targets(req);
 
     if (req.method == "recipe.create")       return handle_recipe_create(req);
     if (req.method == "recipe.from_session") return handle_recipe_from_session(req);
@@ -789,6 +792,50 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   add("target.close", "Drop a target.",
       obj({{"target_id", target_id_param()}}, {"target_id"}),
       obj({{"closed", bool_()}}, {"closed"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
+
+  add("target.list",
+      "Enumerate every open target in the daemon. Each entry carries "
+      "target_id, triple, executable path (when derivable), optional "
+      "label (target.label), has_process bit, and snapshot string. "
+      "Order is ascending by target_id (deterministic). Tier 3 §9 — "
+      "the agent-side companion to target.open's opaque target_id.",
+      obj({{"view", view_param()}}),
+      obj({
+          {"targets", arr_of(obj({
+              {"target_id",   uint_min(1)},
+              {"triple",      str()},
+              {"path",        str("Executable path on disk; empty for "
+                                  "empty / core-only targets.")},
+              {"label",       str("Set by target.label; absent if "
+                                  "unlabelled.")},
+              {"has_process", bool_("True iff a live process is "
+                                    "attached or launched.")},
+              {"snapshot",    str("Same value snapshot_for_target "
+                                  "produces for the dispatcher's "
+                                  "_provenance.snapshot.")},
+          }, {"target_id", "triple", "has_process"}))},
+          {"total",       uint_()},
+          {"next_offset", uint_()},
+      }, {"targets", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("target.label",
+      "Set a stable, daemon-process-scoped label on a target. Labels are "
+      "globally unique across open targets — relabeling another target "
+      "to a label already in use returns -32602 with the conflicting "
+      "owner in the message. Re-labeling the same target with a new "
+      "string replaces the old name; same string is a no-op. Labels die "
+      "with target.close (no cross-restart persistence — Tier 3 §9 "
+      "scope).",
+      obj({
+          {"target_id", target_id_param()},
+          {"label",     str("Non-empty string; uniqueness enforced.")},
+      }, {"target_id", "label"}),
+      obj({
+          {"target_id", uint_min(1)},
+          {"label",     str()},
+      }, {"target_id", "label"}),
       /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
   // ============== static analysis ==============
@@ -1396,6 +1443,32 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"next_offset", int_()},
       }, {"summary", "entries", "total"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "unbounded");
+
+  add("session.targets",
+      "List the distinct target_ids a session has interacted with, with "
+      "per-target call_count and the seq window of those calls. Mines "
+      "the rpc_log; rows without params.target_id (hello, "
+      "describe.endpoints, session.* themselves) are filtered out. "
+      "Labels are enriched from the live backend state when the target "
+      "is still open — closed targets appear without a label. Tier 3 "
+      "§9.",
+      obj({
+          {"session_id", str("32-hex session id from session.create.")},
+          {"view",       view_param()},
+      }, {"session_id"}),
+      obj({
+          {"targets", arr_of(obj({
+              {"target_id",  uint_min(1)},
+              {"label",      str("Live label if the target is still "
+                                 "open; absent otherwise.")},
+              {"call_count", int_()},
+              {"first_seq",  int_()},
+              {"last_seq",   int_()},
+          }, {"target_id", "call_count", "first_seq", "last_seq"}))},
+          {"total",       uint_()},
+          {"next_offset", uint_()},
+      }, {"targets", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   // ============== session.export / .import — `.ldbpack` (M5 part 5) ====
 
@@ -2129,6 +2202,68 @@ Response Dispatcher::handle_target_close(const Request& req) {
   }
   backend_->close_target(static_cast<backend::TargetId>(tid));
   return protocol::make_ok(req.id, json{{"closed", true}});
+}
+
+Response Dispatcher::handle_target_list(const Request& req) {
+  // params is optional (only carries `view`); accept null/missing as
+  // empty-object equivalent. view::parse_from_params already tolerates
+  // a non-object input.
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  auto infos = backend_->list_targets();
+
+  json arr = json::array();
+  for (const auto& t : infos) {
+    json j;
+    j["target_id"]   = t.target_id;
+    j["triple"]      = t.triple;
+    if (!t.path.empty()) j["path"] = t.path;
+    if (t.label.has_value()) j["label"] = *t.label;
+    j["has_process"] = t.has_process;
+    // Best-effort snapshot string. snapshot_for_target is documented as
+    // never-throw; the dispatcher already calls it on every successful
+    // response for `_provenance.snapshot`. Cheap to compute here too.
+    auto snap = backend_->snapshot_for_target(t.target_id);
+    if (!snap.empty()) j["snapshot"] = std::move(snap);
+    arr.push_back(std::move(j));
+  }
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "targets"));
+}
+
+Response Dispatcher::handle_target_label(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* label = require_string(req.params, "label");
+  if (!label || label->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'label'");
+  }
+  // Conflict (label already taken by another target) is the
+  // documented -32602 path — translate the backend's typed Error into
+  // kInvalidParams so the agent can branch on "label collision" without
+  // string-matching the message. Truly unknown target_id stays
+  // -32000 (handled by the outer catch).
+  try {
+    backend_->label_target(static_cast<backend::TargetId>(tid), *label);
+  } catch (const backend::Error& e) {
+    std::string msg = e.what();
+    if (msg.find("already taken") != std::string::npos ||
+        msg.find("must be non-empty") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, msg);
+    }
+    throw;
+  }
+  json data;
+  data["target_id"] = tid;
+  data["label"]     = *label;
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_module_list(const Request& req) {
@@ -3578,6 +3713,43 @@ Response Dispatcher::handle_session_diff(const Request& req) {
   paged["summary"]    = std::move(summary);
 
   return protocol::make_ok(req.id, std::move(paged));
+}
+
+Response Dispatcher::handle_session_targets(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* sid = require_string(req.params, "session_id");
+  if (!sid || sid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'session_id'");
+  }
+  // extract_target_ids throws backend::Error on unknown id; the outer
+  // dispatch() catch maps that to -32000.
+  auto buckets = sessions_->extract_target_ids(*sid);
+
+  json arr = json::array();
+  for (const auto& b : buckets) {
+    json j;
+    j["target_id"]  = b.target_id;
+    j["call_count"] = b.call_count;
+    j["first_seq"]  = b.first_seq;
+    j["last_seq"]   = b.last_seq;
+    // Enrich with the *current* label if the target is still open.
+    // Closed targets simply don't carry one — see worklog: labels are
+    // daemon-process-scoped and die with close_target.
+    if (auto lbl = backend_->get_target_label(
+            static_cast<backend::TargetId>(b.target_id));
+        lbl.has_value()) {
+      j["label"] = *lbl;
+    }
+    arr.push_back(std::move(j));
+  }
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "targets"));
 }
 
 // ----------------------------------------------------------------------------

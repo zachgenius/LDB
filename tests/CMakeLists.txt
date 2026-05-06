@@ -237,6 +237,17 @@ set_tests_properties(smoke_session_diff PROPERTIES
 )
 
 add_test(
+  NAME smoke_multi_binary
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_multi_binary.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_multi_binary PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_recipe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe.py"
           "$<TARGET_FILE:ldbd>"

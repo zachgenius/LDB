@@ -43,6 +43,28 @@ struct OpenResult {
   std::vector<Module> modules;    // typically the executable itself
 };
 
+// Per-target inventory entry — what `target.list` returns. Tier 3 §9.
+//
+// Daemon-process scoped: labels exist only while the target is open and
+// die with `close_target`. Cross-restart persistence is explicitly out
+// of scope (see worklog).
+//
+// `path` is the executable on disk if derivable (set for any target
+// created via open_executable; empty for empty / core-only targets where
+// no file backs the SBTarget). `triple` is whatever
+// `SBTarget::GetTriple()` reports — best-effort string.
+//
+// `has_process` is the cheap "is something attached/launched here right
+// now" bit; agents use it to gate process.* calls without a full
+// process.state round-trip.
+struct TargetInfo {
+  TargetId                    target_id   = 0;
+  std::string                 triple;
+  std::string                 path;        // "" if not derivable
+  std::optional<std::string>  label;
+  bool                        has_process = false;
+};
+
 struct Field {
   std::string name;
   std::string type_name;          // best-effort; whatever DWARF reports
@@ -612,6 +634,36 @@ class DebuggerBackend {
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;
+
+  // --- Multi-binary inventory (Tier 3 §9) -------------------------------
+  //
+  // `list_targets` enumerates every open target in the daemon's process,
+  // best-effort decorating with executable path, triple, optional label,
+  // and the `has_process` bit. Order is implementation-defined; agents
+  // sort client-side if they need a stable view.
+  //
+  // `label_target` stores a daemon-process-scoped label for a target.
+  // Constraints:
+  //   • label must be non-empty.
+  //   • label uniqueness is enforced across open targets — a second
+  //     target trying to claim a label already owned by another target
+  //     throws backend::Error. The error message includes the conflicting
+  //     target_id so the dispatcher can surface it usefully.
+  //   • Re-labeling the same target with a different label replaces the
+  //     previous label (releases the old name) — single label per target.
+  //   • Self-relabel with the same string is a no-op.
+  //
+  // `get_target_label` returns the current label or nullopt. Calling on
+  // an unknown target_id (e.g. one that was just closed) returns nullopt
+  // rather than throwing — get/list is the read path, expected to race
+  // benignly with close_target.
+  //
+  // `close_target` drops the label (it does NOT survive). This is the
+  // documented persistence boundary; cross-restart persistence is out
+  // of scope for §9.
+  virtual std::vector<TargetInfo> list_targets() = 0;
+  virtual void label_target(TargetId tid, std::string label) = 0;
+  virtual std::optional<std::string> get_target_label(TargetId tid) = 0;
 
   // --- Provenance ------------------------------------------------------
   //

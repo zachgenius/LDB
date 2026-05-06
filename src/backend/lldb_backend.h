@@ -101,6 +101,10 @@ class LldbBackend final : public DebuggerBackend {
 
   void close_target(TargetId tid) override;
 
+  std::vector<TargetInfo> list_targets() override;
+  void label_target(TargetId tid, std::string label) override;
+  std::optional<std::string> get_target_label(TargetId tid) override;
+
   std::string snapshot_for_target(TargetId tid) override;
 
   void attach_target_resource(TargetId tid,
