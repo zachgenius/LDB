@@ -50,12 +50,6 @@ bool any_named(const std::vector<GlobalVarMatch>& v, const std::string& n) {
                      [&](const GlobalVarMatch& g) { return g.name == n; });
 }
 
-const GlobalVarMatch* find_named(const std::vector<GlobalVarMatch>& v,
-                                 const std::string& n) {
-  for (const auto& g : v) if (g.name == n) return &g;
-  return nullptr;
-}
-
 }  // namespace
 
 TEST_CASE("globals_of_type: exact match on a struct type returns the lone "

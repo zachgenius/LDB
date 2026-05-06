@@ -4,6 +4,34 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §12: semantic queries v1, scoped to static.globals_of_type (Tier 3)
+
+**Goal:** Ship one semantic query — globals filtered by type — using DWARF + SBValue introspection. heap walk, mutex graph, dataflow queries deferred to v0.5+ per the roadmap.
+
+**Done:**
+- `src/backend/debugger_backend.h` / `lldb_backend.{h,cpp}` — new `GlobalVarMatch` struct (name, type, file/load address, size, owning module, declaration file/line) and `find_globals_of_type(target_id, type_name, strict_out&)` virtual on `DebuggerBackend`. LldbBackend impl uses `SBTarget::FindGlobalVariables(".*", cap, eMatchTypeRegex)` for the catalogue, then a two-pass match: exact `SBValue::GetTypeName()` first, substring fallback (plain `find`, no regex) only if exact returns empty. `kGlobalsOfTypeMaxMatches=10000` caps the enumeration. 8 unit cases / 44 assertions in `tests/unit/test_backend_globals_of_type.cpp`. Commit `55e51fa`.
+- `src/daemon/{describe_schema.h,dispatcher.{h,cpp}}` — `static.globals_of_type` endpoint with full draft-2020-12 schema in `describe.endpoints` (`requires_target=true`, `requires_stopped=false`, `cost_hint=medium`). Wire shape `{globals, total, type_match_strict, truncated?}` with `view::apply_to_array` on `globals`. `global_var_match_to_json` next to `symbol_match_to_json`; `global_var_match_def()` helper added to `describe_schema.h`. Empty-`type_name` and missing-`type_name` both → `-32602`. Smoke `tests/smoke/test_static_globals.py` (TIMEOUT 30) drives all six positive/negative paths against the structs fixture.
+
+**Decisions:**
+- **Type-name canonical form: SBValue::GetTypeName() verbatim.** On Linux LLVM 18+ that means `point2` (no `struct ` prefix), `const char *const` for the user's typedef idiom, `int[4]` for fixed arrays. Tests pin against this exact form. Documented in the struct comment so an agent never has to guess.
+- **Exact-then-substring policy.** If an exact-match pass returns ≥1 hit, return those and surface `type_match_strict=true`. Otherwise fall back to plain substring `find` over the type name and surface `false`. Regex matching deferred — would invite the agent to type `\.*\.` and gum up the cap.
+- **Cap on enumeration: 10000.** Per the brief. Real binaries (~50k globals across glibc + SOs) finish well below that for any single regex pass; well within the daemon's request budget. Result-size hitting the cap surfaces `truncated=true` in the response.
+- **One semantic query, not four.** Per the brief and the roadmap. `heap.objects_of_type` would need glibc `malloc_chunk` walking; `mutex.lock_graph` would need pthread internals; `string.flow_to` and `thread.blockers` need real dataflow analysis. All deferred to v0.5+.
+- **Function-local statics not surfaced.** `FindGlobalVariables` returns DWARF `DW_TAG_variable`s at TU scope; function-local statics live under `DW_TAG_subprogram` and are filtered out by SBAPI. Sane default; matches the endpoint's "global" branding.
+
+**Surprises / blockers:**
+- `target.FindGlobalVariables(".*", max)` (the no-MatchType overload) treats `name` as a literal identifier and returns nothing. The MatchType overload with `eMatchTypeRegex` is required to enumerate the whole catalogue in one pass. Documented in the impl comment.
+
+**Verification:** ctest 47/47 PASS on this worktree branch (`worktree-agent-a2be49b89151f4ece`), ~33s wall clock. Was 46/46 at master HEAD `c694a3c`; +1 is `smoke_static_globals`. Build first-party warning-clean (the only `-Wnull-dereference` warnings come from pre-existing `third_party/nlohmann/json.hpp` — same as every other slice).
+
+**Sibling slice:** §10 cross-binary correlation (parallel agent).
+
+**Deferred:** `heap.objects_of_type`, `mutex.lock_graph`, `string.flow_to`, `thread.blockers`, regex type matching, typedef aliasing across modules, DWARF type-hash-keyed cross-binary correlation (that's §10's territory).
+
+**Next:** Whatever the lead picks up after §10 / §12 land. The roadmap row is "v0.5 → v1.0" so the deferred list above is on the runway.
+
+---
+
 ## 2026-05-07 — post-v0.1 §9: multi-binary sessions (Tier 3)
 
 **Goal:** Inventory + naming for multi-target sessions. `target.list`, `target.label`, `session.targets`. Cross-target join queries (§10) explicitly out of scope.

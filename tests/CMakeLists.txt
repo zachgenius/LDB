@@ -228,6 +228,16 @@ set_tests_properties(smoke_session PROPERTIES
 )
 
 add_test(
+  NAME smoke_static_globals
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_static_globals.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_static_globals PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_session_diff
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_session_diff.py"
           "$<TARGET_FILE:ldbd>"

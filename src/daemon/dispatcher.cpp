@@ -209,6 +209,22 @@ json string_match_to_json(const backend::StringMatch& s) {
   return j;
 }
 
+// Tier 3 §12 — globals-of-type wire shape. `addr` is the file (un-
+// relocated) address; `load_addr` only present when the target has an
+// attached process so the agent can pipe straight into mem.read.
+json global_var_match_to_json(const backend::GlobalVarMatch& g) {
+  json j;
+  j["name"]      = g.name;
+  j["type"]      = g.type;
+  j["addr"]      = g.file_address;
+  j["sz"]        = g.size;
+  j["module"]    = g.module;
+  if (g.load_address.has_value()) j["load_addr"] = *g.load_address;
+  if (!g.file.empty())            j["file"]      = g.file;
+  if (g.line > 0)                 j["line"]      = g.line;
+  return j;
+}
+
 json symbol_match_to_json(const backend::SymbolMatch& s) {
   json j;
   j["name"]    = s.name;
@@ -499,6 +515,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "disasm.function")    return handle_disasm_function(req);
     if (req.method == "xref.addr")          return handle_xref_addr(req);
     if (req.method == "string.xref")        return handle_string_xref(req);
+    if (req.method == "static.globals_of_type")
+      return handle_static_globals_of_type(req);
 
     if (req.method == "process.launch")     return handle_process_launch(req);
     if (req.method == "process.state")      return handle_process_state(req);
@@ -946,6 +964,37 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
           {{"StringEntry", string_entry_def()},
            {"XrefMatch",   xref_match_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "high");
+
+  add("static.globals_of_type",
+      "Tier 3 §12 — semantic queries v1. Find every global variable in "
+      "the target whose DWARF type matches `type_name`. Matching policy: "
+      "exact match against SBValue::GetTypeName() first; if no exact "
+      "hit, fall back to substring match (plain find, no regex) and "
+      "surface `type_match_strict=false`. Result count is capped; "
+      "`truncated=true` flags the rare case where a hostile or huge "
+      "binary fills the cap. heap.objects_of_type / mutex.lock_graph / "
+      "string.flow_to / thread.blockers are deferred to v0.5+ — they "
+      "need glibc / pthread internals or substantial dataflow analysis. "
+      "Type-name canonical form is whatever the host LLDB reports; on "
+      "Linux LLVM 18+ that means bare struct/typedef names (no `struct "
+      "` prefix), `const char *const`, `int[4]`.",
+      obj({
+          {"target_id", target_id_param()},
+          {"type_name", str("DWARF type name; canonical form is "
+                            "SBValue::GetTypeName() output.")},
+          {"view",      view_param()},
+      }, {"target_id", "type_name"}),
+      with_defs(obj({
+          {"globals",            arr_of(ref("GlobalVarMatch"))},
+          {"total",              uint_()},
+          {"next_offset",        uint_()},
+          {"type_match_strict",  bool_("False iff results came from the "
+                                       "substring fallback.")},
+          {"truncated",          bool_("Present and true only when the "
+                                       "result count hit the backend cap.")},
+      }, {"globals", "type_match_strict"}),
+          {{"GlobalVarMatch", global_var_match_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   // ============== process.* ==============
 
@@ -2986,6 +3035,47 @@ Response Dispatcher::handle_type_layout(const Request& req) {
   } else {
     data["found"]  = false;
   }
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_static_globals_of_type(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* type_name = require_string(req.params, "type_name");
+  if (!type_name) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'type_name'");
+  }
+  if (type_name->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'type_name' must be non-empty");
+  }
+
+  auto view_spec = protocol::view::parse_from_params(req.params);
+
+  bool strict = false;
+  auto matches = backend_->find_globals_of_type(
+      static_cast<backend::TargetId>(tid), *type_name, strict);
+
+  // Cap-aware truncation hint. The cap value is wired through the
+  // backend; matching the constant here would couple the dispatcher to
+  // the backend cap, so we surface it via the result-size threshold.
+  bool truncated = matches.size() >= backend::kGlobalsOfTypeMaxMatches;
+
+  json arr = json::array();
+  for (const auto& g : matches) arr.push_back(global_var_match_to_json(g));
+
+  json data = protocol::view::apply_to_array(
+      std::move(arr), view_spec, "globals");
+  data["type_match_strict"] = strict;
+  if (truncated) data["truncated"] = true;
   return protocol::make_ok(req.id, std::move(data));
 }
 
