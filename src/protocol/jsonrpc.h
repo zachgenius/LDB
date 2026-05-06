@@ -24,6 +24,11 @@ enum class ErrorCode : int {
   kNotImplemented  = -32001,
   kBadState        = -32002,
   kForbidden       = -32003,
+  // -32011: client's `protocol_min` (sent in `hello`) is outside the
+  // range this daemon serves. Distinct from kInvalidParams (the param
+  // was well-formed but the requested version isn't servable). See
+  // docs/05-protocol-versioning.md.
+  kProtocolVersionMismatch = -32011,
 };
 
 struct Request {

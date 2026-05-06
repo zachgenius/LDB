@@ -5,6 +5,7 @@ set(LDBD_SOURCES
   daemon/stdio_loop.cpp
   daemon/dispatcher.cpp
   protocol/jsonrpc.cpp
+  protocol/version.cpp
   protocol/cost.cpp
   protocol/provenance.cpp
   protocol/transport.cpp
