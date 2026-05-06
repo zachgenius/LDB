@@ -9,6 +9,7 @@ set(LDB_UNIT_SOURCES
   test_sqlite_connectivity.cpp
   test_protocol_jsonrpc.cpp
   test_protocol_version.cpp
+  test_dispatcher_hello.cpp
   test_protocol_cost.cpp
   test_protocol_cbor.cpp
   test_protocol_view.cpp

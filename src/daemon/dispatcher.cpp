@@ -3,6 +3,7 @@
 #include "backend/debugger_backend.h"
 #include "daemon/describe_schema.h"
 #include "ldb/version.h"
+#include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
 #include "probes/probe_orchestrator.h"
@@ -555,12 +556,41 @@ Response Dispatcher::dispatch_inner(const Request& req) {
 // ---- Handlers --------------------------------------------------------------
 
 Response Dispatcher::handle_hello(const Request& req) {
+  // Optional version handshake: a client that wants to fail fast on a
+  // too-old daemon sends `params.protocol_min = "<major>.<minor>"`. We
+  // satisfy iff our current version >= the requested floor; otherwise
+  // -32011 kProtocolVersionMismatch. Malformed strings (or non-string
+  // types) → -32602 kInvalidParams. See docs/05-protocol-versioning.md.
+  if (req.params.is_object() && req.params.contains("protocol_min")) {
+    const auto& pm = req.params["protocol_min"];
+    if (!pm.is_string()) {
+      return protocol::make_err(
+          req.id, ErrorCode::kInvalidParams,
+          "params.protocol_min must be a string of the form \"<major>.<minor>\"");
+    }
+    auto requested = protocol::parse_protocol_version(pm.get<std::string>());
+    if (!requested.has_value()) {
+      return protocol::make_err(
+          req.id, ErrorCode::kInvalidParams,
+          "params.protocol_min is malformed; expected \"<major>.<minor>\"");
+    }
+    if (*requested > protocol::kProtocolCurrent) {
+      std::string msg = "client requires protocol >= " + requested->to_string()
+                      + "; daemon is " + protocol::kProtocolVersionString;
+      return protocol::make_err(
+          req.id, ErrorCode::kProtocolVersionMismatch, std::move(msg));
+    }
+    // requested <= current ⇒ servable; fall through to ok.
+  }
+
   json data;
   data["name"] = "ldbd";
   data["version"] = kVersionString;
   data["protocol"] = {
-    {"major", kProtocolMajor},
-    {"minor", kProtocolMinor},
+      {"version",       protocol::kProtocolVersionString},
+      {"major",         protocol::kProtocolVersionMajor},
+      {"minor",         protocol::kProtocolVersionMinor},
+      {"min_supported", protocol::kProtocolMinSupported.to_string()},
   };
   data["formats"] = json::array({"json"});  // CBOR / json-compact / tabular: post-M0
   return protocol::make_ok(req.id, std::move(data));
@@ -601,12 +631,31 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
 
   // ============== meta ==============
 
-  add("hello", "Server identification and protocol version",
-      obj({}),
+  add("hello",
+      "Server identification and protocol version. Optionally negotiates "
+      "the wire protocol via `protocol_min` — see docs/05-protocol-versioning.md.",
+      obj({
+          {"protocol_min", str_pattern(
+              "^[0-9]+\\.[0-9]+$",
+              "Optional. Minimum wire-protocol version the client will "
+              "accept, as \"<major>.<minor>\". Daemon serves iff its "
+              "current version >= this floor; otherwise -32011 "
+              "kProtocolVersionMismatch.")},
+      }),
       obj({
           {"name",     str()},
-          {"version",  str()},
-          {"protocol", obj_open()},
+          {"version",  str("Daemon version (separate from protocol version).")},
+          {"formats",  arr_of(str(), "Supported wire formats.")},
+          {"protocol", obj({
+              {"version",       str_pattern("^[0-9]+\\.[0-9]+$",
+                                            "Current wire-protocol version.")},
+              {"major",         uint_()},
+              {"minor",         uint_()},
+              {"min_supported", str_pattern(
+                  "^[0-9]+\\.[0-9]+$",
+                  "Oldest version the daemon would still serve; "
+                  "informational, does not affect satisfy check.")},
+          }, {"version", "major", "minor", "min_supported"})},
       }, {"name", "version", "protocol"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
