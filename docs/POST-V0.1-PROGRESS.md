@@ -28,7 +28,7 @@
 | # | Slice | Status | Worker | Reviewer | Merge commit |
 |---|---|---|---|---|---|
 | 1a | Live provenance — endpoint determinism audit | ✅ | `a05ab0000ec0248b1` | (inline review) | — |
-| 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | — | — | — | — |
+| 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | 🔍 | `a1da55c9959d40268` | — | — |
 | 1c | Live provenance — CI determinism gate extended to live targets | — | — | — | — |
 | 2 | macOS arm64 hardening pass (Linux-side fixes; macOS sign-off deferred to user) | — | — | — | — |
 | 3a | Public release polish — protocol semver + version handshake in `hello` | — | — | — | — |
