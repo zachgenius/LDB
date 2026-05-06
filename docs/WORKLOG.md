@@ -4,6 +4,48 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §11: session.diff (Tier 3)
+
+**Goal:** Ship structured diff over two sessions' rpc_logs. LCS alignment, content-hash equality at the (method, canonical-params-JSON) level, byte-identical canonical responses for the common-vs-diverged distinction. Wire endpoint `session.diff(session_a, session_b, view?)` returning summary + entries + total.
+
+**Done:**
+- `feat(store): SessionStore::diff_logs — LCS alignment over rpc_logs (Tier 3 §11 prep)` — `91f4099`. Introduces `DiffSummary`, `DiffEntry`, `DiffResult` in `src/store/session_store.h`. `diff_logs(a_id, b_id)` reads both rpc_logs (existing `read_log`), canonicalizes each row's params + response (re-parse + re-dump through nlohmann::json — its object_t is `std::map`, so dump() is alphabetically keyed), packs `(method, params_canon)` into a single string key per row, runs O(n*m) LCS DP, then backtracks to emit entries in stable order: removed runs (A-side) precede added runs (B-side) in each gap; aligned pairs land at their alignment point. 8 Catch2 cases (`tests/unit/test_session_diff.cpp`): empty/empty zeros, all-identical → all common, lone added, lone removed, diverged response, X-Y-Z vs X-W-Z LCS proof, unknown-id error, key-order canonicalization.
+- `feat(daemon): session.diff endpoint (Tier 3 §11)` — `aba33cd`. New handler `Dispatcher::handle_session_diff` wired in `dispatch_inner`, registered in `describe.endpoints` with full draft-2020-12 schema for params/returns and `cost_hint=unbounded`. Wire shape: `{summary:{total_a, total_b, added, removed, common, diverged}, entries:[{kind, method, params_hash, ...}, ...], total, next_offset?}`. Per-entry shape varies by kind: `common` carries only seq_a/seq_b/method/params_hash (responses are equal — don't repeat); `diverged` carries full params + both responses; `added`/`removed` carry params + the single side's response. `view::apply_to_array` provides limit/offset/summary on `entries`. 7 Catch2 cases (`tests/unit/test_dispatcher_session_diff.cpp`) plus end-to-end smoke (`tests/smoke/test_session_diff.py`, TIMEOUT 30) wired into `tests/CMakeLists.txt`.
+
+**Decisions:**
+- **LCS over pair-by-position.** Pair-by-position would noisify any single inserted call into a downstream cascade of false `diverged` entries — the visual debt makes the tool useless on real investigations. LCS is O(n*m), fine for low-thousand-row session logs (the typical "human-driven investigation" size); the `unbounded` cost-hint warns callers if they go bigger.
+- **Diff key = (method, canonical-params-JSON).** Method alone aligns too coarsely (every `module.list` would match every other); response equality alone aligns too narrowly (a flaky timestamp in any response defeats the diff). Method + params is the right "same call, possibly different result" granularity. Diffing across binaries is allowed but expected to be high-divergence and documented as such in the endpoint summary.
+- **Re-canonicalization on read, not on write.** The Writer's `dump()` is already canonical (nlohmann::json's std::map keying), but re-parsing + re-dumping in the diff is belt-and-braces against future clients (e.g. a `.ldbpack` produced by some other tool that bypasses the Writer) and against the stored-string-corruption-on-disk failure mode. Cost is bounded by row count.
+- **Per-kind variable entry shape.** `common` entries omit the params and response payloads — those are equal by definition, repeating them on every common row inflates responses by O(rows × params+response). `params_hash` (16 hex chars; first 64 bits of sha256 of the canonical params string) is the tiny stable label callers index by. Diverged carries both responses (you need them — that's what diverged means). Added/removed carry the single side's row.
+- **Order is part of the diff, not bucketing.** Single endpoint with a typed `kind` discriminator rather than four parallel arrays. The LCS alignment is order-bearing; emitting `added` and `removed` as separate top-level lists would lose the in-stream position of each insertion/deletion, defeating the "what changed in this investigation" reading. Callers can group client-side by `kind` if they want the buckets.
+- **Diff summary block independent of view's `total`.** The view's `total` is the count of all entries; the diff `summary` block always reflects the unsliced diff so summary stays trustworthy when `entries` is paginated. Two `total` values is mildly redundant on the wire but the alternative (mutating summary counts when paginating) is much worse.
+- **`canon_params_from_request` accepts both shapes.** The Writer wraps the user's `params` inside `{"method": ..., "params": ..., "id": ...}` for some paths and writes raw `params` for others. `canon_params_from_request` extracts `params` if present, else treats the whole object as params. The choice doesn't affect correctness as long as it's consistent across both diffed sessions (same code path produced both rows).
+- **sha256 truncation for params_hash.** Reuses already-vendored `util/sha256`. 64-bit truncation is plenty for a short label; the actual diff key is the canonical string. Avoids pulling in a new hash dep.
+
+**Surprises / blockers:**
+- **Two `total` keys felt redundant — kept both anyway.** `view::apply_to_array` writes its own `total` (full entry count) at the wire's top level; the diff's `summary.total_a` / `summary.total_b` are the per-session row counts. The names are different so no collision, but a confused reader could conflate them. Documented inline in the handler.
+- **Existing nlohmann/json third-party warnings.** `-Wnull-dereference` warnings fire on `third_party/nlohmann/json.hpp:12972` whenever it's pulled into a fresh TU. Pre-existing on master HEAD `caacc81` (verified by touching the header in the master build); not introduced by this slice.
+
+**Verification:**
+- `ctest --test-dir build --output-on-failure`: 44/44 pass, ~32 s wall clock. Baseline was 43/43 (master at `caacc81`); +1 is `smoke_session_diff`. Inside the unit_tests binary, +15 Catch2 cases (8 store-side + 7 dispatcher) — total Catch2 suite now 472 cases.
+- Build is warning-clean (zero new warnings; pre-existing nlohmann warnings unchanged).
+- Manual: `python3 tests/smoke/test_session_diff.py build/bin/ldbd` → `session.diff smoke test PASSED`.
+
+**Sibling slice:** §7 artifact knowledge graph (parallel agent, separate worktree).
+
+**Deferred:**
+- **Cross-binary diff polish.** Allowed by the endpoint but expected to be high-divergence; no semantic match across build_ids today. A future enhancement could mark cross-binary diffs in the summary or bias the alignment toward whatever the caller's intent is.
+- **Per-call data-field diffing.** Inside a `module.list` response with 50 modules, knowing which 2 differ would be far more useful than the binary "diverged" flag. Explicit v0.5 follow-up — needs schema-aware traversal so it can drill into endpoint-specific shapes.
+- **Diff visualization rendering.** The wire format is structured; renderers are caller-side concerns.
+- **Patch / apply.** Turning a diff into a runnable session (apply A→B's adds, drop A→B's removes) would be the natural next step but needs replay infra from §6's recipe surface to compose cleanly.
+
+**Next:**
+- §7 artifact knowledge graph (sibling agent already in flight).
+- Tier 3 §10 cross-binary correlation will benefit from this diff once the symbol-index foundation lands — the same alignment algorithm against symbol lists rather than rpc rows.
+- An optional `session.diff_apply(diff, target)` slice could turn the §11 output into a recipe-style replay, fulfilling Tier 3 §11's "what would B look like if I added back A's removed calls" question.
+
+---
+
 ## 2026-05-07 — post-v0.1 §4: DAP shim (Tier 2)
 
 **Goal:** Ship `ldb-dap` binary that speaks DAP on stdio, spawns ldbd as a child, translates DAP requests to LDB JSON-RPC. Minimum useful set for VS Code attach.
