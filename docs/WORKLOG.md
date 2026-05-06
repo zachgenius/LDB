@@ -4,6 +4,33 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 — **MVP CUT — v0.1**
+
+All M5 polish landed. Cutting the MVP tag.
+
+**State at the tag:**
+
+- ctest **35/35 PASS** in 28s wall on Pop!_OS 24.04 / GCC 13.3.0 / LLVM 22.1.5.
+- 65 JSON-RPC endpoints across the M0–M5 surface, every one schematized in `describe.endpoints` (draft 2020-12) with `requires_target` / `requires_stopped` / `cost_hint` metadata.
+- Every successful response carries `_cost: {bytes, items?, tokens_est}` and `_provenance: {snapshot, deterministic}` per plan §3.2 / §3.5.
+- Two wire formats: line-delimited JSON (default) and length-prefixed CBOR (`--format=cbor`).
+- Portable `.ldbpack` (gzip+ustar) bundles via `session.export`/`import` and `artifact.export`/`import`.
+- Replayable determinism test against a generated core file: cross-process byte-identical responses for 7 deterministic RPCs.
+- `tools/ldb/ldb` thin Python CLI, schema-driven, supports both wire formats.
+
+**Reference workflow §5 status:** all primitives in place — `target.open` → `module.list` → `type.layout` → `string.list`/`string.xref` → `disasm.function` → `target.attach` → `probe.create` (lldb_breakpoint or uprobe_bpf) → `process.resume` → `probe.events` → `artifact.get` → `observer.net.tcpdump`/`observer.proc.fds` → `session.export`. Each step is a tested endpoint; the full sequence has been exercised piecemeal across the M2–M5 smoke suite.
+
+**Out-of-MVP per `dc01e5f`:**
+- Live-process provenance (snapshot model + per-endpoint determinism audit) — major post-MVP milestone.
+- `session.fork` / `session.replay` — depend on live provenance.
+- `.ldbpack` signing — operator-trust feature; matters once packs travel to untrusted hands.
+
+**Tag:** `v0.1`.
+
+**Next:** Post-MVP backlog at the top of `docs/03-ldb-full-roadmap.md`. Likely first slices: live provenance (foundational); GDB/MI second backend (proves the `DebuggerBackend` abstraction); extension-script Python embedding for user-authored probes. None are blockers for shipping v0.1.
+
+---
+
 ## 2026-05-06 (cont. 23) — M5 part 6: cores-only provenance + replay determinism gate
 
 **Goal:** Ship `_provenance.snapshot` on every response (cores-only per dc01e5f) plus a replayable test corpus that enforces the (method, params, snapshot) → byte-identical contract.
