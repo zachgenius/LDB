@@ -4,6 +4,34 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §14: non-stop debugging, scoped to protocol surface (Tier 4)
+
+**Goal:** Ship the agent-visible per-thread continue surface (`thread.continue`, `process.continue+tid`) so client code is async-ready. True async runtime (`SBProcess::SetAsync(true)` + event-loop pump) deferred to v0.4 — touching every endpoint that depends on sync.
+
+**Done:**
+- `src/backend/debugger_backend.h` / `lldb_backend.{h,cpp}` — new `continue_thread(target_id, thread_id)` virtual on `DebuggerBackend`. `LldbBackend` impl is a sync passthrough into `continue_process` and logs the tid for diagnostic visibility. The interface contract comment marks the v0.4 expansion point (resolve `SBThread`, `Suspend()` siblings, `Continue()` process). 3 unit cases / pin in `tests/unit/test_backend_continue_thread.cpp` (sync passthrough returns kExited from stop-at-entry, invalid target_id throws, no-process throws).
+- `src/daemon/{dispatcher.{h,cpp}}` — `thread.continue({target_id, tid})` endpoint registered + dispatched via `handle_thread_continue`. `process.continue` extended with optional `tid`: when present, routes through `continue_thread`; when absent, original `continue_process` path. `describe.endpoints` updated for both — `process.continue` advertises `tid` as an optional property and the `summary` calls out the v0.3-sync passthrough; `thread.continue` summary leads with `WARNING: in v0.3 this is SYNC ...` so an agent reading the catalog at session start sees the gap without any docs round-trip. 8 unit cases / 41 assertions in `tests/unit/test_dispatcher_thread_continue.cpp` (CountingStub backend pins routing: process.continue without tid → continue_process; with tid → continue_thread; thread.continue → continue_thread; missing required params → -32602; bogus target_id → -32000; describe.endpoints disclosure shape).
+- `tests/smoke/test_thread_continue.py` (TIMEOUT 60) — drives the wire end-to-end: opens structs fixture, launches stop-at-entry, exercises `thread.continue` and `process.continue+tid` (both produce `state=exited` under v0.3 sync semantics), pins missing-param/bogus-target_id errors, and asserts `describe.endpoints` advertises both surfaces with the v0.3-sync disclosure language.
+- `docs/11-non-stop.md` — full protocol-shape-vs-runtime gap doc. TL;DR for agents up top, table of v0.3 vs v0.4 runtime per endpoint, the five-item async-mode surgery list (event-loop pump, per-thread state machine, suspend/resume, endpoint review, push events), specifically-deferred items (`thread.stop`, push events, true keep-running, per-thread `<gen>` provenance), versioning plan (bump protocol minor when v0.4 ships, agents negotiate via `hello.protocol_min`), and implementation pointers for the v0.4 worker.
+
+**Decisions:**
+- **Sync passthrough — `continue_thread` calls `continue_process` directly.** `LldbBackend` is `SetAsync(false)`. A real per-thread Continue would need `SBThread::Suspend()` on every other thread first, and the sync mode means `Continue()` blocks the dispatcher thread until any-stop — no other RPCs would be servicing during that window anyway. Passthrough is the only correct v0.3 behavior. The wire shape is what gets shipped now; the runtime is v0.4 work.
+- **`tid` is logged but not validated in v0.3.** Validating against the live thread set would diverge from the v0.4 contract (v0.4 must validate to suspend the right SBThread) and v0.3's whole-process resume can't actually go wrong on a bogus tid. Documented in the impl comment.
+- **`describe.endpoints` disclosure is the contract anchor.** Agents read the catalogue once at session start. Surfacing the v0.3 caveat in both `summary` strings (and the smoke test asserting on substring `v0.3` / `sync`) means a protocol bump in v0.4 will be visible to existing clients without code changes — they read the new summary, see `v0.4` instead, and switch behavior.
+- **No `thread.stop` endpoint yet.** In sync mode the process is fully stopped or fully running and there's no daemon RPC servicing while running anyway. Endpoint arrives with v0.4 when async mode unlocks the "one thread running, one thread stopped" split.
+
+**Surprises / blockers:** None. The build was warning-clean once the two existing stub backends in `tests/unit/test_correlate.cpp` were updated for the new pure-virtual.
+
+**Verification:** ctest **49/49 PASS** on this worktree branch, ~33s wall clock. Was 48/48 at master HEAD `d892d49`; +1 is `smoke_thread_continue`. Build first-party warning-clean.
+
+**Sibling slice:** §13 rr integration (parallel agent on a separate worktree).
+
+**Deferred to v0.4 (documented in `docs/11-non-stop.md`):** async runtime (`SBProcess::SetAsync(true)`), true per-thread keep-running (suspend siblings, resume one), `thread.stop({tid})` selective stop, push-based event subscription, per-thread `<gen>` provenance.
+
+**Next:** §13 rr replay merge or §15 hardware tracing slice — both can land independently of v0.4 async work.
+
+---
+
 ## 2026-05-07 — post-v0.1 §12: semantic queries v1, scoped to static.globals_of_type (Tier 3)
 
 **Goal:** Ship one semantic query — globals filtered by type — using DWARF + SBValue introspection. heap walk, mutex graph, dataflow queries deferred to v0.5+ per the roadmap.

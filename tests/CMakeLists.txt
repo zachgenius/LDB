@@ -160,6 +160,19 @@ set_tests_properties(smoke_step PROPERTIES
   TIMEOUT 60
 )
 
+# Tier 4 §14 (scoped): thread.continue + process.continue+tid.
+# Pins the v0.3 sync-passthrough wire shape so v0.4 async-mode
+# work can switch behavior without a client-side rewrite.
+add_test(
+  NAME smoke_thread_continue
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_thread_continue.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_thread_continue PROPERTIES
+  TIMEOUT 60
+)
+
 add_test(
   NAME smoke_value_eval
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_value_eval.py"
