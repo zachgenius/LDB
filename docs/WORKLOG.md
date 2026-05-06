@@ -4,6 +4,54 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §4: DAP shim (Tier 2)
+
+**Goal:** Ship `ldb-dap` binary that speaks DAP on stdio, spawns ldbd as a child, translates DAP requests to LDB JSON-RPC. Minimum useful set for VS Code attach.
+
+**Done:**
+- `src/dap/transport.{h,cpp}` — `Content-Length:`-framed DAP read/write. Handles CRLF or bare-LF line endings, case-insensitive header names, ignored Content-Type. 11 unit cases / 22 assertions covering round-trip, malformed length, missing length, short body, multiple back-to-back frames, malformed JSON body, clean EOF (`tests/unit/test_dap_transport.cpp`). Commit `059c7b4`.
+- `src/dap/rpc_channel.{h,cpp}` — abstract `RpcChannel` interface so handlers are unit-testable with a stub, plus concrete `SubprocessRpcChannel` that forks `ldbd --stdio --format json`, pipes stdin/stdout, and parses line-delimited responses by id. Live unit tests against the real ldbd binary (`tests/unit/test_dap_rpc_channel.cpp`). Commit `6ff0f89`.
+- `src/dap/handlers.{h,cpp}` — translation layer for the shipped DAP requests: `initialize`, `launch`, `attach`, `configurationDone`, `setBreakpoints`, `disconnect`, `threads`, `stackTrace`, `scopes`, `variables`, `evaluate`, `continue`, `next`, `stepIn`, `stepOut`. Stable per-session frameId/variablesReference allocation. Each handler is a pure function `(json args) -> DapResult` with `body`, `success`/`message`, queued `events`, and a `terminate` flag. 13 unit cases / 119 assertions against a stub channel that records (method, params) pairs (`tests/unit/test_dap_handlers.cpp`). Commit `772d5be`.
+- `src/dap/main.cpp` — `ldb-dap` binary. Read DAP request → wrap handler body in DAP response envelope (seq/type/request_seq/command/success) → drain queued events → exit on `terminate=true`. Server-side `seq` counter is independent of client's per the spec. Discovery for ldbd: `--ldbd <path>` → PATH → `./build/bin/ldbd` (matches the `ldb` CLI's in-tree fallback). Commit `d9379d4`.
+- `tests/smoke/test_dap_shim.py` — end-to-end smoke driving `initialize → attach → configurationDone → threads → stackTrace → scopes → variables → evaluate → disconnect` against the sleeper fixture. Verifies event sequencing for `initialized` (after initialize) and `terminated` (after disconnect). Wired into `tests/CMakeLists.txt` as `smoke_dap_shim` with TIMEOUT 60.
+- `docs/07-dap-shim.md` — supported-request table, capability advertisement, event sequencing rules, stdout discipline, known gaps, VS Code launch.json example, future-slice list.
+
+**Decisions:**
+- **Polling, not push, for stop/exit events.** The daemon's JSON-RPC stream doesn't yet emit unsolicited events on the same channel as responses, so `on_continue` polls `process.state` until non-running (5s cap). Documented in `07-dap-shim.md`'s "Limits and known gaps". Push-based eventing is a daemon-side change and was deferred to a follow-up. Step is synchronous in the daemon so no polling needed there.
+- **Honest capability advertisement.** Every feature the shim doesn't implement is set to `false` in `initialize`. The IDE greys out the corresponding UI rather than letting the user click into a black hole. Specifically `false`: conditional bps, function bps, data bps, exception filters, restart, terminate, setVariable, setExpression, valueFormatting, logPoints, completions, modules, dataBreakpoints, read/writeMemory, disassemble, steppingGranularity, instructionBreakpoints, breakpointLocations, clipboardContext, terminateThreads, cancel, evaluateForHovers, stepBack, loadedSources.
+- **`disconnect` defaults to detach, not kill.** DAP's `terminateDebuggee` defaults false; matches the LDB principle of "least destructive default." `terminateDebuggee=true` switches to `process.kill`.
+- **Shim does NOT link liblldb.** Pure protocol translation; the daemon child is the only LLDB consumer. Build-graph-wise this means `ldb-dap` doesn't pull in the 700 MB LLVM dep at link time, so a release tarball can ship `ldb-dap` separately from `ldbd` if a downstream wants only the shim.
+- **Abstract `RpcChannel` interface.** Keeps every handler unit-testable with a stub channel that records calls and returns canned responses, no fork/exec required. The concrete subprocess channel is exercised live against the real ldbd in a separate test file.
+- **One DAP session per shim process.** No multiplexing. Matches DAP's actual usage pattern (each launch.json run spawns a fresh adapter).
+- **`scopes` returns three fixed scopes per frame.** Locals, Arguments, Registers in that order. Picks up directly from the three matching daemon endpoints. Children are not currently expanded (every `variable` returns `variablesReference: 0`); deferred per `07-dap-shim.md`.
+- **`setBreakpoints` translates to `probe.create({kind:lldb_breakpoint, action:stop})` per line.** Returns `verified: true` on success, `verified: false` with `message` on failure. The IDE shows a hollow circle for unverified breakpoints, which is the correct UX for a daemon error.
+- **No DAP extension package.** The shim is the binary; a per-IDE extension that points at it is out of scope. The `07-dap-shim.md` doc has a launch.json example so an operator can wire it manually until an extension lands.
+
+**Surprises / blockers:**
+- **`describe.endpoints` schema uses `method`, not `name`.** First version of `test_dap_rpc_channel.cpp` looked up `ep.value("name", "")` and silently never matched. Fixed before commit by inspecting the live response.
+- **Python BufferedReader hides data from `select()`.** First version of the smoke test used `select.select([proc.stdout], [], [], 0.05)` to drain trailing events; this returned not-ready even when the kernel pipe had no bytes left because Python had already buffered them. Fixed by switching to a sequential `read()` loop with an `expect_events` count: the shim's main loop guarantees response-then-events ordering on the wire, so the client just reads N more frames after the response.
+- **DAP `seq` is per-direction.** Initially conflated with `request_seq`. The spec is explicit: client→server has its own counter, server→client has its own. The shim's response/event seq is `out_seq` starting at 1, independent of whatever the client sends.
+- **Local apt-llvm-18 isn't installed on this dev box.** Built against `/opt/llvm-22` — the same prefix the existing test suite uses. ctest 42/42 green confirms.
+
+**Verification:**
+- `ctest --output-on-failure`: 42/42 pass, ~32s wall clock. Baseline was 41/41; +1 is `smoke_dap_shim`. Unit count rose from N to N+3 inside `unit_tests` (one Catch2 binary, multiple files). Specifically 26 new DAP-related Catch2 cases (11 transport + 13 handlers + 2 rpc_channel).
+- `build/bin/ldb-dap --version` prints `ldb-dap 0.1.0`.
+- `build/bin/ldb-dap` errors out cleanly when ldbd isn't found (`cannot find ldbd. Pass --ldbd <path>, put ldbd on PATH, or build it at ./build/bin/ldbd.`).
+- Build is warning-clean; the new TU runs through `ldb_warnings`.
+- **Couldn't validate without a real DAP client:** the actual VS Code "attach to running process" UX. The smoke test exercises the wire shape, but VS Code's adapter handshake includes negotiated capabilities and view-state queries that the unit tests don't replay. A follow-up should add a manual VS Code test plan or a Mock DAP client based on the spec's TypeScript types.
+
+**Sibling slice:** §6 probe recipes (parallel agent in a different worktree).
+
+**Deferred:** advanced DAP requests (`setExceptionBreakpoints`, `setFunctionBreakpoints`, `setDataBreakpoints`, `restart`, `terminate`, `goto`, `loadedSources`, `source`, `completions`, reverse exec, per-thread state events, `setVariable`, `setExpression`, `disassemble`, memory read/write); push-based event subscription on the daemon JSON-RPC channel; auto-generation of the DAP capability list from `describe.endpoints`; hierarchical variable expansion via `value.read` `children`; conditional breakpoints (need `probe.create` to take a predicate). Each entry is documented in `docs/07-dap-shim.md`'s "Future slices" table.
+
+**Next:**
+- Sibling slice §6 (probe recipes) — already in flight in a parallel worktree.
+- Tier 2 §5 (native libbpf probe agent) is `⏭ deferred` per the run plan ("no measurement evidence the bpftrace shellout is too slow").
+- Once the daemon grows a push-based event channel, revisit the polling-based `stopped`/`exited` emission in `on_continue` and remove the 5s cap.
+- An `ldb-vscode` extension package (separate slice) would point VS Code at `ldb-dap` automatically and let the user pick "type: ldb" in launch.json without manual `settings.json` editing.
+
+---
+
 ## 2026-05-06 — post-v0.1 §3c: CONTRIBUTING + PR template
 
 **Goal:** Stand up the external-contributor surface paralleling the internal `CLAUDE.md` workflow. `CLAUDE.md` is loaded by AI agents and tells them the strict TDD / commit / worklog rules; humans arriving from GitHub need a different doc. Ship `CONTRIBUTING.md` at the repo root, a PR template under `.github/`, and an opening-salvo bug report issue template.

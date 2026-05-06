@@ -63,6 +63,9 @@ set(LDB_UNIT_SOURCES
   test_live_provenance.cpp
   test_live_provenance_bp.cpp
   test_audit_bugfixes.cpp
+  test_dap_transport.cpp
+  test_dap_rpc_channel.cpp
+  test_dap_handlers.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -89,6 +92,9 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/probes/bpftrace_engine.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
+  ${CMAKE_SOURCE_DIR}/src/dap/transport.cpp
+  ${CMAKE_SOURCE_DIR}/src/dap/rpc_channel.cpp
+  ${CMAKE_SOURCE_DIR}/src/dap/handlers.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.
@@ -121,11 +127,12 @@ target_link_libraries(ldb_unit_tests PRIVATE
 # Fixture binaries consumed by tests at runtime. Paths are baked into
 # the test binary via compile-time definitions; the $<TARGET_FILE:...>
 # generator expression ensures the build system knows we depend on them.
-add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper)
+add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper ldbd)
 target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_STRUCTS_PATH="$<TARGET_FILE:ldb_fix_structs>"
   LDB_FIXTURE_SLEEPER_PATH="$<TARGET_FILE:ldb_fix_sleeper>"
   LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
+  LDBD_PATH="$<TARGET_FILE:ldbd>"
 )
 
 # lldb-server path for the connect_remote positive-path test. Discovery
