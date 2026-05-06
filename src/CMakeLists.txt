@@ -5,6 +5,7 @@ set(LDBD_SOURCES
   daemon/stdio_loop.cpp
   daemon/dispatcher.cpp
   protocol/jsonrpc.cpp
+  protocol/cost.cpp
   protocol/view.cpp
   backend/lldb_backend.cpp
   probes/probe_orchestrator.cpp

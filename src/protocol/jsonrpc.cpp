@@ -1,5 +1,7 @@
 #include "protocol/jsonrpc.h"
 
+#include "protocol/cost.h"
+
 #include <stdexcept>
 
 namespace ldb::protocol {
@@ -49,6 +51,10 @@ std::string serialize_response(const Response& r) {
   j["ok"] = r.ok;
   if (r.ok) {
     j["data"] = r.data;
+    // Cost-preview metadata, plan §3.2. Only on successful responses;
+    // errors are short and don't benefit. Computed against the data
+    // payload — bytes is the exact serialized size of `data`.
+    j["_cost"] = cost::compute_cost(r.data);
   } else {
     json err;
     err["code"] = static_cast<int>(r.error_code);

@@ -4,6 +4,52 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 20a) — M5 part 1: cost-preview metadata
+
+**Goal:** Ship `_cost: {bytes, items, tokens_est}` on every successful response per plan §3.2 so an LLM agent can budget-check before pulling a big response.
+
+**Done:**
+
+- **`src/protocol/cost.{h,cpp}`** — pure helper `compute_cost(const json& data) -> json` returning `{bytes, items?, tokens_est}`:
+  - `bytes` = `data.dump().size()` (exact serialized byte count, no formatting whitespace).
+  - `tokens_est` = `(bytes + 3) / 4` (ceil division). Same formula will hold for the CBOR transport when it lands — the agent treats it as a byte-level approximation, not literal tokens.
+  - `items` populated only when `data` has one obvious array. Heuristic: prefer a plan-listed key (`groups`, `packets`, `sockets`, `modules`, `events`, `endpoints`, `threads`, `frames`, `regions`, `artifacts`, `sessions`, `probes`, `strings`, `fds`, `maps`, `symbols`, `xrefs`, `addresses`, `matches`, `entries`, `values`, `fields`, `rows`, `items`); fall back to "the only array-valued key in `data`" if none of the known keys match. If `data` is itself a top-level array, items = its size. Otherwise `items` is omitted (multiple unknown arrays / no arrays / scalar data all → absent).
+- **`src/protocol/jsonrpc.cpp`** — `serialize_response()` now embeds `_cost` into the wire JSON object iff `r.ok` is true. Errors stay short: no `_cost` on `ok:false`. The serialized response shape goes from `{jsonrpc, id, ok, data}` → `{jsonrpc, id, ok, data, _cost}` for successful calls.
+- **`src/CMakeLists.txt` + `tests/unit/CMakeLists.txt`** — add `protocol/cost.cpp` to both the daemon and the unit-test build (the unit binary compiles src/ directly, per the existing M1 convention).
+- **Tests** (TDD red→green):
+  - `tests/unit/test_protocol_cost.cpp` — 11 cases / 26 assertions exercising the pure helper: empty object, exact-bytes match against `dump()`, tokens_est formula round-trip, single-array-key population, known-keyword preference, multiple-unknown-arrays fallback to omit, scalar data omits items, top-level-array data populates items, empty array under known key reports items=0.
+  - `tests/unit/test_protocol_jsonrpc.cpp` — 4 new cases on the serialization integration: `_cost` present + bytes + tokens_est on a basic ok response; `items` populated when data has a known array key; `_cost` ABSENT on error; ok with empty `data` still carries `_cost` (bytes=2 for "{}").
+  - `tests/smoke/test_cost.py` — end-to-end smoke through the running `ldbd` binary. Drives `hello` (object data, no/maybe items), `describe.endpoints` (large array data — items must equal endpoints.size and be ≥30), and `no.such.method` (error → no `_cost`). Confirms the wire formula `tokens_est == ceil(bytes/4)` matches what the agent will compute, and that `bytes` matches the locally-serialized data dump.
+- **`tests/CMakeLists.txt`** — register `smoke_cost` (test #29 → #30 wall, was 29 → 30 total).
+
+**Decisions:**
+
+- **Embed at `serialize_response` rather than at `make_ok` / `make_err`.** `make_ok` builds the typed `Response` struct without serializing — and `_cost.bytes` requires the serialized form. Computing `data.dump()` once during the wire write is the cheapest place. The struct stays pure (carries `data`, not `data + cost`).
+- **Items heuristic is two-stage: known-key list first, then "only array" fallback.** The plan calls out a non-exhaustive list (`groups`, `packets`, `sockets`, ...). Hard-coding stable preference order keeps the reported `items` deterministic across releases — adding a new endpoint that returns `{modules: [...], extras: [...]}` won't accidentally flip the count. Unknown-only arrays are still useful (e.g. a future endpoint returning `{my_things: [...]}` gets items=N via the fallback). Multiple unknown arrays → absent (the spec says "when unclear, omit").
+- **`tokens_est = (bytes + 3) / 4` everywhere.** Plan says "approximate; bytes / 4 for JSON" — round-up by integer arithmetic, no floating-point. Worst case the agent over-estimates by 3 bytes' worth of tokens; that's fine for a budget-check that's already an approximation.
+- **Empty data still carries `_cost`.** A response with `data = {}` reports `bytes: 2, tokens_est: 1, no items`. The plan's done-criteria says "_cost present on every ok:true response with non-empty data" — but reporting bytes=2 for the literal `{}` is a strictly more useful number for the agent (vs. omitting and forcing them to special-case empty), and costs nothing. Errors still get no `_cost`.
+- **Smoke test asserts wire compatibility, not internals.** It re-serializes `r["data"]` with Python's `json.dumps(..., separators=(",", ":"))` and checks bytes match. nlohmann/json's default `dump()` and Python's compact-separator dump emit byte-identical output for our shapes (no Unicode, no float edge cases here), so the assertion is tight.
+
+**Surprises / blockers:**
+
+- **`hello` happens to have a `formats` array.** First draft of the smoke test asserted `items` was absent on `hello` (wrong: `data.formats = ["json"]` triggers the fallback heuristic, items=1). Loosened the assertion — `_cost.items` for `hello` is now treated as either-or; the bytes/tokens_est checks still hold tight. This is exactly the bug TDD is supposed to surface — silent over-counting on a payload the agent didn't expect to be counted.
+- **No worktree-vs-master leak this session.** `git status` mid-session and at end shows only the worktree branch touched. (Sibling agents had this problem in 19a/b.)
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **30/30 PASS in 24.61 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 29/29 → +1 for `smoke_cost`.)
+  - `smoke_cost`: 0.12 s.
+  - `unit_tests`: 13.58 s. **+15 cases, ~+30 assertions** for the cost helper + serialization integration.
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` from GCC 13).
+- Stdout-discipline preserved: cost helper is pure (no logging, no IO); the serializer just appends one more JSON key.
+- `build/bin/ldbd --version` → 0.1.0.
+
+**Sibling slices:** schemas in `describe.endpoints` (M5), CBOR transport (M5 part 3 — same `tokens_est` formula reused), `ldb` CLI (M5).
+
+**Next:** CBOR transport (plan §3.2 line 2 — "Streaming responses use NDJSON-over-CBOR-streams"), full schemas in `describe.endpoints`, `ldb` CLI, public test corpus + replayable goldens. Cost-preview is a prerequisite for the agent to safely call into them with budget caps.
+
+---
+
 ## 2026-05-06 (cont. 19a) — M4 polish: observer.net.tcpdump
 
 **Goal:** Ship the deferred §4.6 streaming-capture observer. Close out the M4 typed-observer surface with the live-capture endpoint that pairs with `observer.net.sockets` for the agent's "what's actually on the wire" workflow.
