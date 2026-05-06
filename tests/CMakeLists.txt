@@ -350,6 +350,36 @@ set_tests_properties(smoke_live_provenance PROPERTIES
   TIMEOUT 60
 )
 
+add_test(
+  NAME smoke_live_dlopen
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_live_dlopen.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_dlopener>"
+)
+set_tests_properties(smoke_live_dlopen PROPERTIES
+  TIMEOUT 60
+)
+
+add_test(
+  NAME smoke_live_determinism_gate
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_live_determinism_gate.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_live_determinism_gate PROPERTIES
+  TIMEOUT 90
+)
+
+add_test(
+  NAME smoke_live_continue_provenance
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_live_continue_provenance.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_looper>"
+)
+set_tests_properties(smoke_live_continue_provenance PROPERTIES
+  TIMEOUT 60
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)
 

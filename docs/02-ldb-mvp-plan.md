@@ -132,15 +132,46 @@ A session is a sqlite database (`~/.ldb/sessions/<uuid>.db`) holding the RPC log
 
 Every response carries `_provenance.snapshot` — a stable identifier of the inferior state at fetch time.
 
-**MVP scope (cores-only determinism):** snapshot is populated for core-loaded targets only — it's the SHA-256 of the core file. Live targets receive `snapshot: "live"` (sentinel — no determinism guarantee). Identical `(method, params, snapshot)` against a core MUST yield byte-identical `data`. CI replays a recorded session against the corresponding core and diffs the response stream byte-for-byte; that's the deterministic-protocol gate.
+**Cores-only branch (cores).** Snapshot for a core-loaded target is `core:<lowercase-hex-sha256>` — the SHA-256 of the core file on disk, computed once by `target.load_core`. Identical `(method, params, snapshot)` against the same core MUST yield byte-identical `data`. CI replays a recorded session against the corresponding core and diffs the response stream byte-for-byte (`tests/smoke/test_provenance_replay.py`).
 
-**Post-MVP (live provenance — major implementation):** the live-process branch needs a real snapshot model — counter that bumps on every resume + register-snapshot hash — plus an audit of every endpoint to remove non-deterministic elements (timestamps in responses, ordering, PID-dependent fields, mmap-layout drift). This work is **deferred to a dedicated post-MVP milestone**, not part of M5 polish, because:
+**Live branch (slice 1b + 1c — v0.3).** Snapshot for a live target is
 
-1. The hard part (audit + retrofit of every existing endpoint) is engineering against speculation if done before real users tell us which endpoints actually matter for live determinism.
-2. The MVP reference workflow §5 doesn't depend on live-process replay determinism — it depends on probe events being captured, artifacts being stored, sessions being logged. None of those need byte-identical replay.
-3. Adding `_provenance.snapshot` later is additive (the field already exists in the response shape) — no protocol redesign, no backward-compat shim.
+    live:<gen>:<reg_digest>:<layout_digest>:<bp_digest>
 
-The test corpus (M5) ships with **core-replay goldens only**. Live tests don't replay. Documented limitation; cleared post-MVP.
+where:
+  - `<gen>` is a 64-bit monotonic counter, bumped on every observed `stopped→running→stopped` transition (`process.continue`, `process.step`, attach/launch resets to 0). Session-local — does not persist across detach/re-attach.
+  - `<reg_digest>` is SHA-256 of `(thread_index, register_set_name, register_bytes)` tuples for every thread, every GP register, sorted by `(tid, register_name)` with a length-prefixed encoding. Cached per-`<gen>`.
+  - `<layout_digest>` is SHA-256 of `(module_path, first-non-zero-section-load-addr)` tuples for every loaded module, sorted by path. Cached per-`<gen>`. Invalidated on `eBroadcastBitModulesLoaded` events (slice 1c — closes the dlopen-without-resume gap).
+  - `<bp_digest>` is SHA-256 of `(load_address, 0xCC)` tuples for every active `lldb_breakpoint`-engine probe location, sorted by address (slice 1c — closes the SW-bp .text-patch invisibility gap). Disabled probes don't contribute. Computed fresh per call (NOT cached) — probe.create/delete don't bump `<gen>`.
+
+The empty-bp-set sentinel is `af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc` (SHA-256 of u64-LE 0).
+
+**Cross-process equality contract (slice 1c — what the determinism CI gate enforces).**
+
+The contract is `(method, params, snapshot)` → byte-identical `data`. How "snapshot" enters the equality test depends on the source target:
+
+| Snapshot source | Cross-process equality test |
+|---|---|
+| `core:<sha256>` | exact-string match (the SHA-256 IS the identity) |
+| `live:<gen>:<reg>:<layout>:<bp>` | `(reg_digest, layout_digest, bp_digest)` only — `<gen>` is **session-local** and explicitly EXCLUDED from cross-daemon comparisons |
+| `none` | not part of the determinism contract; either the response was unrelated to inferior state or there is no inferior |
+
+**Live↔core boundary (slice 1c determinism gate, `tests/smoke/test_live_determinism_gate.py`).** A live snapshot's `(reg_digest, layout_digest, bp_digest)` matches the same target's core IF the core was taken at that instant. The contract `(method, params, REG+LAYOUT+BP digest triple)` → byte-identical `data` holds across this boundary for endpoints whose data derives from invariant sources (DWARF, file_addr arithmetic, snapshot-pinned register state). Endpoints whose `data` legitimately differs between live and core are documented exclusions, NOT weakened assertions:
+
+  - `module.list` — Linux `save_core` adds a `[vdso]` PT_LOAD module that the live SBTarget doesn't surface (LLDB reads modules from the dynamic linker's `r_debug` for live targets; cores get vdso from PT_LOAD-mapped pages). Triple suffix can also drift (`x86_64-unknown-linux` vs `…-gnu`).
+  - `thread.list` — `threads[*].name` is kernel-side metadata only readable from a live ptrace'd process; cores omit it.
+  - `mem.regions` — Linux core dumps omit some VDSO/vsyscall mappings.
+  - `frame.registers` — register output is byte-identical for the same instant, but register-set list ordering can differ between the live SBProcess and the core PT_NOTE on some LLDB versions; the `reg_digest` equality covers the actual register state.
+  - `observer.*` — host state, not inferior state. Permanent exclusion per audit §9.
+  - `probe.*` — needs a running process; cores have no live exec.
+
+These exclusions are caused by `save_core` coverage gaps, not by determinism bugs in the protocol. The deterministic-protocol contract holds for the inclusion-list endpoints in `test_live_determinism_gate.py`.
+
+**Deferred (slices not in v0.3 first cut):**
+  - **Non-stop snapshot model** (per-thread `<gen>`). Out of scope.
+  - **Cross-process gen=0 collisions.** Addressed by the cross-process equality contract above (gen is session-local, not part of the equality test).
+  - **`bp_digest` for `uprobe_bpf` engine.** uprobe_bpf doesn't patch inferior memory (kernel-side trampolines), so the SW-bp digest doesn't apply. Future hardware-watchpoint variants would extend `bp_digest` with their own sentinel byte.
+  - **Content-addressed handles (R7), path redaction (R5), `view.deterministic_only` mode (R10).** Audit §5 cross-cutting recommendations; defer to v0.4.
 
 ---
 

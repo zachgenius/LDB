@@ -5,17 +5,18 @@ Audit doc: docs/04-determinism-audit.md §6.
 Spec:      docs/POST-V0.1-PROGRESS.md "Audit-driven corrections folded
            into slice 1b spec".
 
-Live snapshot shape:    live:<gen>:<reg_digest>:<layout_digest>
+Live snapshot shape (slice 1c — adds bp_digest):
+    live:<gen>:<reg_digest>:<layout_digest>:<bp_digest>
 
 Contract enforced here (single-process — cross-process determinism
-extension is slice 1c):
+gate lives in test_live_determinism_gate.py):
 
   1. Two consecutive same-RPC calls against an attached, *not-resumed*
      inferior return byte-identical `data` AND byte-identical
      `_provenance.snapshot`.
 
   2. The snapshot string matches the documented regex
-     ^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}$.
+     ^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$.
 
   3. Provenance for live: snapshots reports deterministic=false in this
      slice — the cross-process equality contract that flips it to true
@@ -33,7 +34,7 @@ import subprocess
 import sys
 
 
-LIVE_RE = re.compile(r"^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}$")
+LIVE_RE = re.compile(r"^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$")
 
 
 def usage():

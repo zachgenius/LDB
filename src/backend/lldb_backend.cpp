@@ -146,18 +146,25 @@ struct LldbBreakpointCb {
 // Per-target live-snapshot state for the v0.3 live-provenance model
 // (audit doc §6).
 //
-//   live:<gen>:<reg_digest>:<layout_digest>
+//   live:<gen>:<reg_digest>:<layout_digest>:<bp_digest>
 //
 // `gen` is a session-local monotonic counter, bumped on every observed
 // stopped→running→stopped transition AND on attach/launch (initial
-// value 0; first stop is gen=0). The digests are SHA-256 over the
-// canonicalised register state and module layout respectively. They
-// are computed lazily and cached per-`gen` so a hot loop of read-only
-// RPCs against a paused target hashes once.
+// value 0; first stop is gen=0). reg_digest and layout_digest are
+// SHA-256 over the canonicalised register state and module layout
+// respectively, cached lazily per-`gen` so a hot loop of read-only
+// RPCs against a paused target hashes once. bp_digest covers the
+// active SW-breakpoint set (slice 1c — closes the .text-patch
+// invisibility gap flagged by the 1b reviewer); it's computed fresh
+// on every call rather than cached because probe.create/delete/
+// enable/disable do not bump `<gen>` and a cache would need extra
+// invalidation hooks. The bp set is small (typically <10), so the
+// per-call hash cost is negligible.
 //
-// Cross-process equality in this slice is `(reg_digest, layout_digest)`
-// only — `gen` is session-local and explicitly excluded. The slice 1c
-// determinism gate is what enforces the cross-process invariant.
+// Cross-process equality in this model is
+// `(reg_digest, layout_digest, bp_digest)` only — `gen` is
+// session-local and explicitly excluded. The slice 1c live↔core
+// determinism gate enforces this cross-process invariant.
 struct LiveSnapshotState {
   std::uint64_t gen           = 0;
   std::string   reg_digest;        // 64 lowercase hex chars
@@ -189,6 +196,17 @@ inline void reset_live_state_locked(LiveSnapshotState& st) {
   st.digests_valid = false;
 }
 
+// Subscribe the backend's module-load listener to a target's broadcaster
+// (slice 1c). Called from attach/launch/connect so snapshot_for_target
+// can later drain dlopen events synchronously.
+inline void subscribe_modules_loaded(lldb::SBListener& listener,
+                                     lldb::SBTarget target) {
+  if (!listener.IsValid() || !target.IsValid()) return;
+  listener.StartListeningForEvents(
+      target.GetBroadcaster(),
+      static_cast<std::uint32_t>(lldb::SBTarget::eBroadcastBitModulesLoaded));
+}
+
 }  // namespace
 
 struct LldbBackend::Impl {
@@ -213,6 +231,21 @@ struct LldbBackend::Impl {
   // detach / kill / close_target. Guarded by `mu`.
   std::unordered_map<TargetId, LiveSnapshotState> live_state;
   std::atomic<TargetId> next_id{1};
+
+  // Dedicated SBListener for module-load notifications (slice 1c —
+  // closes the dlopen-without-resume gap from the 1b reviewer). On
+  // attach/launch we subscribe each target's broadcaster to
+  // SBTarget::eBroadcastBitModulesLoaded; snapshot_for_target drains
+  // any pending events synchronously before computing layout_digest,
+  // so a dlopen between two snapshots invalidates the cache and the
+  // second snapshot's layout_digest reflects the new module set.
+  //
+  // Synchronous drain (rather than a background listener thread)
+  // avoids the lifetime hazards the 1b worker flagged: no thread to
+  // join on dtor, no risk of receiving an event for a target that
+  // was just closed. The cost is a small amount of work on each
+  // snapshot_for_target call, which is dwarfed by the digest hash.
+  lldb::SBListener module_listener;
 
   // Breakpoint callback registry. A separate mutex from `mu` so the
   // hot-path lookup from LLDB's event thread doesn't contend with
@@ -280,6 +313,10 @@ LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
   ensure_lldb_initialized();
   impl_->debugger = lldb::SBDebugger::Create();
   impl_->debugger.SetAsync(false);
+  // Module-load listener (slice 1c). Created up front and reused for
+  // every target's broadcaster — synchronous drain in
+  // snapshot_for_target means we never block on it.
+  impl_->module_listener = lldb::SBListener("ldb.modules_loaded");
   // One-line trace per backend instance is useful for debugging client
   // setup but not for steady-state operation; demoted to debug so
   // --log-level error and the unit-test default (info) stay quiet.
@@ -1332,6 +1369,7 @@ ProcessStatus LldbBackend::launch_process(TargetId tid,
     std::lock_guard<std::mutex> lk(impl_->mu);
     reset_live_state_locked(impl_->live_state[tid]);
   }
+  subscribe_modules_loaded(impl_->module_listener, target);
   return snapshot(proc);
 }
 
@@ -1463,6 +1501,7 @@ ProcessStatus LldbBackend::attach(TargetId tid, std::int32_t pid) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     reset_live_state_locked(impl_->live_state[tid]);
   }
+  subscribe_modules_loaded(impl_->module_listener, target);
   return snapshot(proc);
 }
 
@@ -1585,6 +1624,7 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
     std::lock_guard<std::mutex> lk(impl_->mu);
     reset_live_state_locked(impl_->live_state[tid]);
   }
+  subscribe_modules_loaded(impl_->module_listener, target);
   return snapshot(proc);
 }
 
@@ -2917,6 +2957,80 @@ std::string compute_reg_digest(lldb::SBProcess proc) {
   return util::sha256_hex(h.finalize());
 }
 
+// Compute the SW-breakpoint digest. Captures the set of inferior memory
+// addresses currently patched with a 0xCC trap by an active
+// `lldb_breakpoint`-engine probe. Sorted by address so the digest is
+// invariant under LLDB's per-process bp iteration order.
+//
+// Each entry is
+//   <load_address : u64 LE>  <patch_byte : u64 LE>
+// — `patch_byte` is always 0xCC for SW breakpoints today, but we
+// future-proof the canonicalisation by hashing it explicitly so a
+// future hardware-watchpoint variant can extend the same digest with a
+// different sentinel without colliding.
+//
+// Disabled breakpoints DON'T contribute (LLDB removes the patch when
+// the bp is disabled — including a disabled bp would mean the digest
+// doesn't match the inferior's actual .text bytes). Locations of a
+// multi-location bp are each enumerated.
+//
+// This closes the slice-1c gap from the 1b reviewer: probe.create
+// patches .text but the snapshot didn't reflect that, so two
+// `mem.read` calls bracketing a probe.create would yield different
+// bytes but identical snapshots.
+std::string compute_bp_digest(lldb::SBTarget target) {
+  if (!target.IsValid()) {
+    // Empty-set sentinel: SHA-256 of u64-LE 0 (count=0). This is the
+    // documented value; pinned by tests/unit/test_live_provenance_bp.cpp.
+    util::Sha256 h;
+    hash_u64_le(h, 0);
+    return util::sha256_hex(h.finalize());
+  }
+
+  struct BpEntry {
+    std::uint64_t addr  = 0;
+    std::uint8_t  patch = 0xCC;  // SW-bp trap byte on x86; on arm64 it's
+                                 // a different opcode, but we hash a
+                                 // sentinel rather than the actual byte
+                                 // because the canonical form is
+                                 // arch-agnostic and the opcode-vs-trap
+                                 // distinction lands on the agent side
+                                 // via mem.read.
+  };
+  std::vector<BpEntry> entries;
+  std::uint32_t n = target.GetNumBreakpoints();
+  entries.reserve(n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto bp = target.GetBreakpointAtIndex(i);
+    if (!bp.IsValid()) continue;
+    if (!bp.IsEnabled()) continue;          // disabled → not patching
+    std::size_t nloc = bp.GetNumLocations();
+    for (std::size_t l = 0; l < nloc; ++l) {
+      auto loc = bp.GetLocationAtIndex(static_cast<std::uint32_t>(l));
+      if (!loc.IsValid() || !loc.IsEnabled()) continue;
+      auto la = loc.GetLoadAddress();
+      if (la == LLDB_INVALID_ADDRESS) continue;
+      BpEntry e;
+      e.addr  = static_cast<std::uint64_t>(la);
+      e.patch = 0xCC;
+      entries.push_back(e);
+    }
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const BpEntry& a, const BpEntry& b) {
+              if (a.addr != b.addr) return a.addr < b.addr;
+              return a.patch < b.patch;
+            });
+
+  util::Sha256 h;
+  hash_u64_le(h, entries.size());
+  for (const auto& e : entries) {
+    hash_u64_le(h, e.addr);
+    hash_u64_le(h, static_cast<std::uint64_t>(e.patch));
+  }
+  return util::sha256_hex(h.finalize());
+}
+
 // Compute the module layout digest. Modules are sorted by path
 // ascending. Each entry is
 //   <path : LP string> <load_address : u64 LE>
@@ -2990,6 +3104,68 @@ bool process_is_live(lldb::SBProcess proc) {
 
 }  // namespace
 
+// Drain pending module-load events from `module_listener` and invalidate
+// the layout cache of any target whose broadcaster fired. Called from
+// snapshot_for_target before computing layout_digest so a dlopen between
+// snapshots is reflected in the very next snapshot string (slice 1c —
+// closes the dlopen-without-resume gap from the 1b reviewer).
+//
+// Synchronous drain (rather than a background thread) sidesteps the
+// listener-lifetime hazards the 1b worker flagged. Cost is bounded:
+// dlopen events are infrequent and we drain every snapshot call.
+//
+// Caller MUST hold impl_->mu (we mutate live_state).
+void LldbBackend::drain_module_events_locked() {
+  auto& listener = impl_->module_listener;
+  if (!listener.IsValid()) return;
+  lldb::SBEvent ev;
+  while (listener.GetNextEvent(ev)) {
+    // Find which target's broadcaster matches; invalidate that
+    // target's layout cache. SBEvent::BroadcasterMatchesRef is the
+    // documented matcher; we use SBTarget::EventIsTargetEvent /
+    // GetTargetFromEvent first as a fast path, then fall back.
+    bool matched = false;
+    if (lldb::SBTarget::EventIsTargetEvent(ev)) {
+      auto evt_target = lldb::SBTarget::GetTargetFromEvent(ev);
+      if (evt_target.IsValid()) {
+        for (auto& [tid, tgt] : impl_->targets) {
+          if (tgt.IsValid() &&
+              tgt.GetBroadcaster().GetName() != nullptr &&
+              evt_target.GetBroadcaster().GetName() != nullptr &&
+              std::string_view(tgt.GetBroadcaster().GetName()) ==
+                  std::string_view(evt_target.GetBroadcaster().GetName())) {
+            // Multiple targets can in principle share a broadcaster
+            // name; double-check via BroadcasterMatchesRef.
+            if (ev.BroadcasterMatchesRef(tgt.GetBroadcaster())) {
+              auto it = impl_->live_state.find(tid);
+              if (it != impl_->live_state.end()) {
+                it->second.digests_valid = false;
+                it->second.layout_digest.clear();
+                // reg_digest stays — registers don't change on dlopen.
+              }
+              matched = true;
+            }
+          }
+        }
+      }
+    }
+    if (!matched) {
+      // Generic fallback: walk targets and find a broadcaster match.
+      for (auto& [tid, tgt] : impl_->targets) {
+        if (!tgt.IsValid()) continue;
+        if (ev.BroadcasterMatchesRef(tgt.GetBroadcaster())) {
+          auto it = impl_->live_state.find(tid);
+          if (it != impl_->live_state.end()) {
+            it->second.digests_valid = false;
+            it->second.layout_digest.clear();
+          }
+          break;
+        }
+      }
+    }
+  }
+}
+
 std::string LldbBackend::snapshot_for_target(TargetId tid) {
   // Best-effort metadata: if anything unusual happens (target gone
   // mid-call, SBProcess invalid) we degrade to "none" rather than
@@ -3015,21 +3191,33 @@ std::string LldbBackend::snapshot_for_target(TargetId tid) {
   if (!core_hex.empty()) {
     return "core:" + core_hex;
   }
-  // Live target → "live:<gen>:<reg_digest>:<layout_digest>"; otherwise
-  // (target exists but no process: e.g. target.open without launch
-  // /attach, or process exited) → "none".
+  // Live target → "live:<gen>:<reg_digest>:<layout_digest>:<bp_digest>";
+  // otherwise (target exists but no process: e.g. target.open without
+  // launch/attach, or process exited) → "none".
   if (!target.IsValid()) return "none";
   auto proc = target.GetProcess();
   if (!process_is_live(proc)) return "none";
 
-  // Compute (or reuse cached) digests for the current `gen`. The cache
-  // is invalidated by attach / launch / continue / step / detach /
-  // close; see those entry points.
+  // Compute (or reuse cached) reg+layout digests for the current `gen`.
+  // The cache is invalidated by attach / launch / continue / step /
+  // detach / close; see those entry points.
+  //
+  // bp_digest is computed FRESH on every call rather than cached: it
+  // changes on probe.create / probe.delete / probe.enable / probe.disable
+  // — none of which bump <gen> (they don't resume the inferior) — so a
+  // cache invalidation hook would have to fire from those backend
+  // entrypoints. Computing fresh is cheap (typically zero or a handful
+  // of bps; SHA-256 of <100 bytes) and avoids the additional plumbing.
   std::uint64_t gen = 0;
   std::string reg_hex;
   std::string layout_hex;
+  std::string bp_hex;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
+    // Drain pending dlopen events first — a module-load between two
+    // snapshot calls must invalidate the cached layout digest for that
+    // target (slice 1c).
+    drain_module_events_locked();
     auto& st = impl_->live_state[tid];  // value-init on first sight
     if (!st.digests_valid) {
       st.reg_digest    = compute_reg_digest(proc);
@@ -3039,15 +3227,18 @@ std::string LldbBackend::snapshot_for_target(TargetId tid) {
     gen        = st.gen;
     reg_hex    = st.reg_digest;
     layout_hex = st.layout_digest;
+    bp_hex     = compute_bp_digest(target);
   }
   std::string out;
-  out.reserve(5 /*"live:"*/ + 20 + 1 + 64 + 1 + 64);
+  out.reserve(5 /*"live:"*/ + 20 + 1 + 64 + 1 + 64 + 1 + 64);
   out  = "live:";
   out += std::to_string(gen);
   out += ':';
   out += reg_hex;
   out += ':';
   out += layout_hex;
+  out += ':';
+  out += bp_hex;
   return out;
 }
 
