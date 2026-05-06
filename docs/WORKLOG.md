@@ -4,6 +4,70 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 18) — M4 part 4: BPF probe engine via bpftrace
+
+**Goal:** Land the second `probe.create` engine — `kind: "uprobe_bpf"` — alongside M3's `lldb_breakpoint`. The agent now picks low-rate / app-level (LLDB) vs. high-rate / syscall-level (BPF) per-probe; both flow into the same per-probe ring buffer and the same `ProbeEvent` shape (plan §7.2 + §7.3). bpftrace is shelled out as a long-lived subprocess; events stream back over a NEW transport primitive (`StreamingExec`).
+
+**Done:**
+
+- **`src/transport/streaming_exec.{h,cpp}`** — third member of the transport family alongside `ssh_exec`/`local_exec` (synchronous one-shot) and `SshTunneledCommand` (long-lived, no per-line pump). `StreamingExec` is async and line-streaming: a dedicated reader thread pumps stdout into an `on_line` callback as fast as the child produces bytes, with a 32 KiB per-line cap (longer lines deliver a `<prefix>...[truncated]` and we drop until the next `\n`). Stderr captured to an internal 64 KiB bounded buffer for diagnostics. Same `posix_spawnp` discipline as ssh.cpp + a `POSIX_SPAWN_SETPGROUP`-of-zero so we can `kill(-pgid, ...)` and reap shell-wrappers AND grand-children together (without this, `sh -c 'sleep 30'` leaves an orphan sleep holding stdout). Remote routing is `nullopt` → local, `Some(SshHost)` → `ssh -- argv...` with the same shell-quoting helper as `ssh_exec`.
+- **`src/probes/bpftrace_engine.{h,cpp}`** — the new engine.
+  - **Program generation** (`generate_bpftrace_program`): pure string transform from a typed `UprobeBpfSpec` to a one-line bpftrace program. `where.{uprobe|tracepoint|kprobe}: TARGET` becomes the probe attachment site. Optional `filter_pid: N` becomes `/pid == N/`. `capture.args = ["arg0","arg1"]` becomes `printf("...{\"args\":[\"0x%lx\",\"0x%lx\"]}", ..., arg0, arg1)`. **Allowlist boundary at the C++ layer**: `is_supported_arg_name` rejects anything not in `arg0..arg9` so an agent can't smuggle arbitrary bpftrace expressions through this path. Throws `std::invalid_argument` for empty target / bad arg names.
+  - **Output parser** (`BpftraceParse::parse_line`): one JSON object per line, parsed via nlohmann::json; missing/unrecognized fields tolerated; non-JSON status lines (`Attaching N probes...`) yield `nullopt` (the engine uses them as a "startup OK" signal). Both decimal and `0x...` hex string forms accepted for arg values.
+  - **`discover_bpftrace`**: `LDB_BPFTRACE` env → `/usr/bin/bpftrace` → `/usr/local/bin/bpftrace` → `command -v bpftrace`. Returns `""` if not found — `start()` then throws `backend::Error("bpftrace not installed; install via your distro or grab a static binary from https://github.com/iovisor/bpftrace/releases. Or set LDB_BPFTRACE=...")`.
+  - **`BpftraceEngine::start(setup_timeout)`** spawns bpftrace via `StreamingExec` and BLOCKS until either (a) first stdout line (success) OR (b) child exit (failure: probe attach error). On failure it surfaces the captured stderr in the `backend::Error` message — that string flows up through `dispatch_inner` to the agent as `-32000`. No more "create succeeded but no events ever come."
+  - **`-B line` flag**: bpftrace defaults to BLOCK buffering when stdout is a pipe (which it always is for us), which would defer events by tens of seconds under light load. We pass `-B line` to force line-buffered output. (Documented landmine in CLAUDE.md / WORKLOG.)
+- **`src/probes/probe_orchestrator.{h,cpp}`** wired for engine dispatch:
+  - New `BpftraceWhere {kind, target}` struct on `ProbeSpec`, plus `bpftrace_args / bpftrace_filter_pid / bpftrace_host` fields. Ignored for `kind=="lldb_breakpoint"`; required for `kind=="uprobe_bpf"`.
+  - `ProbeOrchestrator::create()` dispatches: `"lldb_breakpoint"` → existing path unchanged; `"uprobe_bpf"` → new `create_uprobe_bpf` which constructs the engine, hooks its event callback into the per-probe ring buffer (same `kEventBufferCap` = 1024, same drop-oldest discipline), and `start()`s it. Engine handle stored on `ProbeState::bpf_engine` (unique_ptr); `enable/disable/remove/dtor` branch on `bpf_engine != nullptr`.
+  - **`enable/disable` semantics for BPF**: bpftrace runs continuously (we don't stop it on disable — too expensive to detach + re-attach), so disable is a SOFT toggle in the orchestrator. Events fire while disabled get DROPPED at the callback before they enter the ring buffer.
+  - **`remove` ordering preserved**: stop the engine BEFORE erasing the table entry, so the reader thread joins (and the callback's baton — `ProbeState*` — can never fire after the surrounding shared_ptr drops).
+- **Dispatcher wiring** (`src/daemon/dispatcher.cpp`):
+  - `handle_probe_create` branches at the top on `kind == "uprobe_bpf"` and parses the new param shape (`where: {uprobe|tracepoint|kprobe}`, `capture: {args: [...]}`, `filter_pid`, `host`). Exactly one of the three where-forms must be set. Multiple → `-32602`. Empty → `-32602`. `target_id` is OPTIONAL for this kind (the BPF engine doesn't attach to an LLDB target).
+  - `describe.endpoints` updated: `probe.create` summary now mentions both engines, the param schema documents the new fields. Param table includes `uprobe?,tracepoint?,kprobe?` in `where` and `args?[]` in `capture`. Return shape stays `{probe_id, kind}` (we drop `breakpoint_id` and `locations` from the documented return — they were lldb_breakpoint-specific and the dispatcher wasn't even setting them).
+- **Tests** (TDD red→green):
+  - `tests/unit/test_streaming_exec.cpp` — 8 cases: spawn + stream lines + complete; `alive()` flips on exit; `terminate()` kills a sleeping child promptly (≤2s); dtor reaps cleanly; long-line truncation with marker; empty argv throws; nonexistent binary throws; stderr captured separately. **All cases EXERCISED on this box** (Pop!_OS / GCC 13 / sh + sleep all available).
+  - `tests/unit/test_bpftrace_parser.cpp` — 4 cases: well-formed line; extra/missing fields; malformed lines; hex-string vs decimal arg values.
+  - `tests/unit/test_bpftrace_program.cpp` — 6 cases: uprobe / tracepoint / kprobe forms; `filter_pid` predicate emission; zero captured args → `"args":[]`; rejection of unsupported arg names (e.g. `"; rm -rf /"`).
+  - `tests/unit/test_bpftrace_live.cpp` — 2 cases / `[live][requires_bpftrace_root]`: discovery returns "" or absolute path; engine ctor smoke. **SKIPped on this box** (bpftrace absent — apt is wedged for the XRT pin; a future session on a privileged box can wire the full attach test).
+  - `tests/unit/test_dispatcher_uprobe_bpf.cpp` — 3 cases: malformed where → -32602; missing bpftrace OR bogus uprobe path → -32000 with discoverable error; unknown kind → -32602.
+  - `tests/smoke/test_uprobe_bpf.py` — end-to-end: describe.endpoints surface; missing-where → -32602; multi-where → -32602; the "bpftrace not avail → -32000 with 'bpftrace' in the message" path. **EXERCISED**, passes in 0.16s.
+
+**Decisions:**
+
+- **`StreamingExec` as a brand-new primitive, NOT "ssh_exec with a streaming variant."** The reader-thread + line-cap + on-done discipline is fundamentally different from one-shot exec. Trying to retrofit `ssh_exec` would have meant either two callback shapes on one type or a giant bool-flag that branches the pump. A separate type keeps each primitive single-purpose and lets future engines (M5 CBOR transport, custom probe agent) reuse it.
+- **Process-group signaling, not just `kill(pid, ...)`.** Discovered via test breakage: `sh -c 'sleep 30'` keeps `sleep` running after the parent shell exits, and `sleep` inherits our stdout pipe via fork — so the reader thread blocks for 30 s until sleep finishes. `posix_spawnattr_setpgroup(0)` + `kill(-pgid, ...)` reaps the whole tree atomically. bpftrace forks worker children too; this fixes both cases at once.
+- **`-B line` for bpftrace stdout buffering.** The CLAUDE.md task brief flagged this. Without it, low-rate probes (1-2 hits/sec) would buffer in the bpftrace stdout pipe for 4-8 KiB before flushing — meaning `probe.events` returns nothing for tens of seconds even though the probe IS firing. `-B line` flushes per `\n`, costing nothing for our line-shaped output.
+- **Allowlist `arg0..arg9` only.** bpftrace's expression language is rich; `printf("%s", str(arg0))` is a thing. We could surface that, but every additional grammar token is operator-supplied input that ends up inside the bpftrace program — the same risk class as shelling out to `bash -c "$user_string"`. For MVP we accept only `argN` (numeric) and reject everything else. Future expansion (typed args via DWARF, `str(...)` for char* dereference) becomes its own slice with its own allowlist.
+- **`disable` for BPF is a SOFT toggle, not a real detach.** bpftrace's "detach probe" requires program rewrite + re-attach. For MVP we let bpftrace keep running and drop events at the orchestrator callback. The wire contract (`enabled: false` ⇒ no events in `probe.events`) is preserved. This means `disable` doesn't reduce kernel overhead — operators who care should `probe.delete` and `probe.create` again.
+- **Engine startup is SYNCHRONOUS in the dispatcher thread.** `start()` blocks until first-line-or-exit — typically <300 ms but can be up to the 3 s setup timeout. The dispatcher is single-threaded, so other RPCs queue behind. Acceptable at MVP scale (probe creation is a low-rate human-driven operation); when we want to allow concurrent dispatcher work we can hand the engine to a per-probe worker thread.
+- **`describe.endpoints` `summary` field, not `description`.** Smoke test caught my off-by-one — I'd named the test field `description`, but the existing dispatcher uses `summary` for every endpoint. Test corrected; the wire shape stays.
+- **`ProbeState::bpf_engine` as `unique_ptr`, NOT `shared_ptr`.** The engine baton is `ProbeState*`, not `BpftraceEngine*`. The engine is owned by exactly one ProbeState; when the orchestrator's `remove()` resets the unique_ptr, the engine dtor runs (which terminates + joins the reader thread), and only then do we erase the surrounding shared_ptr. This is the same lifecycle discipline M3 documented for the lldb_breakpoint trampoline baton.
+
+**Surprises / blockers:**
+
+- **First-pass dtor took 30 seconds per long-running test** because SIGTERM only killed the parent shell, not the grandchildren. Process-group fix (above) reduced terminate to ~10 ms.
+- **`Impl` private-vs-anonymous-namespace TU helpers**: the reader_loop and line-deliverer are in the .cpp's anonymous namespace — they can't see private nested types of an outer class. Fixed by making `StreamingExec::Impl` public (declared in the header, defined in the .cpp). Same pattern ssh.cpp would have used if its helpers needed Impl access.
+- **bpftrace stdout's "Attaching N probes..." line is a status message, not an event.** Parser must return `nullopt` for it; engine's `start()` uses the FIRST stdout line (event-or-not) as the "startup OK" signal. This works because bpftrace prints "Attaching..." synchronously on probe attachment; if attach fails, the process exits without printing it.
+- **GCC 13 + nlohmann/json `-Wnull-dereference` noise persists** — pre-existing; not from our code.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **26/26 PASS in 24.12 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 25/25 → +1 for `smoke_uprobe_bpf`.)
+  - `smoke_uprobe_bpf`: 0.16 s.
+  - `unit_tests`: 13.80 s (267 cases / 3462 assertions; was 244/3375 — +23 cases, +87 assertions).
+  - **Live BPF test SKIPPED** on this box (bpftrace not installed). Discovery test PASSES (returns "" cleanly, no crash). `[requires_bpftrace_root]` tag in place for future privileged-box runs.
+  - `[transport][streaming]` cases all EXERCISED — sh / sleep / head / tr all available.
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` noise from GCC 13).
+- Stdout-discipline preserved: bpftrace's stdout goes into our pipe (never inherited); stderr captured separately so it can't poison events; `-B line` keeps event delivery prompt.
+- `build/bin/ldbd --version` → 0.1.0 (binary still links and runs).
+
+**M4 status:** parts 1-4 all landed. Remaining M4: `observer.net.tcpdump` (streaming — would reuse `StreamingExec`!), `observer.net.igmp`, `observer.exec` (operator-allowlist design slice), and proper end-user documentation.
+
+**Next:** Decision point — finish M4 polish (igmp + tcpdump using the new StreamingExec) or move to M3 polish (`.ldbpack`, `session.fork`/replay, provenance system) or M5 (CBOR transport, CLI, polish). The transport surface is now broad enough that observer.net.tcpdump becomes a thin wrapper over `StreamingExec(... ["tcpdump","-i",iface,"-w","-",...])` plus a packet parser — natural follow-on if we want M4 fully closed.
+
+---
+
 ## 2026-05-06 (cont. 17) — M4 part 3: typed observers (proc + net)
 
 **Goal:** Land the four lowest-friction `observer.*` endpoints called for by §4.6 of the plan — `observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets`. These replace the §4.6 `run_host_command` foot-gun with allowlisted, typed JSON. Local-vs-remote routing is parameterized: `host?` absent ⇒ `local_exec` on the daemon's own machine, `host?` present ⇒ `ssh_exec` over M4-1's SSH transport.

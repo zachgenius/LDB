@@ -1,5 +1,6 @@
 #include "probes/probe_orchestrator.h"
 
+#include "probes/bpftrace_engine.h"
 #include "store/artifact_store.h"
 #include "util/log.h"
 
@@ -37,6 +38,12 @@ struct ProbeOrchestrator::ProbeState {
   // is fine because the orchestrator outlives every ProbeState
   // (orchestrator's dtor reaps everything).
   ProbeOrchestrator*           owner = nullptr;
+
+  // For kind == "uprobe_bpf": the engine handle. nullptr otherwise.
+  // Engine outlives this struct only inside the orchestrator table;
+  // dtor / remove() resets it before the surrounding ProbeState is
+  // freed so no callback can fire against a dangling owner pointer.
+  std::unique_ptr<BpftraceEngine> bpf_engine;
 };
 
 namespace {
@@ -93,11 +100,17 @@ ProbeOrchestrator::ProbeOrchestrator(
       artifacts_(std::move(artifacts)) {}
 
 ProbeOrchestrator::~ProbeOrchestrator() {
-  // Reap every probe so the trampoline can never fire after `*this`
-  // is gone. Errors here are logged-and-ignored — we're tearing down,
-  // any individual delete failure shouldn't cascade.
+  // Reap every probe so the trampoline / engine can never fire after
+  // `*this` is gone. Errors here are logged-and-ignored — we're
+  // tearing down, any individual delete failure shouldn't cascade.
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& [id, st] : probes_) {
+    if (st->bpf_engine) {
+      // Stop the engine first so its callback cannot fire against a
+      // pointer we're about to free.
+      st->bpf_engine.reset();
+      continue;
+    }
     try {
       backend_->disable_breakpoint(st->spec.target_id, st->bp_id);
     } catch (const std::exception& e) {
@@ -112,11 +125,28 @@ ProbeOrchestrator::~ProbeOrchestrator() {
   probes_.clear();
 }
 
+namespace {
+
+// Render a uprobe_bpf where for list() / where_expr.
+std::string render_bpftrace_where(const BpftraceWhere& w) {
+  switch (w.kind) {
+    case BpftraceWhere::Kind::kUprobe:     return "uprobe:" + w.target;
+    case BpftraceWhere::Kind::kTracepoint: return "tracepoint:" + w.target;
+    case BpftraceWhere::Kind::kKprobe:     return "kprobe:" + w.target;
+  }
+  return w.target;
+}
+
+}  // namespace
+
 std::string ProbeOrchestrator::create(const ProbeSpec& spec_in) {
+  if (spec_in.kind == "uprobe_bpf") {
+    return create_uprobe_bpf(spec_in);
+  }
   if (spec_in.kind != "lldb_breakpoint") {
     throw std::invalid_argument(
-        "probe.create: only kind=\"lldb_breakpoint\" is supported in this "
-        "slice (uprobe_bpf is M4)");
+        "probe.create: unknown kind \"" + spec_in.kind +
+        "\"; expected lldb_breakpoint or uprobe_bpf");
   }
   if (spec_in.action == Action::kStoreArtifact) {
     if (spec_in.build_id.empty()) {
@@ -179,6 +209,13 @@ void ProbeOrchestrator::enable(const std::string& probe_id) {
     }
     st = it->second;
   }
+  if (st->bpf_engine) {
+    // bpftrace runs continuously — enable/disable is a soft toggle on
+    // the orchestrator side. Events arriving while disabled are dropped.
+    std::lock_guard<std::mutex> lk(mu_);
+    st->enabled = true;
+    return;
+  }
   backend_->enable_breakpoint(st->spec.target_id, st->bp_id);
   std::lock_guard<std::mutex> lk(mu_);
   st->enabled = true;
@@ -193,6 +230,11 @@ void ProbeOrchestrator::disable(const std::string& probe_id) {
       throw backend::Error("unknown probe_id: " + probe_id);
     }
     st = it->second;
+  }
+  if (st->bpf_engine) {
+    std::lock_guard<std::mutex> lk(mu_);
+    st->enabled = false;
+    return;
   }
   backend_->disable_breakpoint(st->spec.target_id, st->bp_id);
   std::lock_guard<std::mutex> lk(mu_);
@@ -214,6 +256,15 @@ void ProbeOrchestrator::remove(const std::string& probe_id) {
       throw backend::Error("unknown probe_id: " + probe_id);
     }
     st = it->second;
+  }
+  if (st->bpf_engine) {
+    // Stop the engine BEFORE erasing — the engine's reader thread
+    // joins inside the dtor, after which no more callbacks can fire
+    // against the baton (st.get()).
+    st->bpf_engine.reset();
+    std::lock_guard<std::mutex> lk(mu_);
+    probes_.erase(probe_id);
+    return;
   }
   // Best-effort disable; if it fails the delete still proceeds and
   // the trampoline is unhooked there.
@@ -275,6 +326,96 @@ ProbeOrchestrator::events(const std::string& probe_id,
     if (max != 0 && out.size() >= max) break;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// uprobe_bpf path — bpftrace shellout.
+// ---------------------------------------------------------------------------
+
+std::string ProbeOrchestrator::create_uprobe_bpf(const ProbeSpec& spec_in) {
+  if (!spec_in.bpftrace_where.has_value()
+      || spec_in.bpftrace_where->target.empty()) {
+    throw std::invalid_argument(
+        "probe.create(uprobe_bpf): where must set one of "
+        "{uprobe, tracepoint, kprobe}");
+  }
+
+  UprobeBpfSpec bs;
+  switch (spec_in.bpftrace_where->kind) {
+    case BpftraceWhere::Kind::kUprobe:
+      bs.where_kind = UprobeBpfSpec::Kind::kUprobe; break;
+    case BpftraceWhere::Kind::kTracepoint:
+      bs.where_kind = UprobeBpfSpec::Kind::kTracepoint; break;
+    case BpftraceWhere::Kind::kKprobe:
+      bs.where_kind = UprobeBpfSpec::Kind::kKprobe; break;
+  }
+  bs.where_target    = spec_in.bpftrace_where->target;
+  bs.captured_args   = spec_in.bpftrace_args;
+  bs.filter_pid      = spec_in.bpftrace_filter_pid;
+  bs.rate_limit_text = spec_in.rate_limit_text;
+  bs.remote          = spec_in.bpftrace_host;
+
+  ProbeSpec spec = spec_in;
+  spec.where_expr = render_bpftrace_where(*spec_in.bpftrace_where);
+
+  auto st = std::make_shared<ProbeState>();
+  st->kind        = spec.kind;
+  st->where_expr  = spec.where_expr;
+  st->spec        = std::move(spec);
+  st->bp_id       = 0;
+  st->enabled     = true;
+  st->owner       = this;
+
+  std::string probe_id;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    probe_id = "p" + std::to_string(next_probe_seq_++);
+    st->probe_id = probe_id;
+  }
+
+  ProbeState* raw = st.get();
+  auto on_event = [raw](const ProbeEvent& ev_in) {
+    if (!raw || !raw->owner) return;
+    if (!raw->enabled) return;  // bpftrace keeps running; we drop while disabled.
+    ProbeOrchestrator* self = raw->owner;
+    ProbeEvent ev = ev_in;
+    {
+      std::lock_guard<std::mutex> lk(self->mu_);
+      raw->hit_count += 1;
+      ev.hit_seq = raw->hit_count;
+      auto& buf = raw->events;
+      if (buf.size() >= ProbeOrchestrator::kEventBufferCap) {
+        buf.pop_front();
+      }
+      buf.push_back(std::move(ev));
+    }
+  };
+  auto on_exit = [raw](int code, bool /*timed_out*/, std::string err) {
+    if (!raw) return;
+    if (code != 0) {
+      log::warn(std::string("probe ") + raw->probe_id +
+                ": bpftrace exited rc=" + std::to_string(code) +
+                "; stderr: " + err);
+    }
+  };
+
+  st->bpf_engine = std::make_unique<BpftraceEngine>(
+      std::move(bs), std::move(on_event), std::move(on_exit));
+
+  // Start outside the orchestrator lock — bpftrace startup involves
+  // a subprocess + a few hundred ms of attach work. We don't want to
+  // block other RPCs.
+  try {
+    st->bpf_engine->start();
+  } catch (...) {
+    // Don't insert a half-broken probe.
+    st->bpf_engine.reset();
+    throw;
+  }
+
+  std::lock_guard<std::mutex> lk(mu_);
+  probes_.emplace(probe_id, st);
+  return probe_id;
 }
 
 // ---------------------------------------------------------------------------

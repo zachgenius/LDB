@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend/debugger_backend.h"
+#include "transport/ssh.h"  // SshHost — for uprobe_bpf remote routing
 
 #include <cstdint>
 #include <map>
@@ -101,9 +102,22 @@ enum class Action {
   kStoreArtifact,
 };
 
+// `uprobe_bpf` engine selector — only the where-form, capture.args,
+// optional pid-filter, and optional remote host are meaningful for
+// this engine. Memory/registers from CaptureSpec are ignored.
+struct BpftraceWhere {
+  enum class Kind : std::uint8_t {
+    kUprobe,        // path:symbol
+    kTracepoint,    // category:name
+    kKprobe,        // function name
+  };
+  Kind          kind = Kind::kUprobe;
+  std::string   target;
+};
+
 struct ProbeSpec {
   backend::TargetId  target_id = 0;
-  std::string        kind;          // "lldb_breakpoint" only in this slice
+  std::string        kind;          // "lldb_breakpoint" or "uprobe_bpf"
   // Where the probe sits — exactly one of the three forms must be set.
   // The orchestrator forwards to backend::create_breakpoint.
   backend::BreakpointSpec where;
@@ -121,6 +135,12 @@ struct ProbeSpec {
   // Parsed but UNENFORCED in this slice (deferred to a later M3 slice).
   // Stored verbatim for round-trip in list() output if useful.
   std::string        rate_limit_text;
+
+  // --- uprobe_bpf only ----------------------------------------------------
+  std::optional<BpftraceWhere>      bpftrace_where;
+  std::vector<std::string>          bpftrace_args;     // arg0,arg1,...
+  std::optional<std::int64_t>       bpftrace_filter_pid;
+  std::optional<transport::SshHost> bpftrace_host;
 };
 
 struct ProbeEvent {
@@ -206,6 +226,9 @@ class ProbeOrchestrator {
 
   static bool on_breakpoint_hit(void* baton,
                                 const backend::BreakpointCallbackArgs& args);
+
+  // kind=="uprobe_bpf" path.
+  std::string create_uprobe_bpf(const ProbeSpec& spec_in);
 };
 
 }  // namespace ldb::probes

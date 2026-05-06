@@ -7,6 +7,7 @@
 #include "protocol/view.h"
 #include "store/artifact_store.h"
 #include "store/session_store.h"
+#include "transport/ssh.h"
 #include "util/log.h"
 
 #include <chrono>
@@ -907,22 +908,26 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"path", "string"}});
 
   add("probe.create",
-      "Create a probe — an auto-resuming breakpoint with structured "
-      "capture. kind=\"lldb_breakpoint\" is the only engine in this "
-      "slice (uprobe_bpf is M4). where = {function} | {address} | "
-      "{file, line}. capture optionally snapshots registers and "
-      "memory regions. action is one of log_and_continue (default), "
-      "stop, store_artifact. For store_artifact, build_id and "
-      "artifact_name (template, with {hit} substitution) are "
-      "required. rate_limit is parsed but UNENFORCED in this slice.",
-      json{{"target_id", "uint64"}, {"kind", "string"},
-           {"where", "object{function?,address?,file?,line?}"},
-           {"capture", "object{registers?[],memory?[]}?"},
+      "Create a probe — an auto-resuming probe with structured capture. "
+      "kind = \"lldb_breakpoint\" (low-rate / app-level: where = "
+      "{function} | {address} | {file,line}; capture snapshots registers "
+      "and memory regions) OR \"uprobe_bpf\" (high-rate / syscall- and "
+      "libc-level via bpftrace shellout: where = {uprobe:'PATH:SYM'} | "
+      "{tracepoint:'CAT:NAME'} | {kprobe:'FN'}; capture.args lists "
+      "bpftrace builtins to print, e.g. ['arg0','arg1']; optional "
+      "host='user@hostname' routes through ssh, optional filter_pid "
+      "fires only on matching pid). action is one of log_and_continue "
+      "(default), stop, store_artifact (lldb_breakpoint only). "
+      "rate_limit is parsed but UNENFORCED.",
+      json{{"target_id", "uint64?"}, {"kind", "string"},
+           {"where", "object{function?,address?,file?,line?,"
+                     "uprobe?,tracepoint?,kprobe?}"},
+           {"capture", "object{registers?[],memory?[],args?[]}?"},
            {"action", "string?"},
            {"build_id", "string?"}, {"artifact_name", "string?"},
-           {"rate_limit", "string?"}},
-      json{{"probe_id", "string"}, {"breakpoint_id", "int"},
-           {"locations", "uint"}});
+           {"rate_limit", "string?"},
+           {"host", "string?"}, {"filter_pid", "int?"}},
+      json{{"probe_id", "string"}, {"kind", "string"}});
 
   add("probe.events",
       "Pull captured events for a probe. since=N returns events with "
@@ -2505,14 +2510,140 @@ Response Dispatcher::handle_probe_create(const Request& req) {
                               "params must be object");
   }
   std::uint64_t target_id = 0;
-  if (!require_uint(req.params, "target_id", &target_id)) {
-    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
-                              "missing uint param 'target_id'");
-  }
+  // For uprobe_bpf, target_id is OPTIONAL — the BPF engine doesn't
+  // attach to an LLDB target. Default to 0; the orchestrator ignores
+  // it for that kind.
+  bool have_target_id = require_uint(req.params, "target_id", &target_id);
   const auto* kind = require_string(req.params, "kind");
   if (!kind || kind->empty()) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing non-empty string param 'kind'");
+  }
+
+  // ---- uprobe_bpf path ---------------------------------------------------
+  if (*kind == "uprobe_bpf") {
+    auto wit = req.params.find("where");
+    if (wit == req.params.end() || !wit->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "missing object param 'where'");
+    }
+    probes::BpftraceWhere bw;
+    int set = 0;
+    if (auto it = wit->find("uprobe");
+        it != wit->end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "where.uprobe must be string");
+      }
+      bw.kind = probes::BpftraceWhere::Kind::kUprobe;
+      bw.target = it->get<std::string>();
+      ++set;
+    }
+    if (auto it = wit->find("tracepoint");
+        it != wit->end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "where.tracepoint must be string");
+      }
+      bw.kind = probes::BpftraceWhere::Kind::kTracepoint;
+      bw.target = it->get<std::string>();
+      ++set;
+    }
+    if (auto it = wit->find("kprobe");
+        it != wit->end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "where.kprobe must be string");
+      }
+      bw.kind = probes::BpftraceWhere::Kind::kKprobe;
+      bw.target = it->get<std::string>();
+      ++set;
+    }
+    if (set == 0 || bw.target.empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where must set exactly one of "
+                                "{uprobe, tracepoint, kprobe} (non-empty)");
+    }
+    if (set > 1) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where must set exactly one of "
+                                "{uprobe, tracepoint, kprobe}");
+    }
+
+    std::vector<std::string> bpf_args;
+    if (auto cit = req.params.find("capture");
+        cit != req.params.end() && cit->is_object()) {
+      if (auto ait = cit->find("args");
+          ait != cit->end() && !ait->is_null()) {
+        if (!ait->is_array()) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.args must be array of string");
+        }
+        for (const auto& a : *ait) {
+          if (!a.is_string()) {
+            return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                      "capture.args entries must be strings");
+          }
+          bpf_args.push_back(a.get<std::string>());
+        }
+      }
+    }
+
+    std::optional<std::int64_t> filter_pid;
+    if (auto it = req.params.find("filter_pid");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_number_integer() && !it->is_number_unsigned()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "filter_pid must be integer");
+      }
+      filter_pid = it->get<std::int64_t>();
+    }
+
+    std::optional<transport::SshHost> remote;
+    if (auto it = req.params.find("host");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "host must be string");
+      }
+      transport::SshHost h;
+      h.host = it->get<std::string>();
+      remote = std::move(h);
+    }
+
+    std::string rate_limit;
+    if (const auto* rl = require_string(req.params, "rate_limit")) {
+      rate_limit = *rl;
+    }
+
+    probes::ProbeSpec ps;
+    ps.target_id           = static_cast<backend::TargetId>(target_id);
+    ps.kind                = "uprobe_bpf";
+    ps.bpftrace_where      = std::move(bw);
+    ps.bpftrace_args       = std::move(bpf_args);
+    ps.bpftrace_filter_pid = filter_pid;
+    ps.bpftrace_host       = std::move(remote);
+    ps.rate_limit_text     = std::move(rate_limit);
+
+    std::string probe_id;
+    try {
+      probe_id = probes_->create(ps);
+    } catch (const std::invalid_argument& e) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
+    }
+    // backend::Error from start() (bpftrace missing, attach failed, etc.)
+    // propagates through dispatch_inner's catch → -32000.
+
+    json data;
+    data["probe_id"] = probe_id;
+    data["kind"]     = "uprobe_bpf";
+    return protocol::make_ok(req.id, std::move(data));
+  }
+
+  // ---- lldb_breakpoint path ---------------------------------------------
+  if (!have_target_id) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
   }
 
   // where = {function} | {address} | {file, line}
