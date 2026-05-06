@@ -3877,6 +3877,29 @@ Response Dispatcher::handle_recipe_run(const Request& req) {
       break;
     }
 
+    // Recursion guard: reject any recipe.* sub-call. recipe.run inside a
+    // recipe segfaults the daemon via unbounded dispatch_inner recursion;
+    // recipe.create / .from_session inside a recipe is operationally
+    // pointless and complicates audit. The agent can compose recipes
+    // out-of-band (call recipe.run, then call recipe.run again) — there
+    // is no use case for nested recipe calls. Surfaced as -32003
+    // kForbidden with a stop-on-first-error truncation, matching the
+    // policy for substitution failures above.
+    if (call.method.rfind("recipe.", 0) == 0) {
+      json entry;
+      entry["seq"]    = seq;
+      entry["method"] = call.method;
+      entry["ok"]     = false;
+      json err;
+      err["code"]    = static_cast<int>(ErrorCode::kForbidden);
+      err["message"] = "recipe.* sub-calls are forbidden inside a recipe "
+                       "(would recurse without bound); compose recipes "
+                       "out-of-band by calling recipe.run from the agent";
+      entry["error"] = std::move(err);
+      responses.push_back(std::move(entry));
+      break;
+    }
+
     Request sub_req;
     sub_req.id     = std::nullopt;  // sub-calls don't need their own ids
     sub_req.method = call.method;
