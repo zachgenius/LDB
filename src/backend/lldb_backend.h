@@ -101,6 +101,8 @@ class LldbBackend final : public DebuggerBackend {
 
   void close_target(TargetId tid) override;
 
+  std::string snapshot_for_target(TargetId tid) override;
+
   void attach_target_resource(TargetId tid,
                               std::unique_ptr<TargetResource> r) override;
 

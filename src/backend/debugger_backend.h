@@ -613,6 +613,23 @@ class DebuggerBackend {
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;
 
+  // --- Provenance ------------------------------------------------------
+  //
+  // Cores-only MVP per plan §3.5. The dispatcher decorates every
+  // successful response with `_provenance.snapshot`; this is the
+  // string it embeds, computed against the named target.
+  //
+  //   * core-loaded target → "core:<lowercase-hex-sha256>". The hash
+  //     is computed once by load_core (against the core file on
+  //     disk) and cached on the per-target state.
+  //   * live target with an attached process → "live".
+  //   * any other case (target not yet known, target with no process,
+  //     unknown tid) → "none".
+  //
+  // Best-effort metadata: never throw — the dispatcher calls this on
+  // every dispatch and a thrown exception would poison the response.
+  virtual std::string snapshot_for_target(TargetId tid) = 0;
+
   // --- Out-of-band target-bound resources ------------------------------
   //
   // Some endpoints (e.g. target.connect_remote_ssh) need to keep an

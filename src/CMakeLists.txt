@@ -23,6 +23,7 @@ set(LDBD_SOURCES
   observers/net_igmp.cpp
   observers/exec_allowlist.cpp
   util/log.cpp
+  util/sha256.cpp
 )
 
 add_executable(ldbd ${LDBD_SOURCES})
