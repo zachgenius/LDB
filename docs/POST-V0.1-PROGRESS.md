@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-Tier 2 §4+§6 merge — DAP shim + probe recipes live) |
-| **ctest at HEAD** | 43/43 green |
+| **HEAD now** | (updated post-Tier 3 §7+§11 merge — knowledge graph + session.diff live) |
+| **ctest at HEAD** | 45/45 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -47,11 +47,11 @@
 
 | # | Slice | Status | Worker | Reviewer | Merge commit |
 |---|---|---|---|---|---|
-| 7 | Artifact knowledge graph — typed relations | — | — | — | — |
-| 8 | Hot reload of Python extensions | — | — | — | — |
+| 7 | Artifact knowledge graph — typed relations | ✅ | `abfaab1cad3209671` | `a989f5100a94c9e46` | (merge commit on master) |
+| 8 | Hot reload of Python extensions | ⏭ | — | — | (deferred — see rationale §) |
 | 9 | Multi-binary sessions — N targets per session | — | — | — | — |
 | 10 | Cross-binary correlation — needs symbol index foundation | — | — | — | — |
-| 11 | `session.diff(s1, s2)` | — | — | — | — |
+| 11 | `session.diff(s1, s2)` | ✅ | `ad680d6272d58c67f` | `ab980bad2d484ab5f` | (merge commit on master) |
 | 12 | Semantic queries v1 — heap walk, mutex graph | — | — | — | — |
 
 ## Tier 4 — Power features
@@ -69,6 +69,7 @@
 | Item | Why |
 |---|---|
 | **5 — Native libbpf probe agent** | The roadmap explicitly says replace `bpftrace` shellout "when measurement justifies it." We have no measurement evidence that the shellout is too slow. Speculative replacement violates the progressive-replacement strategy in §03 §7. Will revisit when a workload exposes the latency. |
+| **8 — Hot reload of Python extensions** | LDB picked the C++ baton path for probes (M3, slice 13) — no embedded Python extensions exist. The v0.4 roadmap pitch ("edit Python extension, hot-load without losing state") is moot until Python embedding lands. Re-evaluate when extension scripting is on the agenda. |
 
 ## Blockers / decisions surfaced for user
 
