@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-1a-merge) |
-| **ctest at HEAD** | 35/35 green |
+| **HEAD now** | (updated post-1b-merge) |
+| **ctest at HEAD** | 36/36 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -28,7 +28,7 @@
 | # | Slice | Status | Worker | Reviewer | Merge commit |
 |---|---|---|---|---|---|
 | 1a | Live provenance — endpoint determinism audit | ✅ | `a05ab0000ec0248b1` | (inline review) | — |
-| 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | 🔍 | `a1da55c9959d40268` | — | — |
+| 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | ✅ | `a1da55c9959d40268` | `a379567ea90e9472a` | (merge commit on master) |
 | 1c | Live provenance — CI determinism gate extended to live targets | — | — | — | — |
 | 2 | macOS arm64 hardening pass (Linux-side fixes; macOS sign-off deferred to user) | — | — | — | — |
 | 3a | Public release polish — protocol semver + version handshake in `hello` | — | — | — | — |
@@ -73,6 +73,15 @@
 ## Blockers / decisions surfaced for user
 
 _(none so far)_
+
+## 1b reviewer findings folded into slice 1c spec
+
+The reviewer's pass on 1b approved the merge but flagged 4 issues for slice 1c:
+
+1. **SW-bp memory-patch invisibility** — Two snapshots straddling `probe.create` (with the same `<gen>`) carry identical strings even though `.text` was patched with `0xCC`. 1c should fold breakpoint-patch addresses into `<layout_digest>` OR document the gap in the deterministic-only view spec. Add a regression test that creates a probe and asserts the snapshot string changes.
+2. **dlopen-without-resume gap** — `<gen>` does NOT bump on dlopen. Two `module.list` calls before/after a dlopen would have different output but same `<gen>` AND same cached `<layout_digest>`. 1c should subscribe to `eBroadcastBitModulesLoaded` (or similar) to invalidate `<layout_digest>` independently of `<gen>`.
+3. **No `process.continue` round-trip in 1b's smoke test** — SIGSTOP-via-tracer relationship absorbs the cycle. 1c's CI gate needs a different approach (spawning a fixture that runs to a placed breakpoint, then observing the gen bump).
+4. **`describe.endpoints` size doc nit** — 56,652 vs 56,805. Trivial.
 
 ## Audit-driven corrections folded into slice 1b spec
 
