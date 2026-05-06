@@ -18,6 +18,7 @@ set(LDBD_SOURCES
   observers/net_sockets.cpp
   observers/net_tcpdump.cpp
   observers/net_igmp.cpp
+  observers/exec_allowlist.cpp
   util/log.cpp
 )
 

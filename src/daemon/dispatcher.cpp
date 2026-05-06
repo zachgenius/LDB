@@ -2,6 +2,7 @@
 
 #include "backend/debugger_backend.h"
 #include "ldb/version.h"
+#include "observers/exec_allowlist.h"
 #include "observers/observers.h"
 #include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
@@ -368,11 +369,13 @@ json artifact_row_to_list_json(const ldb::store::ArtifactRow& r) {
 Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
                        std::shared_ptr<store::ArtifactStore> artifacts,
                        std::shared_ptr<store::SessionStore> sessions,
-                       std::shared_ptr<probes::ProbeOrchestrator> probes)
+                       std::shared_ptr<probes::ProbeOrchestrator> probes,
+                       std::shared_ptr<observers::ExecAllowlist> exec_allowlist)
     : backend_(std::move(backend)),
       artifacts_(std::move(artifacts)),
       sessions_(std::move(sessions)),
-      probes_(std::move(probes)) {}
+      probes_(std::move(probes)),
+      exec_allowlist_(std::move(exec_allowlist)) {}
 
 Dispatcher::~Dispatcher() = default;
 
@@ -489,6 +492,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "observer.net.sockets") return handle_observer_net_sockets(req);
     if (req.method == "observer.net.tcpdump") return handle_observer_net_tcpdump(req);
     if (req.method == "observer.net.igmp")    return handle_observer_net_igmp(req);
+    if (req.method == "observer.exec")        return handle_observer_exec(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -1046,6 +1050,23 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
             "array of {idx,device,count?,querier?,addresses:"
             "[{address,users,timer}]}"},
            {"total", "uint"}});
+
+  add("observer.exec",
+      "Operator-allowlisted exec escape hatch (plan §4.6). OFF by "
+      "default: returns -32002 unless the daemon was launched with "
+      "--observer-exec-allowlist <path> or LDB_OBSERVER_EXEC_ALLOWLIST. "
+      "The allowlist file lists fnmatch(FNM_PATHNAME) glob patterns "
+      "against the space-joined argv, one per line; '#' starts a "
+      "comment, blank lines are ignored, EMPTY file rejects all. "
+      "argv[0] MUST be an absolute path or a bare basename on PATH; "
+      "relative paths (./foo, ../bar) are -32602. stdin payload is "
+      "capped at 64 KiB. Disallowed argv → -32003 (kForbidden); the "
+      "allowlist contents are NEVER returned over the wire.",
+      json{{"argv", "array of string"}, {"host", "string?"},
+           {"timeout_ms", "uint?"}, {"stdin", "string?"}},
+      json{{"stdout", "string"}, {"stderr", "string"},
+           {"exit_code", "int"}, {"duration_ms", "uint"},
+           {"truncated", "bool?"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -3302,6 +3323,123 @@ Response Dispatcher::handle_observer_net_igmp(const Request& req) {
   for (const auto& g : r.groups) arr.push_back(igmp_group_to_json(g));
   return protocol::make_ok(req.id,
       protocol::view::apply_to_array(std::move(arr), view_spec, "groups"));
+}
+
+// ---- observer.exec -----------------------------------------------------
+//
+// The escape-hatch endpoint from §4.6. This is the ONLY observer.* that
+// runs operator-supplied argv; the others run hardcoded argv against an
+// operator-supplied integer pid. The wire shape is bounded (argv array,
+// not a single shell string) so we never compose a /bin/sh -c command;
+// each argv element is passed verbatim through posix_spawnp (local) or
+// shell-quoted by ssh_exec (remote).
+//
+// Off-by-default policy: if no allowlist was wired in at startup we
+// return -32002 immediately. If one IS wired, we still verify the
+// joined argv matches one of the operator's patterns; misses are
+// -32003 (kForbidden). The dispatcher does NOT echo the allowlist
+// patterns back to the agent — the contents are operator policy and
+// the agent learns by attempting and seeing the typed error.
+
+Response Dispatcher::handle_observer_exec(const Request& req) {
+  if (!exec_allowlist_) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "observer.exec disabled — no allowlist configured. Set "
+        "--observer-exec-allowlist or LDB_OBSERVER_EXEC_ALLOWLIST to a "
+        "file containing one allowed argv pattern per line.");
+  }
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+
+  // argv: required, non-empty, all-strings.
+  auto it = req.params.find("argv");
+  if (it == req.params.end() || !it->is_array() || it->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "missing or empty array param 'argv'");
+  }
+  std::vector<std::string> argv;
+  argv.reserve(it->size());
+  for (const auto& e : *it) {
+    if (!e.is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "param 'argv' must be array of string");
+    }
+    argv.push_back(e.get<std::string>());
+  }
+
+  // argv[0] resolution rule: absolute path, OR a bare basename (no '/').
+  // Relative paths like ./foo or ../foo are agent mistakes, not policy.
+  const std::string& arg0 = argv[0];
+  if (arg0.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "param 'argv[0]' must be non-empty");
+  }
+  const bool absolute = arg0.front() == '/';
+  const bool basename = arg0.find('/') == std::string::npos;
+  if (!absolute && !basename) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "param 'argv[0]' must be an absolute path or a bare basename "
+        "on PATH (relative paths like ./foo, ../bar are rejected)");
+  }
+
+  // timeout_ms: optional, default 30s, max 300s.
+  std::chrono::milliseconds timeout = std::chrono::seconds(30);
+  if (auto t = req.params.find("timeout_ms");
+      t != req.params.end() && !t->is_null()) {
+    if (!t->is_number_unsigned() && !t->is_number_integer()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'timeout_ms' must be uint");
+    }
+    auto v = t->get<std::int64_t>();
+    if (v <= 0 || v > 300000) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'timeout_ms' must be in 1..300000");
+    }
+    timeout = std::chrono::milliseconds(v);
+  }
+
+  // stdin: optional string, capped at 64 KiB.
+  std::string stdin_data;
+  if (auto s = req.params.find("stdin");
+      s != req.params.end() && !s->is_null()) {
+    if (!s->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'stdin' must be string");
+    }
+    stdin_data = s->get<std::string>();
+    if (stdin_data.size() > 64 * 1024) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "param 'stdin' exceeds 64 KiB cap");
+    }
+  }
+
+  auto remote = observer_host_from_params(req.params);
+
+  // Allowlist check is the last gate before transport.
+  if (!exec_allowlist_->allows(argv)) {
+    return protocol::make_err(req.id, ErrorCode::kForbidden,
+        "observer.exec: argv not allowed by operator policy");
+  }
+
+  ldb::observers::ExecRequest ereq;
+  ereq.argv       = std::move(argv);
+  ereq.remote     = std::move(remote);
+  ereq.timeout    = timeout;
+  ereq.stdin_data = std::move(stdin_data);
+
+  auto er = ldb::observers::run_observer_exec(*exec_allowlist_, ereq);
+
+  json data;
+  data["stdout"]      = er.stdout_data;
+  data["stderr"]      = er.stderr_data;
+  data["exit_code"]   = er.exit_code;
+  data["duration_ms"] = static_cast<std::uint64_t>(er.duration.count());
+  if (er.stdout_truncated || er.stderr_truncated || er.timed_out) {
+    data["truncated"] = true;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 }  // namespace ldb::daemon

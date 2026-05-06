@@ -23,6 +23,7 @@ enum class ErrorCode : int {
   kBackendError    = -32000,
   kNotImplemented  = -32001,
   kBadState        = -32002,
+  kForbidden       = -32003,
 };
 
 struct Request {
