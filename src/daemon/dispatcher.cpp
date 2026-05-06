@@ -540,6 +540,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "session.info")       return handle_session_info(req);
     if (req.method == "session.export")     return handle_session_export(req);
     if (req.method == "session.import")     return handle_session_import(req);
+    if (req.method == "session.diff")       return handle_session_diff(req);
 
     if (req.method == "recipe.create")       return handle_recipe_create(req);
     if (req.method == "recipe.from_session") return handle_recipe_from_session(req);
@@ -1354,6 +1355,47 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"path",         str()},
       }, {"id", "name", "created_at", "call_count", "path"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("session.diff",
+      "Structured diff between two sessions' rpc_logs (Tier 3 §11). "
+      "Two log rows match iff their (method, canonical-params-JSON) "
+      "tuples are byte-identical; an aligned pair is `common` if their "
+      "canonical responses are byte-identical, else `diverged`. "
+      "Unaligned A rows are `removed`, unaligned B rows are `added`. "
+      "Alignment is computed via Longest Common Subsequence on the "
+      "(method, params_canon) sequence — a single inserted call shows "
+      "up as one `added` entry, not as a downstream cascade of "
+      "diverged. Diffing across different binaries is allowed but "
+      "expected to be high-divergence (no semantic match across "
+      "build_ids). Use `view` for limit/offset/summary slicing — "
+      "responses on long traces can be very large; cost_hint is "
+      "`unbounded`.",
+      obj({
+          {"session_a", str("Base session id (32-hex).")},
+          {"session_b", str("Compared session id (32-hex).")},
+          {"view",      view_param()},
+      }, {"session_a", "session_b"}),
+      obj({
+          {"summary", obj({
+              {"total_a",  int_()},
+              {"total_b",  int_()},
+              {"added",    int_()},
+              {"removed",  int_()},
+              {"common",   int_()},
+              {"diverged", int_()},
+          }, {"total_a", "total_b", "added", "removed",
+              "common", "diverged"})},
+          {"entries",     arr_of(obj_open(
+              "Diff entry. Fields by kind: "
+              "common={kind, method, params_hash, seq_a, seq_b}; "
+              "added={kind, method, params, response, seq_b}; "
+              "removed={kind, method, params, response, seq_a}; "
+              "diverged={kind, method, params, seq_a, seq_b, "
+              "response_a, response_b}."))},
+          {"total",       int_()},
+          {"next_offset", int_()},
+      }, {"summary", "entries", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "unbounded");
 
   // ============== session.export / .import — `.ldbpack` (M5 part 5) ====
 
@@ -3453,6 +3495,89 @@ Response Dispatcher::handle_session_info(const Request& req) {
   }
   data["path"]       = row->path;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_session_diff(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* a = require_string(req.params, "session_a");
+  if (!a || a->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'session_a'");
+  }
+  const auto* b = require_string(req.params, "session_b");
+  if (!b || b->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'session_b'");
+  }
+
+  // diff_logs throws backend::Error on missing id; the outer dispatch()
+  // catch maps it to -32000.
+  auto result = sessions_->diff_logs(*a, *b);
+
+  // Render entries as an array; the wire shape per entry depends on
+  // kind. All entries carry method + params_hash; common omits params
+  // and response (they're equal — params_hash is enough to identify);
+  // diverged carries both responses; added/removed carry the row's
+  // params + response from the side where it lives.
+  //
+  // We re-parse params_canon back to an embedded JSON value (rather
+  // than emitting it as a string) so the wire shape composes cleanly
+  // with downstream tools — a planning agent expects `params` to be
+  // an object, not a JSON-encoded string. Same for response_*.
+  auto reembed = [](const std::string& canon) -> json {
+    if (canon.empty()) return json::object();
+    try { return json::parse(canon); }
+    catch (...) { return json{{"raw", canon}}; }
+  };
+
+  json arr = json::array();
+  for (const auto& e : result.entries) {
+    json je;
+    je["kind"]        = e.kind;
+    je["method"]      = e.method;
+    je["params_hash"] = e.params_hash;
+    if (e.kind == "common") {
+      je["seq_a"] = e.seq_a;
+      je["seq_b"] = e.seq_b;
+    } else if (e.kind == "diverged") {
+      je["params"]     = reembed(e.params_canon);
+      je["seq_a"]      = e.seq_a;
+      je["seq_b"]      = e.seq_b;
+      je["response_a"] = reembed(e.response_a_canon);
+      je["response_b"] = reembed(e.response_b_canon);
+    } else if (e.kind == "added") {
+      je["params"]   = reembed(e.params_canon);
+      je["seq_b"]    = e.seq_b;
+      je["response"] = reembed(e.response_b_canon);
+    } else if (e.kind == "removed") {
+      je["params"]   = reembed(e.params_canon);
+      je["seq_a"]    = e.seq_a;
+      je["response"] = reembed(e.response_a_canon);
+    }
+    arr.push_back(std::move(je));
+  }
+
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  json paged = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                              "entries");
+
+  // Fold the diff summary block alongside the paged entries. The view's
+  // own `total` is the total number of entries (== sum of summary
+  // counts); we keep both so a caller can sanity-check the shape.
+  json summary;
+  summary["total_a"]  = result.summary.total_a;
+  summary["total_b"]  = result.summary.total_b;
+  summary["added"]    = result.summary.added;
+  summary["removed"]  = result.summary.removed;
+  summary["common"]   = result.summary.common;
+  summary["diverged"] = result.summary.diverged;
+  paged["summary"]    = std::move(summary);
+
+  return protocol::make_ok(req.id, std::move(paged));
 }
 
 // ----------------------------------------------------------------------------

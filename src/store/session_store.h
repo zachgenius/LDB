@@ -111,6 +111,67 @@ class SessionStore {
                                 std::int64_t since_seq = 0,
                                 std::int64_t until_seq = 0);
 
+  // Tier 3 §11: structured diff between two sessions' rpc_logs.
+  //
+  // The diff is content-only (timing fields are ignored). Two log rows
+  // match iff their (method, canonical-params-JSON) tuples are
+  // byte-equal; an aligned pair is "common" iff the canonical
+  // response-JSON strings are also byte-equal, otherwise "diverged".
+  // Unmatched A rows are "removed", unmatched B rows are "added".
+  //
+  // Alignment is computed via Longest Common Subsequence on the
+  // (method, params_canon) tuple sequence. Entries are emitted in a
+  // stable backtrack order: runs of "removed" (in A order) precede
+  // "added" runs (in B order) within each gap; aligned entries
+  // (common/diverged) appear at their alignment point.
+  //
+  // Canonicalization: stored request/response JSON strings are
+  // re-parsed and re-dumped through nlohmann::json (whose object_t is
+  // std::map, so keys are alphabetically sorted at dump time). This
+  // shields the diff from key-order drift that might appear if a future
+  // client emits its requests through a different JSON library.
+  //
+  // Throws backend::Error if either session id is unknown.
+  struct DiffSummary {
+    std::int64_t total_a   = 0;
+    std::int64_t total_b   = 0;
+    std::int64_t added     = 0;
+    std::int64_t removed   = 0;
+    std::int64_t common    = 0;
+    std::int64_t diverged  = 0;
+  };
+
+  struct DiffEntry {
+    // "common" | "added" | "removed" | "diverged"
+    std::string  kind;
+    std::string  method;
+    // Canonical-JSON params string (alphabetically-keyed object dump).
+    // Always set on every entry (it's the diff key).
+    std::string  params_canon;
+    // Short stable hash of params_canon — present on every entry. Used
+    // by the wire shape on `common` entries to keep the response small
+    // (caller can re-fetch full params via session.read_log if needed).
+    std::string  params_hash;
+    // seq from session A. 0 when entry is "added" (A had no row).
+    std::int64_t seq_a = 0;
+    // seq from session B. 0 when entry is "removed" (B had no row).
+    std::int64_t seq_b = 0;
+    // Canonical response strings.
+    //   common:   response_a_canon == response_b_canon (set on a only)
+    //   diverged: both set, differ
+    //   added:    response_b_canon set, a empty
+    //   removed:  response_a_canon set, b empty
+    std::string  response_a_canon;
+    std::string  response_b_canon;
+  };
+
+  struct DiffResult {
+    DiffSummary             summary;
+    std::vector<DiffEntry>  entries;
+  };
+
+  DiffResult diff_logs(std::string_view a_id, std::string_view b_id);
+
   // Open a per-session writer. The Writer holds its own sqlite handle
   // to the <uuid>.db; multiple Writers on the same id are allowed and
   // both can append (WAL handles it), but the dispatcher only ever

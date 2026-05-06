@@ -38,6 +38,8 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_recipe_guard.cpp
   test_session_store.cpp
   test_dispatcher_session_log.cpp
+  test_session_diff.cpp
+  test_dispatcher_session_diff.cpp
   test_backend_breakpoint.cpp
   test_probe_orchestrator.cpp
   test_dispatcher_probes.cpp

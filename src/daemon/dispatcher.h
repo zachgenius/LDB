@@ -107,6 +107,7 @@ class Dispatcher {
   protocol::Response handle_session_info(const protocol::Request& req);
   protocol::Response handle_session_export(const protocol::Request& req);
   protocol::Response handle_session_import(const protocol::Request& req);
+  protocol::Response handle_session_diff(const protocol::Request& req);
   protocol::Response handle_artifact_export(const protocol::Request& req);
   protocol::Response handle_artifact_import(const protocol::Request& req);
 
