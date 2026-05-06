@@ -291,6 +291,33 @@ std::vector<ProbeOrchestrator::ListEntry> ProbeOrchestrator::list() {
     e.hit_count  = st->hit_count;
     out.push_back(std::move(e));
   }
+  // Audit §11.4: probe ids are "p<seq>" where seq is a per-orchestrator
+  // monotonic counter. The underlying std::map keys-by-string, so
+  // p10/p11 sort BEFORE p2 in lex order. We sort by the numeric suffix
+  // so list() returns probes in creation order. Choice: numeric sort
+  // at serialization time. Other valid options were zero-padded ids
+  // (changes the wire format) and switching storage to std::map<int>
+  // (forfeits the human-readable string key in logs / store rows).
+  // Sort-at-serialize is the cheapest with no observable id change.
+  auto extract_seq = [](std::string_view id) -> std::uint64_t {
+    if (id.size() < 2 || id.front() != 'p') return 0;
+    std::uint64_t v = 0;
+    for (std::size_t i = 1; i < id.size(); ++i) {
+      char c = id[i];
+      if (c < '0' || c > '9') return 0;
+      v = v * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    return v;
+  };
+  std::sort(out.begin(), out.end(),
+            [&](const ListEntry& a, const ListEntry& b) {
+              auto sa = extract_seq(a.probe_id);
+              auto sb = extract_seq(b.probe_id);
+              if (sa != sb) return sa < sb;
+              // Fallback for ids that weren't of the canonical "p<n>"
+              // shape (none today, but defensive).
+              return a.probe_id < b.probe_id;
+            });
   return out;
 }
 
