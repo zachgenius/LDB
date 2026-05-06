@@ -75,7 +75,7 @@ These are the features no current debugger has and no LLDB-wrapper alternative w
 |---|---|---|
 | **View descriptors** | Already in MVP; expanded with cost preview, diff-mode, change-only updates | v0.2 |
 | **Schema-typed everything** | Every endpoint has a JSON Schema in `describe.endpoints`; clients generate typed bindings | v0.2 |
-| **Provenance & determinism** | MVP guarantees byte-identical output for `(method, params, snapshot)`; we expose snapshot IDs as first-class refs | v0.3 |
+| **Provenance & determinism** | **MVP scope: cores only** (snapshot = SHA-256 of core). v0.3 lifts this to live processes — resume-counter + register-hash, audit of every endpoint for non-deterministic elements, snapshot IDs become first-class refs across the live branch too. | v0.3 |
 | **Artifact knowledge graph** | Artifacts gain typed relations: "this XML is the schema parsed by `xml_parse` which is called from `init_schema` in build `<bid>`" — queryable as a graph | v0.4 |
 | **Cross-binary correlation** | Same struct (by DWARF type-hash), same string, same function-fingerprint across multiple binaries — find drift between versions | v0.5 |
 | **Semantic queries** | First-class operators: `heap.objects_of_type("MyClass")`, `mutex.lock_graph()`, `string.flow_to(addr)`, `thread.blockers()` | v0.5 → v1.0 |

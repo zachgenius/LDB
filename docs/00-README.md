@@ -53,7 +53,7 @@ Pre-v0.1. Design phase. The four documents in this folder define the work.
 - **Local daemon, remote `lldb-server platform`.** Don't grow attack surface on the target. — `02 §9`
 - **Two probe engines, one event shape.** LLDB breakpoints for low-rate / app-level. eBPF/uprobe for high-rate / syscall. Same JSON event shape; the agent picks the kind. — `02 §7`
 - **Typed observers, not generic shell.** No `run_host_command` foot-gun. — `02 §4.6`
-- **Provenance and determinism are tested in CI.** Same `(method, params, snapshot)` ⇒ byte-identical output. — `02 §3.5`, `03 §4`
+- **Provenance and determinism are tested in CI.** Same `(method, params, snapshot)` ⇒ byte-identical output. **MVP scope: cores only** (snapshot = SHA-256 of core file). Live-process provenance is a major post-MVP milestone. — `02 §3.5`, `03 §4`
 
 ## Reading order
 

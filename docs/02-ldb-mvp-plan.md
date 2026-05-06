@@ -130,7 +130,17 @@ A session is a sqlite database (`~/.ldb/sessions/<uuid>.db`) holding the RPC log
 
 ### 3.5 Provenance
 
-Every response carries `_provenance.snapshot` — a stable identifier of the inferior state at fetch time. For cores it's the file hash; for live processes it's a counter that bumps on every resume + a register-snapshot hash. Identical `(method, params, snapshot)` MUST yield byte-identical `data`. We test this in CI.
+Every response carries `_provenance.snapshot` — a stable identifier of the inferior state at fetch time.
+
+**MVP scope (cores-only determinism):** snapshot is populated for core-loaded targets only — it's the SHA-256 of the core file. Live targets receive `snapshot: "live"` (sentinel — no determinism guarantee). Identical `(method, params, snapshot)` against a core MUST yield byte-identical `data`. CI replays a recorded session against the corresponding core and diffs the response stream byte-for-byte; that's the deterministic-protocol gate.
+
+**Post-MVP (live provenance — major implementation):** the live-process branch needs a real snapshot model — counter that bumps on every resume + register-snapshot hash — plus an audit of every endpoint to remove non-deterministic elements (timestamps in responses, ordering, PID-dependent fields, mmap-layout drift). This work is **deferred to a dedicated post-MVP milestone**, not part of M5 polish, because:
+
+1. The hard part (audit + retrofit of every existing endpoint) is engineering against speculation if done before real users tell us which endpoints actually matter for live determinism.
+2. The MVP reference workflow §5 doesn't depend on live-process replay determinism — it depends on probe events being captured, artifacts being stored, sessions being logged. None of those need byte-identical replay.
+3. Adding `_provenance.snapshot` later is additive (the field already exists in the response shape) — no protocol redesign, no backward-compat shim.
+
+The test corpus (M5) ships with **core-replay goldens only**. Live tests don't replay. Documented limitation; cleared post-MVP.
 
 ---
 
@@ -524,7 +534,8 @@ ldbd (laptop) ──ssh──► target host:
 - Capability advertisement (`describe.endpoints`) with full schemas.
 - `ldb` CLI (thin client, mainly for humans / scripts).
 - Cost-preview metadata on every response.
-- Public test corpus + replayable session goldens.
+- Public test corpus + replayable session goldens (**core-replay only** — see §3.5).
+- Cores-only `_provenance.snapshot` (SHA-256 of the core file); live targets receive `snapshot: "live"` sentinel.
 - Cut MVP tag.
 
 ---
@@ -533,6 +544,7 @@ ldbd (laptop) ──ssh──► target host:
 
 These get explicit interface seams in MVP code so they slot in without rewriting:
 
+- **Live provenance (major post-MVP milestone — see §3.5):** the `_provenance.snapshot` field is already in the response shape — populated only for cores in MVP. Post-MVP work: real snapshot model for live processes (resume-counter + register-hash), audit of every endpoint to remove non-deterministic elements (timestamps, ordering, PID-dependent fields, mmap drift), CI determinism gate extended to live tests. Unblocks `session.replay`/`fork` against live targets and makes `(method, params, snapshot)` byte-identical for the live branch too. Substantial — its own milestone, not polish.
 - **Second backend (GDB/MI):** `DebuggerBackend` interface already abstracts.
 - **Reverse execution / rr replay:** the snapshot model (`SnapshotId`) is the seam.
 - **DAP shim:** built atop `describe.endpoints` later; no MVP work needed.
