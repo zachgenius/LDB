@@ -1,6 +1,7 @@
 #include "daemon/dispatcher.h"
 
 #include "backend/debugger_backend.h"
+#include "daemon/describe_schema.h"
 #include "ldb/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
@@ -522,551 +523,916 @@ Response Dispatcher::handle_hello(const Request& req) {
 }
 
 Response Dispatcher::handle_describe_endpoints(const Request& req) {
-  // Minimal hand-written catalog for M0. Will be schema-generated in M1+.
+  // Catalog upgraded in M5 (plan §4.8). Each entry now carries proper
+  // JSON Schema (draft 2020-12) for params/returns, plus
+  // `requires_stopped` and `cost_hint` so a planning agent can read the
+  // catalog once at session start and avoid expensive trial-and-error
+  // calls.
+  //
+  // The informal `params: {key:"type-name"}` shape that shipped through
+  // M4 is dropped: this is pre-MVP, no clients in the wild, and the
+  // schema form fully supersedes it. Any client that needs the old
+  // shape can derive it locally from `properties` + `required`.
+  using namespace ldb::daemon::schema;
+
   json eps = json::array();
-  auto add = [&](const char* name, const char* summary, const json& params,
-                 const json& returns) {
+  auto add = [&](std::string name, const char* summary,
+                 json params_schema, json returns_schema,
+                 bool requires_target, bool requires_stopped,
+                 std::string cost_hint) {
     json e;
     e["method"] = name;
     e["summary"] = summary;
-    e["params"] = params;
-    e["returns"] = returns;
-    // Observer / artifact / session endpoints don't take a target_id —
-    // they're host-side or store-side. The requires_target flag is
-    // informational and answers "do I need a live target before
-    // calling?" The original heuristic (everything except hello /
-    // describe / target.open) is wrong for these new shapes, but we
-    // keep it for back-compat and add explicit exclusions here as the
-    // catalog grows.
-    auto n = std::string(name);
-    e["requires_target"] = (n != "hello" &&
-                            n != "describe.endpoints" &&
-                            n != "target.open" &&
-                            n.rfind("observer.", 0) != 0);
+    // The `params_schema` carries the dialect tag so clients have a
+    // single anchor; nested $defs / properties inherit by virtue of
+    // being in the same document. We don't repeat the tag on the
+    // returns_schema to keep the payload small.
+    e["params_schema"]  = with_draft(std::move(params_schema));
+    e["returns_schema"] = std::move(returns_schema);
+    e["requires_target"]  = requires_target;
+    e["requires_stopped"] = requires_stopped;
+    e["cost_hint"]        = std::move(cost_hint);
     eps.push_back(std::move(e));
   };
 
+  // ============== meta ==============
+
   add("hello", "Server identification and protocol version",
-      json::object(),
-      json{{"name", "string"}, {"version", "string"}, {"protocol", "object"}});
+      obj({}),
+      obj({
+          {"name",     str()},
+          {"version",  str()},
+          {"protocol", obj_open()},
+      }, {"name", "version", "protocol"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
-  add("describe.endpoints", "List supported methods with their schemas",
-      json::object(),
-      json{{"endpoints", "array"}});
+  add("describe.endpoints",
+      "List supported methods with their JSON Schema params/returns, "
+      "requires_target, requires_stopped, and cost_hint.",
+      obj({}),
+      obj({{"endpoints", arr_of(obj_open(
+          "Per-method record. See plan §4.8."))}}, {"endpoints"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
-  add("target.open", "Create a target from a binary on disk (no process)",
-      json{{"path", "string"}},
-      json{{"target_id", "uint64"}, {"triple", "string"}, {"modules", "array"}});
+  // ============== target.* ==============
+
+  add("target.open",
+      "Create a target from a binary on disk (no process).",
+      obj({{"path", str("Absolute path to executable on the daemon's host.")}},
+          {"path"}),
+      with_defs(obj({
+          {"target_id", uint_min(1)},
+          {"triple",    str()},
+          {"modules",   arr_of(ref("Module"))},
+      }, {"target_id"}),
+          {{"Module", module_def()}}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("target.create_empty",
       "Create a target with no associated executable. Used as host for "
-      "target.attach by pid and (later) target.load_core.",
-      json::object(),
-      json{{"target_id", "uint64"}, {"triple", "string"},
-           {"modules", "array"}});
+      "target.attach by pid and target.load_core.",
+      obj({}),
+      obj({
+          {"target_id", uint_min(1)},
+          {"triple",    str()},
+          {"modules",   arr_of(obj_open())},
+      }, {"target_id"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("target.attach",
       "Attach to a running process by pid. Synchronous: blocks until "
       "the inferior is stopped on attach.",
-      json{{"target_id", "uint64"}, {"pid", "int"}},
-      json{{"state", "string"}, {"pid", "int"},
-           {"stop_reason", "string?"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"pid",       pid_param()},
+      }, {"target_id", "pid"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"stop_reason", str()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("target.connect_remote",
       "Connect to a remote debug server (lldb-server, gdbserver, "
       "debugserver, qemu-gdbstub) over its gdb-remote-protocol "
       "endpoint. URL forms accepted: \"connect://host:port\" or "
-      "\"host:port\". plugin defaults to \"gdb-remote\". Synchronous: "
-      "blocks until the connect handshake completes or fails.",
-      json{{"target_id", "uint64"}, {"url", "string"},
-           {"plugin", "string?"}},
-      json{{"state", "string"}, {"pid", "int"},
-           {"stop_reason", "string?"}});
+      "\"host:port\". plugin defaults to \"gdb-remote\".",
+      obj({
+          {"target_id", target_id_param()},
+          {"url",       str("connect://host:port or host:port.")},
+          {"plugin",    str("gdb-remote (default), kdp-remote, etc.")},
+      }, {"target_id", "url"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"stop_reason", str()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("target.connect_remote_ssh",
       "End-to-end remote debugging over SSH. Spawns a single ssh "
       "subprocess that simultaneously port-forwards a kernel-assigned "
-      "local port to a chosen remote port AND runs `lldb-server "
-      "gdbserver 127.0.0.1:<remote_port> -- <inferior_path> "
-      "<inferior_argv...>` on the target host. The local end of the "
-      "tunnel is then connected via the existing gdb-remote pathway. "
-      "Tunnel lifetime is bound to the target: target.close (and the "
-      "daemon shutting down) tears the ssh subprocess down, which kills "
-      "lldb-server on the remote via SIGHUP.",
-      json{{"target_id", "uint64"}, {"host", "string"},
-           {"port", "int?"}, {"ssh_options", "array?"},
-           {"remote_lldb_server", "string?"},
-           {"inferior_path", "string"}, {"inferior_argv", "array?"},
-           {"setup_timeout_ms", "uint?"}},
-      json{{"target_id", "uint64"}, {"state", "string"}, {"pid", "int"},
-           {"stop_reason", "string?"}, {"local_tunnel_port", "uint16"}});
+      "local port AND runs lldb-server gdbserver on the target host. "
+      "Tunnel lifetime is bound to the target.",
+      obj({
+          {"target_id",          target_id_param()},
+          {"host",               str("`[user@]hostname`.")},
+          {"port",               uint_("Remote port to bind lldb-server to. "
+                                       "Default 0 = kernel-assigned.")},
+          {"ssh_options",        arr_of(str(),
+              "Extra args passed verbatim to `ssh`.")},
+          {"remote_lldb_server", str("Path to lldb-server on the remote.")},
+          {"inferior_path",      str("Path to the inferior on the remote.")},
+          {"inferior_argv",      arr_of(str(), "Argv tail for the inferior.")},
+          {"setup_timeout_ms",   uint_("Cap for the connect handshake.")},
+      }, {"target_id", "host", "inferior_path"}),
+      obj({
+          {"target_id",         uint_min(1)},
+          {"state",             str()},
+          {"pid",               int_()},
+          {"stop_reason",       str()},
+          {"local_tunnel_port", uint_range(1, 65535)},
+      }, {"target_id", "state", "pid", "local_tunnel_port"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("target.load_core",
       "Load a postmortem core file as a fresh target with frozen "
       "threads. Same read-only endpoints (modules, threads, frames, "
       "memory, ...) work against the resulting target.",
-      json{{"path", "string"}},
-      json{{"target_id", "uint64"}, {"triple", "string"},
-           {"modules", "array"}});
+      obj({{"path", str("Absolute path to the core file.")}},
+          {"path"}),
+      obj({
+          {"target_id", uint_min(1)},
+          {"triple",    str()},
+          {"modules",   arr_of(obj_open())},
+      }, {"target_id"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
-  add("target.close", "Drop a target",
-      json{{"target_id", "uint64"}},
-      json{{"closed", "bool"}});
+  add("target.close", "Drop a target.",
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      obj({{"closed", bool_()}}, {"closed"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
-  add("module.list", "Enumerate modules of a target",
-      json{{"target_id", "uint64"}},
-      json{{"modules", "array"}});
+  // ============== static analysis ==============
+
+  add("module.list", "Enumerate modules of a target.",
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+with_defs(      obj({{"modules", arr_of(ref("Module"))}}, {"modules"}),
+          {{"Module", module_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
   add("type.layout",
-      "Look up a struct/class/union by name and return its memory layout",
-      json{{"target_id", "uint64"}, {"name", "string"}},
-      json{{"found", "bool"},
-           {"layout",
-            "object{name,byte_size,alignment,fields[],holes_total}"}});
+      "Look up a struct/class/union by name and return its memory layout.",
+      obj({
+          {"target_id", target_id_param()},
+          {"name",      str("Type name; LLDB resolves namespaces.")},
+      }, {"target_id", "name"}),
+      with_defs(obj({
+          {"found",  bool_()},
+          {"layout", obj({
+              {"name",        str()},
+              {"byte_size",   uint_()},
+              {"alignment",   uint_()},
+              {"fields",      arr_of(ref("Field"))},
+              {"holes_total", uint_()},
+          })},
+      }, {"found"}),
+          {{"Field", field_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("symbol.find",
-      "Find symbols by exact name; optionally filtered by kind "
-      "(function|variable|other|any)",
-      json{{"target_id", "uint64"}, {"name", "string"},
-           {"kind", "string?"}},
-      json{{"matches",
-            "array of {name,kind,addr,sz,module,mangled?}"}});
+      "Find symbols by exact name; optionally filtered by kind.",
+      obj({
+          {"target_id", target_id_param()},
+          {"name",      str()},
+          {"kind",      enum_str({"function", "variable", "other", "any"},
+                                 "Default: any.")},
+      }, {"target_id", "name"}),
+with_defs(      obj({{"matches", arr_of(ref("SymbolMatch"))}}, {"matches"}),
+          {{"SymbolMatch", symbol_match_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("string.list",
       "Enumerate ASCII strings (printable runs) in the target's data "
       "sections. Default scope is the main executable.",
-      json{{"target_id", "uint64"},
-           {"min_len", "uint?"}, {"max_len", "uint?"},
-           {"section", "string?"}, {"module", "string?"}},
-      json{{"strings", "array of {text,addr,section,module}"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"min_len",   uint_("Minimum run length. Default 4.")},
+          {"max_len",   uint_("Cap per-string emit length.")},
+          {"section",   str("Limit to a named section (e.g. .rodata).")},
+          {"module",    str("Limit to a named module.")},
+      }, {"target_id"}),
+with_defs(      obj({{"strings", arr_of(ref("StringEntry"))}}, {"strings"}),
+          {{"StringEntry", string_entry_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
   add("disasm.range",
       "Disassemble [start_addr, end_addr) and return one entry per "
       "instruction.",
-      json{{"target_id", "uint64"},
-           {"start_addr", "uint64"}, {"end_addr", "uint64"}},
-      json{{"instructions",
-            "array of {addr,sz,bytes,mnemonic,operands,comment?}"}});
+      obj({
+          {"target_id",  target_id_param()},
+          {"start_addr", uint_()},
+          {"end_addr",   uint_()},
+      }, {"target_id", "start_addr", "end_addr"}),
+with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
+          {{"Insn", disasm_insn_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
   add("disasm.function",
       "Disassemble the body of a function looked up by exact name. "
       "Equivalent to symbol.find + disasm.range.",
-      json{{"target_id", "uint64"}, {"name", "string"}},
-      json{{"found", "bool"},
-           {"address", "uint64"}, {"byte_size", "uint64"},
-           {"instructions", "array of disasm insns"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"name",      str()},
+      }, {"target_id", "name"}),
+      with_defs(obj({
+          {"found",        bool_()},
+          {"address",      uint_()},
+          {"byte_size",    uint_()},
+          {"instructions", arr_of(ref("Insn"))},
+      }, {"found"}),
+          {{"Insn", disasm_insn_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("xref.addr",
       "Find every instruction in the main executable that references "
       "an address. Detects direct branches reliably; ARM64 ADRP+ADD "
       "reconstruction is a known gap.",
-      json{{"target_id", "uint64"}, {"addr", "uint64"}},
-      json{{"matches",
-            "array of {addr,sz,mnemonic,operands,function,comment?}"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"addr",      address_param()},
+      }, {"target_id", "addr"}),
+with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
+          {{"XrefMatch", xref_match_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
   add("string.xref",
       "Find xrefs to an exact-text string. Combines address-hex "
       "detection (x86-64 direct loads) with LLDB comment-text "
       "matching (ARM64 ADRP+ADD pairs).",
-      json{{"target_id", "uint64"}, {"text", "string"}},
-      json{{"results",
-            "array of {string:{text,addr,section,module}, "
-            "xrefs:array of xref matches}"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"text",      str("Exact string text to match.")},
+      }, {"target_id", "text"}),
+      with_defs(obj({{"results", arr_of(obj({
+          {"string", ref("StringEntry")},
+          {"xrefs",  arr_of(ref("XrefMatch"))},
+      }))}}, {"results"}),
+          {{"StringEntry", string_entry_def()},
+           {"XrefMatch",   xref_match_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
+
+  // ============== process.* ==============
 
   add("process.launch",
-      "Spawn the target's executable as an inferior. Synchronous: "
-      "blocks until the process is stopped or has exited.",
-      json{{"target_id", "uint64"}, {"stop_at_entry", "bool?"}},
-      json{{"state", "string"}, {"pid", "int"},
-           {"stop_reason", "string?"}, {"exit_code", "int?"}});
+      "Spawn the target's executable as an inferior. Synchronous.",
+      obj({
+          {"target_id",     target_id_param()},
+          {"stop_at_entry", bool_("Stop at the executable entry point.")},
+      }, {"target_id"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"stop_reason", str()},
+          {"exit_code",   int_()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("process.state",
       "Query the current state of the target's process. Returns "
       "state=\"none\" if no process is associated.",
-      json{{"target_id", "uint64"}},
-      json{{"state", "string"}, {"pid", "int"}});
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      process_state_def(),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
   add("process.continue",
       "Resume a stopped process. Blocks until next stop or exit.",
-      json{{"target_id", "uint64"}},
-      json{{"state", "string"}, {"pid", "int"}});
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      process_state_def(),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("process.kill",
       "Terminate the target's process. Idempotent.",
-      json{{"target_id", "uint64"}},
-      json{{"state", "string"}, {"pid", "int"}});
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      process_state_def(),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
   add("process.detach",
       "Detach from the target's process, leaving it running. Preferred "
       "over process.kill for attached processes. Idempotent.",
-      json{{"target_id", "uint64"}},
-      json{{"state", "string"}, {"pid", "int"}});
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      process_state_def(),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
   add("process.save_core",
-      "Save a core file of the target's stopped process to a path. "
-      "Returns saved=false if the platform doesn't support core saves "
-      "for this process; otherwise saved=true and the file is on disk.",
-      json{{"target_id", "uint64"}, {"path", "string"}},
-      json{{"saved", "bool"}, {"path", "string"}});
+      "Save a core file of the target's stopped process to a path.",
+      obj({
+          {"target_id", target_id_param()},
+          {"path",      str("Destination path on the daemon host.")},
+      }, {"target_id", "path"}),
+      obj({
+          {"saved", bool_()},
+          {"path",  str()},
+      }, {"saved", "path"}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "high");
 
   add("process.step",
       "Single-step the given thread. kind=in|over|out|insn maps to "
-      "SBThread::StepInto/StepOver/StepOut/StepInstruction. Synchronous: "
-      "blocks until the next stop or terminal state.",
-      json{{"target_id", "uint64"}, {"tid", "uint64"}, {"kind", "string"}},
-      json{{"state", "string"}, {"pid", "int"},
-           {"pc", "uint64?"}, {"stop_reason", "string?"}});
+      "SBThread::StepInto/StepOver/StepOut/StepInstruction.",
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       tid_param()},
+          {"kind",      enum_str({"in", "over", "out", "insn"})},
+      }, {"target_id", "tid", "kind"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"pc",          uint_()},
+          {"stop_reason", str()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
+
+  // ============== thread.* / frame.* / value.* ==============
 
   add("thread.list",
       "Enumerate threads of the target's process.",
-      json{{"target_id", "uint64"}},
-      json{{"threads",
-            "array of {tid,index,state,pc,sp,name?,stop_reason?}"}});
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+with_defs(      obj({{"threads", arr_of(ref("Thread"))}}, {"threads"}),
+          {{"Thread", thread_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("thread.frames",
       "Backtrace a thread, innermost first. max_depth=0 means no cap.",
-      json{{"target_id", "uint64"}, {"tid", "uint64"},
-           {"max_depth", "uint?"}},
-      json{{"frames",
-            "array of {index,pc,fp,sp,function?,module?,file?,line?,inlined?}"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       tid_param()},
+          {"max_depth", uint_("Default 0 (no cap).")},
+      }, {"target_id", "tid"}),
+with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
+          {{"Frame", frame_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("frame.locals",
       "Local variables in scope at a frame. Bytes capped at 64; agents "
       "follow up with mem.read for fuller dumps.",
-      json{{"target_id", "uint64"}, {"tid", "uint64"},
-           {"frame_index", "uint?"}},
-      json{{"locals",
-            "array of {name,type,address?,bytes?,summary?,kind}"}});
+      obj({
+          {"target_id",   target_id_param()},
+          {"tid",         tid_param()},
+          {"frame_index", frame_index_param()},
+      }, {"target_id", "tid"}),
+with_defs(      obj({{"locals", arr_of(ref("ValueInfo"))}}, {"locals"}),
+          {{"ValueInfo", value_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("frame.args",
       "Function arguments visible at a frame.",
-      json{{"target_id", "uint64"}, {"tid", "uint64"},
-           {"frame_index", "uint?"}},
-      json{{"args",
-            "array of {name,type,address?,bytes?,summary?,kind}"}});
+      obj({
+          {"target_id",   target_id_param()},
+          {"tid",         tid_param()},
+          {"frame_index", frame_index_param()},
+      }, {"target_id", "tid"}),
+with_defs(      obj({{"args", arr_of(ref("ValueInfo"))}}, {"args"}),
+          {{"ValueInfo", value_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("frame.registers",
       "All register sets at a frame, flattened.",
-      json{{"target_id", "uint64"}, {"tid", "uint64"},
-           {"frame_index", "uint?"}},
-      json{{"registers",
-            "array of {name,type,address?,bytes?,summary?,kind}"}});
+      obj({
+          {"target_id",   target_id_param()},
+          {"tid",         tid_param()},
+          {"frame_index", frame_index_param()},
+      }, {"target_id", "tid"}),
+with_defs(      obj({{"registers", arr_of(ref("ValueInfo"))}}, {"registers"}),
+          {{"ValueInfo", value_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("value.eval",
       "Evaluate a C/C++ expression in the context of (target, tid, "
       "frame_index). Compile/runtime/timeout failures are returned as "
-      "{error:'...'} data, NOT as JSON-RPC errors. Default timeout is "
-      "250ms; bump via `timeout_us` for expressions that legitimately "
-      "call into the inferior. The evaluator ignores breakpoints and "
-      "won't run sibling threads (no spurious side effects).",
-      json{{"target_id", "uint64"}, {"tid", "uint64"},
-           {"frame_index", "uint?"}, {"expr", "string"},
-           {"timeout_us", "uint64?"}},
-      json{{"value", "object{name,type,address?,bytes?,summary?,kind}?"},
-           {"error", "string?"}});
+      "{error:'...'} data, NOT as JSON-RPC errors.",
+      obj({
+          {"target_id",   target_id_param()},
+          {"tid",         tid_param()},
+          {"frame_index", frame_index_param()},
+          {"expr",        str("C/C++ expression text.")},
+          {"timeout_us",  uint_("Default 250000 (250 ms).")},
+      }, {"target_id", "tid", "expr"}),
+      with_defs(obj({
+          {"value", ref("ValueInfo")},
+          {"error", str()},
+      }),
+          {{"ValueInfo", value_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("value.read",
       "Resolve a frame-relative dotted/bracketed path "
-      "(e.g. `g_origin.x`, `arr[3].field`) to a typed value. Path "
-      "resolution failures (parser error, no member, unknown root) "
-      "return {error:'...'} data. Bad target/tid/frame_index throw. "
-      "Returns the resolved value plus its immediate children for "
-      "one-shot struct/array introspection.",
-      json{{"target_id", "uint64"}, {"tid", "uint64"},
-           {"frame_index", "uint?"}, {"path", "string"}},
-      json{{"value", "object{name,type,address?,bytes?,summary?,kind}?"},
-           {"children",
-            "array of {name,type,address?,bytes?,summary?,kind}?"},
-           {"error", "string?"}});
+      "(e.g. `g_origin.x`, `arr[3].field`) to a typed value.",
+      obj({
+          {"target_id",   target_id_param()},
+          {"tid",         tid_param()},
+          {"frame_index", frame_index_param()},
+          {"path",        str("Dotted/bracketed access path.")},
+      }, {"target_id", "tid", "path"}),
+      with_defs(obj({
+          {"value",    ref("ValueInfo")},
+          {"children", arr_of(ref("ValueInfo"))},
+          {"error",    str()},
+      }),
+          {{"ValueInfo", value_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
+
+  // ============== mem.* ==============
 
   add("mem.read",
       "Read up to 1 MiB of process memory at the given runtime address. "
       "Returns lower-case packed hex.",
-      json{{"target_id", "uint64"}, {"address", "uint64"},
-           {"size", "uint64"}},
-      json{{"address", "uint64"}, {"bytes", "string<hex>"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"address",   address_param()},
+          {"size",      size_param()},
+      }, {"target_id", "address", "size"}),
+      obj({
+          {"address", uint_()},
+          {"bytes",   hex_string()},
+      }, {"address", "bytes"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
   add("mem.read_cstr",
       "Read a NUL-terminated string at a runtime address, capped at "
       "max_len bytes (default 4096).",
-      json{{"target_id", "uint64"}, {"address", "uint64"},
-           {"max_len", "uint?"}},
-      json{{"address", "uint64"}, {"value", "string"},
-           {"truncated", "bool"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"address",   address_param()},
+          {"max_len",   uint_("Default 4096.")},
+      }, {"target_id", "address"}),
+      obj({
+          {"address",   uint_()},
+          {"value",     str()},
+          {"truncated", bool_()},
+      }, {"address", "value", "truncated"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("mem.regions",
       "Enumerate the inferior's mapped memory regions with permissions.",
-      json{{"target_id", "uint64"}},
-      json{{"regions",
-            "array of {base,size,r,w,x,name?}"}});
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
+          {{"Region", memory_region_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
 
   add("mem.search",
       "Scan process memory for a byte pattern. Needle is either a hex "
       "string or {text:'...'}. length=0 searches all readable regions "
       "(capped at 256 MiB). max_hits capped at 1024.",
-      json{{"target_id", "uint64"},
-           {"needle", "string<hex>|object{text}"},
-           {"address", "uint64?"}, {"length", "uint64?"},
-           {"max_hits", "uint?"}},
-      json{{"hits", "array of {address}"}});
+      obj({
+          {"target_id", target_id_param()},
+          {"needle",    obj_open(
+              "Hex string OR an {\"text\":\"...\"} object.")},
+          {"address",   address_param()},
+          {"length",    uint_("0 = scan all readable regions.")},
+          {"max_hits",  uint_("Capped at 1024.")},
+      }, {"target_id", "needle"}),
+      obj({{"hits", arr_of(obj({{"address", uint_()}}, {"address"}))}},
+          {"hits"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
   add("mem.dump_artifact",
       "Read [len] bytes at [addr] from the live target and store them "
-      "as an artifact under (build_id, name) in one round-trip. "
-      "Composes mem.read + artifact.put; same 1 MiB cap as mem.read "
-      "(oversize → -32000). format and meta are forwarded to the store. "
-      "Re-using (build_id, name) replaces the prior entry per the "
-      "artifact.put contract (artifact_id changes).",
-      json{{"target_id", "uint64"}, {"addr", "uint64"},
-           {"len", "uint64"}, {"build_id", "string"},
-           {"name", "string"},
-           {"format", "string?"}, {"meta", "object?"}},
-      json{{"artifact_id", "int64"}, {"byte_size", "uint64"},
-           {"sha256", "string"}, {"name", "string"}});
+      "as an artifact under (build_id, name) in one round-trip. Composes "
+      "mem.read + artifact.put; same 1 MiB cap as mem.read.",
+      obj({
+          {"target_id", target_id_param()},
+          {"addr",      address_param()},
+          {"len",       size_param()},
+          {"build_id",  str()},
+          {"name",      str()},
+          {"format",    str("Caller-supplied content tag.")},
+          {"meta",      obj_open("Caller-supplied metadata.")},
+      }, {"target_id", "addr", "len", "build_id", "name"}),
+      obj({
+          {"artifact_id", int_()},
+          {"byte_size",   uint_()},
+          {"sha256",      str()},
+          {"name",        str()},
+      }, {"artifact_id", "byte_size", "sha256", "name"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "high");
+
+  // ============== artifact.* ==============
 
   add("artifact.put",
       "Store a binary blob in the artifact store, keyed by "
-      "(build_id, name). bytes_b64 is base64-encoded. (build_id, name) "
-      "is unique — putting again with the same pair *replaces* the "
-      "prior entry (the old blob file is unlinked, the row's id "
-      "changes). format and meta are caller-supplied annotations; the "
-      "store is content-agnostic.",
-      json{{"build_id", "string"}, {"name", "string"},
-           {"bytes_b64", "string<base64>"},
-           {"format", "string?"}, {"meta", "object?"}},
-      json{{"id", "int64"}, {"sha256", "string"},
-           {"byte_size", "uint64"}, {"stored_path", "string"}});
+      "(build_id, name). bytes_b64 is base64-encoded.",
+      obj({
+          {"build_id",  str()},
+          {"name",      str()},
+          {"bytes_b64", str("base64-encoded payload.")},
+          {"format",    str("Caller-supplied content tag.")},
+          {"meta",      obj_open("Caller-supplied metadata.")},
+      }, {"build_id", "name", "bytes_b64"}),
+      obj({
+          {"id",          int_()},
+          {"sha256",      str()},
+          {"byte_size",   uint_()},
+          {"stored_path", str()},
+      }, {"id", "sha256", "byte_size", "stored_path"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
   add("artifact.get",
-      "Fetch an artifact by (build_id, name) or by id. Returns the blob "
-      "as bytes_b64; cap with view.max_bytes to preview large blobs "
-      "without pulling the full payload over the channel. truncated=true "
-      "indicates the cap was applied.",
-      json{{"build_id", "string?"}, {"name", "string?"},
-           {"id", "int64?"},
-           {"view", "object{max_bytes?}?"}},
-      json{{"bytes_b64", "string"}, {"byte_size", "uint64"},
-           {"sha256", "string"}, {"format", "string?"},
-           {"meta", "object"}, {"build_id", "string"},
-           {"name", "string"}, {"created_at", "int64"},
-           {"truncated", "bool"}});
+      "Fetch an artifact by (build_id, name) or by id. Cap with "
+      "view.max_bytes to preview large blobs without pulling the full "
+      "payload.",
+      obj({
+          {"build_id", str()},
+          {"name",     str()},
+          {"id",       int_()},
+          {"view",     obj({{"max_bytes", uint_()}})},
+      }),
+      obj({
+          {"bytes_b64",  str()},
+          {"byte_size",  uint_()},
+          {"sha256",     str()},
+          {"format",     str()},
+          {"meta",       obj_open()},
+          {"build_id",   str()},
+          {"name",       str()},
+          {"created_at", int_()},
+          {"truncated",  bool_()},
+      }, {"bytes_b64", "byte_size", "sha256", "build_id", "name",
+          "created_at", "truncated"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
   add("artifact.list",
-      "Enumerate stored artifacts, optionally filtered by build_id "
-      "(exact match) and/or name_pattern (sqlite LIKE — '%' is multi-"
-      "char wildcard, '_' is single-char). Bytes are not included; use "
-      "artifact.get for the payload.",
-      json{{"build_id", "string?"}, {"name_pattern", "string?"}},
-      json{{"artifacts",
-            "array of {id,build_id,name,byte_size,sha256,format?,"
-            "tags?,created_at}"},
-           {"total", "uint"}});
+      "Enumerate stored artifacts, optionally filtered by build_id and/or "
+      "name_pattern (sqlite LIKE — '%' multi-char, '_' single-char). Bytes "
+      "are not included; use artifact.get for the payload.",
+      obj({
+          {"build_id",     str()},
+          {"name_pattern", str()},
+      }),
+      obj({
+          {"artifacts", arr_of(obj({
+              {"id",         int_()},
+              {"build_id",   str()},
+              {"name",       str()},
+              {"byte_size",  uint_()},
+              {"sha256",     str()},
+              {"format",     str()},
+              {"tags",       arr_of(str())},
+              {"created_at", int_()},
+          }))},
+          {"total", uint_()},
+      }, {"artifacts", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("artifact.tag",
-      "Add tags to an existing artifact (additive, idempotent — "
-      "duplicates are no-ops). Returns the resulting full tag set.",
-      json{{"id", "int64"}, {"tags", "array of string"}},
-      json{{"tags", "array of string"}});
+      "Add tags to an existing artifact (additive, idempotent — duplicates "
+      "are no-ops). Returns the resulting full tag set.",
+      obj({
+          {"id",   int_()},
+          {"tags", arr_of(str())},
+      }, {"id", "tags"}),
+      obj({{"tags", arr_of(str())}}, {"tags"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== session.* ==============
 
   add("session.create",
       "Create a new investigation session — a per-session sqlite db "
       "under ${LDB_STORE_ROOT}/sessions/<uuid>.db that holds the "
-      "rpc_log of every call made while attached. Does NOT attach "
-      "automatically; follow with session.attach to start logging.",
-      json{{"name", "string"}, {"target_id", "string?"}},
-      json{{"id", "string"}, {"name", "string"},
-           {"created_at", "int64"}, {"path", "string"}});
+      "rpc_log of every call made while attached. Does NOT attach.",
+      obj({
+          {"name",      str()},
+          {"target_id", str("Optional — may be a string handle, not the "
+                            "uint64 target_id (see plan).")},
+      }, {"name"}),
+      obj({
+          {"id",         str()},
+          {"name",       str()},
+          {"created_at", int_()},
+          {"path",       str()},
+      }, {"id", "name", "created_at", "path"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("session.attach",
       "Activate a session: every subsequent rpc dispatched on this "
       "connection — including this attach call — will be appended to "
-      "the session's rpc_log table. Replaces any prior attachment on "
-      "this connection.",
-      json{{"id", "string"}},
-      json{{"id", "string"}, {"name", "string"},
-           {"attached", "bool"}});
+      "the session's rpc_log table.",
+      obj({{"id", str()}}, {"id"}),
+      obj({
+          {"id",       str()},
+          {"name",     str()},
+          {"attached", bool_()},
+      }, {"id", "name", "attached"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("session.detach",
-      "Stop logging rpcs to the active session. The detach call "
-      "itself is logged before logging stops; subsequent rpcs are "
-      "not appended.",
-      json::object(),
-      json{{"detached", "bool"}});
+      "Stop logging rpcs to the active session.",
+      obj({}),
+      obj({{"detached", bool_()}}, {"detached"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("session.list",
-      "Enumerate every session known to this store, sorted newest-"
-      "first by created_at. Each entry includes call_count (live "
-      "from the per-session rpc_log) so an agent can spot the "
-      "in-progress investigation.",
-      json::object(),
-      json{{"sessions",
-            "array of {id,name,created_at,call_count,path}"},
-           {"total", "uint"}});
+      "Enumerate every session known to this store, sorted newest-first "
+      "by created_at. Each entry includes call_count.",
+      obj({}),
+      obj({
+          {"sessions", arr_of(obj({
+              {"id",         str()},
+              {"name",       str()},
+              {"created_at", int_()},
+              {"call_count", int_()},
+              {"path",       str()},
+          }))},
+          {"total", uint_()},
+      }, {"sessions", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("session.info",
       "Detailed view of one session: name, target_id (if any), "
-      "created_at, current call_count, last_call_at (or null), and "
-      "the absolute path to the per-session db.",
-      json{{"id", "string"}},
-      json{{"id", "string"}, {"name", "string"},
-           {"target_id", "string?"}, {"created_at", "int64"},
-           {"call_count", "int64"}, {"last_call_at", "int64?"},
-           {"path", "string"}});
+      "created_at, current call_count, last_call_at, path.",
+      obj({{"id", str()}}, {"id"}),
+      obj({
+          {"id",           str()},
+          {"name",         str()},
+          {"target_id",    str()},
+          {"created_at",   int_()},
+          {"call_count",   int_()},
+          {"last_call_at", int_()},
+          {"path",         str()},
+      }, {"id", "name", "created_at", "call_count", "path"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== probe.* ==============
 
   add("probe.create",
       "Create a probe — an auto-resuming probe with structured capture. "
-      "kind = \"lldb_breakpoint\" (low-rate / app-level: where = "
-      "{function} | {address} | {file,line}; capture snapshots registers "
-      "and memory regions) OR \"uprobe_bpf\" (high-rate / syscall- and "
-      "libc-level via bpftrace shellout: where = {uprobe:'PATH:SYM'} | "
-      "{tracepoint:'CAT:NAME'} | {kprobe:'FN'}; capture.args lists "
-      "bpftrace builtins to print, e.g. ['arg0','arg1']; optional "
-      "host='user@hostname' routes through ssh, optional filter_pid "
-      "fires only on matching pid). action is one of log_and_continue "
-      "(default), stop, store_artifact (lldb_breakpoint only). "
-      "rate_limit is parsed but UNENFORCED.",
-      json{{"target_id", "uint64?"}, {"kind", "string"},
-           {"where", "object{function?,address?,file?,line?,"
-                     "uprobe?,tracepoint?,kprobe?}"},
-           {"capture", "object{registers?[],memory?[],args?[]}?"},
-           {"action", "string?"},
-           {"build_id", "string?"}, {"artifact_name", "string?"},
-           {"rate_limit", "string?"},
-           {"host", "string?"}, {"filter_pid", "int?"}},
-      json{{"probe_id", "string"}, {"kind", "string"}});
+      "kind = \"lldb_breakpoint\" (low-rate / app-level) OR \"uprobe_bpf\" "
+      "(high-rate / syscall- and libc-level via bpftrace). action is one of "
+      "log_and_continue (default), stop, store_artifact (lldb_breakpoint "
+      "only). rate_limit is parsed but UNENFORCED.",
+      obj({
+          {"target_id",     optional_target_id_param()},
+          {"kind",          enum_str({"lldb_breakpoint", "uprobe_bpf"})},
+          {"where",         obj({
+              {"function",   str()},
+              {"address",    uint_()},
+              {"file",       str()},
+              {"line",       uint_()},
+              {"uprobe",     str("PATH:SYMBOL")},
+              {"tracepoint", str("CATEGORY:NAME")},
+              {"kprobe",     str("FUNCTION_NAME")},
+          })},
+          {"capture", obj({
+              {"registers", arr_of(str())},
+              {"memory",    arr_of(obj({
+                  {"reg", str()},
+                  {"len", uint_()},
+              }))},
+              {"args", arr_of(str(), "bpftrace builtins like 'arg0'.")},
+          })},
+          {"action",        enum_str({"log_and_continue", "stop", "store_artifact"})},
+          {"build_id",      str()},
+          {"artifact_name", str()},
+          {"rate_limit",    str("e.g. \"100/s\" — currently parsed but "
+                                "UNENFORCED.")},
+          {"host",          host_param()},
+          {"filter_pid",    int_()},
+      }, {"kind", "where"}),
+      obj({
+          {"probe_id", str()},
+          {"kind",     str()},
+      }, {"probe_id", "kind"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("probe.events",
       "Pull captured events for a probe. since=N returns events with "
-      "hit_seq > N (default 0 = all). max caps the page size (default "
-      "0 = all in buffer). Events are oldest-first; next_since is the "
-      "hit_seq of the last returned event so the agent can paginate.",
-      json{{"probe_id", "string"}, {"since", "uint64?"},
-           {"max", "uint?"}},
-      json{{"events",
-            "array of {probe_id,hit_seq,ts_ns,tid,pc,registers,"
-            "memory[],site,artifact_id?,artifact_name?}"},
-           {"total", "uint"}, {"next_since", "uint64"}});
+      "hit_seq > N (default 0 = all). max caps the page size. Events "
+      "are oldest-first; next_since paginates.",
+      obj({
+          {"probe_id", str()},
+          {"since",    uint_("Default 0 = all.")},
+          {"max",      uint_("Default 0 = no cap.")},
+      }, {"probe_id"}),
+      obj({
+          {"events", arr_of(obj({
+              {"probe_id",      str()},
+              {"hit_seq",       uint_()},
+              {"ts_ns",         uint_()},
+              {"tid",           uint_()},
+              {"pc",            uint_()},
+              {"registers",     obj_open()},
+              {"memory",        arr_of(obj_open())},
+              {"site",          obj_open()},
+              {"artifact_id",   int_()},
+              {"artifact_name", str()},
+          }))},
+          {"total",      uint_()},
+          {"next_since", uint_()},
+      }, {"events", "total", "next_since"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "unbounded");
 
   add("probe.list",
-      "Enumerate every active probe with its kind, where, enabled "
-      "state, and current hit_count.",
-      json::object(),
-      json{{"probes",
-            "array of {probe_id,kind,where_expr,enabled,hit_count}"},
-           {"total", "uint"}});
+      "Enumerate every active probe with its kind, where, enabled state, "
+      "and current hit_count.",
+      obj({}),
+      obj({
+          {"probes", arr_of(obj({
+              {"probe_id",   str()},
+              {"kind",       str()},
+              {"where_expr", str()},
+              {"enabled",    bool_()},
+              {"hit_count",  uint_()},
+          }))},
+          {"total", uint_()},
+      }, {"probes", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("probe.disable",
-      "Disable a probe — the underlying breakpoint stays installed "
-      "but won't fire until enabled again. hit_count is preserved.",
-      json{{"probe_id", "string"}},
-      json{{"probe_id", "string"}, {"enabled", "bool"}});
+      "Disable a probe — the underlying breakpoint stays installed but "
+      "won't fire until enabled again. hit_count is preserved.",
+      obj({{"probe_id", str()}}, {"probe_id"}),
+      obj({
+          {"probe_id", str()},
+          {"enabled",  bool_()},
+      }, {"probe_id", "enabled"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("probe.enable",
       "Re-enable a previously-disabled probe.",
-      json{{"probe_id", "string"}},
-      json{{"probe_id", "string"}, {"enabled", "bool"}});
+      obj({{"probe_id", str()}}, {"probe_id"}),
+      obj({
+          {"probe_id", str()},
+          {"enabled",  bool_()},
+      }, {"probe_id", "enabled"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("probe.delete",
-      "Delete a probe entirely: removes the underlying breakpoint and "
-      "drops the orchestrator's record. Captured events are lost.",
-      json{{"probe_id", "string"}},
-      json{{"probe_id", "string"}, {"deleted", "bool"}});
+      "Delete a probe entirely: removes the underlying breakpoint and drops "
+      "the orchestrator's record. Captured events are lost.",
+      obj({{"probe_id", str()}}, {"probe_id"}),
+      obj({
+          {"probe_id", str()},
+          {"deleted",  bool_()},
+      }, {"probe_id", "deleted"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== observer.* ==============
 
   add("observer.proc.fds",
-      "Enumerate /proc/<pid>/fd of the target host. Each entry is the "
-      "fd number, its readlink target, and a coarse type "
-      "(\"socket\"|\"pipe\"|\"anon\"|\"file\"|\"other\"). When `host` is "
-      "absent the daemon's own host is queried via local_exec; when "
-      "present the call is dispatched over ssh_exec to that host. "
-      "Argv is hardcoded (find /proc/<pid>/fd -printf); pid is "
-      "validated as a positive integer before any subprocess spawns.",
-      json{{"pid", "int"}, {"host", "string?"}},
-      json{{"fds", "array of {fd,target,type}"}, {"total", "uint"}});
+      "Enumerate /proc/<pid>/fd of the target host. Each entry is the fd "
+      "number, its readlink target, and a coarse type "
+      "(socket|pipe|anon|file|other).",
+      obj({
+          {"pid",  pid_param()},
+          {"host", host_param()},
+      }, {"pid"}),
+      obj({
+          {"fds", arr_of(obj({
+              {"fd",     uint_()},
+              {"target", str()},
+              {"type",   enum_str({"socket", "pipe", "anon", "file", "other"})},
+          }))},
+          {"total", uint_()},
+      }, {"fds", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("observer.proc.maps",
-      "Read /proc/<pid>/maps from the target host and return parsed "
-      "regions: {start,end,perm,offset,dev,inode,path?}. Same "
-      "local-vs-remote dispatch as observer.proc.fds. Path may contain "
-      "spaces; we split greedily on the first 5 columns and take the "
-      "remainder as the path.",
-      json{{"pid", "int"}, {"host", "string?"}},
-      json{{"regions", "array of {start,end,perm,offset,dev,inode,path?}"},
-           {"total", "uint"}});
+      "Read /proc/<pid>/maps from the target host and return parsed regions.",
+      obj({
+          {"pid",  pid_param()},
+          {"host", host_param()},
+      }, {"pid"}),
+      obj({
+          {"regions", arr_of(obj({
+              {"start",  uint_()},
+              {"end",    uint_()},
+              {"perm",   str()},
+              {"offset", uint_()},
+              {"dev",    str()},
+              {"inode",  uint_()},
+              {"path",   str()},
+          }))},
+          {"total", uint_()},
+      }, {"regions", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
   add("observer.proc.status",
-      "Read /proc/<pid>/status from the target host and return a "
-      "parsed subset (name, pid, ppid, state, uid, gid, threads, "
-      "vm_rss_kb?, vm_size_kb?, vm_peak_kb?, fd_size?). Zombie "
-      "processes parse cleanly with absent VmRSS/VmSize. The full "
-      "key/value list is also exposed in raw_fields for the rare "
-      "agent that needs more.",
-      json{{"pid", "int"}, {"host", "string?"}},
-      json{{"name", "string"}, {"pid", "int?"}, {"ppid", "int?"},
-           {"state", "string"}, {"uid", "uint?"}, {"gid", "uint?"},
-           {"threads", "uint?"}, {"vm_rss_kb", "uint64?"},
-           {"vm_size_kb", "uint64?"}, {"vm_peak_kb", "uint64?"},
-           {"fd_size", "uint64?"},
-           {"raw_fields", "array of {key,value}"}});
+      "Read /proc/<pid>/status from the target host and return a parsed "
+      "subset (name, pid, ppid, state, uid, gid, threads, vm_rss_kb?, etc).",
+      obj({
+          {"pid",  pid_param()},
+          {"host", host_param()},
+      }, {"pid"}),
+      obj({
+          {"name",       str()},
+          {"pid",        int_()},
+          {"ppid",       int_()},
+          {"state",      str()},
+          {"uid",        uint_()},
+          {"gid",        uint_()},
+          {"threads",    uint_()},
+          {"vm_rss_kb",  uint_()},
+          {"vm_size_kb", uint_()},
+          {"vm_peak_kb", uint_()},
+          {"fd_size",    uint_()},
+          {"raw_fields", arr_of(obj({
+              {"key",   str()},
+              {"value", str()},
+          }))},
+      }, {"name", "state", "raw_fields"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("observer.net.sockets",
-      "Run `ss -tunap` on the target host and return parsed socket "
-      "rows: {proto, state, local, peer, pid?, comm?, fd?}. The "
-      "`filter` param is applied POST-PARSE as a substring match "
-      "against \"<proto> <local> <peer> <state>\" — it is NEVER passed "
-      "to ss to avoid any chance of shell-meta interpretation.",
-      json{{"host", "string?"}, {"filter", "string?"}},
-      json{{"sockets",
-            "array of {proto,state,local,peer,pid?,comm?,fd?}"},
-           {"total", "uint"}});
+      "Run `ss -tunap` on the target host and return parsed socket rows. "
+      "`filter` is applied POST-PARSE — never passed to ss.",
+      obj({
+          {"host",   host_param()},
+          {"filter", str("Substring against \"<proto> <local> <peer> "
+                         "<state>\".")},
+      }),
+      obj({
+          {"sockets", arr_of(obj({
+              {"proto", str()},
+              {"state", str()},
+              {"local", str()},
+              {"peer",  str()},
+              {"pid",   int_()},
+              {"comm",  str()},
+              {"fd",    int_()},
+          }))},
+          {"total", uint_()},
+      }, {"sockets", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   add("observer.net.tcpdump",
       "Bounded one-shot live capture: spawn "
-      "`tcpdump -nn -tt -l -c <count> -i <iface> -s <snaplen> [bpf]` "
-      "via the StreamingExec primitive, parse each stdout line into "
-      "{ts, summary, proto?, src?, dst?, len?, iface?}, and return "
-      "exactly `count` packets (or what was captured before the 30 s "
-      "wall-clock cap fires — `truncated` flags the latter). Requires "
-      "CAP_NET_RAW or root; permission errors surface as -32000 with "
-      "the underlying tcpdump stderr. `count` ≤ 10000, `snaplen` ≤ 65535.",
-      json{{"iface",   "string"},     {"count", "uint"},
-           {"bpf",     "string?"},    {"snaplen", "uint?"},
-           {"host",    "string?"}},
-      json{{"packets",
-            "array of {ts,summary,iface?,src?,dst?,proto?,len?}"},
-           {"total", "uint"}, {"truncated", "bool"}});
+      "`tcpdump -nn -tt -l -c <count> -i <iface> -s <snaplen> [bpf]`. "
+      "Permission errors surface as -32000 with the underlying tcpdump "
+      "stderr. count ≤ 10000, snaplen ≤ 65535.",
+      obj({
+          {"iface",   str("Interface name (lo, eth0, any).")},
+          {"count",   uint_range(1, 10000)},
+          {"bpf",     str("Optional BPF filter expression.")},
+          {"snaplen", uint_range(1, 65535)},
+          {"host",    host_param()},
+      }, {"iface", "count"}),
+      obj({
+          {"packets", arr_of(obj({
+              {"ts",      str()},
+              {"summary", str()},
+              {"iface",   str()},
+              {"src",     str()},
+              {"dst",     str()},
+              {"proto",   str()},
+              {"len",     uint_()},
+          }))},
+          {"total",     uint_()},
+          {"truncated", bool_()},
+      }, {"packets", "total", "truncated"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "unbounded");
 
   add("observer.net.igmp",
       "Read /proc/net/igmp (and /proc/net/igmp6 if present) on the "
-      "target host and return parsed multicast memberships: "
-      "{idx, device, count?, querier?, addresses: [{address, users, "
-      "timer}, ...]}. V4 group hex words (kernel little-endian) are "
-      "converted to dotted-quad; V6 32-hex-char rows are rendered as "
-      "8 colon-separated 4-hex-char groups (no zero-compression). "
-      "Local dispatch reads /proc/net/igmp{,6} via ifstream — no "
-      "subprocess; remote dispatch shells out `cat` over ssh_exec. "
-      "Missing /proc/net/igmp6 is silently tolerated.",
-      json{{"host", "string?"}},
-      json{{"groups",
-            "array of {idx,device,count?,querier?,addresses:"
-            "[{address,users,timer}]}"},
-           {"total", "uint"}});
+      "target host and return parsed multicast memberships. V4 group hex "
+      "is converted to dotted-quad; V6 is rendered as 8 colon-separated "
+      "4-hex-char groups (no zero-compression).",
+      obj({{"host", host_param()}}),
+      obj({
+          {"groups", arr_of(obj({
+              {"idx",       uint_()},
+              {"device",    str()},
+              {"count",     uint_()},
+              {"querier",   str()},
+              {"addresses", arr_of(obj({
+                  {"address", str()},
+                  {"users",   uint_()},
+                  {"timer",   uint_()},
+              }))},
+          }))},
+          {"total", uint_()},
+      }, {"groups", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("observer.exec",
       "Operator-allowlisted exec escape hatch (plan §4.6). OFF by "
       "default: returns -32002 unless the daemon was launched with "
       "--observer-exec-allowlist <path> or LDB_OBSERVER_EXEC_ALLOWLIST. "
-      "The allowlist file lists fnmatch(FNM_PATHNAME) glob patterns "
-      "against the space-joined argv, one per line; '#' starts a "
-      "comment, blank lines are ignored, EMPTY file rejects all. "
       "argv[0] MUST be an absolute path or a bare basename on PATH; "
-      "relative paths (./foo, ../bar) are -32602. stdin payload is "
-      "capped at 64 KiB. Disallowed argv → -32003 (kForbidden); the "
-      "allowlist contents are NEVER returned over the wire.",
-      json{{"argv", "array of string"}, {"host", "string?"},
-           {"timeout_ms", "uint?"}, {"stdin", "string?"}},
-      json{{"stdout", "string"}, {"stderr", "string"},
-           {"exit_code", "int"}, {"duration_ms", "uint"},
-           {"truncated", "bool?"}});
+      "stdin payload is capped at 64 KiB.",
+      obj({
+          {"argv",       arr_of(str())},
+          {"host",       host_param()},
+          {"timeout_ms", uint_("Default daemon-configured.")},
+          {"stdin",      str("UTF-8 stdin payload, capped at 64 KiB.")},
+      }, {"argv"}),
+      obj({
+          {"stdout",      str()},
+          {"stderr",      str()},
+          {"exit_code",   int_()},
+          {"duration_ms", uint_()},
+          {"truncated",   bool_()},
+      }, {"stdout", "stderr", "exit_code", "duration_ms"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
   json data;
   data["endpoints"] = std::move(eps);

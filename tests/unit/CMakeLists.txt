@@ -51,6 +51,7 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_igmp.cpp
   test_exec_allowlist.cpp
   test_dispatcher_observer_exec.cpp
+  test_describe_endpoints_schema.cpp
 )
 
 set(LDB_LIB_SOURCES
