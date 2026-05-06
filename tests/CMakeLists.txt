@@ -256,6 +256,15 @@ set_tests_properties(smoke_uprobe_bpf PROPERTIES
   TIMEOUT 60
 )
 
+add_test(
+  NAME smoke_observer_tcpdump
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_observer_tcpdump.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_observer_tcpdump PROPERTIES
+  TIMEOUT 30
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)
 

@@ -1,0 +1,18 @@
+# Synthesized fixture for `tcpdump -nn -tt -l -c N -i lo` output.
+#
+# The test framework uses this when an actual privileged tcpdump
+# capture isn't available. Captured shape mirrors what `tcpdump 4.99`
+# emits on Pop!_OS when running:
+#
+#   sudo tcpdump -nn -tt -l -c 5 -i lo
+#
+# while a peer connects (`nc -l 9001` + `nc 127.0.0.1 9001`).
+#
+# Lines beginning with "#" are stripped by the test harness before the
+# fixture is fed to parse_tcpdump_lines() (so this comment doesn't
+# break it). The trailing newline matters; getline() drops the LF.
+1709123456.789012 IP 127.0.0.1.34567 > 127.0.0.1.9001: Flags [S], seq 0, win 65535, options [mss 1460,sackOK,TS val 1 ecr 0,nop,wscale 7], length 0
+1709123456.789098 IP 127.0.0.1.9001 > 127.0.0.1.34567: Flags [S.], seq 0, ack 1, win 65535, options [mss 1460,sackOK,TS val 1 ecr 1,nop,wscale 7], length 0
+1709123456.789157 IP 127.0.0.1.34567 > 127.0.0.1.9001: Flags [.], ack 1, win 512, options [nop,nop,TS val 1 ecr 1], length 0
+1709123457.012345 IP6 ::1.51234 > ::1.9001: Flags [P.], seq 1:6, ack 1, win 512, length 5
+1709123457.500000 ARP, Request who-has 192.168.0.1 tell 192.168.0.2, length 28
