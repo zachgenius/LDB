@@ -389,6 +389,17 @@ set_tests_properties(smoke_live_continue_provenance PROPERTIES
   TIMEOUT 60
 )
 
+# Infrastructure sanity check — parse `.github/workflows/ci.yml` and
+# assert the documented shape. Cheap, fast, runs without ldbd.
+add_test(
+  NAME check_ci_yaml
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/check_ci_yaml.py"
+          "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties(check_ci_yaml PROPERTIES
+  TIMEOUT 10
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)
 

@@ -1,0 +1,139 @@
+# LDB CI — Linux x86-64
+#
+# Builds and tests `ldbd` on every push and pull request against
+# `master`, plus a tag-driven job that uploads the binary as an
+# artifact for `v*.*` tags. macOS arm64 is intentionally NOT in the
+# matrix yet — see Tier 1 §2 in `docs/POST-V0.1-PROGRESS.md` (gated on
+# B1 hardware sign-off).
+#
+# Documented in `docs/06-ci.md` and reproduced locally per that doc.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*.*"
+  pull_request:
+    branches:
+      - master
+
+# Don't pile up redundant runs on a fast-pushing branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: Linux x86-64 (Ubuntu 24.04, gcc-13, apt LLDB 18)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build + test dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build cmake build-essential \
+            liblldb-dev lldb \
+            libsqlite3-dev zlib1g-dev \
+            python3 \
+            bpftrace tcpdump \
+            openssh-server openssh-client
+
+      - name: Disable Yama ptrace_scope (live attach tests)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cat /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Configure local sshd + key auth (target.connect_remote_ssh)
+        run: |
+          sudo systemctl start ssh || sudo service ssh start
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -t ed25519 localhost >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=no localhost true
+
+      - name: Configure (CMake + Ninja, apt LLDB 18)
+        run: |
+          cmake -B build -G Ninja \
+            -DLDB_LLDB_ROOT=/usr/lib/llvm-18 \
+            -DCMAKE_PREFIX_PATH=/usr
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Verify daemon (--version smoke)
+        run: build/bin/ldbd --version
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload failure artifacts (build + ctest logs)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-failure-logs
+          path: |
+            build/Testing/
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+            build/.ninja_log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Tagged release artifact (ldbd binary)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build cmake build-essential \
+            liblldb-dev lldb \
+            libsqlite3-dev zlib1g-dev \
+            python3
+
+      - name: Configure (Release)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLDB_LLDB_ROOT=/usr/lib/llvm-18 \
+            -DCMAKE_PREFIX_PATH=/usr
+
+      - name: Build ldbd
+        run: cmake --build build --parallel --target ldbd
+
+      - name: Stage release artifact
+        id: stage
+        run: |
+          tag="${GITHUB_REF##*/}"
+          stage="ldbd-${tag}-linux-x86_64"
+          mkdir -p "dist/${stage}"
+          cp build/bin/ldbd "dist/${stage}/ldbd"
+          cp README.md "dist/${stage}/README.md"
+          (cd dist && tar -czf "${stage}.tar.gz" "${stage}")
+          ls -la dist/
+          echo "name=${stage}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload ldbd binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: dist/${{ steps.stage.outputs.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 90
