@@ -154,8 +154,11 @@ TEST_CASE("dispatcher: observer.net.tcpdump in describe.endpoints",
     if (e["method"] == "observer.net.tcpdump") {
       found = true;
       REQUIRE(e.contains("summary"));
-      REQUIRE(e.contains("params"));
-      REQUIRE(e.contains("returns"));
+      // M5 part 2: schema shape (informal `params`/`returns` was dropped).
+      REQUIRE(e.contains("params_schema"));
+      REQUIRE(e.contains("returns_schema"));
+      REQUIRE(e.contains("requires_stopped"));
+      REQUIRE(e.contains("cost_hint"));
       break;
     }
   }
