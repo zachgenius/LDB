@@ -1,6 +1,7 @@
 #include "store/session_store.h"
 
 #include "backend/debugger_backend.h"
+#include "util/sha256.h"
 
 #include <sqlite3.h>
 
@@ -449,6 +450,216 @@ SessionStore::read_log(std::string_view id,
   sqlite3_close(db);
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Tier 3 §11 — diff_logs
+//
+// Walks both rpc_logs (in seq order), canonicalizes each row's params and
+// response via re-parse + re-dump (sorted-key), and aligns the two
+// (method, params_canon) sequences with classic O(n*m) LCS DP. The
+// alignment is then walked top-down to emit DiffEntry rows in a stable
+// order: removed runs (A-side gap) come before added runs (B-side gap)
+// inside each block; aligned pairs are emitted at their alignment point.
+
+namespace {
+
+// Re-parse and re-dump a stored JSON string to obtain a canonical-key
+// representation. nlohmann::json's object_t is std::map, so dump()
+// already sorts keys alphabetically. The stored string is *probably*
+// already canonical (Writer::append goes through json::dump too) but
+// re-canonicalizing here is belt-and-braces: a future client that bypasses
+// the writer (or a `.ldbpack` round-trip through some other library) can
+// still produce comparable output.
+std::string canon_json(std::string_view raw) {
+  if (raw.empty()) return "{}";
+  try {
+    auto j = nlohmann::json::parse(raw);
+    return j.dump();
+  } catch (...) {
+    // Fall back to the raw bytes — a malformed row is its own equivalence
+    // class. Diffing two malformed rows with byte-identical text still
+    // works; a malformed row vs a parseable one will simply not align.
+    return std::string(raw);
+  }
+}
+
+// Extract canonical params from a stored request_json. The Writer writes
+// requests as `{"params": <user-params>, ...}` — see Writer::append's
+// caller in dispatcher.cpp — but the dispatcher actually passes the
+// caller-supplied `req.params` *directly* as the request body in some
+// paths (e.g. session.detach packs explicitly). To be robust we accept
+// either shape: if the parsed JSON has a top-level "params" key, treat
+// that as the params object; otherwise treat the whole object as params.
+// The choice doesn't affect correctness as long as it's consistent across
+// both sessions in the diff.
+std::string canon_params_from_request(std::string_view request_json) {
+  if (request_json.empty()) return "{}";
+  try {
+    auto j = nlohmann::json::parse(request_json);
+    if (j.is_object() && j.contains("params")) {
+      return j["params"].dump();
+    }
+    return j.dump();
+  } catch (...) {
+    return std::string(request_json);
+  }
+}
+
+// 64-bit truncation of sha256, hex-encoded — 16 chars. Plenty for a
+// short label; the actual diff key is the canonical params string, not
+// the hash. Reusing sha256 keeps us within the dependencies already
+// vendored for util/.
+std::string short_hash(std::string_view bytes) {
+  auto full = ldb::util::sha256_hex(bytes);
+  return full.substr(0, 16);
+}
+
+struct CanonRow {
+  std::int64_t seq           = 0;
+  std::string  method;
+  std::string  params_canon;
+  std::string  response_canon;
+};
+
+std::vector<CanonRow> canonicalize_log(
+    const std::vector<SessionStore::LogRow>& log) {
+  std::vector<CanonRow> out;
+  out.reserve(log.size());
+  for (const auto& r : log) {
+    CanonRow c;
+    c.seq             = r.seq;
+    c.method          = r.method;
+    c.params_canon    = canon_params_from_request(r.request_json);
+    c.response_canon  = canon_json(r.response_json);
+    out.push_back(std::move(c));
+  }
+  return out;
+}
+
+// Pack (method, params_canon) into one comparison key. Using '\x1f'
+// (unit-separator) as a delimiter — never legal inside JSON-without-
+// escapes, never in a method name. Keeps the LCS comparison a single
+// std::string == op rather than two compares per cell.
+std::string make_key(const CanonRow& r) {
+  std::string k;
+  k.reserve(r.method.size() + 1 + r.params_canon.size());
+  k.append(r.method);
+  k.push_back('\x1f');
+  k.append(r.params_canon);
+  return k;
+}
+
+}  // namespace
+
+SessionStore::DiffResult
+SessionStore::diff_logs(std::string_view a_id, std::string_view b_id) {
+  auto log_a = read_log(a_id);
+  auto log_b = read_log(b_id);
+  auto can_a = canonicalize_log(log_a);
+  auto can_b = canonicalize_log(log_b);
+
+  const std::size_t n = can_a.size();
+  const std::size_t m = can_b.size();
+
+  // Pre-compute keys to avoid concatenating inside the DP loop.
+  std::vector<std::string> ka, kb;
+  ka.reserve(n); kb.reserve(m);
+  for (const auto& r : can_a) ka.push_back(make_key(r));
+  for (const auto& r : can_b) kb.push_back(make_key(r));
+
+  // O(n*m) LCS DP, length only. We back out the alignment by walking
+  // backward through the table. For session traces of "human-driven
+  // investigation" size (low thousands of rows) this fits comfortably.
+  // Unbounded cost-hint on the wire endpoint warns callers if they go
+  // bigger.
+  std::vector<std::vector<std::int32_t>> dp(
+      n + 1, std::vector<std::int32_t>(m + 1, 0));
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = 0; j < m; ++j) {
+      if (ka[i] == kb[j]) {
+        dp[i + 1][j + 1] = dp[i][j] + 1;
+      } else {
+        dp[i + 1][j + 1] = std::max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  // Backtrack to recover the alignment. We collect pair-records in
+  // reverse, then walk forward to emit DiffEntries in stable order.
+  enum Op { kCommon, kRemoved, kAdded };
+  struct Pair { Op op; std::size_t ia; std::size_t ib; };
+  std::vector<Pair> pairs;
+  pairs.reserve(n + m);
+  {
+    std::size_t i = n, j = m;
+    while (i > 0 && j > 0) {
+      if (ka[i - 1] == kb[j - 1]) {
+        pairs.push_back({kCommon, i - 1, j - 1});
+        --i; --j;
+      } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+        pairs.push_back({kRemoved, i - 1, 0});
+        --i;
+      } else {
+        pairs.push_back({kAdded, 0, j - 1});
+        --j;
+      }
+    }
+    while (i > 0) { pairs.push_back({kRemoved, i - 1, 0}); --i; }
+    while (j > 0) { pairs.push_back({kAdded,   0, j - 1}); --j; }
+  }
+  std::reverse(pairs.begin(), pairs.end());
+
+  DiffResult out;
+  out.summary.total_a = static_cast<std::int64_t>(n);
+  out.summary.total_b = static_cast<std::int64_t>(m);
+
+  for (const auto& p : pairs) {
+    DiffEntry e;
+    if (p.op == kCommon) {
+      const auto& a = can_a[p.ia];
+      const auto& b = can_b[p.ib];
+      e.method        = a.method;
+      e.params_canon  = a.params_canon;
+      e.params_hash   = short_hash(a.params_canon);
+      e.seq_a         = a.seq;
+      e.seq_b         = b.seq;
+      if (a.response_canon == b.response_canon) {
+        e.kind             = "common";
+        e.response_a_canon = a.response_canon;
+        // response_b_canon left empty for "common" — they're identical;
+        // duplicating wastes bytes on the wire.
+        ++out.summary.common;
+      } else {
+        e.kind             = "diverged";
+        e.response_a_canon = a.response_canon;
+        e.response_b_canon = b.response_canon;
+        ++out.summary.diverged;
+      }
+    } else if (p.op == kRemoved) {
+      const auto& a = can_a[p.ia];
+      e.kind             = "removed";
+      e.method           = a.method;
+      e.params_canon     = a.params_canon;
+      e.params_hash      = short_hash(a.params_canon);
+      e.seq_a            = a.seq;
+      e.response_a_canon = a.response_canon;
+      ++out.summary.removed;
+    } else {  // kAdded
+      const auto& b = can_b[p.ib];
+      e.kind             = "added";
+      e.method           = b.method;
+      e.params_canon     = b.params_canon;
+      e.params_hash      = short_hash(b.params_canon);
+      e.seq_b            = b.seq;
+      e.response_b_canon = b.response_canon;
+      ++out.summary.added;
+    }
+    out.entries.push_back(std::move(e));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 
 void SessionStore::import_session(std::string_view id,
                                   std::string_view name,
