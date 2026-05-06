@@ -214,6 +214,15 @@ set_tests_properties(smoke_connect_remote_ssh PROPERTIES
 )
 
 add_test(
+  NAME smoke_connect_rr
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_connect_rr.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_connect_rr PROPERTIES
+  TIMEOUT 60
+)
+
+add_test(
   NAME smoke_artifact
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_artifact.py"
           "$<TARGET_FILE:ldbd>"

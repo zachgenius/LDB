@@ -54,6 +54,8 @@ set(LDB_UNIT_SOURCES
   test_transport_ssh.cpp
   test_transport_ssh_tunneled.cpp
   test_backend_connect_remote_ssh.cpp
+  test_rr_url_parser.cpp
+  test_backend_connect_remote_rr.cpp
   test_observers_parsers.cpp
   test_observers_live.cpp
   test_streaming_exec.cpp
@@ -100,6 +102,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/transport/ssh.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/local_exec.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/streaming_exec.cpp
+  ${CMAKE_SOURCE_DIR}/src/transport/rr.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/proc.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/exec_allowlist.cpp
