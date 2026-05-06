@@ -1,5 +1,7 @@
 # LDB
 
+[![CI](https://github.com/zachgenius/LDB/actions/workflows/ci.yml/badge.svg)](https://github.com/zachgenius/LDB/actions/workflows/ci.yml)
+
 **An LLM/agent-first universal debugger.**
 
 LDB is a debugger built for LLM agents and reverse engineers, not for humans
@@ -236,6 +238,7 @@ docs/                Design docs and engineering worklog
 | [`docs/01-gdb-core-methodology.md`](docs/01-gdb-core-methodology.md) | Analysis of GDB 17.1's architecture — foundational reading |
 | [`docs/02-ldb-mvp-plan.md`](docs/02-ldb-mvp-plan.md) | MVP plan: protocol spec, RPC surface, milestones, reference workflow |
 | [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md) | Post-MVP trajectory: progressive replacement of LLDB components |
+| [`docs/06-ci.md`](docs/06-ci.md) | What CI runs, what SKIPs on the runner, how to reproduce locally |
 | [`docs/WORKLOG.md`](docs/WORKLOG.md) | Engineering journal — newest entries on top |
 | [`CLAUDE.md`](CLAUDE.md) | Workflow rules for AI-assisted development on this repo |
 

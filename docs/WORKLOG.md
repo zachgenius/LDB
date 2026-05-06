@@ -4,6 +4,43 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 — post-v0.1 §3b: GitHub Actions CI
+
+**Goal:** Wire CI on every push and PR. Linux x86-64 only; macOS arm64 gated on B1.
+
+**Done:**
+- `.github/workflows/ci.yml` — two jobs on `ubuntu-24.04`:
+  - `linux` runs on push-to-master, PRs, and tag push: apt-installs the documented deps (`ninja-build`, `cmake`, `build-essential`, `liblldb-dev`, `lldb`, `libsqlite3-dev`, `zlib1g-dev`, `python3`, `bpftrace`, `tcpdump`, `openssh-server`, `openssh-client`); disables Yama; sets up local sshd + ed25519 keypair so `target.connect_remote_ssh` exercises its positive path; configures with `-DLDB_LLDB_ROOT=/usr/lib/llvm-18 -DCMAKE_PREFIX_PATH=/usr`; builds parallel; runs `ctest --output-on-failure`; uploads `build/Testing/`, CMake logs, and `.ninja_log` as `linux-failure-logs` artifact on failure only. 30-minute timeout. Concurrency group cancels duplicate PR runs.
+  - `release` is gated on `v*.*` tags AND `needs: linux`, builds `ldbd` in Release, tarballs as `ldbd-<tag>-linux-x86_64.tar.gz`, uploads via `actions/upload-artifact@v4` with 90-day retention. No GitHub Release object — operator policy decision deferred.
+- `tests/check_ci_yaml.py` + `add_test(NAME check_ci_yaml ...)` in `tests/CMakeLists.txt` — sanity check that parses the YAML and asserts top-level shape, push+pull_request triggers with the `v*.*` tag pattern, an Ubuntu-24.04 ctest job with the documented apt deps + ptrace_scope sysctl + LLVM-18 prefix + 30-min timeout, and a release job that uploads `ldbd`. Skips structural checks if PyYAML isn't installed (file presence still verified). TIMEOUT 10 sec. Test was written first, confirmed failing for the expected reason ("missing workflow file"), then YAML written, then green.
+- `README.md` — CI badge at top of the file linking to the Actions page; `docs/06-ci.md` row added to the Documentation table.
+- `docs/06-ci.md` — what CI runs, what tests SKIP on the runner (CAP_BPF, CAP_NET_RAW), how to reproduce the environment locally, and why CI uses apt LLDB 18 vs the local prebuilt LLVM 22.
+
+**Decisions:**
+- **Apt LLDB 18 in CI vs prebuilt LLVM 22 locally.** The runner image already mirrors `liblldb-dev` so apt installs in seconds; pulling down a 700 MB upstream tarball every run adds latency without surfacing bugs the SBAPI floor (LLVM 18) doesn't already cover. Local dev keeps `LDB_LLDB_ROOT` parameterized; the README's "LLDB 18 or newer" floor is now actually exercised by CI. Documented the trade in `docs/06-ci.md` so the next person knows when to flip it (any feature that needs LLVM ≥ 19 SBAPI).
+- **Set up sshd + key auth in the workflow.** The brief made this explicit and it's worth the eight lines: without it `smoke_connect_remote_ssh`'s positive path SKIPs and we lose live SSH-transport coverage. The runner doesn't auto-start sshd; `sudo systemctl start ssh` runs *before* `ssh-keyscan` so host-key generation is deterministic.
+- **`kernel.yama.ptrace_scope=0` via `sysctl -w`, not a sysctl conf file.** Ephemeral runner, so persistence is irrelevant; the inline command is the simplest readable form and matches what a local operator would run.
+- **Tag-release artifact only, no GitHub Release.** The brief explicitly said operator-policy decision; uploading the binary as a workflow artifact is enough for v0.1 polish. Promotion to Release happens by hand or in a follow-up slice.
+- **Two jobs, not one with conditional steps.** Easier to read, easier to add a macOS row later, and the release job runs apt-install minus the live-test deps so its build is faster. `needs: linux` keeps the release artifact from being produced for a tag whose ctest is red.
+- **Concurrency group cancels duplicate PR runs.** Master-branch runs are kept (no cancel-in-progress on push) so we always get a clean signal at HEAD. Saves runner minutes on a fast-pushing PR without hiding flakiness on master.
+- **PyYAML normalizes `on:` to True.** YAML 1.1 parses bareword `on` as a boolean. The check_ci_yaml script reads `doc.get("on", doc.get(True))` to handle both — this is documented behavior, not a bug. Verified the workflow file otherwise parses fine.
+
+**Surprises / blockers:**
+- **Local apt is broken on the dev box** so I couldn't `sudo apt-get install` to dry-run the install line; instead verified each package name exists in `apt-cache show` and confirmed the SBAPI surfaces I touch are stable across LLVM 18 (the apt version) and the local LLVM 22.1.5 by running ctest 41/41 against `/opt/llvm-22` after the change.
+- **`actionlint` not installed locally.** Hand-validated YAML structure with PyYAML + a Python AST walk — printed `runs-on`, `timeout-minutes`, `needs`, `if`, and step names for both jobs and confirmed they match the brief. Documented the limitation in the worklog and left the hook for `actionlint` in `docs/06-ci.md`'s "When the workflow itself changes" section.
+- **`bpftrace` and `tcpdump` are installed but their live tests still SKIP** on the runner because CAP_BPF / CAP_NET_RAW aren't granted; documented in `docs/06-ci.md`. Installing them anyway means the discovery branches of those tests run instead of short-circuiting on `which: not found`, which is the test surface we have without giving the runner caps.
+
+**Verification:**
+- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` clean.
+- `cmake --build build && ctest --test-dir build --output-on-failure` → **41/41 PASS in ~31s** at HEAD on the worktree (40 → 41, the new entry is `check_ci_yaml`). Build warning-clean against `/opt/llvm-22`.
+- TDD trail: wrote the test first (commit will show this), confirmed `1/1 *** Failed` with `missing workflow file`, then created the YAML and got `1/1 Passed`.
+- Cannot validate the workflow on GitHub from this box; it'll green/red on the first push. The shape check + hand-validation is the closest pre-push signal we have.
+
+**Next:**
+- §3c — `CONTRIBUTING.md` + commit-style guide + PR template. Sibling agent.
+
+---
+
 ## 2026-05-06 — post-v0.1 §3a: protocol semver + hello handshake
 
 **Goal:** Wire `<major>.<minor>` protocol versioning into `hello`,
