@@ -19,7 +19,7 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | `c16adf0` |
+| **HEAD now** | (updated post-1a-merge) |
 | **ctest at HEAD** | 35/35 green |
 | **Tag** | `v0.1` |
 
@@ -27,7 +27,7 @@
 
 | # | Slice | Status | Worker | Reviewer | Merge commit |
 |---|---|---|---|---|---|
-| 1a | Live provenance — endpoint determinism audit | ⏳ | `a05ab0000ec0248b1` | — | — |
+| 1a | Live provenance — endpoint determinism audit | ✅ | `a05ab0000ec0248b1` | (inline review) | — |
 | 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | — | — | — | — |
 | 1c | Live provenance — CI determinism gate extended to live targets | — | — | — | — |
 | 2 | macOS arm64 hardening pass (Linux-side fixes; macOS sign-off deferred to user) | — | — | — | — |
@@ -72,7 +72,17 @@
 
 ## Blockers / decisions surfaced for user
 
-_(empty so far)_
+_(none so far)_
+
+## Audit-driven corrections folded into slice 1b spec
+
+The reviewer's pass on 1a found 5 issues to track for the implementation slice. Folded into 1b's brief verbatim:
+
+1. **§11.2 bug claim is wrong** — `session.list` and `artifact.list` already have `ORDER BY`. Real concern is tiebreak on random uuid `id`. Implementation slice must read the SQL before "fixing" it.
+2. **Counts inconsistent** — §1 says "60 catalogued"; §4 says 56; §9 lists 9 EXC; §4 totals 8. Actual catalog is 62 (verified). Reconcile during impl.
+3. **Snapshot-ID gaps** — non-stop mode (per-thread `<gen>` or out-of-scope), SW-breakpoint memory patches, dlopen layout cache invalidation, cross-process gen=0 collisions, register-fetch cost on high-thread remote targets.
+4. **§7 vs §3 ORDER BY keys clash** — §3.8/3.9 want `(build_id, name)` / `(name, id)`; existing SQL uses `(created_at DESC, id ASC)` / `(id ASC)`. Pick one before slice 2 starts.
+5. **`describe.endpoints` size: 56,805 bytes**, not "56 KB". Trivial doc nit.
 
 ## Conventions for this run
 
