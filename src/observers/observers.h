@@ -2,6 +2,7 @@
 
 #include "transport/ssh.h"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -132,5 +133,67 @@ SocketsResult fetch_net_sockets(const std::optional<transport::SshHost>& remote,
                                 const std::string&                       filter);
 
 SocketsResult parse_ss_tunap(const std::string& ss_output);
+
+
+// ---- net.tcpdump -------------------------------------------------------
+//
+// Bounded one-shot live capture (plan §4.6). Spawns
+//   tcpdump -nn -tt -l -c <count> -i <iface> -s <snaplen> [bpf]
+// either locally or via SSH using `transport::StreamingExec` (NOT
+// `local_exec` / `ssh_exec` — those are blocking one-shots and would
+// either buffer indefinitely or starve us of intermediate events).
+// Each stdout line is parsed into a PacketEntry; we collect up to
+// `count` packets, then `terminate()` the streaming subprocess.
+//
+// **Privilege:** tcpdump needs CAP_NET_RAW or root. When the binary
+// reports "permission denied" / "Operation not permitted" we surface
+// that as a clean `backend::Error` and the dispatcher maps it to
+// -32000 with the underlying stderr text in the message.
+//
+// **Bounding:** per-call wall-clock cap defaults to 30 s. If tcpdump
+// hasn't produced `count` packets by then, we stop, return what we
+// have, and set `truncated = true`.
+struct PacketEntry {
+  double                          ts_epoch = 0.0;   // float seconds (epoch)
+  std::optional<std::string>      iface;            // populated only when caller passes it
+  std::optional<std::string>      src;
+  std::optional<std::string>      dst;
+  std::optional<std::string>      proto;            // "IP" | "IP6" | "ARP" | etc.
+  std::optional<std::uint64_t>    len;              // parsed from "length N" suffix
+  std::string                     summary;          // tcpdump line minus the leading ts
+};
+
+struct TcpdumpRequest {
+  std::string                     iface;            // required, non-empty
+  std::optional<std::string>      bpf;              // optional BPF expression
+  std::uint32_t                   count    = 0;     // required, 1..10000
+  std::optional<std::uint32_t>    snaplen;          // 1..65535; default 256
+  std::optional<transport::SshHost> remote;         // nullopt → local
+  std::chrono::milliseconds       timeout  = std::chrono::seconds(30);
+};
+
+struct TcpdumpResult {
+  std::vector<PacketEntry>        packets;
+  std::uint32_t                   total     = 0;
+  bool                            truncated = false;
+};
+
+// Invokes tcpdump and returns when either count packets have been
+// captured, the child exits, or the wall-clock timeout fires.
+// Throws backend::Error on transport failure or tcpdump permission
+// errors. The `iface` arg from the request is propagated into each
+// PacketEntry's `iface` field.
+TcpdumpResult tcpdump(const TcpdumpRequest& req);
+
+// Pure parser: feeds `tcpdump -nn -tt -l` text into PacketEntry
+// values. Exposed for unit tests that don't want a subprocess.
+// Lines beginning with '#' are skipped (so committed fixtures may
+// include leading comments documenting where the capture came from).
+std::vector<PacketEntry> parse_tcpdump_lines(const std::string& text);
+
+// Single-line variant. Returns nullopt when the line is empty,
+// comment-only, or malformed in a way that prevents us from
+// extracting at least the timestamp + a non-empty summary.
+std::optional<PacketEntry> parse_tcpdump_line(const std::string& line);
 
 }  // namespace ldb::observers

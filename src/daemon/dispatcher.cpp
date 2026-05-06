@@ -487,6 +487,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
     if (req.method == "observer.proc.status") return handle_observer_proc_status(req);
     if (req.method == "observer.net.sockets") return handle_observer_net_sockets(req);
+    if (req.method == "observer.net.tcpdump") return handle_observer_net_tcpdump(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -1012,6 +1013,22 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"sockets",
             "array of {proto,state,local,peer,pid?,comm?,fd?}"},
            {"total", "uint"}});
+
+  add("observer.net.tcpdump",
+      "Bounded one-shot live capture: spawn "
+      "`tcpdump -nn -tt -l -c <count> -i <iface> -s <snaplen> [bpf]` "
+      "via the StreamingExec primitive, parse each stdout line into "
+      "{ts, summary, proto?, src?, dst?, len?, iface?}, and return "
+      "exactly `count` packets (or what was captured before the 30 s "
+      "wall-clock cap fires — `truncated` flags the latter). Requires "
+      "CAP_NET_RAW or root; permission errors surface as -32000 with "
+      "the underlying tcpdump stderr. `count` ≤ 10000, `snaplen` ≤ 65535.",
+      json{{"iface",   "string"},     {"count", "uint"},
+           {"bpf",     "string?"},    {"snaplen", "uint?"},
+           {"host",    "string?"}},
+      json{{"packets",
+            "array of {ts,summary,iface?,src?,dst?,proto?,len?}"},
+           {"total", "uint"}, {"truncated", "bool"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -3126,6 +3143,112 @@ Response Dispatcher::handle_observer_net_sockets(const Request& req) {
   for (const auto& s : r.sockets) arr.push_back(socket_entry_to_json(s));
   return protocol::make_ok(req.id,
       protocol::view::apply_to_array(std::move(arr), view_spec, "sockets"));
+}
+
+namespace {
+
+json packet_entry_to_json(const ldb::observers::PacketEntry& p) {
+  json j;
+  // `ts` is the canonical wire name (epoch float seconds). `ts_epoch`
+  // is the C++ struct field name; we don't expose the C++-y suffix on
+  // the wire — agents reading the JSON care about "what timestamp,"
+  // not "in what epoch flavor."
+  j["ts"]      = p.ts_epoch;
+  j["summary"] = p.summary;
+  if (p.iface.has_value()) j["iface"] = *p.iface;
+  if (p.src.has_value())   j["src"]   = *p.src;
+  if (p.dst.has_value())   j["dst"]   = *p.dst;
+  if (p.proto.has_value()) j["proto"] = *p.proto;
+  if (p.len.has_value())   j["len"]   = *p.len;
+  return j;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_observer_net_tcpdump(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  // iface (required, non-empty string)
+  auto it = req.params.find("iface");
+  if (it == req.params.end() || !it->is_string()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'iface'");
+  }
+  std::string iface = it->get<std::string>();
+  if (iface.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "param 'iface' must be non-empty");
+  }
+  // count (required, positive int ≤ 10000)
+  auto it_c = req.params.find("count");
+  if (it_c == req.params.end()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing int param 'count'");
+  }
+  std::int64_t count_signed = 0;
+  if (it_c->is_number_integer()) {
+    count_signed = it_c->get<std::int64_t>();
+  } else if (it_c->is_number_unsigned()) {
+    auto u = it_c->get<std::uint64_t>();
+    if (u > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'count' out of range");
+    }
+    count_signed = static_cast<std::int64_t>(u);
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "param 'count' must be an integer");
+  }
+  if (count_signed <= 0 || count_signed > 10000) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "param 'count' out of range (1..10000)");
+  }
+  // snaplen (optional, 1..65535)
+  std::optional<std::uint32_t> snaplen;
+  if (auto it_s = req.params.find("snaplen"); it_s != req.params.end()) {
+    if (!it_s->is_number_integer() && !it_s->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'snaplen' must be an integer");
+    }
+    std::int64_t s = it_s->is_number_integer()
+                       ? it_s->get<std::int64_t>()
+                       : static_cast<std::int64_t>(it_s->get<std::uint64_t>());
+    if (s <= 0 || s > 65535) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'snaplen' out of range (1..65535)");
+    }
+    snaplen = static_cast<std::uint32_t>(s);
+  }
+  // bpf (optional string)
+  std::optional<std::string> bpf;
+  if (auto it_b = req.params.find("bpf");
+      it_b != req.params.end() && it_b->is_string()) {
+    std::string v = it_b->get<std::string>();
+    if (!v.empty()) bpf = std::move(v);
+  }
+
+  auto view_spec = protocol::view::parse_from_params(req.params);
+
+  ldb::observers::TcpdumpRequest tr;
+  tr.iface   = std::move(iface);
+  tr.count   = static_cast<std::uint32_t>(count_signed);
+  tr.snaplen = snaplen;
+  tr.bpf     = std::move(bpf);
+  tr.remote  = observer_host_from_params(req.params);
+  // tr.timeout stays at the default 30 s; future versions may surface
+  // a `timeout_ms` param if agents want to capture longer.
+
+  auto r = ldb::observers::tcpdump(tr);
+  json arr = json::array();
+  for (const auto& p : r.packets) arr.push_back(packet_entry_to_json(p));
+  json data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                             "packets");
+  // apply_to_array sets `total` to the original (pre-view) array size,
+  // which matches `r.total` — so we don't overwrite it.
+  data["truncated"] = r.truncated;
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 }  // namespace ldb::daemon

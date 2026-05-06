@@ -4,6 +4,62 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 19a) — M4 polish: observer.net.tcpdump
+
+**Goal:** Ship the deferred §4.6 streaming-capture observer. Close out the M4 typed-observer surface with the live-capture endpoint that pairs with `observer.net.sockets` for the agent's "what's actually on the wire" workflow.
+
+**Done:**
+
+- **`src/observers/net_tcpdump.cpp`** — sibling to `net_sockets.cpp`. Spawns `tcpdump -nn -tt -l -c <count> -i <iface> -s <snaplen> [bpf]` via the new `transport::StreamingExec` primitive (M4-4) — NOT `local_exec`/`ssh_exec`, which are blocking one-shots. Local vs. remote routing piggybacks on `StreamingExec`'s `optional<SshHost>` ctor arg (M4-1's ssh transport). One-shot bounded: collect up to `count` packets via the on_line callback, then `terminate()` the child. Per-call wall-clock cap defaults to 30 s; if tcpdump hasn't filled the count by then, return what we have with `truncated: true`.
+- **Pure parser** (`parse_tcpdump_line` / `parse_tcpdump_lines`): leading `<sec>.<usec>` epoch timestamp into `ts_epoch` (round-trips through strtod), the rest of the line into `summary`. Best-effort `proto/src/dst/len` extraction is opportunistic — the contract is "ts + summary always; structured fields when we can parse cleanly," matching the omit-when-empty convention from `proc.cpp`.
+- **Permission gating**: tcpdump exits non-zero with "permission denied" / "Operation not permitted" on stderr when CAP_NET_RAW is absent. The fetcher inspects `child->drain_stderr()` after `terminate()`, recognizes the no-perm signatures (case-insensitive), and throws `backend::Error("observer.net.tcpdump: permission denied: <stderr>")`. The dispatcher's existing `backend::Error` catch maps that to `-32000` with the original message reaching the agent verbatim. Other failure modes (`syntax error`, `No such device`, `BIOCSETIF` ioctl errors) get the same surface.
+- **`src/observers/observers.h`** extended: `PacketEntry`, `TcpdumpRequest`, `TcpdumpResult` types, `tcpdump()` entry point, and the two parser entry points. `<chrono>` added for the timeout field.
+- **Dispatcher wiring** (`src/daemon/dispatcher.{h,cpp}`):
+  - Routing: `observer.net.tcpdump` → `handle_observer_net_tcpdump`.
+  - Param validation: `iface` required + non-empty, `count` 1..10000 (positive int32), `snaplen?` 1..65535, `bpf?` optional non-empty string. Bad params → `-32602`. Backend errors → `-32000`. The validation re-checks happen in the backend too (defense in depth), per the M4-3 allowlist convention.
+  - `describe.endpoints` entry documents the params (`iface`, `count`, `bpf?`, `snaplen?`, `host?`) and return shape (`{packets[], total, truncated}`). Catalog goes from 56 → 57 endpoints.
+  - `view::apply_to_array` applied to `packets` so agents can paginate / project / summary against the captured packet stream like every other array-returning endpoint.
+  - JSON wire shape: `ts` (NOT `ts_epoch` — agents don't care about C++-y suffixes), `summary`, plus the optional `iface/src/dst/proto/len` per the omit-when-empty convention.
+- **Tests** (TDD red→green, fixture committed):
+  - `tests/fixtures/text/tcpdump_lo.txt` — synthesized fixture mirroring `tcpdump 4.99 -nn -tt -l -c 5 -i lo` output (this Pop!_OS box has tcpdump but no CAP_NET_RAW, so we couldn't capture for real; the fixture documents that with a leading `#` comment block, which the parser's comment-skip handles).
+  - `tests/unit/test_observer_tcpdump_parser.cpp` — 6 cases / 38 assertions: TCP SYN parse (proto/src/dst/len populated); IPv6 P. with payload (validates the `dst` colon-suffix strip — IPv6 addresses contain colons natively); ARP without `>` separator (proto only, no src/dst); empty/comment/malformed lines refused; full fixture round-trip; blank/comment line tolerance.
+  - `tests/unit/test_observer_tcpdump_live.cpp` — 1 case / `[live][requires_tcpdump_cap]` — gated SKIP when tcpdump binary missing OR no CAP_NET_RAW. Generates lo traffic via `curl http://127.0.0.1:1` (refused → SYN+RST on lo, plenty for a 3-packet capture). 5 s timeout, double-checks `iface` round-trips into the response.
+  - `tests/unit/test_dispatcher_tcpdump.cpp` — 8 cases: missing iface / empty iface / missing count / zero / negative / over-10000 / oversize snaplen all → `-32602`; describe.endpoints catalog membership; the no-permission path on this box → `-32000` with stderr in the message (also gated).
+  - `tests/smoke/test_observer_tcpdump.py` — end-to-end RPC: `describe.endpoints` membership, all the param-validation paths, live happy-path gated on `has_tcpdump_binary && has_capture_permission` (SKIPped cleanly here).
+
+**Decisions:**
+
+- **One-shot bounded, NOT streaming-subscribe.** The dispatcher is single-threaded today; making tcpdump a long-lived `subscribe` shape would change the dispatcher model (events have to land somewhere between RPCs). The plan says §4.6 is "live capture, structured per-packet" — bounded one-shot satisfies that contract: pick `count`, get back exactly that many (or `truncated: true`). When a future agent wants a continuous flow, M5 can add `observer.net.tcpdump.subscribe` as a separate endpoint that mirrors `probe.events`'s ring buffer.
+- **Parser depth: ts + summary always; structured fields opportunistic.** tcpdump's text format is rich and dialect-dependent (NSH, PIM, IGMP, raw 802.11 — each has its own grammar). A "complete" parser would be a maintenance crater. We extract the easy things (`IP`/`IP6` proto, `src > dst` for those, `length N`) and leave the long tail in `summary`. Agents who need MAC frames or BGP attributes can read the summary string; the wire shape is stable.
+- **`-l` and the omit-when-empty convention.** `-l` forces tcpdump's stdout to line-buffered — without it, low-rate captures buffer 4-8 KiB before flushing and our wall-clock cap fires before we ever get a packet. (Same landmine the bpftrace engine documented for `-B line` in M4-4.) The omit-when-empty convention (no `iface` / `src` / etc. when we couldn't parse) matches every other typed observer in this repo and the `module.list` view-spec contract.
+- **Permission detection via stderr substring match (case-insensitive).** tcpdump's exact phrasing varies by version — "you don't have permission to perform this capture", "Operation not permitted", `EACCES` — but they all carry "permission" or "Operation not permitted". A substring search is more robust than parsing the line structure, and the worst case (false positive) is just a -32000 with the operator's actual stderr in `error.message` — the agent can read it.
+- **`packet_entry_to_json` keyed `ts` not `ts_epoch`.** Wire keys should describe what they ARE, not how they're stored in C++. Every other `ts` field on the wire (probe events, session log entries) uses `ts`; we follow.
+
+**Surprises / blockers:**
+
+- **IPv6 dst parser bug** — first iteration stopped tokenizing the dst on `:` (which works for `127.0.0.1.34567` but breaks on `::1.9001` because the FIRST char is a colon). Test `parse_tcpdump_line: IPv6 P. with payload` caught it; fix is to read up to whitespace/`,` only and strip a single trailing `:` after tokenization. This is exactly the kind of silent bug TDD is supposed to surface — without the IPv6 case, the parser would have silently returned absent `dst` for every IPv6 packet on the wire.
+- **Worktree vs master collision:** my session ran in `/home/zach/Develop/LDB/.claude/worktrees/agent-a633b296f93c931c7` but several initial edits accidentally landed in the shared master checkout (sibling agents are also adding files there in parallel). Re-applied all changes inside the worktree; only the worktree branch is touched.
+- **Live test gating** is unconditional SKIP on this box (no CAP_NET_RAW). The smoke test mirrors the same gating with a Python-side `has_capture_permission()` probe so CI runs cleanly. A privileged-box future session can confirm the live capture path.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **27/27 PASS in 24.32 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 26/26 → +1 for `smoke_observer_tcpdump`.)
+  - `smoke_observer_tcpdump`: 0.23 s.
+  - `unit_tests`: 13.58 s (282 cases / 3522 assertions; was 267/3462 — +15 cases, +60 assertions).
+  - **Live tcpdump test SKIPPED** on this box (no CAP_NET_RAW). The dispatcher's no-permission path is exercised live (-32000 with stderr in the message).
+  - Parser tests EXERCISED end-to-end including the IPv6 + ARP + commented-fixture paths.
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` from GCC 13).
+- Stdout-discipline preserved: tcpdump's stdout goes through `StreamingExec`'s pipe (never inherited); stderr captured into the bounded buffer for diagnostics. The smoke test's JSON-RPC channel is bit-clean.
+- `build/bin/ldbd --version` → 0.1.0.
+
+**M4 status:** parts 1-5 landed. Remaining M4 polish: `observer.net.igmp` (sibling agent's slice), `observer.exec` (sibling agent — needs allowlist design slice), end-user docs.
+
+**Deferred:** `observer.net.igmp` (sibling agent), `observer.exec` (sibling agent).
+
+**Next:** Once igmp + exec ship, M4 closes. Decision point between M3 polish (`.ldbpack`, `session.fork`/replay, provenance) and M5 (CBOR transport, CLI, agent API polish).
+
+---
+
 ## 2026-05-06 (cont. 18) — M4 part 4: BPF probe engine via bpftrace
 
 **Goal:** Land the second `probe.create` engine — `kind: "uprobe_bpf"` — alongside M3's `lldb_breakpoint`. The agent now picks low-rate / app-level (LLDB) vs. high-rate / syscall-level (BPF) per-probe; both flow into the same per-probe ring buffer and the same `ProbeEvent` shape (plan §7.2 + §7.3). bpftrace is shelled out as a long-lived subprocess; events stream back over a NEW transport primitive (`StreamingExec`).
