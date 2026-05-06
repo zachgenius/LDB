@@ -18,6 +18,7 @@
 #include <chrono>
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -518,6 +519,10 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "static.globals_of_type")
       return handle_static_globals_of_type(req);
 
+    if (req.method == "correlate.types")    return handle_correlate_types(req);
+    if (req.method == "correlate.symbols")  return handle_correlate_symbols(req);
+    if (req.method == "correlate.strings")  return handle_correlate_strings(req);
+
     if (req.method == "process.launch")     return handle_process_launch(req);
     if (req.method == "process.state")      return handle_process_state(req);
     if (req.method == "process.continue")   return handle_process_continue(req);
@@ -995,6 +1000,105 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
       }, {"globals", "type_match_strict"}),
           {{"GlobalVarMatch", global_var_match_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "medium");
+
+  // ============== correlate.* (Tier 3 §10, scoped) ==============
+  //
+  // Composition endpoints over the per-target primitives (type.layout,
+  // symbol.find, string.xref). Each takes a list of target_ids and
+  // batches the same lookup across all of them, producing a per-target
+  // result row the agent can compare. Full DWARF type-hash and
+  // function-fingerprint correlation are deferred to Tier 5 §21.
+  //
+  // Validation rules (consistent across the three):
+  //   • target_ids must be a non-empty array of uint target ids.
+  //   • Empty array → -32602.
+  //   • Unknown target_id (not currently open) → -32602 with the
+  //     offender id in the message.
+  //   • Duplicate target_ids → silently deduped (caller's mistake).
+
+  add("correlate.types",
+      "Look up a struct/class/union by name across N target_ids and "
+      "report drift. For each target the result row carries "
+      "{target_id, status, layout?, error?}. status is one of "
+      "\"found\" (layout populated), \"missing\" (layout=null; type "
+      "not present in that target), or \"backend_error\" (the lookup "
+      "threw; error message in `error`). drift=true iff at least two "
+      "found-set layouts differ; drift_reason names the FIRST kind of "
+      "drift detected, with priority byte_size > alignment > "
+      "fields_count > field_offsets > field_types. With fewer than two "
+      "found rows there is nothing to compare across, so drift=false "
+      "and drift_reason is omitted. Tier 3 §10.",
+      obj({
+          {"target_ids", arr_of(target_id_param(),
+              "Two or more target ids to compare. Duplicates are "
+              "deduped. Unknown ids → -32602.")},
+          {"name",       str("Type name; LLDB resolves namespaces.")},
+          {"view",       view_param()},
+      }, {"target_ids", "name"}),
+      with_defs(obj({
+          {"results", arr_of(obj({
+              {"target_id", uint_min(1)},
+              {"status",    enum_str({"found", "missing", "backend_error"})},
+              {"layout",    obj({
+                  {"name",        str()},
+                  {"byte_size",   uint_()},
+                  {"alignment",   uint_()},
+                  {"fields",      arr_of(ref("Field"))},
+                  {"holes_total", uint_()},
+              })},
+              {"error",     str()},
+          }, {"target_id", "status"}))},
+          {"drift",        bool_()},
+          {"drift_reason", enum_str({"byte_size", "alignment",
+                                     "fields_count", "field_offsets",
+                                     "field_types"})},
+          {"total",        uint_()},
+      }, {"results", "drift", "total"}),
+          {{"Field", field_def()}}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  add("correlate.symbols",
+      "Find symbols matching `name` across N target_ids; per-target "
+      "matches stand alone (no cross-target dedupe — agent compares "
+      "addresses). Tier 3 §10.",
+      obj({
+          {"target_ids", arr_of(target_id_param())},
+          {"name",       str()},
+          {"view",       view_param()},
+      }, {"target_ids", "name"}),
+      with_defs(obj({
+          {"results", arr_of(obj({
+              {"target_id", uint_min(1)},
+              {"matches",   arr_of(ref("SymbolMatch"))},
+          }, {"target_id", "matches"}))},
+          {"total",   uint_("Sum of matches across all results.")},
+      }, {"results", "total"}),
+          {{"SymbolMatch", symbol_match_def()}}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  add("correlate.strings",
+      "Find xrefs to `text` across N target_ids; per-target callsites "
+      "are flattened into {addr, function?} entries. Empty callsites "
+      "array means the string is absent or has no xrefs in that "
+      "target. NOTE: file/line resolution per callsite is deferred — "
+      "the underlying XrefMatch type doesn't carry source-line info; "
+      "a backend extension is needed to populate them. Tier 3 §10.",
+      obj({
+          {"target_ids", arr_of(target_id_param())},
+          {"text",       str("Exact string text to match.")},
+          {"view",       view_param()},
+      }, {"target_ids", "text"}),
+      obj({
+          {"results", arr_of(obj({
+              {"target_id", uint_min(1)},
+              {"callsites", arr_of(obj({
+                  {"addr",     uint_()},
+                  {"function", str()},
+              }, {"addr"}))},
+          }, {"target_id", "callsites"}))},
+          {"total",   uint_("Sum of callsites across all results.")},
+      }, {"results", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
   // ============== process.* ==============
 
@@ -3076,6 +3180,284 @@ Response Dispatcher::handle_static_globals_of_type(const Request& req) {
       std::move(arr), view_spec, "globals");
   data["type_match_strict"] = strict;
   if (truncated) data["truncated"] = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// --- correlate.* (Tier 3 §10, scoped) --------------------------------------
+//
+// Pure dispatcher composition over per-target primitives. The shared
+// preflight extracts a deduped target_ids list and validates each id
+// against the live target table; we surface the offending id so the
+// agent can branch without string-matching the message.
+
+namespace {
+
+// Parse + validate `target_ids` as a non-empty array of uint64. Stable
+// dedupe: preserves first-occurrence order so per-result rows come back
+// in the order the caller requested. Returns nullopt on a structural
+// error and writes the wire-shaped error message into `*err_msg`.
+std::optional<std::vector<std::uint64_t>>
+parse_target_ids(const json& params, std::string* err_msg) {
+  auto it = params.find("target_ids");
+  if (it == params.end() || !it->is_array()) {
+    *err_msg = "missing array param 'target_ids'";
+    return std::nullopt;
+  }
+  if (it->empty()) {
+    *err_msg = "'target_ids' must be a non-empty array";
+    return std::nullopt;
+  }
+  std::vector<std::uint64_t> out;
+  out.reserve(it->size());
+  std::set<std::uint64_t> seen;
+  for (const auto& el : *it) {
+    std::uint64_t v = 0;
+    if (el.is_number_unsigned()) {
+      v = el.get<std::uint64_t>();
+    } else if (el.is_number_integer()) {
+      auto s = el.get<std::int64_t>();
+      if (s < 0) {
+        *err_msg = "'target_ids' entries must be non-negative integers";
+        return std::nullopt;
+      }
+      v = static_cast<std::uint64_t>(s);
+    } else {
+      *err_msg = "'target_ids' entries must be integers";
+      return std::nullopt;
+    }
+    if (seen.insert(v).second) out.push_back(v);
+  }
+  return out;
+}
+
+// Validate that every id in `ids` corresponds to an open target. On the
+// first miss returns the offender; nullopt on success.
+std::optional<std::uint64_t>
+first_unknown_target_id(backend::DebuggerBackend& be,
+                        const std::vector<std::uint64_t>& ids) {
+  // Snapshot current open targets once (cheaper than O(N×M) backend
+  // calls for a 2-target case but the call is trivial either way).
+  auto infos = be.list_targets();
+  std::set<std::uint64_t> open;
+  for (const auto& t : infos) open.insert(t.target_id);
+  for (auto id : ids) {
+    if (open.find(id) == open.end()) return id;
+  }
+  return std::nullopt;
+}
+
+// drift_reason priority: byte_size > alignment > fields_count >
+// field_offsets > field_types. First difference wins; ordering is
+// deterministic so tests don't depend on hash iteration order.
+std::optional<std::string>
+detect_drift_reason(const std::vector<backend::TypeLayout>& found) {
+  if (found.size() < 2) return std::nullopt;
+  const auto& base = found.front();
+  for (std::size_t i = 1; i < found.size(); ++i) {
+    const auto& other = found[i];
+    if (other.byte_size != base.byte_size) return "byte_size";
+  }
+  for (std::size_t i = 1; i < found.size(); ++i) {
+    const auto& other = found[i];
+    if (other.alignment != base.alignment) return "alignment";
+  }
+  for (std::size_t i = 1; i < found.size(); ++i) {
+    const auto& other = found[i];
+    if (other.fields.size() != base.fields.size()) return "fields_count";
+  }
+  for (std::size_t i = 1; i < found.size(); ++i) {
+    const auto& other = found[i];
+    for (std::size_t k = 0; k < base.fields.size(); ++k) {
+      if (other.fields[k].offset != base.fields[k].offset ||
+          other.fields[k].byte_size != base.fields[k].byte_size ||
+          other.fields[k].name != base.fields[k].name) {
+        return "field_offsets";
+      }
+    }
+  }
+  for (std::size_t i = 1; i < found.size(); ++i) {
+    const auto& other = found[i];
+    for (std::size_t k = 0; k < base.fields.size(); ++k) {
+      if (other.fields[k].type_name != base.fields[k].type_name) {
+        return "field_types";
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_correlate_types(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::string err;
+  auto ids = parse_target_ids(req.params, &err);
+  if (!ids.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'name'");
+  }
+  if (auto bad = first_unknown_target_id(*backend_, *ids); bad.has_value()) {
+    return protocol::make_err(
+        req.id, ErrorCode::kInvalidParams,
+        "unknown target_id: " + std::to_string(*bad));
+  }
+
+  json results = json::array();
+  std::vector<backend::TypeLayout> found_set;
+  found_set.reserve(ids->size());
+
+  for (auto tid : *ids) {
+    json row;
+    row["target_id"] = tid;
+    try {
+      auto layout = backend_->find_type_layout(
+          static_cast<backend::TargetId>(tid), *name);
+      if (layout.has_value()) {
+        row["status"] = "found";
+        row["layout"] = type_layout_to_json(*layout);
+        found_set.push_back(std::move(*layout));
+      } else {
+        row["status"] = "missing";
+        row["layout"] = nullptr;
+      }
+    } catch (const backend::Error& e) {
+      // backend exception is data, not transport-level: per-target
+      // failures shouldn't poison the whole batch.
+      row["status"] = "backend_error";
+      row["layout"] = nullptr;
+      row["error"]  = std::string(e.what());
+    }
+    results.push_back(std::move(row));
+  }
+
+  auto drift_reason = detect_drift_reason(found_set);
+  json data;
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  json paged = protocol::view::apply_to_array(
+      std::move(results), view_spec, "results");
+  data["results"] = std::move(paged["results"]);
+  data["total"]   = paged["total"];
+  if (paged.contains("next_offset")) data["next_offset"] = paged["next_offset"];
+  if (paged.contains("summary"))     data["summary"]     = paged["summary"];
+  data["drift"]   = drift_reason.has_value();
+  if (drift_reason.has_value()) data["drift_reason"] = *drift_reason;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_correlate_symbols(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::string err;
+  auto ids = parse_target_ids(req.params, &err);
+  if (!ids.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+  }
+  const auto* name = require_string(req.params, "name");
+  if (!name) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'name'");
+  }
+  if (auto bad = first_unknown_target_id(*backend_, *ids); bad.has_value()) {
+    return protocol::make_err(
+        req.id, ErrorCode::kInvalidParams,
+        "unknown target_id: " + std::to_string(*bad));
+  }
+
+  json results = json::array();
+  std::int64_t total = 0;
+  backend::SymbolQuery q;
+  q.name = *name;
+  q.kind = backend::SymbolKind::kAny;
+
+  for (auto tid : *ids) {
+    json row;
+    row["target_id"] = tid;
+    json arr = json::array();
+    auto matches = backend_->find_symbols(
+        static_cast<backend::TargetId>(tid), q);
+    for (const auto& m : matches) arr.push_back(symbol_match_to_json(m));
+    total += static_cast<std::int64_t>(arr.size());
+    row["matches"] = std::move(arr);
+    results.push_back(std::move(row));
+  }
+
+  json data;
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  json paged = protocol::view::apply_to_array(
+      std::move(results), view_spec, "results");
+  data["results"] = std::move(paged["results"]);
+  // Override the view's per-page total with the cross-target sum so
+  // agents can size aggregates without iterating.
+  data["total"]   = total;
+  if (paged.contains("next_offset")) data["next_offset"] = paged["next_offset"];
+  if (paged.contains("summary"))     data["summary"]     = paged["summary"];
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_correlate_strings(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::string err;
+  auto ids = parse_target_ids(req.params, &err);
+  if (!ids.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+  }
+  const auto* text = require_string(req.params, "text");
+  if (!text) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'text'");
+  }
+  if (auto bad = first_unknown_target_id(*backend_, *ids); bad.has_value()) {
+    return protocol::make_err(
+        req.id, ErrorCode::kInvalidParams,
+        "unknown target_id: " + std::to_string(*bad));
+  }
+
+  json results = json::array();
+  std::int64_t total = 0;
+
+  for (auto tid : *ids) {
+    json row;
+    row["target_id"] = tid;
+    json callsites = json::array();
+    auto sxrs = backend_->find_string_xrefs(
+        static_cast<backend::TargetId>(tid), *text);
+    // Flatten across all matching string instances in this target.
+    // XrefMatch carries function name; file/line are not in scope for
+    // the v0.3 slice (XrefMatch doesn't surface them — defer to
+    // future work that resolves SBLineEntry per address).
+    for (const auto& r : sxrs) {
+      for (const auto& x : r.xrefs) {
+        json c;
+        c["addr"] = x.address;
+        if (!x.function.empty()) c["function"] = x.function;
+        callsites.push_back(std::move(c));
+      }
+    }
+    total += static_cast<std::int64_t>(callsites.size());
+    row["callsites"] = std::move(callsites);
+    results.push_back(std::move(row));
+  }
+
+  json data;
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  json paged = protocol::view::apply_to_array(
+      std::move(results), view_spec, "results");
+  data["results"] = std::move(paged["results"]);
+  data["total"]   = total;
+  if (paged.contains("next_offset")) data["next_offset"] = paged["next_offset"];
+  if (paged.contains("summary"))     data["summary"]     = paged["summary"];
   return protocol::make_ok(req.id, std::move(data));
 }
 
