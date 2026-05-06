@@ -65,6 +65,7 @@ set(LDB_UNIT_SOURCES
   test_audit_bugfixes.cpp
   test_dap_transport.cpp
   test_dap_rpc_channel.cpp
+  test_dap_handlers.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -93,6 +94,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
   ${CMAKE_SOURCE_DIR}/src/dap/transport.cpp
   ${CMAKE_SOURCE_DIR}/src/dap/rpc_channel.cpp
+  ${CMAKE_SOURCE_DIR}/src/dap/handlers.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.
