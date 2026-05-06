@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-§3b/§3c-merge — Tier 1 complete modulo macOS hw) |
-| **ctest at HEAD** | 41/41 green |
+| **HEAD now** | (updated post-Tier 2 §4+§6 merge — DAP shim + probe recipes live) |
+| **ctest at HEAD** | 43/43 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -39,9 +39,9 @@
 
 | # | Slice | Status | Worker | Reviewer | Merge commit |
 |---|---|---|---|---|---|
-| 4 | DAP shim — auto-generated from `describe.endpoints` | — | — | — | — |
+| 4 | DAP shim — auto-generated from `describe.endpoints` | ✅ | `a4f2a828db5c7b1e1` | `a2957e535f5ea673c` | (merge commit on master) |
 | 5 | Native libbpf probe agent | ⏭ | — | — | — |
-| 6 | Probe recipes — promote replayable session traces to named recipes | 🔍 | `acf8f743ad7295e95` | — | (worktree-only) |
+| 6 | Probe recipes — promote replayable session traces to named recipes | ✅ | `acf8f743ad7295e95` | `a47f22c1b53d2cba6` | (merge commit on master + `a440a51` recursion-guard fix) |
 
 ## Tier 3 — Differentiator wave
 
@@ -112,6 +112,26 @@ From the §3c reviewer:
 ### B4 — LOW (informational): Tier 1 §2 cannot be promoted to ✅ without Apple silicon
 
 This audit closed the Linux-side static review and produced an actionable sign-off checklist (`docs/macos-arm64-status.md §7`). §2 stays at "audit ✅ / hw sign-off pending" until a session on Apple silicon clears the checklist. Lead-agent run continues with §3 (release polish) as the next slice.
+
+## §6 reviewer findings folded back
+
+The §6 reviewer surfaced a HIGH-severity SIGSEGV (`recipe.run` recursing into itself crashes the daemon). Reviewer marked tracked-not-blocking; lead overrode and shipped a fix-up commit (`a440a51`) — daemon-crash from agent-supplied input violates the run's "TDD-strict, maintain all features working" mandate. Fix: reject any `recipe.*` sub-call in `handle_recipe_run` with `-32003 kForbidden`. 2 unit cases pin the contract.
+
+Other §6 reviewer items (still tracked, non-blocking):
+1. **MEDIUM** — Unknown placeholder is silently a literal (e.g. `"{patH}"` with no slot named `patH` passes through verbatim, masking typos). Worker documented; consider a `recipe.lint` follow-up.
+2. **PROCESS** — Worker edited `docs/POST-V0.1-PROGRESS.md` against the brief (line marking §6 as 🔍). Lead-agent territory; absorbed in this update.
+3. **LOW** — `artifact.delete` blob-unlink failure leaves dangling blob (best-effort; mirrors `put`-replace semantics).
+4. **LOW** — `recipe.from_session` empty-extraction returns `-32602` (kInvalidParams) rather than `-32000`; consistent with other dispatcher patterns.
+5. **LOW** — `recipe.from_session` `include_methods` bypasses default strip set, so a caller could re-introduce `recipe.run` by name. Bundled with #1's recursion-guard fix (the guard catches it at run time).
+
+## §4 reviewer findings (tracked, non-blocking)
+
+1. `evaluate` always returns `variablesReference: 0` — structs render as flat strings. Future child-expansion work.
+2. `stopped` event hardcodes `threadId: 0` and `exitCode: 0` rather than the actually-stopped thread / exit code.
+3. `evaluate` with no `frameId` silently uses `tid=0, frame_index=0`. Worker disclosed.
+4. 5s polling cap on `on_continue` — long-running breakpoints further than 5s out emit no `stopped` event. Needs push-based daemon events.
+5. **IDE-validation gap** — shim isn't tested against real VS Code/Zed. Manual VS Code test plan or typed-mock client is a follow-up.
+6. No DAP `cancelRequest` — long-running continues block the shim's main loop.
 
 ## 1c reviewer findings (tracked, none blocking)
 
