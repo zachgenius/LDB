@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-§9 merge — multi-binary inventory live) |
-| **ctest at HEAD** | 46/46 green |
+| **HEAD now** | (Tier 3 complete — cross-binary correlation + semantic queries v1 live) |
+| **ctest at HEAD** | 48/48 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -50,9 +50,9 @@
 | 7 | Artifact knowledge graph — typed relations | ✅ | `abfaab1cad3209671` | `a989f5100a94c9e46` | (merge commit on master) |
 | 8 | Hot reload of Python extensions | ⏭ | — | — | (deferred — see rationale §) |
 | 9 | Multi-binary sessions — N targets per session | ✅ | `aeb4c686ee1206795` | `aadfd2e8c17a0ebb5` | (merge commit on master) |
-| 10 | Cross-binary correlation — needs symbol index foundation | — | — | — | — |
+| 10 | Cross-binary correlation — needs symbol index foundation | ✅ (scoped to composition) | `a55156c817c13f70e` | `a54c2b1c9aef6adde` | (merge `0f515af` + inline schema-drift fix) |
 | 11 | `session.diff(s1, s2)` | ✅ | `ad680d6272d58c67f` | `ab980bad2d484ab5f` | (merge commit on master) |
-| 12 | Semantic queries v1 — heap walk, mutex graph | — | — | — | — |
+| 12 | Semantic queries v1 — heap walk, mutex graph | ✅ (scoped to `static.globals_of_type`) | `a2be49b89151f4ece` | `a0733221f7fcd444a` | (merge commit on master) |
 
 ## Tier 4 — Power features
 
