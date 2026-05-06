@@ -39,6 +39,17 @@ target_compile_options(ldb_fix_sleeper PRIVATE
 # beyond libc/libdl is loaded; the harness signals it via SIGUSR1 to
 # trigger the dlopen of libpthread, then re-observes the snapshot's
 # layout_digest.
+#
+# macOS portability gap (see docs/macos-arm64-status.md §5.2): the
+# fixture and its smoke test (tests/smoke/test_live_dlopen.py) both
+# bake in glibc-Linux assumptions (`-ldl`, `dlopen("libpthread.so.0")`).
+# On Apple silicon the link below is best-effort (some macOS clang
+# `ld` accept `-ldl` via a stub .tbd, others reject it) and the
+# fixture's `dlopen("libpthread.so.0")` call would return NULL even
+# if the link succeeded. Until this is rewritten as a portable
+# fixture (a `#ifdef __APPLE__` branch picking a different DSO, plus
+# a platform SKIP in the smoke), macOS arm64 ctest is expected to
+# fail at this target. Linux ctest unaffected.
 add_executable(ldb_fix_dlopener c/dlopener.c)
 set_target_properties(ldb_fix_dlopener PROPERTIES
   OUTPUT_NAME    dlopener

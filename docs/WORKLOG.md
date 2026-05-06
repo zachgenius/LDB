@@ -4,6 +4,48 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 — post-v0.1 Tier 1 §2: macOS arm64 hardening — Linux-side audit
+
+**Goal:** Audit every macOS-specific code path in the codebase for consistency, classify each into PR1 (Mac-specific code), PR2 (cross-platform branching on macOS), PR3 (doc reference only), or PR4 (recent Linux-targeted change with possible Mach-O regression risk). Document the validation gap honestly. Do NOT promote Tier 1 §2 to first-class — that requires real macOS arm64 hardware.
+
+**Done:**
+
+- **`docs/macos-arm64-status.md`** — new audit document. §1 methodology + greps; §2 PR1 entries (1: `maybe_seed_apple_debugserver`); §3 PR2 entries (8: `is_data_section`, `string.list` leaf-name match + segment recursion, `xref_address` RIP-relative vs ADRP+ADD, connect_remote listener pump on debugserver, `compute_bp_digest` arch-agnostic patch byte, `compute_reg_digest` GPR-set name fallback, SaveCore stdout guard); §4 PR3 (worklog refs); §5 PR4 (3 distinct findings with verdicts); §6 known limitations (Homebrew lldb-server broken, `_dyld_start` invariants); §7 first-class sign-off checklist; §8 risk register; §9 explicit "DID / DID NOT" boundary.
+- **PR4 audit** — three commits since v0.1 cut were vetted for Mach-O regression risk:
+  - `e1cf38f` (M2 Linux portability fixes — `is_data_section` ELF branch, leaf section-name match, `rip_relative_targets`): all three additions are purely additive; macOS Mach-O paths preserved. No regression.
+  - `a466a64` (slice 1c dlopen-invalidation fixture + SBListener subscription): **HIGH-priority macOS regression.** The `dlopener` fixture links `-ldl` (no libdl on macOS) and the C source calls `dlopen("libpthread.so.0", ...)` (glibc SONAME). Smoke test has no platform SKIP. Will break the macOS build at the fixture and/or fail at runtime. Pointer comment added to `tests/fixtures/CMakeLists.txt:39-50` flagging the gap; full description in `docs/macos-arm64-status.md §5.2`.
+  - `de5db21` (live↔core determinism gate): test exclusion list is Linux-flavored ([vdso], kernel-side thread name, triple suffix). Static-DWARF endpoints (`symbol.find`, `string.list`, `disasm.function`) likely round-trip OK on Mach-O for the same DWARF reasons as ELF, but unproven. Medium risk, low severity.
+- **Code comments** — inventoried every PR1/PR2 site. All 9 sites already carry adequate explanatory comments (logged in `docs/macos-arm64-status.md` per-section "Comment status"); no new comments needed. The one place where a new comment was added is the `dlopener` fixture in `tests/fixtures/CMakeLists.txt`, flagging the §5.2 macOS portability gap as a doc-only annotation (no behavior change on Linux).
+- **Risk register** in §8 of the audit doc, ranking 5 findings by likelihood × severity. Top item: §5.2 dlopener fixture build break (likelihood HIGH, severity HIGH — blocks macOS ctest entirely).
+
+**Decisions:**
+
+- **Linux-side audit only.** Per the brief: this dev box is Pop!_OS 24.04, no Apple silicon. Every claim about runtime behavior on macOS is backed by either a prior-validated worklog entry (M2/M3 closeouts) or static reading of the SBAPI surface — never a fresh ctest run on macOS. The audit document marks this boundary explicitly in §9.
+- **No code patches for the dlopener gap.** Per the brief, fixes I cannot validate on Linux ctest are out of scope. Adding `if(NOT APPLE)` around `target_link_libraries(... dl)` and rewriting `dlopen("libpthread.so.0")` to use `"libcurl.dylib"` (or similar) is the right fix, but it must land in a session that has macOS hardware to verify. A pointer comment + doc entry surfaces the gap for the user / next session.
+- **Did NOT touch any daemon code.** All PR1/PR2 macOS-relevant call sites already have adequate explanatory comments. Tinkering "to be more macOS-friendly" without a macOS ctest would risk regressions.
+- **The `compute_reg_digest` GPR-set name fallback is flagged as a risk** (§3.7 / §8 row 3) but not patched. The fallback to "first set" is defensive; whether macOS LLDB names the set differently AND orders it differently is a real macOS-hardware question.
+- **The audit's PR1 count is 1, PR2 count is 8, PR4 distinct findings is 3.** Other macOS references in the tree are either documentation (worklog, plan) or naturally handled by the SBAPI being portable.
+
+**Surprises / blockers:**
+
+- **Slice 1c silently introduced a hard macOS build break.** The dlopener fixture (`a466a64`, `feat(backend): SBListener for module-load events`) ships with `target_link_libraries(... dl)` and a glibc-specific `dlopen("libpthread.so.0", ...)` SONAME — neither portable to Mach-O. The reviewer for slice 1c did not flag this (no macOS test infra in the autonomous run). This is exactly the kind of silent-on-Linux drift the Tier 1 §2 hardening pass is supposed to surface. Caught here, not patched here (no macOS hardware to verify a fix), surfaced for the user.
+- **Worklog grep was non-trivial.** `docs/WORKLOG.md` contains a stray non-text byte (`file` reports "data") that defeats vanilla `grep`. `grep -a` (treat as text) works. Worth knowing for any future audit pass — entries before this one were authored on macOS where the file's encoding was set up via macOS terminal defaults, possibly involving a UTF-8 BOM or smart-quote injection. Not investigating; not blocking.
+- **PR4 audit was efficient.** Only three substantive Linux-targeted commits since v0.1 (`e1cf38f`, `a466a64`, `de5db21`); the others were SBAPI-pure (`3a8b7d9`, `63cbc30`) or unrelated (`cd5d429`, `43a02f7`). The narrow blast radius is a side effect of the progressive-replacement strategy paying off.
+
+**Verification:**
+
+- `cmake --build build && ctest --test-dir build --output-on-failure` → **39/39 PASS in 29.55s** at HEAD. Linux baseline preserved; no daemon code changed. Build warning-clean under GCC 13.3.0 + LLVM 22.1.5 prebuilt + the project's `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion` flags.
+- Audit document: 9 sections, ~430 lines. Every PR1/PR2 site has a per-entry "Comment status" verdict, every PR4 finding has an explicit "AUDITED" verdict + regression-risk rationale.
+- `tests/fixtures/CMakeLists.txt` pointer comment: 12 lines added; no functional change (the `target_link_libraries(... PRIVATE dl)` line is preserved). Linux build / ctest unaffected.
+
+**Next session pickup:**
+
+- **User decision needed:** `docs/macos-arm64-status.md §5.2` flags the dlopener-fixture build break. Recommended fix: gate `target_link_libraries(... dl)` on `if(NOT APPLE)` AND `#ifdef __APPLE__` in `dlopener.c` to dlopen a Mach-O-friendly DSO (or just `posix_spawn` + a stub child) AND wrap `add_test(... smoke_live_dlopen)` in `if(NOT APPLE)` until the fixture is portable. This must be done in a session with macOS hardware to verify the fix doesn't regress Linux.
+- **Sign-off checklist** in §7 of the audit doc enumerates what must run green on real Apple silicon before MVP §1 line "macOS arm64 builds and runs" can be promoted to a first-class, gate-tested claim. The lead agent's `POST-V0.1-PROGRESS.md` should surface this gap into "Blockers / decisions surfaced for user."
+- **Tier 1 §3** (release polish — protocol semver, GitHub Actions CI, CONTRIBUTING) is the next logical slice; macOS first-class promotion is blocked on hardware availability.
+
+---
+
 ## 2026-05-06 — post-v0.1 slice 1c: live-provenance CI determinism gate
 
 **Goal:** Close the 3 substantive 1b-reviewer findings (SW-bp memory-patch invisibility; dlopen-without-resume layout invalidation; `process.continue` round-trip not exercised in 1b's smoke) and extend the determinism gate to live targets via live↔core snapshot equality. Final slice of Tier 1 §1.
