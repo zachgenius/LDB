@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -461,6 +462,57 @@ bool try_connect_local(std::uint16_t port) {
   return ok;
 }
 
+// Connect through an SSH -L tunnel and check that the connection is
+// "real" — i.e. the remote side is also listening, not just the ssh
+// client. SSH opens the local port the moment the channel is up, and
+// connect() succeeds immediately even when the remote endpoint isn't
+// listening; the remote-side failure surfaces as the peer closing the
+// stream within milliseconds.
+//
+// Returns true when:
+//   - connect() succeeded AND
+//   - after a short grace period, the connection is still open
+//     (no EOF, no RST signaled via POLLHUP/POLLERR).
+//
+// IMPORTANT: this consumes one connection through the tunnel. lldb-
+// server's gdbserver is multi-accept on the same listen socket, so a
+// probe accept-then-close is harmless. Single-shot servers will be
+// drained — same caveat documented for SshPortForward.
+bool try_tunneled_connect_local(std::uint16_t port,
+                                std::chrono::milliseconds grace) {
+  int s = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (s < 0) return false;
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sa.sin_port = htons(port);
+  if (::connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    ::close(s);
+    return false;
+  }
+  // The connect itself may have raced ssh's local-port-open. Wait
+  // briefly: if the peer hangs up (POLLHUP / POLLIN with read=0), the
+  // remote isn't listening. If poll times out, the connection is still
+  // open — remote is listening (or at least not actively closing).
+  pollfd pfd{};
+  pfd.fd = s;
+  pfd.events = POLLIN;
+  int pr = ::poll(&pfd, 1, static_cast<int>(grace.count()));
+  bool ok = true;
+  if (pr > 0) {
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+      ok = false;
+    } else if (pfd.revents & POLLIN) {
+      // Drain — if 0, peer closed.
+      char buf[1];
+      ssize_t n = ::recv(s, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
+      if (n == 0) ok = false;
+    }
+  }
+  ::close(s);
+  return ok;
+}
+
 }  // namespace
 
 ExecResult ssh_exec(const SshHost&                       host,
@@ -614,6 +666,240 @@ bool SshPortForward::alive() const noexcept {
   pid_t r = ::waitpid(impl_->pid, &status, WNOHANG);
   if (r == 0) return true;
   return false;
+}
+
+// ---- pick_remote_free_port ----------------------------------------------
+
+std::uint16_t pick_remote_free_port(const SshHost&            host,
+                                    std::chrono::milliseconds timeout) {
+  ExecOptions opts;
+  opts.timeout    = timeout;
+  opts.stdout_cap = 64;
+  opts.stderr_cap = 4096;
+
+  // Primary: python3 (available on every modern Linux distro and macOS).
+  // Bind to port 0, read kernel-assigned port via getsockname, close.
+  static constexpr const char* kPythonProbe =
+      "import socket;"
+      "s=socket.socket();"
+      "s.bind(('127.0.0.1',0));"
+      "print(s.getsockname()[1]);"
+      "s.close()";
+
+  auto try_parse_port = [](const std::string& out) -> std::uint16_t {
+    // Strip trailing whitespace.
+    std::string s = out;
+    while (!s.empty() &&
+           (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' ||
+            s.back() == '\t')) {
+      s.pop_back();
+    }
+    if (s.empty()) return 0;
+    char* end = nullptr;
+    long v = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || v <= 0 || v > 65535) return 0;
+    return static_cast<std::uint16_t>(v);
+  };
+
+  ExecResult er;
+  try {
+    er = ssh_exec(host, {"python3", "-c", kPythonProbe}, opts);
+  } catch (const backend::Error& e) {
+    throw backend::Error(std::string("pick_remote_free_port: ssh failed: ")
+                         + e.what());
+  }
+  if (er.exit_code == 0 && !er.stdout_data.empty()) {
+    if (auto p = try_parse_port(er.stdout_data); p != 0) return p;
+  }
+
+  // Fallback: ss -tln + AWK to find the first unused ephemeral port in
+  // the IANA dynamic range. Documented in the header. Some hosts run
+  // sshd inside containers without python3 (Alpine `ash`-only), so
+  // this matters.
+  static constexpr const char* kSsProbe =
+      "ss -tln 2>/dev/null | awk 'NR>1{split($4,a,\":\");"
+      "used[a[length(a)]]=1} END{for(p=49152;p<60000;p++)"
+      " if (!used[p]) {print p; exit}}'";
+
+  ExecResult er2;
+  try {
+    er2 = ssh_exec(host, {"/bin/sh", "-c", kSsProbe}, opts);
+  } catch (const backend::Error& e) {
+    throw backend::Error(std::string("pick_remote_free_port: ss fallback "
+                                     "failed: ") + e.what());
+  }
+  if (er2.exit_code == 0 && !er2.stdout_data.empty()) {
+    if (auto p = try_parse_port(er2.stdout_data); p != 0) return p;
+  }
+
+  // Both probes failed. Surface what we saw.
+  std::string detail = "no free-port helper succeeded on remote (";
+  detail += "python3 exit=" + std::to_string(er.exit_code);
+  if (!er.stderr_data.empty()) {
+    detail += " stderr=";
+    detail += er.stderr_data.substr(0, 160);
+  }
+  detail += "; ss exit=" + std::to_string(er2.exit_code);
+  if (!er2.stderr_data.empty()) {
+    detail += " stderr=";
+    detail += er2.stderr_data.substr(0, 160);
+  }
+  detail += ")";
+  throw backend::Error(detail);
+}
+
+// ---- SshTunneledCommand --------------------------------------------------
+
+struct SshTunneledCommand::Impl {
+  pid_t           pid          = -1;
+  std::uint16_t   local_port   = 0;
+  std::uint16_t   remote_port  = 0;
+  int             out_fd       = -1;
+  int             err_fd       = -1;
+};
+
+SshTunneledCommand::SshTunneledCommand(
+    const SshHost&                  host,
+    std::uint16_t                   local_port,
+    std::uint16_t                   remote_port,
+    const std::vector<std::string>& remote_argv,
+    std::chrono::milliseconds       setup_timeout,
+    ProbeKind                       probe_kind)
+    : impl_(std::make_unique<Impl>()) {
+  install_sigpipe_ignore_once();
+
+  if (remote_argv.empty()) {
+    throw backend::Error("SshTunneledCommand: remote_argv must not be empty");
+  }
+  if (remote_port == 0) {
+    throw backend::Error("SshTunneledCommand: remote_port must be non-zero");
+  }
+  if (local_port == 0) {
+    local_port = pick_ephemeral_port();
+  }
+  impl_->local_port  = local_port;
+  impl_->remote_port = remote_port;
+
+  std::string fwd_arg = "127.0.0.1:" + std::to_string(local_port)
+                        + ":127.0.0.1:" + std::to_string(remote_port);
+
+  // Single ssh that does -L AND runs the remote command. We can't use
+  // -N (no remote command) because we need the command; we don't need
+  // -f either (we want the foreground subprocess so RAII teardown
+  // hangs up the remote). The remote command is shell-quoted so paths
+  // with spaces survive ssh's argv-flattening.
+  std::vector<std::string> argv;
+  argv.push_back("ssh");
+  for (const auto& o : host.ssh_options) argv.push_back(o);
+  argv.push_back("-o"); argv.push_back("BatchMode=yes");
+  argv.push_back("-o"); argv.push_back("StrictHostKeyChecking=accept-new");
+  argv.push_back("-o"); argv.push_back("ConnectTimeout=10");
+  argv.push_back("-o"); argv.push_back("ExitOnForwardFailure=yes");
+  argv.push_back("-T");
+  argv.push_back("-L"); argv.push_back(fwd_arg);
+  if (host.port) {
+    argv.push_back("-p");
+    argv.push_back(std::to_string(*host.port));
+  }
+  argv.push_back(host.host);
+  // Remote command — pre-quoted so ssh's space-flattening on the wire
+  // doesn't split argv elements at embedded spaces.
+  argv.push_back(join_argv_for_ssh(remote_argv));
+
+  SpawnedChild child = spawn_with_pipes(argv, /*merge_stderr=*/false);
+  impl_->pid    = child.pid;
+  impl_->out_fd = child.out_fd;
+  impl_->err_fd = child.err_fd;
+  // We don't pipe data into the remote command via stdin in this
+  // shape; close it so the child's stdin sees EOF cleanly.
+  close_safely(child.in_fd);
+
+  // Setup probe loop. Two modes:
+  //   kTunneledConnect — keep retrying a TCP connect through the
+  //     tunnel until the remote command is listening (or ssh dies, or
+  //     we hit the deadline). Suitable for multi-accept servers.
+  //   kAliveOnly — only verify ssh stayed alive past the initial
+  //     spawn (a short grace check); do NOT touch the remote port.
+  //     Suitable for single-accept servers (lldb-server gdbserver).
+  const auto deadline = std::chrono::steady_clock::now() + setup_timeout;
+  // Brief grace for ssh's auth/handshake; we want to detect "ssh exits
+  // immediately because of bad host / auth failure" without sleeping
+  // long when things are healthy.
+  const auto alive_grace = std::min(
+      setup_timeout, std::chrono::milliseconds(750));
+  const auto alive_deadline = std::chrono::steady_clock::now() + alive_grace;
+  while (std::chrono::steady_clock::now() < deadline) {
+    int status = 0;
+    pid_t r = ::waitpid(impl_->pid, &status, WNOHANG);
+    if (r == impl_->pid) {
+      impl_->pid = -1;
+      // Drain whatever's on stderr so the error is informative.
+      std::string err;
+      char buf[4096];
+      while (true) {
+        ssize_t n = ::read(impl_->err_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        err.append(buf, static_cast<std::size_t>(n));
+        if (err.size() > 4096) break;
+      }
+      close_safely(impl_->out_fd);
+      close_safely(impl_->err_fd);
+      throw backend::Error(
+          "SshTunneledCommand: ssh exited during setup (exit "
+          + std::to_string(decode_exit(status)) + ")"
+          + (err.empty() ? std::string{} : ": " + err));
+    }
+    if (probe_kind == ProbeKind::kAliveOnly) {
+      // Once the alive-grace window has passed without ssh dying, we
+      // declare the tunnel ready — caller takes it from here.
+      if (std::chrono::steady_clock::now() >= alive_deadline) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    // 60ms grace is enough for ssh's RST to round-trip from the remote
+    // when the remote endpoint isn't listening; lldb-server takes
+    // ~50–200ms to bind, so a few of these probes are normal.
+    if (try_tunneled_connect_local(local_port, std::chrono::milliseconds(60))) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  // Setup deadline blew past — tear down and throw.
+  if (impl_->pid > 0) {
+    reap_child(impl_->pid);
+    impl_->pid = -1;
+  }
+  close_safely(impl_->out_fd);
+  close_safely(impl_->err_fd);
+  throw backend::Error(
+      "SshTunneledCommand: setup timed out before remote port "
+      + std::to_string(remote_port) + " became reachable");
+}
+
+SshTunneledCommand::~SshTunneledCommand() {
+  if (!impl_) return;
+  if (impl_->pid > 0) {
+    reap_child(impl_->pid);
+    impl_->pid = -1;
+  }
+  close_safely(impl_->out_fd);
+  close_safely(impl_->err_fd);
+}
+
+std::uint16_t SshTunneledCommand::local_port() const noexcept {
+  return impl_ ? impl_->local_port : 0;
+}
+
+std::uint16_t SshTunneledCommand::remote_port() const noexcept {
+  return impl_ ? impl_->remote_port : 0;
+}
+
+bool SshTunneledCommand::alive() const noexcept {
+  if (!impl_ || impl_->pid <= 0) return false;
+  int status = 0;
+  pid_t r = ::waitpid(impl_->pid, &status, WNOHANG);
+  return r == 0;
 }
 
 }  // namespace ldb::transport

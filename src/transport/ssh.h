@@ -150,4 +150,81 @@ class SshPortForward {
   std::unique_ptr<Impl> impl_;
 };
 
+// Ask the remote host for a free TCP port. Tries `python3 -c '...'`
+// first (universally available on Linux distros and macOS); falls back
+// to a `ss`-based AWK scan if python3 is missing. Throws backend::Error
+// if both probes fail (e.g. neither tool present, or ssh itself fails).
+//
+// **Caveat — TOCTOU race:** the port we hand back is "free as of a few
+// hundred ms ago." Another process on the remote can grab the port
+// before our caller binds it. For MVP this is acceptable; both ssh -L
+// and lldb-server will fail loudly on EADDRINUSE and the caller can
+// retry.
+std::uint16_t pick_remote_free_port(
+    const SshHost&            host,
+    std::chrono::milliseconds timeout = std::chrono::seconds(10));
+
+// Single ssh subprocess that simultaneously holds a `-L LOCAL:127.0.0.1:
+// REMOTE` port forward AND runs `argv` on the remote in the foreground.
+//
+// Why one subprocess (not two): `lldb-server gdbserver --listen
+// 127.0.0.1:RPORT -- inferior` is the remote command, and the same
+// ssh client tunnels its listening port back to us. When we tear down
+// this object, ssh exits, the remote shell hangs up, and lldb-server
+// dies via SIGHUP — single PID to manage.
+//
+// Construction:
+//   1. local_port=0  → kernel-assigned (same trick as SshPortForward).
+//   2. spawn `ssh -L ... -- <quoted argv>`.
+//   3. wait until either:
+//        a. our setup probe — TCP connect to 127.0.0.1:local_port —
+//           succeeds (forward is open AND remote is listening), or
+//        b. the ssh child exits early (throw), or
+//        c. setup_timeout elapses (throw).
+//
+// **Setup-probe semantics differ from SshPortForward:** here the probe
+// loops with retries, because the remote command (e.g. lldb-server)
+// takes 50–200 ms to bind its port AFTER ssh's tunnel handshake
+// completes. SshPortForward's single-shot probe assumes the remote is
+// already listening; this one waits for the remote to come up.
+//
+// **Probe kind matters for single-accept servers.** Each probe retry
+// DOES open a real TCP connection through the tunnel. Multi-accept
+// servers (HTTP, lldb-server platform) tolerate that fine; single-
+// accept servers (`lldb-server gdbserver`, which exits after its first
+// connection closes) will be DRAINED by the probe. For those, pass
+// `ProbeKind::kAliveOnly`: we only verify ssh is alive after spawn,
+// no destructive TCP probe. The caller then retries its real protocol
+// connect with backoff.
+enum class ProbeKind : std::uint8_t {
+  kTunneledConnect,  // poll TCP connect through the tunnel until success
+  kAliveOnly,        // just verify ssh stays alive past the spawn
+};
+
+class SshTunneledCommand {
+ public:
+  SshTunneledCommand(const SshHost&                  host,
+                     std::uint16_t                   local_port,
+                     std::uint16_t                   remote_port,
+                     const std::vector<std::string>& remote_argv,
+                     std::chrono::milliseconds       setup_timeout =
+                         std::chrono::seconds(10),
+                     ProbeKind                       probe_kind =
+                         ProbeKind::kTunneledConnect);
+  ~SshTunneledCommand();
+
+  SshTunneledCommand(const SshTunneledCommand&)            = delete;
+  SshTunneledCommand& operator=(const SshTunneledCommand&) = delete;
+  SshTunneledCommand(SshTunneledCommand&&)                 = delete;
+  SshTunneledCommand& operator=(SshTunneledCommand&&)      = delete;
+
+  std::uint16_t local_port()  const noexcept;
+  std::uint16_t remote_port() const noexcept;
+  bool          alive()       const noexcept;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace ldb::transport
