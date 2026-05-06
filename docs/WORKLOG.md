@@ -4,6 +4,51 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 20c) — M5 part 3: CBOR transport
+
+**Goal:** Add `application/cbor` wire format alongside JSON, selectable via `--format=cbor` at startup. Plan §3.1 specifies three wire formats; the previous milestones shipped only line-delimited JSON. M5 polish wants `application/cbor` (RFC 8949) for tooling clients where binary efficiency and unambiguous numeric typing both matter.
+
+**Done:**
+
+- **`src/protocol/transport.{h,cpp}`** (new module — sibling to `protocol/jsonrpc`): `WireFormat` enum (`kJson`, `kCbor`), `read_message(istream&, fmt) → optional<json>`, `write_message(ostream&, json, fmt)`, and a typed `protocol::Error` for framing-level malfunctions distinct from `nlohmann::json::parse_error`.
+  - JSON path: line-delimited (`\n`), skips blank lines, returns nullopt on clean EOF.
+  - CBOR path: length-prefixed `[4-byte big-endian uint32 length][N bytes of RFC 8949 CBOR]`. `htonl`/`ntohl` from `<arpa/inet.h>` (no hand-rolled byte swap). `from_cbor(span, /*strict=*/true)` so trailing bytes inside a frame are rejected. 64 MiB hard cap on frame size; zero-length frame rejected (would otherwise spin the loop on the same offset).
+- **`src/main.cpp`** — new `--format json|cbor` CLI flag (default `json`), parsed at argv time and threaded through to `run_stdio_loop`. Bad value → exit 2 with a clear error. `--help` updated to document the flag and the post-MVP deferral note.
+- **`src/daemon/stdio_loop.{h,cpp}`** — loop body refactored to call `read_message` / `write_message` instead of inlining `getline` and `cout <<`. Request building moved into a `request_from_json(j)` helper (mirrors `parse_request` but skips the string-parse step — CBOR frames never go through a JSON string). Framing errors emit a typed `kParseError` response in the negotiated format and continue (JSON) or exit (CBOR — desync is unrecoverable). Stdout discipline preserved end-to-end: every CBOR write goes through `write_message`, never `<<`.
+- **`tests/unit/test_protocol_cbor.cpp`** — 12 cases / 30 assertions: JSON round-trip; JSON skips blank lines; clean-EOF returns nullopt for both formats; malformed JSON line throws `Error`; CBOR round-trip; back-to-back CBOR frames decoded individually; CBOR clean EOF returns nullopt; short prefix throws; truncated body throws; invalid CBOR bytes throw; zero-length frame throws; the length prefix is in fact big-endian.
+- **`tests/smoke/test_cbor.py`** — end-to-end against a real ldbd subprocess with `--format=cbor`. Hand-rolled minimal CBOR encoder/decoder (RFC 8949 subset that covers ldbd's wire shapes — maps, arrays, strings, ints, bools, null) since the stdlib has no CBOR. Exercises hello → describe.endpoints → target.close → unknown-method (-32601), all over the binary wire.
+- **CMake wiring**: `protocol/transport.cpp` added to both `src/CMakeLists.txt` (ldbd binary) and `tests/unit/CMakeLists.txt` (`LDB_LIB_SOURCES`). New smoke test registered with a 30 s timeout in `tests/CMakeLists.txt`.
+
+**Decisions:**
+
+- **Length-prefix over self-delimiting CBOR.** nlohmann's `from_cbor` *can* read one value out of a stream and stop on its own, but length-prefixing makes torn-frame vs. decode-failure trivially distinguishable, makes `xxd` debugging tractable, and lets us bound allocation up front. The 4 bytes per message is negligible against any realistic RPC payload.
+- **CLI-only format selection (no per-session negotiation).** Negotiating via `hello` would require sniffing the wire format of the *first* incoming message before parsing it — which adds parser surface for negligible benefit when every known client (`ldb` CLI, future tooling adapters) knows what it speaks. Documented as deferred in the new transport.h header and in the `--help` text. Revisit post-MVP if a real client emerges that needs auto-detection.
+- **Big-endian length prefix** (`htonl`/`ntohl`). Matches RFC convention everywhere (TCP, TLS records, CBOR major-type-7 ext-uint encoding itself). Don't roll byte swaps.
+- **64 MiB hard cap** on frame size. A corrupt/spoofed length prefix could otherwise pin the daemon's heap. 64 MiB is well above any realistic single-message debugger response (the largest legitimate payloads — disasm pages, `mem.read` views — are bounded to a few MiB by the view-descriptor caps).
+- **Framing-error policy diverges by format.** JSON's `\n` framing self-resyncs at the next newline, so we emit a typed -32700 and continue. CBOR's length prefix means a torn frame leaves the byte stream desynchronized — we emit one final error and exit 1. Logged as the M5 limitation; if a client wants self-recovering CBOR framing it can add a sentinel byte.
+- **`request_from_json` duplicates four lines from `parse_request`.** Could DRY by having `parse_request(string_view)` re-encode through json::parse and call the new helper, but the duplication is one screen and the alternative is uglier (mutual #include, or a third "internal" header). Leaving the duplication intentional and documented.
+
+**Surprises / blockers:**
+
+- **`from_cbor` of an indefinite-break byte (0xff) doesn't *throw*** — nlohmann's strict mode is "consume entire input as one value," and 0xff happens to consume itself as a malformed value. The `truncated body` and `zero-length` test cases catch the framing-level bugs that matter; the all-0xff body test was tightened to a stricter assertion only after I observed the looser failure mode.
+- **First-attempt build broke** because I added `transport.cpp` to the unit-tests `LDB_LIB_SOURCES` but forgot the daemon's own `LDBD_SOURCES`. Caught at link time — `undefined reference to ldb::protocol::read_message` from `stdio_loop.cpp.o`. Fixed in one line. Caught it before any commit.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **30/30 PASS in 24.45 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 29/29 → +1 for `smoke_cbor`.)
+- `[transport][cbor]` filter: 8 cases / 21 assertions.
+- `[transport][json]` filter: 4 cases / 9 assertions.
+- Build warning-clean (only the pre-existing nlohmann-json `-Wnull-dereference` from GCC 13).
+- Stdout discipline preserved: no `printf` / `std::cout <<` introduced; all writes go through `write_message` which dispatches to either `<<j.dump()<<'\n'` or `out.write(prefix); out.write(body)`.
+
+**Sibling slices:** cost-preview metadata, JSON schemas in `describe.endpoints`. Both orthogonal to wire transport — slot in alongside.
+
+**Deferred:** per-session format negotiation via `hello` (post-MVP — needs a stable sniff strategy or a "first-message-is-always-JSON" rule). `application/json; profile=compact` is a separate compactness lever (omit-nulls, short keys), not a separate transport — handled in the response builder, not here.
+
+**Next:** M5 polish remaining — describe.endpoints schemas, `_cost` metadata, CLI client. Cores-only `_provenance.snapshot` is also still open for the test corpus.
+
+---
+
 ## 2026-05-06 (cont. 19a) — M4 polish: observer.net.tcpdump
 
 **Goal:** Ship the deferred §4.6 streaming-capture observer. Close out the M4 typed-observer surface with the live-capture endpoint that pairs with `observer.net.sockets` for the agent's "what's actually on the wire" workflow.
