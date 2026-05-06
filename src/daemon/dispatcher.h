@@ -107,6 +107,13 @@ class Dispatcher {
   protocol::Response handle_artifact_export(const protocol::Request& req);
   protocol::Response handle_artifact_import(const protocol::Request& req);
 
+  protocol::Response handle_recipe_create(const protocol::Request& req);
+  protocol::Response handle_recipe_from_session(const protocol::Request& req);
+  protocol::Response handle_recipe_list(const protocol::Request& req);
+  protocol::Response handle_recipe_get(const protocol::Request& req);
+  protocol::Response handle_recipe_run(const protocol::Request& req);
+  protocol::Response handle_recipe_delete(const protocol::Request& req);
+
   protocol::Response handle_probe_create(const protocol::Request& req);
   protocol::Response handle_probe_events(const protocol::Request& req);
   protocol::Response handle_probe_list(const protocol::Request& req);
