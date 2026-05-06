@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-Tier 3 §7+§11 merge — knowledge graph + session.diff live) |
-| **ctest at HEAD** | 45/45 green |
+| **HEAD now** | (updated post-§9 merge — multi-binary inventory live) |
+| **ctest at HEAD** | 46/46 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -49,7 +49,7 @@
 |---|---|---|---|---|---|
 | 7 | Artifact knowledge graph — typed relations | ✅ | `abfaab1cad3209671` | `a989f5100a94c9e46` | (merge commit on master) |
 | 8 | Hot reload of Python extensions | ⏭ | — | — | (deferred — see rationale §) |
-| 9 | Multi-binary sessions — N targets per session | — | — | — | — |
+| 9 | Multi-binary sessions — N targets per session | ✅ | `aeb4c686ee1206795` | `aadfd2e8c17a0ebb5` | (merge commit on master) |
 | 10 | Cross-binary correlation — needs symbol index foundation | — | — | — | — |
 | 11 | `session.diff(s1, s2)` | ✅ | `ad680d6272d58c67f` | `ab980bad2d484ab5f` | (merge commit on master) |
 | 12 | Semantic queries v1 — heap walk, mutex graph | — | — | — | — |
