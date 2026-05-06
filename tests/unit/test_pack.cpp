@@ -459,3 +459,104 @@ TEST_CASE("unpack: conflict_policy=overwrite replaces local",
     CHECK(bytes == bytes_of("FROM_PACK"));
   }
 }
+
+// ---- pack/unpack carries relations across the .ldbpack boundary --------
+// Tier 3 §7: a packed session that carries 2 artifacts + 1 relation
+// must round-trip the relation, with the new (re-mapped) artifact ids on
+// the import side.
+
+TEST_CASE("pack/unpack: relations round-trip with id remapping",
+          "[store][pack][e2e][relations]") {
+  TmpDir t;
+  auto src_root  = t.root / "src";
+  auto pack_path = t.root / "rel.ldbpack";
+  auto dst_root  = t.root / "dst";
+
+  std::string sid;
+  std::int64_t src_a = 0, src_b = 0;
+  {
+    SessionStore ss(src_root);
+    ArtifactStore as(src_root);
+    auto row = ss.create("rel-investigation", std::nullopt);
+    sid = row.id;
+    auto a = as.put("buildA", "schema.xml", bytes_of("<schema/>"),
+                    std::optional<std::string>("xml"),
+                    nlohmann::json::object());
+    auto b = as.put("buildA", "frame.bin", bytes_of("\x01\x02"),
+                    std::nullopt, nlohmann::json::object());
+    src_a = a.id;
+    src_b = b.id;
+    as.add_relation(src_a, src_b, "parsed_by",
+                    nlohmann::json{{"function", "xml_parse"}, {"line", 42}});
+    ldb::store::pack_session(ss, as, sid, pack_path);
+  }
+
+  {
+    SessionStore ss(dst_root);
+    ArtifactStore as(dst_root);
+    auto report = ldb::store::unpack(ss, as, pack_path,
+                                     ConflictPolicy::kError);
+    // 1 session + 2 artifacts + 1 relation = 4 imports.
+    CHECK(report.imported.size() == 4);
+    CHECK(report.skipped.empty());
+
+    // The new ids may not match the source ids — fetch by (build_id, name).
+    auto a = as.get_by_name("buildA", "schema.xml");
+    auto b = as.get_by_name("buildA", "frame.bin");
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+
+    auto rels = as.list_relations(std::nullopt, std::nullopt,
+                                   ldb::store::RelationDir::kBoth);
+    REQUIRE(rels.size() == 1);
+    CHECK(rels[0].from_id == a->id);
+    CHECK(rels[0].to_id   == b->id);
+    CHECK(rels[0].predicate == "parsed_by");
+    REQUIRE(rels[0].meta.contains("function"));
+    CHECK(rels[0].meta["function"] == "xml_parse");
+  }
+}
+
+// pack_artifacts (no session) carries relations whose endpoints are both
+// inside the exported set; relations whose endpoints fall outside the
+// filter are dropped.
+TEST_CASE("pack_artifacts: relations exported when both endpoints in set",
+          "[store][pack][e2e][relations]") {
+  TmpDir t;
+  auto src_root  = t.root / "src";
+  auto pack_path = t.root / "rel.ldbpack";
+  auto dst_root  = t.root / "dst";
+
+  {
+    ArtifactStore as(src_root);
+    auto a = as.put("buildA", "schema.xml", bytes_of("<schema/>"),
+                    std::nullopt, nlohmann::json::object());
+    auto b = as.put("buildA", "frame.bin", bytes_of("\x01"),
+                    std::nullopt, nlohmann::json::object());
+    auto c = as.put("buildB", "other.bin", bytes_of("xyz"),
+                    std::nullopt, nlohmann::json::object());
+    // a→b inside buildA — should be packed when filtering by buildA.
+    as.add_relation(a.id, b.id, "parsed_by", nlohmann::json::object());
+    // a→c crosses build boundary — should be DROPPED when only buildA
+    // is exported (the pack should not produce a dangling relation).
+    as.add_relation(a.id, c.id, "extracted_from", nlohmann::json::object());
+
+    ldb::store::pack_artifacts(as,
+                                std::optional<std::string>("buildA"),
+                                std::nullopt, pack_path);
+  }
+
+  {
+    SessionStore ss(dst_root);
+    ArtifactStore as(dst_root);
+    auto report = ldb::store::unpack(ss, as, pack_path,
+                                     ConflictPolicy::kError);
+    // 2 artifacts + 1 relation (the buildA→buildA edge), no sessions.
+    CHECK(report.imported.size() == 3);
+
+    auto rels = as.list_relations(std::nullopt, std::nullopt,
+                                   ldb::store::RelationDir::kBoth);
+    REQUIRE(rels.size() == 1);
+    CHECK(rels[0].predicate == "parsed_by");
+  }
+}

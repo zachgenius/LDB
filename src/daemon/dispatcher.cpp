@@ -1376,10 +1376,19 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
             {"byte_size", uint_()},
             {"path",      str()},
         }))},
+        {"relations",  arr_of(obj({
+            {"from_build_id", str()},
+            {"from_name",     str()},
+            {"to_build_id",   str()},
+            {"to_name",       str()},
+            {"predicate",     str()},
+            {"meta",          obj_open()},
+            {"created_at",    int_()},
+        }))},
     }, {"format", "sessions", "artifacts"});
 
     auto import_entry_schema = obj({
-        {"kind",   enum_str({"session", "artifact"})},
+        {"kind",   enum_str({"session", "artifact", "relation"})},
         {"key",    str()},
         {"reason", str()},
     }, {"kind", "key"});
