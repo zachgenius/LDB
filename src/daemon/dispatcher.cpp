@@ -1434,9 +1434,19 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
       }, {"stdout", "stderr", "exit_code", "duration_ms"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
-  json data;
-  data["endpoints"] = std::move(eps);
-  return protocol::make_ok(req.id, std::move(data));
+  // View descriptors (M5 part 4): `params.view = {fields, limit,
+  // offset, summary}` lets the agent / `ldb` CLI ask for a projected
+  // and/or sliced catalog. Without a view, we still go through
+  // apply_to_array — it preserves the array under the `endpoints` key
+  // and adds a `total` count, which is strictly informative.
+  protocol::view::Spec view_spec;
+  try {
+    view_spec = protocol::view::parse_from_params(req.params);
+  } catch (const std::invalid_argument& e) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
+  }
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(eps), view_spec, "endpoints"));
 }
 
 Response Dispatcher::handle_target_open(const Request& req) {

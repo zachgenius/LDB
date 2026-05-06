@@ -1,0 +1,763 @@
+#!/usr/bin/env python3
+"""ldb — thin command-line client for the ldbd daemon (M5 part 4).
+
+Spawns `ldbd --stdio` as a child process per invocation, sends one
+JSON-RPC request, and prints the response.
+
+Usage:
+    ldb [--ldbd PATH] [--format json|cbor] [--verbose] [--raw]
+        <subcommand> [key=value ...] [--view k=v ...]
+
+Subcommands are discovered dynamically from `describe.endpoints` on
+startup. Per-method `--help` prints the JSON Schema for the call's
+parameters in human-readable form.
+
+Design notes:
+
+  • One-shot per invocation. The daemon is spawned, called once, and torn
+    down. For multi-call scripts, run multiple `ldb` commands or write
+    your own JSON-RPC driver. Interactive REPL is deferred post-MVP.
+  • Schema-driven param parsing. Type coercion (string/integer/number/
+    boolean/array) is derived from the endpoint's `params_schema`, which
+    means new endpoints work without CLI updates.
+  • View descriptors. `--view k=v` (repeatable) collapses into
+    `params.view = {k: v, ...}` with type coercion (`limit`/`offset` →
+    int, `summary` → bool, `fields` → array).
+  • Stdout discipline. The daemon's stdout is the JSON-RPC channel — we
+    pipe it through, capture stderr separately, and print our own output
+    on the CLI's stdout.
+
+The CLI is intentionally small (~400 lines) and depends only on Python's
+stdlib. CBOR support is hand-rolled for the wire-format subset ldbd
+emits.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+from typing import Any
+
+
+# ----------------------------------------------------------------------
+# CBOR codec — minimal subset matching nlohmann::json::to_cbor output.
+# (Same shapes as the daemon emits: maps, arrays, strings, ints, bools,
+# null. No tags, no floats beyond f32/f64, no big integers.)
+# ----------------------------------------------------------------------
+
+def _cbor_uint(major: int, n: int, out: bytearray) -> None:
+    if n < 24:
+        out.append((major << 5) | n)
+    elif n < 1 << 8:
+        out.append((major << 5) | 24)
+        out.append(n)
+    elif n < 1 << 16:
+        out.append((major << 5) | 25)
+        out += struct.pack(">H", n)
+    elif n < 1 << 32:
+        out.append((major << 5) | 26)
+        out += struct.pack(">I", n)
+    else:
+        out.append((major << 5) | 27)
+        out += struct.pack(">Q", n)
+
+
+def cbor_encode(v: Any) -> bytes:
+    out = bytearray()
+    _cbor_enc(v, out)
+    return bytes(out)
+
+
+def _cbor_enc(v: Any, out: bytearray) -> None:
+    if v is None:
+        out.append(0xf6)
+    elif v is True:
+        out.append(0xf5)
+    elif v is False:
+        out.append(0xf4)
+    elif isinstance(v, int):
+        if v >= 0:
+            _cbor_uint(0, v, out)
+        else:
+            _cbor_uint(1, -1 - v, out)
+    elif isinstance(v, float):
+        out.append(0xfb)
+        out += struct.pack(">d", v)
+    elif isinstance(v, str):
+        b = v.encode("utf-8")
+        _cbor_uint(3, len(b), out)
+        out += b
+    elif isinstance(v, (bytes, bytearray)):
+        _cbor_uint(2, len(v), out)
+        out += v
+    elif isinstance(v, list):
+        _cbor_uint(4, len(v), out)
+        for x in v:
+            _cbor_enc(x, out)
+    elif isinstance(v, dict):
+        _cbor_uint(5, len(v), out)
+        for k, x in v.items():
+            _cbor_enc(k, out)
+            _cbor_enc(x, out)
+    else:
+        raise TypeError(f"unsupported type for cbor encode: {type(v)}")
+
+
+def _cbor_read_uint(buf: bytes, i: int, info: int):
+    if info < 24:
+        return info, i
+    if info == 24:
+        return buf[i], i + 1
+    if info == 25:
+        return struct.unpack_from(">H", buf, i)[0], i + 2
+    if info == 26:
+        return struct.unpack_from(">I", buf, i)[0], i + 4
+    if info == 27:
+        return struct.unpack_from(">Q", buf, i)[0], i + 8
+    raise ValueError(f"unsupported additional info {info}")
+
+
+def _cbor_dec(buf: bytes, i: int):
+    b = buf[i]
+    i += 1
+    major = b >> 5
+    info = b & 0x1f
+    if major == 0:
+        n, i = _cbor_read_uint(buf, i, info)
+        return n, i
+    if major == 1:
+        n, i = _cbor_read_uint(buf, i, info)
+        return -1 - n, i
+    if major == 2:
+        n, i = _cbor_read_uint(buf, i, info)
+        return bytes(buf[i:i + n]), i + n
+    if major == 3:
+        n, i = _cbor_read_uint(buf, i, info)
+        return buf[i:i + n].decode("utf-8"), i + n
+    if major == 4:
+        n, i = _cbor_read_uint(buf, i, info)
+        out = []
+        for _ in range(n):
+            v, i = _cbor_dec(buf, i)
+            out.append(v)
+        return out, i
+    if major == 5:
+        n, i = _cbor_read_uint(buf, i, info)
+        out = {}
+        for _ in range(n):
+            k, i = _cbor_dec(buf, i)
+            v, i = _cbor_dec(buf, i)
+            out[k] = v
+        return out, i
+    if major == 7:
+        if info == 20:
+            return False, i
+        if info == 21:
+            return True, i
+        if info == 22:
+            return None, i
+        if info == 23:
+            return None, i  # undefined
+        if info == 26:
+            v, = struct.unpack_from(">f", buf, i)
+            return v, i + 4
+        if info == 27:
+            v, = struct.unpack_from(">d", buf, i)
+            return v, i + 8
+        raise ValueError(f"unsupported simple/float info {info}")
+    raise ValueError(f"unsupported major type {major}")
+
+
+def cbor_decode(buf: bytes) -> Any:
+    v, i = _cbor_dec(buf, 0)
+    if i != len(buf):
+        raise ValueError(f"trailing bytes: consumed {i} of {len(buf)}")
+    return v
+
+
+# ----------------------------------------------------------------------
+# Wire transport — JSON line-delimited or CBOR length-prefixed.
+# ----------------------------------------------------------------------
+
+class JsonTransport:
+    def __init__(self, proc):
+        self.proc = proc
+
+    def send(self, msg):
+        line = json.dumps(msg)
+        self.proc.stdin.write(line.encode("utf-8") + b"\n")
+        self.proc.stdin.flush()
+
+    def recv(self):
+        line = self.proc.stdout.readline()
+        if not line:
+            return None
+        return json.loads(line)
+
+
+class CborTransport:
+    def __init__(self, proc):
+        self.proc = proc
+
+    def send(self, msg):
+        body = cbor_encode(msg)
+        self.proc.stdin.write(struct.pack(">I", len(body)))
+        self.proc.stdin.write(body)
+        self.proc.stdin.flush()
+
+    def recv(self):
+        prefix = self.proc.stdout.read(4)
+        if len(prefix) == 0:
+            return None
+        if len(prefix) != 4:
+            raise IOError(f"short prefix read: got {len(prefix)} bytes")
+        n, = struct.unpack(">I", prefix)
+        body = self.proc.stdout.read(n)
+        if len(body) != n:
+            raise IOError(f"short body: wanted {n}, got {len(body)}")
+        return cbor_decode(body)
+
+
+# ----------------------------------------------------------------------
+# Daemon discovery + lifecycle.
+# ----------------------------------------------------------------------
+
+def find_ldbd(explicit: str | None) -> str:
+    if explicit:
+        if not os.access(explicit, os.X_OK):
+            sys.stderr.write(f"ldb: --ldbd {explicit!r} not executable\n")
+            sys.exit(2)
+        return explicit
+    onpath = shutil.which("ldbd")
+    if onpath:
+        return onpath
+    # In-tree dev fallback: ./build/bin/ldbd from CWD.
+    fallback = os.path.join(os.getcwd(), "build", "bin", "ldbd")
+    if os.access(fallback, os.X_OK):
+        return fallback
+    sys.stderr.write(
+        "ldb: ldbd not found on PATH or at ./build/bin/ldbd\n"
+        "     pass --ldbd /path/to/ldbd to override\n")
+    sys.exit(2)
+
+
+def spawn_daemon(ldbd: str, fmt: str, verbose: bool):
+    cmd = [ldbd, "--stdio", "--format", fmt, "--log-level", "error"]
+    if verbose:
+        sys.stderr.write(f"ldb: spawning {' '.join(cmd)}\n")
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+# ----------------------------------------------------------------------
+# Schema-driven param parsing.
+# ----------------------------------------------------------------------
+
+def coerce_value(raw: str, schema: dict) -> Any:
+    """Best-effort coerce a key=value string per the schema's `type`.
+
+    Falls back to the raw string when the schema is missing or unknown.
+    Schema's `enum` does not constrain client-side; the daemon validates.
+    """
+    t = schema.get("type") if isinstance(schema, dict) else None
+    if t == "integer":
+        # accept hex (0x...) or decimal
+        s = raw.strip()
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            return int(s)
+        except ValueError:
+            raise ValueError(f"expected integer, got {raw!r}")
+    if t == "number":
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"expected number, got {raw!r}")
+    if t == "boolean":
+        s = raw.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"expected boolean, got {raw!r}")
+    if t == "array":
+        # Comma-split. Coerce each item per items.type if present.
+        items_schema = schema.get("items") if isinstance(schema, dict) else None
+        items_schema = items_schema if isinstance(items_schema, dict) else {}
+        parts = raw.split(",") if raw else []
+        return [coerce_value(p, items_schema) for p in parts]
+    if t == "object":
+        # We don't try to parse nested objects from the CLI; accept JSON.
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"expected JSON object, got {raw!r}: {e}")
+    if t == "null":
+        if raw.strip().lower() in ("null", "none", ""):
+            return None
+        raise ValueError(f"expected null, got {raw!r}")
+    # type=string or unknown: accept verbatim. Also tolerate a JSON-like
+    # input: if the value parses as a JSON literal AND looks
+    # JSON-ish (starts with {/[/"), use that. Otherwise raw string.
+    s = raw.lstrip()
+    if s and s[0] in '{["':
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    return raw
+
+
+def parse_kv_pairs(items: list[str]) -> list[tuple[str, str]]:
+    """Split each `key=value` item; barf on bare flags."""
+    pairs = []
+    for it in items:
+        if "=" not in it:
+            raise ValueError(
+                f"params must be key=value; got {it!r}. "
+                f"Use `ldb <method> --help` to list expected params.")
+        k, _, v = it.partition("=")
+        if not k:
+            raise ValueError(f"empty param name in {it!r}")
+        pairs.append((k, v))
+    return pairs
+
+
+def build_params(pairs: list[tuple[str, str]],
+                 view_pairs: list[tuple[str, str]],
+                 schema: dict) -> dict:
+    """Assemble a JSON-RPC params object from key=value pairs.
+
+    - `pairs` go directly into the params dict, with type coercion from
+      `schema.properties[k]` when available.
+    - `view_pairs` collapse into params["view"] = {...} with the same
+      coercion logic, special-casing `fields` as a comma-list, and
+      `limit`/`offset` as integers.
+    """
+    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    params: dict[str, Any] = {}
+
+    # Multiple `--key value --key value` for arrays: collect duplicates.
+    seen: dict[str, list[str]] = {}
+    for k, v in pairs:
+        seen.setdefault(k, []).append(v)
+
+    for k, vs in seen.items():
+        kschema = props.get(k, {}) if isinstance(props, dict) else {}
+        if len(vs) > 1:
+            # multi-value form: treat as array regardless of schema
+            items_schema = kschema.get("items", {}) if isinstance(kschema, dict) else {}
+            if not isinstance(items_schema, dict):
+                items_schema = {}
+            params[k] = [coerce_value(v, items_schema) for v in vs]
+        else:
+            params[k] = coerce_value(vs[0], kschema)
+
+    if view_pairs:
+        view: dict[str, Any] = {}
+        for k, v in view_pairs:
+            if k == "fields":
+                view["fields"] = [s for s in v.split(",") if s]
+            elif k in ("limit", "offset"):
+                try:
+                    view[k] = int(v)
+                except ValueError:
+                    raise ValueError(f"--view {k}: expected integer, got {v!r}")
+            elif k == "summary":
+                vl = v.strip().lower()
+                if vl in ("true", "1", "yes", "on"):
+                    view[k] = True
+                elif vl in ("false", "0", "no", "off"):
+                    view[k] = False
+                else:
+                    raise ValueError(
+                        f"--view summary: expected boolean, got {v!r}")
+            else:
+                # Forward unknown view keys verbatim — the daemon may
+                # know what to do with them.
+                view[k] = v
+        params["view"] = view
+
+    return params
+
+
+# ----------------------------------------------------------------------
+# Help rendering.
+# ----------------------------------------------------------------------
+
+def render_method_help(entry: dict) -> str:
+    method = entry.get("method", "?")
+    summary = entry.get("summary", "")
+    out = []
+    out.append(f"ldb {method}\n")
+    if summary:
+        out.append(f"  {summary}\n")
+    out.append("\n")
+
+    out.append(f"  cost_hint:        {entry.get('cost_hint', '?')}\n")
+    out.append(f"  requires_target:  {entry.get('requires_target', False)}\n")
+    out.append(f"  requires_stopped: {entry.get('requires_stopped', False)}\n")
+
+    ps = entry.get("params_schema", {}) or {}
+    props = ps.get("properties", {}) or {}
+    required = set(ps.get("required", []) or [])
+    out.append("\nParameters:\n")
+    if not props:
+        out.append("  (none)\n")
+    else:
+        for name, sub in props.items():
+            if not isinstance(sub, dict):
+                sub = {}
+            t = sub.get("type", "any")
+            req_marker = "required" if name in required else "optional"
+            desc = sub.get("description", "")
+            out.append(f"  {name}={t!s:<10}  {req_marker}")
+            if desc:
+                out.append(f"  {desc}")
+            out.append("\n")
+
+    out.append("\nView descriptors (optional, for array-returning calls):\n")
+    out.append("  --view fields=k1,k2   project each item to these keys\n")
+    out.append("  --view limit=N        cap items returned\n")
+    out.append("  --view offset=N       skip first N items\n")
+    out.append("  --view summary=true   small sample + total\n")
+
+    return "".join(out)
+
+
+def render_top_help(catalog: list[dict]) -> str:
+    out = []
+    out.append(
+        "ldb — thin CLI for ldbd (LDB daemon)\n"
+        "\n"
+        "Usage:\n"
+        "  ldb [--ldbd PATH] [--format json|cbor] [--verbose] [--raw]\n"
+        "      <subcommand> [key=value ...] [--view k=v ...]\n"
+        "  ldb <subcommand> --help\n"
+        "  ldb --help | --version\n"
+        "\n"
+        "Top-level options:\n"
+        "  --ldbd PATH          ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
+        "  --format json|cbor   wire format on the daemon channel (default: json)\n"
+        "  --verbose            log JSON-RPC traffic to stderr\n"
+        "  --raw                print the full JSON-RPC envelope, not just data\n"
+        "  --help               this help\n"
+        "  --version            print client version and exit\n"
+        "\n"
+        "Subcommands (from describe.endpoints):\n"
+    )
+    # Group by section prefix for readability (e.g. target.*, mem.*).
+    rows = []
+    for e in catalog:
+        m = e.get("method", "?")
+        s = e.get("summary", "")
+        # Trim long summaries for the top-level listing.
+        if len(s) > 70:
+            s = s[:67] + "..."
+        rows.append((m, s))
+    rows.sort(key=lambda r: r[0])
+    width = max((len(m) for m, _ in rows), default=20)
+    for m, s in rows:
+        out.append(f"  {m:<{width}}  {s}\n")
+    out.append("\nRun `ldb <subcommand> --help` for per-method parameters.\n")
+    return "".join(out)
+
+
+# ----------------------------------------------------------------------
+# Catalog fetch (one daemon roundtrip).
+# ----------------------------------------------------------------------
+
+def fetch_catalog(ldbd: str, fmt: str, verbose: bool) -> list[dict]:
+    """Spawn ldbd, ask describe.endpoints, return the catalog list.
+
+    Errors here are fatal (CLI can't function without the catalog).
+    """
+    proc = spawn_daemon(ldbd, fmt, verbose)
+    try:
+        if fmt == "cbor":
+            tr = CborTransport(proc)
+        else:
+            tr = JsonTransport(proc)
+        req = {"jsonrpc": "2.0", "id": "describe",
+               "method": "describe.endpoints"}
+        if verbose:
+            sys.stderr.write(f"ldb: -> {json.dumps(req)}\n")
+        tr.send(req)
+        resp = tr.recv()
+        if resp is None:
+            stderr = proc.stderr.read().decode("utf-8", errors="replace")
+            sys.stderr.write(
+                f"ldb: daemon closed stdout while fetching catalog\n"
+                f"     daemon stderr: {stderr}\n")
+            sys.exit(1)
+        if verbose:
+            sys.stderr.write(f"ldb: <- {json.dumps(resp)[:200]}...\n")
+        if not resp.get("ok"):
+            err = resp.get("error", {})
+            sys.stderr.write(
+                f"ldb: describe.endpoints failed: "
+                f"{err.get('code')} {err.get('message')}\n")
+            sys.exit(1)
+        eps = resp.get("data", {}).get("endpoints", [])
+        if not isinstance(eps, list):
+            sys.stderr.write("ldb: describe.endpoints: malformed catalog\n")
+            sys.exit(1)
+        return eps
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# ----------------------------------------------------------------------
+# RPC call.
+# ----------------------------------------------------------------------
+
+def do_rpc(ldbd: str, fmt: str, verbose: bool, method: str,
+           params: dict) -> dict:
+    proc = spawn_daemon(ldbd, fmt, verbose)
+    try:
+        tr = CborTransport(proc) if fmt == "cbor" else JsonTransport(proc)
+        req = {"jsonrpc": "2.0", "id": "1", "method": method,
+               "params": params}
+        if verbose:
+            sys.stderr.write(f"ldb: -> {json.dumps(req)}\n")
+        tr.send(req)
+        resp = tr.recv()
+        if resp is None:
+            stderr = proc.stderr.read().decode("utf-8", errors="replace")
+            sys.stderr.write(
+                f"ldb: daemon closed stdout (stderr was: {stderr})\n")
+            sys.exit(1)
+        if verbose:
+            sys.stderr.write(f"ldb: <- {json.dumps(resp)[:512]}\n")
+        return resp
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# ----------------------------------------------------------------------
+# Argument parsing.
+# ----------------------------------------------------------------------
+
+# We can't use argparse subparsers cleanly because subcommands are
+# discovered at runtime from describe.endpoints. Hand-roll a simple
+# two-pass parser:
+#   1. Strip top-level options (anything starting with `--` recognized).
+#   2. Whatever's left: first token = method; the rest = params + --view.
+
+TOP_OPTIONS_WITH_ARG = {"--ldbd", "--format"}
+TOP_OPTIONS_NOARG    = {"--verbose", "--raw"}
+HELP_FLAGS           = {"--help", "-h"}
+
+CLIENT_VERSION = "0.1.0"
+
+
+def parse_argv(argv: list[str]) -> dict:
+    """Hand-rolled parser. Returns a dict with parsed fields."""
+    out = {
+        "ldbd": None,
+        "format": "json",
+        "verbose": False,
+        "raw": False,
+        "help_top": False,
+        "version": False,
+        "method": None,
+        "method_help": False,
+        "params": [],     # list[str] — key=value
+        "view": [],       # list[(key, value)]
+    }
+
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a in TOP_OPTIONS_WITH_ARG:
+            if i + 1 >= n:
+                raise ValueError(f"{a} requires an argument")
+            if a == "--ldbd":
+                out["ldbd"] = argv[i + 1]
+            elif a == "--format":
+                fmt = argv[i + 1]
+                if fmt not in ("json", "cbor"):
+                    raise ValueError(
+                        f"--format must be json|cbor, got {fmt!r}")
+                out["format"] = fmt
+            i += 2
+        elif a == "--verbose":
+            out["verbose"] = True
+            i += 1
+        elif a == "--raw":
+            out["raw"] = True
+            i += 1
+        elif a in HELP_FLAGS and out["method"] is None:
+            out["help_top"] = True
+            i += 1
+        elif a == "--version" and out["method"] is None:
+            out["version"] = True
+            i += 1
+        elif a.startswith("--format=") or a.startswith("--ldbd="):
+            # Accept --foo=bar form too.
+            key, _, val = a.partition("=")
+            if key == "--format":
+                if val not in ("json", "cbor"):
+                    raise ValueError(
+                        f"--format must be json|cbor, got {val!r}")
+                out["format"] = val
+            else:
+                out["ldbd"] = val
+            i += 1
+        elif out["method"] is None:
+            if a.startswith("--"):
+                raise ValueError(f"unknown option: {a}")
+            out["method"] = a
+            i += 1
+        elif a in HELP_FLAGS:
+            out["method_help"] = True
+            i += 1
+        elif a == "--view":
+            if i + 1 >= n:
+                raise ValueError("--view requires k=v")
+            kv = argv[i + 1]
+            if "=" not in kv:
+                raise ValueError(
+                    f"--view expects k=v form, got {kv!r}")
+            k, _, v = kv.partition("=")
+            out["view"].append((k, v))
+            i += 2
+        elif a.startswith("--view="):
+            kv = a[len("--view="):]
+            if "=" not in kv:
+                raise ValueError(f"--view= expects k=v, got {kv!r}")
+            k, _, v = kv.partition("=")
+            out["view"].append((k, v))
+            i += 1
+        else:
+            # method param: must be key=value (unless it's --foo we
+            # don't recognize, in which case complain).
+            if a.startswith("--"):
+                raise ValueError(
+                    f"unknown option after method: {a}")
+            out["params"].append(a)
+            i += 1
+
+    return out
+
+
+# ----------------------------------------------------------------------
+# Entry point.
+# ----------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    try:
+        opts = parse_argv(argv[1:])
+    except ValueError as e:
+        sys.stderr.write(f"ldb: {e}\n")
+        return 2
+
+    if opts["version"]:
+        print(f"ldb {CLIENT_VERSION}")
+        return 0
+
+    ldbd = find_ldbd(opts["ldbd"])
+    fmt = opts["format"]
+    verbose = opts["verbose"]
+
+    # Fetch catalog only when we need it.
+    needs_catalog = (
+        opts["help_top"] or opts["method_help"] or opts["method"] is not None
+    )
+    catalog: list[dict] = []
+    if needs_catalog:
+        catalog = fetch_catalog(ldbd, fmt, verbose)
+
+    if opts["help_top"]:
+        sys.stdout.write(render_top_help(catalog))
+        return 0
+
+    if opts["method"] is None:
+        sys.stderr.write(
+            "ldb: missing subcommand. Try `ldb --help`.\n")
+        return 2
+
+    method = opts["method"]
+    entry = next((e for e in catalog if e.get("method") == method), None)
+
+    if opts["method_help"]:
+        if entry is None:
+            sys.stderr.write(
+                f"ldb: unknown method {method!r}. Try `ldb --help`.\n")
+            return 2
+        sys.stdout.write(render_method_help(entry))
+        return 0
+
+    if entry is None:
+        # Allow the daemon to be authoritative — it'll emit -32601 with
+        # a clear message. Useful if the catalog is somehow stale.
+        # We still want exit 1 from that path.
+        params_schema = {}
+    else:
+        params_schema = entry.get("params_schema", {}) or {}
+
+    # Validate required params client-side for nicer error messages.
+    required = list(params_schema.get("required", []) or [])
+    try:
+        kv_pairs = parse_kv_pairs(opts["params"])
+        params = build_params(kv_pairs, opts["view"], params_schema)
+    except ValueError as e:
+        sys.stderr.write(f"ldb: {e}\n")
+        return 2
+
+    missing = [r for r in required if r not in params]
+    if missing:
+        sys.stderr.write(
+            f"ldb: {method}: required param(s) missing: "
+            f"{', '.join(missing)}\n"
+            f"     run `ldb {method} --help` for the parameter list.\n")
+        return 2
+
+    resp = do_rpc(ldbd, fmt, verbose, method, params)
+
+    if opts["raw"]:
+        sys.stdout.write(json.dumps(resp, indent=2) + "\n")
+    elif resp.get("ok") is True:
+        sys.stdout.write(json.dumps(resp.get("data", {}), indent=2) + "\n")
+    else:
+        err = resp.get("error", {})
+        sys.stderr.write(
+            f"ldb: {method}: error {err.get('code')}: "
+            f"{err.get('message', '')}\n")
+        if "data" in err:
+            sys.stderr.write(json.dumps(err["data"], indent=2) + "\n")
+        return 1
+
+    return 0 if resp.get("ok") else 1
+
+
+if __name__ == "__main__":
+    try:
+        rc = main(sys.argv)
+    except KeyboardInterrupt:
+        rc = 130
+    sys.exit(rc)
