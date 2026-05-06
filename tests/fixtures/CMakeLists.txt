@@ -51,3 +51,20 @@ target_compile_options(ldb_fix_dlopener PRIVATE
   -fno-eliminate-unused-debug-types
 )
 target_link_libraries(ldb_fix_dlopener PRIVATE dl)
+
+# Slice 1c continue-round-trip fixture. main() calls work_step in a
+# bounded hot loop with usleep cooperation; the harness sets a bp on
+# work_step and drives process.continue twice to verify <gen> bumps
+# on each round-trip and the snapshot string shape stays consistent
+# across hits even though reg_digest changes (the loop index moves).
+add_executable(ldb_fix_looper c/looper.c)
+set_target_properties(ldb_fix_looper PROPERTIES
+  OUTPUT_NAME    looper
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+  C_STANDARD     11
+)
+target_compile_options(ldb_fix_looper PRIVATE
+  -g -O0
+  -fno-omit-frame-pointer
+  -fno-eliminate-unused-debug-types
+)
