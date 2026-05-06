@@ -4,6 +4,34 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §9: multi-binary sessions (Tier 3)
+
+**Goal:** Inventory + naming for multi-target sessions. `target.list`, `target.label`, `session.targets`. Cross-target join queries (§10) explicitly out of scope.
+
+**Done:**
+- `src/backend/debugger_backend.h` / `lldb_backend.{h,cpp}` — new `TargetInfo` struct and three virtuals on `DebuggerBackend`: `list_targets`, `label_target`, `get_target_label`. LldbBackend impl walks `impl_->targets` for the inventory, decorates each entry with `SBTarget::GetTriple()` + `SBTarget::GetExecutable()::GetPath()` + a `has_process` bit derived from `SBProcess::GetState()`. Labels stored in two unordered_maps (id→label and label→id for O(1) uniqueness) under `impl_->mu` — no second mutex. `close_target` drops the label entry on both sides. 10 unit cases / 45 assertions in `tests/unit/test_backend_targets.cpp`. Commit `c8d057f`.
+- `src/store/session_store.{h,cpp}` — `extract_target_ids(session_id)` walks `read_log()` rows, parses each row's stored `request_json` defensively (try/catch on `json::parse`), buckets by `params.target_id` when present and integer-typed. Output ordered ascending via `std::map`. Malformed JSON / missing-params / non-integer / negative all silently skipped — best-effort post-hoc inventory, not a parser conformance check. 7 unit cases / 28 assertions in `tests/unit/test_session_targets_extract.cpp`. Commit `c1645a2`.
+- `src/daemon/dispatcher.{h,cpp}` — three new endpoints with full draft-2020-12 schemas in `describe.endpoints`: `target.list`, `target.label`, `session.targets`. `view::apply_to_array` retrofit on `targets` array for the two list-shaped endpoints. `target.label` translates the typed backend `Error` into `-32602` for the documented "already taken" / "must be non-empty" cases (real conflict path); other `Error` traffic stays `-32000`. `session.targets` enriches each bucket with the live label from `get_target_label` (closed targets simply lose their label in the response). 11 unit cases / 74 assertions in `tests/unit/test_dispatcher_multi_binary.cpp`. Smoke `tests/smoke/test_multi_binary.py` (TIMEOUT 30) drives the full wire including conflict, self-relabel no-op, label re-use after close, and the closed-target bucket-without-label path. Commit pending.
+
+**Decisions:**
+- **Label conflict policy: throws.** A second target trying to claim a label already owned by another target → `backend::Error("label \"X\" already taken by target_id Y")`. Dispatcher maps this to `-32602` so the agent can branch on collision without string-matching. Self-relabel with the same string is a no-op.
+- **Re-label policy: replaces.** A second `label_target()` on a target with a *different* string releases the old label name (so another target can pick it up) and assigns the new one. Single label per target, simple mental model.
+- **Label persistence scope: daemon process only.** Labels live in `impl_->labels` / `impl_->label_owners` — in-memory unordered_maps. `close_target` drops them; daemon restart wipes everything. Cross-restart persistence would mean a sqlite migration and reconciliation against fresh `target_id`s on re-open; explicitly deferred per the §9 scope.
+- **`session.targets` enriches labels live, not from the log.** Labels at log-write time are not stored in the rpc_log row (just the params). The bucket's label comes from a fresh `get_target_label()` call — closed targets simply don't carry one. The alternative (snapshotting the label on every append) would have leaked daemon-state into the rpc_log JSON and broken the "method+params is the canonical recipe shape" contract.
+- **No `target.find_by_label`.** Out of scope per the task; an agent can `target.list` and filter client-side. Also avoids a second cache or index.
+- **`list_targets` snapshots under `mu` then queries LLDB outside the lock.** Calling `SBTarget::GetTriple()` etc. with `mu` held would extend the critical section unnecessarily across SBAPI calls; capturing the (id, SBTarget, label) tuples and releasing the lock first is the standard pattern in this file.
+
+**Surprises / blockers:**
+- None substantial. The Tier 3 §9 spec was tight; backend interface changes plus dispatcher wiring went linearly. The only mild snag was deciding whether `target.label` "label conflict" should be `-32602` (params validation) or `-32000` (backend error) — chose `-32602` because the conflict is fundamentally a request validation issue (caller asked for an already-taken name), not a backend-internal failure.
+
+**Verification:** ctest 46/46 PASS on this worktree branch (`worktree-agent-aeb4c686ee1206795`), ~33s wall clock. Was 45/45 at master HEAD `688bcad`; +1 is `smoke_multi_binary`. Build warning-clean (the only warnings are pre-existing in `third_party/nlohmann/json.hpp`).
+
+**Deferred:** cross-target join queries (§10), persistent labels across daemon restart, `target.find_by_label`, bulk target operations.
+
+**Next:** Tier 3 §10 (cross-binary correlation — needs symbol index foundation per the roadmap row).
+
+---
+
 ## 2026-05-07 — post-v0.1 §7: artifact knowledge graph (Tier 3)
 
 **Goal:** Ship typed relations between artifacts as a queryable graph. Manual-attach in this slice; auto-derivation deferred.

@@ -59,6 +59,8 @@ class Dispatcher {
   protocol::Response handle_target_load_core(const protocol::Request& req);
   protocol::Response handle_module_list(const protocol::Request& req);
   protocol::Response handle_target_close(const protocol::Request& req);
+  protocol::Response handle_target_list(const protocol::Request& req);
+  protocol::Response handle_target_label(const protocol::Request& req);
   protocol::Response handle_type_layout(const protocol::Request& req);
   protocol::Response handle_symbol_find(const protocol::Request& req);
   protocol::Response handle_string_list(const protocol::Request& req);
@@ -108,6 +110,7 @@ class Dispatcher {
   protocol::Response handle_session_export(const protocol::Request& req);
   protocol::Response handle_session_import(const protocol::Request& req);
   protocol::Response handle_session_diff(const protocol::Request& req);
+  protocol::Response handle_session_targets(const protocol::Request& req);
   protocol::Response handle_artifact_export(const protocol::Request& req);
   protocol::Response handle_artifact_import(const protocol::Request& req);
 
