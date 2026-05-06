@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-§3a-merge — protocol versioning live) |
-| **ctest at HEAD** | 40/40 green |
+| **HEAD now** | (updated post-§3b/§3c-merge — Tier 1 complete modulo macOS hw) |
+| **ctest at HEAD** | 41/41 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -32,8 +32,8 @@
 | 1c | Live provenance — CI determinism gate extended to live targets | ✅ | `a715e629b235a9434` | `afc1d3706a3b11696` | (merge commit on master) |
 | 2 | macOS arm64 hardening pass — Linux-side audit ✅; **hardware sign-off pending user** (see Blockers § below; checklist at `docs/macos-arm64-status.md` §7) | ✅ (audit) | `aa58d23c1330389d6` | `ac66801b1b097bec0` | (merge commit on master) |
 | 3a | Public release polish — protocol semver + version handshake in `hello` | ✅ | `a7041ead1a14a3982` | `a78224fdd55f8d151` | (merge commit on master) |
-| 3b | Public release polish — GitHub Actions CI (Linux matrix) | — | — | — | — |
-| 3c | Public release polish — `CONTRIBUTING.md` + commit-style + PR template | — | — | — | — |
+| 3b | Public release polish — GitHub Actions CI (Linux matrix) | ✅ | `ae87f7bbcc272c6c3` | `a6b3fa92218603d1a` | (merge commit on master) |
+| 3c | Public release polish — `CONTRIBUTING.md` + commit-style + PR template | ✅ | `a48c7d2b9bc02c163` | `acf25642e78adebf8` | (merge commit on master + `f4b2229` fix) |
 
 ## Tier 2 — Force multipliers
 
@@ -89,6 +89,25 @@ If macOS LLDB names the GPR register set differently AND doesn't order it first,
 ### B3 — MEDIUM: live↔core determinism gate exclusion list is Linux-flavored
 
 `tests/smoke/test_live_determinism_gate.py` excludes `[vdso]`, kernel-side `threads[*].name`, triple-suffix drift — none of those exist on Mach-O. Included endpoints (`symbol.find`, `string.list`, `disasm.function`) should round-trip on macOS but unproven. Audit §5.3 / §7 checkbox 4.
+
+### B5 — LOW: AI-assist disclosure stance (policy call, not correctness)
+
+Per §3c the worker made AI-assist co-author trailer **hard-required** in `CONTRIBUTING.md`. This matches `CLAUDE.md`'s internal rule and the project's agent-first stance, but a drive-by external typo-fixer using Copilot autocomplete now hits a hard policy gate. The §3c reviewer flagged this as a policy call worth surfacing — not a correctness issue. Options:
+- **Keep as hard-required** (current state). Consistent with internal rule.
+- **Soften to "strongly encouraged"** — easier on drive-by contributions, still nudges honesty.
+The rule is unenforceable in practice (you can't tell), so the practical difference is the tone of the doc. Your call.
+
+### B6 — TRACKED: §3b minor follow-ups (not blocking)
+
+From the §3b reviewer:
+1. **`tags: "v*.*"`** matches `v0.2.0` / `v1.0` but not `v1` (single segment). Confirm versioning convention before tagging anything that could trip this.
+2. **First push will be the live CI validation.** `check_ci_yaml` is structural only; semantic CI failures (wrong action input names, etc.) only surface on the runner. Worker disclosed; track whether the first run lands green.
+3. **`actions/upload-artifact@v4` retention defaults differ from v3** — explicitly set; future v5 migration needs re-checking.
+
+### B7 — TRACKED: §3c minor follow-ups (not blocking)
+
+From the §3c reviewer:
+1. **Dangling template references**: `CONTRIBUTING.md` directs feature-idea reporters to "the `feature` or `rfc` template" but only `bug_report.yml` ships. Either reword or add stubs in a follow-up.
 
 ### B4 — LOW (informational): Tier 1 §2 cannot be promoted to ✅ without Apple silicon
 
