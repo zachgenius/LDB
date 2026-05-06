@@ -4,6 +4,38 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §7: artifact knowledge graph (Tier 3)
+
+**Goal:** Ship typed relations between artifacts as a queryable graph. Manual-attach in this slice; auto-derivation deferred.
+
+**Done:**
+- `src/store/artifact_store.{h,cpp}` — new `ArtifactRelation` row, `RelationDir` enum, and three methods (`add_relation`, `list_relations`, `remove_relation`) plus `import_relation` for the pack path. Schema migration adds `artifact_relations(id, from_id, to_id, predicate, meta, created_at)` with `ON DELETE CASCADE` on both endpoints; three indexes (from / to / predicate). 7 unit cases / 43 assertions in `tests/unit/test_artifact_relations.cpp`. Commit `20d91ef`.
+- `src/daemon/dispatcher.{h,cpp}` — `artifact.relate`, `artifact.relations`, `artifact.unrelate` endpoints with full draft-2020-12 schemas in `describe.endpoints`. `view::apply_to_array` retrofit on the `relations` array (limit/offset/fields/summary). `relation_to_json` helper sits next to `artifact_row_to_list_json`. `require_int64` helper added — accepts both number_integer and number_unsigned representations to match the rest of the artifact endpoints. 5 unit cases / 65 assertions in `tests/unit/test_dispatcher_artifact_relate.cpp`. Smoke test `tests/smoke/test_artifact_relations.py` (TIMEOUT 30) covers the live wire including ON DELETE CASCADE through `artifact.delete`. Commit `d7358c2`.
+- `src/store/pack.cpp` — manifest grows a `"relations"` array. Endpoints are encoded as `(build_id, name)` pairs (sqlite ids aren't portable). On import, `get_by_name` resolves them to the destination's freshly-assigned ids and `import_relation` writes the row. `pack_session` emits every relation; `pack_artifacts` filters to relations whose **both** endpoints are in the exported set. Two new e2e cases in `tests/unit/test_pack.cpp`. The `pack_manifest` schema in `describe.endpoints` and the import-entry `kind` enum (now includes `"relation"`) updated to match. Commit `9ad5e64`.
+- `docs/09-artifact-knowledge-graph.md` — design doc covering the data model, ON DELETE CASCADE contract, predicate policy, wire shape, ldbpack round-trip, and the deferred list.
+
+**Decisions:**
+- **Predicate is free-form, no enum.** A closed list would force daemon updates for new relation kinds, defeating the agent-first design. Empty predicates are rejected with `-32602`. Common predicates (`parsed_by`, `extracted_from`, `called_by`, `ancestor_of`, `contains`, `references`) are documented descriptively, not enforced. No reserved keywords.
+- **Endpoint id remapping via (build_id, name) pairs.** Sqlite autoincrement ids are not portable across stores. Encoding endpoints as the natural key on the wire and resolving them via `get_by_name` on import is cheap (we already index `build_id` and `name`) and removes a whole class of "stale id" bugs.
+- **Relations ride alongside artifacts in `index.db`.** Same WAL, same connection, same mutex. No separate `relations.db` — keeps the migration story simple (`CREATE TABLE IF NOT EXISTS` runs on every open).
+- **`created_at` is unix epoch nanoseconds for relations**, not seconds (the artifact `created_at` is in seconds). Agents may attach a burst of relations in a tight loop and ms isn't enough resolution; ns matches `session_store`'s stamp shape.
+- **Cross-set relations are dropped silently in `pack_artifacts`.** When the agent says "give me build A's artifacts only", a relation A→C-from-build-B has nothing meaningful to import — the destination would either fail or import a dangling edge. Silent drop is the producer's call.
+- **Relations under `conflict_policy=skip` whose endpoint was preserved-as-local become "skipped" with reason `"endpoint not present after import"`.** This is the only case where the destination has the artifact-by-name but the relation can't unambiguously attach. Better to surface in the report than silently lose.
+
+**Surprises / blockers:**
+- The first dispatcher test failed with the wrong error code (-32601 vs -32602), which surfaced because `Response` has `error_code` not `error.code` — a few seconds wasted; updating the test to match the project's existing convention (`static_cast<int>(resp.error_code)`) was the fix. Worth a future cleanup: every test in the codebase uses the cast pattern, but no helper exists yet.
+- `pack_artifacts` originally only saw the artifacts post-filter, so I had to thread an `exported` vector through to `emit_relations_for`. Cleaner than re-running the filter logic; an extra ~5 lines.
+
+**Verification:** ctest 44/44 PASS, ~32s wall clock. Was 43/43 PASS at master HEAD `caacc81` — the +1 is `smoke_artifact_relations`.
+
+**Sibling slice:** §11 session.diff (parallel agent in worktree-agent-…); no overlap with §7 territory.
+
+**Deferred:** auto-derivation of relations from `rpc_log` entries (v0.5), recursive graph queries / SHORTEST_PATH / transitive closure (v0.5), predicate enum, relation versioning (use unrelate+relate), perf for >10K relations.
+
+**Next:** A v0.5 follow-up should ship the auto-derivation pass — read `mem.dump_artifact` rows from the session log, infer `extracted_from(memory_dump, binary_at_pc)` automatically. Also worth adding `artifact.relations(view.summary=true)` returning per-predicate counts (currently summary just suppresses items).
+
+---
+
 ## 2026-05-07 — post-v0.1 §4: DAP shim (Tier 2)
 
 **Goal:** Ship `ldb-dap` binary that speaks DAP on stdio, spawns ldbd as a child, translates DAP requests to LDB JSON-RPC. Minimum useful set for VS Code attach.
