@@ -4,6 +4,40 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 — post-v0.1 §3c: CONTRIBUTING + PR template
+
+**Goal:** Stand up the external-contributor surface paralleling the internal `CLAUDE.md` workflow. `CLAUDE.md` is loaded by AI agents and tells them the strict TDD / commit / worklog rules; humans arriving from GitHub need a different doc. Ship `CONTRIBUTING.md` at the repo root, a PR template under `.github/`, and an opening-salvo bug report issue template.
+
+**Done:**
+- `CONTRIBUTING.md` (new, repo root) — eleven sections: project ethos pointer, hard requirements (tests-first, ctest green, warning-clean, stdout-reserved, WHY commits), soft expectations (one-commit-per-change, milestone refs, worklog updates, code style), what-needs-RFC-first list (new endpoints, schema changes, deps, protocol bumps, component swaps), build/test pointers into `README.md`, optional-dep SKIP table, submitting-changes flow, two-line CoC placeholder, license-grant policy (implicit grant under whatever license is adopted; Apache-2.0+LLVM-exception is the leading candidate), AI-assist disclosure with co-author trailer, and a where-to-ask guide.
+- `.github/PULL_REQUEST_TEMPLATE.md` (new) — checkbox-driven test plan / protocol / determinism / cost / schema / worklog / AI-assist sections. Defaults to "no protocol changes / no AI assist / N/A" so a small fix doesn't get lectured at; expands cleanly for an endpoint addition.
+- `.github/ISSUE_TEMPLATE/bug_report.yml` (new) — structured form: what-happened / what-expected / repro (JSON-RPC transcript preferred) / actual response / ldbd version / protocol version / OS dropdown / OS detail / LLDB version / compiler / target binary / notes. The repro hint pushes reporters toward `printf … | ldbd --stdio` rather than CLI invocations, matching the project's wire-shape-is-the-contract stance.
+- `README.md` — added a one-line pointer to `CONTRIBUTING.md` in the License section, where someone scanning for "how do I contribute?" will land.
+- `CLAUDE.md` — one-line note at the top pointing humans at `CONTRIBUTING.md` while keeping `CLAUDE.md` as the AI-agent doc. Both files agree on the hard requirements.
+
+**Decisions:**
+- **Hard-required vs soft-encouraged.** Pulled from `CLAUDE.md`. Hard: tests-first, ctest green, warning-clean, stdout-reserved, WHY-not-WHAT commits. Soft: one-commit-per-change, milestone refs, worklog updates, code style. The split tracks `CLAUDE.md`'s own non-negotiable / negotiable line — what would actually break the project goes on the hard list; what helps `git log` readability goes on the soft list.
+- **Worklog is soft, not hard.** Internal-agent runs are TDD-strict and worklog-strict because the worklog is how the next agent picks up; an external one-off contributor doesn't have that obligation. Encouraged ("if you closed a substantial slice"), not required.
+- **License-grant policy is implicit, not a CLA / DCO.** Adding a CLA bot is its own slice and a real friction tax; for a v0.1 single-maintainer project the implicit grant ("you agree your work will be under whatever license we adopt; Apache-2.0+LLVM-exception is the leading candidate") is enough. Captured the constraint that the eventual license will be "Apache-2.0+LLVM-exception or materially similar" so contributors aren't blindsided by a copyleft pick later.
+- **Code of Conduct is a placeholder, not a full document.** Two-line "be respectful, harassment is grounds for removal" + a note that the full CoC will be adopted before broader public exposure. Drafting a real CoC is a separate slice; shipping a stub now is better than shipping nothing.
+- **AI-assist disclosure is required, not optional.** `CLAUDE.md` already mandates the co-author trailer for internal AI work; extending the requirement to external AI-assisted PRs is the only consistent stance for an agent-first project. Framed as "disclosure helps reviewers calibrate; it is not a black mark" so it doesn't feel adversarial.
+- **PR template uses checkboxes for the per-section gates, not prose prompts.** A reviewer can scan the box state in two seconds; a prose answer takes longer and tempts hand-waving. Lifted the test/protocol/determinism/cost/schema decomposition straight from the brief because it tracks the hard requirements 1-to-1.
+- **Bug report template is structured (`.yml` form), not freeform `.md`.** GitHub renders it as a guided form; a freeform template gets ignored half the time. The repro hint tells reporters to paste a `printf … | ldbd --stdio` transcript rather than describing the CLI invocation, because the wire shape is the contract.
+- **Deferred:** feature_request and rfc issue templates, CODEOWNERS (single-maintainer at v0.1), full CoC, DCO bot, sponsor file. The brief lists these as time-permitting; bug_report alone covers the highest-value case.
+
+**Surprises / blockers:**
+- None. Doc-only slice; build dir wasn't present in the worktree but that's expected — the build is a per-checkout artifact and there are no code changes to verify against.
+
+**Verification:**
+- Doc-only. No code changes; ctest count unchanged at 40/40 (verified at the §3a merge gate, headed by commit `9ec648b`).
+- Visual review of all four files; cross-reference links between `README.md` ↔ `CONTRIBUTING.md` ↔ `CLAUDE.md` ↔ `docs/POST-V0.1-PROGRESS.md` resolve to existing paths.
+
+**Next:**
+- Tier 1 §3 is complete after this slice modulo Apple-silicon hardware sign-off (B1–B4 in `docs/POST-V0.1-PROGRESS.md`). The lead-agent run should pivot to Tier 2: §4 (DAP shim auto-generated from `describe.endpoints`) and §6 (probe recipes — promote replayable session traces to named recipes). §3b (GitHub Actions CI Linux matrix) was the other §3 leaf and is the natural complement to this slice once a maintainer is ready to wire CI to the public repo.
+- When `CONTRIBUTING.md` first sees external traffic, audit the optional-dep SKIP table against the actual test suite — anything that no longer SKIPs gracefully should be either fixed or added to the table. Same for the OS dropdown in `bug_report.yml` once we have non-Linux reporters.
+
+---
+
 ## 2026-05-06 — post-v0.1 §3a: protocol semver + hello handshake
 
 **Goal:** Wire `<major>.<minor>` protocol versioning into `hello`,
