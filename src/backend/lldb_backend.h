@@ -26,6 +26,9 @@ class LldbBackend final : public DebuggerBackend {
       find_type_layout(TargetId tid, const std::string& name) override;
   std::vector<SymbolMatch>
       find_symbols(TargetId tid, const SymbolQuery& query) override;
+  std::vector<GlobalVarMatch>
+      find_globals_of_type(TargetId tid, std::string_view type_name,
+                           bool& strict_out) override;
   std::vector<StringMatch>
       find_strings(TargetId tid, const StringQuery& query) override;
   std::vector<DisasmInsn>

@@ -89,6 +89,43 @@ enum class SymbolKind {
   kOther,      // anything else LLDB reports (labels, indirect, weak)
 };
 
+// --- Semantic queries v1 (Tier 3 §12) -----------------------------------
+//
+// `static.globals_of_type` answers "find every global variable whose
+// DWARF type is X" — a pure-DWARF semantic query, no inferior runtime
+// needed. The first tractable slice of the v0.5 roadmap entry on
+// type-keyed semantic ops; heap walks / mutex graphs / dataflow defer
+// to later versions because they need runtime introspection of glibc /
+// pthread internals.
+//
+// Type-name matching policy (documented contract):
+//   1. Try exact match on `SBValue::GetTypeName()`. If any global hits,
+//      return them with strict_out=true.
+//   2. Otherwise, fall back to substring match (plain `find`, no regex).
+//      Return matches with strict_out=false so the agent can see it
+//      relaxed.
+//
+// Canonical type form is whatever `SBValue::GetTypeName()` reports on
+// the host LLDB. On Linux LLVM 18+ this is bare struct/typedef names
+// (no `struct ` prefix), `const char *const` for the pointer-to-const-
+// char-const idiom, `int[4]` for fixed arrays. Tests pin these forms.
+struct GlobalVarMatch {
+  std::string                  name;
+  std::string                  type;          // SBValue::GetTypeName() verbatim
+  std::uint64_t                file_address = 0;  // unrelocated
+  std::optional<std::uint64_t> load_address;       // set when process attached
+  std::uint32_t                size  = 0;
+  std::string                  module;        // basename of the owning module
+  std::string                  file;          // declaration file (basename)
+  std::uint32_t                line  = 0;     // declaration line (0 if none)
+};
+
+// Cap on globals enumerated and on matches returned. Big enough that
+// real binaries (~50k globals across glibc + all loaded SO) finish in
+// hundreds of ms; small enough that a hostile request can't exhaust
+// daemon memory. See worklog Tier 3 §12 for the back-of-envelope.
+constexpr std::uint32_t kGlobalsOfTypeMaxMatches = 10000;
+
 struct SymbolQuery {
   std::string name;            // exact name match for now; glob/regex later
   SymbolKind  kind = SymbolKind::kAny;
@@ -387,6 +424,21 @@ class DebuggerBackend {
   // Throws backend::Error for invalid target_id.
   virtual std::vector<SymbolMatch>
       find_symbols(TargetId tid, const SymbolQuery& query) = 0;
+
+  // Tier 3 §12 — semantic queries v1. Find every global variable in a
+  // target whose DWARF type matches `type_name`. Empty `type_name` is
+  // an Error (the caller would otherwise dump the whole catalogue
+  // unintentionally). Sets `strict_out=true` when an exact-match pass
+  // produced the results, false when we fell back to substring match
+  // because exact returned nothing. See struct GlobalVarMatch above
+  // for the matching policy contract.
+  //
+  // Result count is capped at kGlobalsOfTypeMaxMatches; on hitting the
+  // cap the caller should treat the result as truncated. The dispatcher
+  // surfaces a `truncated` bit in the wire response.
+  virtual std::vector<GlobalVarMatch>
+      find_globals_of_type(TargetId tid, std::string_view type_name,
+                           bool& strict_out) = 0;
 
   // Enumerate ASCII strings (printable runs) inside a target's data
   // sections. Default scope is the main executable; the query can

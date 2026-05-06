@@ -15,6 +15,7 @@ set(LDB_UNIT_SOURCES
   test_protocol_view.cpp
   test_backend_type_layout.cpp
   test_backend_symbol_find.cpp
+  test_backend_globals_of_type.cpp
   test_backend_string_list.cpp
   test_backend_disasm.cpp
   test_backend_xref.cpp
