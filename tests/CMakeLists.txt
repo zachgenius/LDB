@@ -389,6 +389,20 @@ set_tests_properties(smoke_live_continue_provenance PROPERTIES
   TIMEOUT 60
 )
 
+# DAP shim end-to-end (Tier 2 §4). Spawns ldb-dap which itself spawns
+# ldbd; drives DAP requests over the shim's stdio to the sleeper
+# fixture.
+add_test(
+  NAME smoke_dap_shim
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_dap_shim.py"
+          "$<TARGET_FILE:ldb-dap>"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_dap_shim PROPERTIES
+  TIMEOUT 60
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

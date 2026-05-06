@@ -50,3 +50,37 @@ target_compile_definitions(ldbd PRIVATE
   LDB_VERSION_PATCH=${PROJECT_VERSION_PATCH}
   LDB_VERSION_STRING="${PROJECT_VERSION}"
 )
+
+# ----- ldb-dap (Tier 2 §4 — DAP shim) ---------------------------------
+#
+# Separate binary that speaks Debug Adapter Protocol on stdio and
+# spawns ldbd as a child for JSON-RPC translation. Pure protocol
+# translation — does NOT link liblldb (the daemon child is the LLDB
+# consumer).
+
+set(LDB_DAP_SOURCES
+  dap/main.cpp
+  dap/transport.cpp
+  dap/rpc_channel.cpp
+  dap/handlers.cpp
+  util/log.cpp
+)
+
+add_executable(ldb-dap ${LDB_DAP_SOURCES})
+
+target_include_directories(ldb-dap PRIVATE
+  "${CMAKE_SOURCE_DIR}/include"
+  "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_link_libraries(ldb-dap PRIVATE
+  ldb_json
+  ldb_warnings
+)
+
+target_compile_definitions(ldb-dap PRIVATE
+  LDB_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+  LDB_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  LDB_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+  LDB_VERSION_STRING="${PROJECT_VERSION}"
+)
