@@ -47,7 +47,7 @@ TEST_CASE("snapshot_for_target: target.open without process is \"none\"",
   CHECK(be->snapshot_for_target(open.target_id) == "none");
 }
 
-TEST_CASE("snapshot_for_target: live attached process reports \"live\"",
+TEST_CASE("snapshot_for_target: live attached process reports live:<gen>:<reg>:<layout>",
           "[backend][provenance][live]") {
   auto be = std::make_unique<LldbBackend>();
   auto open = be->open_executable(kSleeperPath);
@@ -58,7 +58,14 @@ TEST_CASE("snapshot_for_target: live attached process reports \"live\"",
   auto st = be->launch_process(open.target_id, opts);
   REQUIRE(st.state == ProcessState::kStopped);
 
-  CHECK(be->snapshot_for_target(open.target_id) == "live");
+  // v0.3 slice 1b: the bare "live" sentinel was replaced by the
+  // detailed shape live:<gen>:<reg_digest>:<layout_digest>. The full
+  // regex assertion lives in tests/unit/test_live_provenance.cpp; here
+  // we just check the prefix and that the compose is non-empty.
+  std::string snap = be->snapshot_for_target(open.target_id);
+  CAPTURE(snap);
+  CHECK(snap.rfind("live:", 0) == 0);
+  CHECK(snap.size() > std::string("live:").size());
 
   be->kill_process(open.target_id);
   be->close_target(open.target_id);

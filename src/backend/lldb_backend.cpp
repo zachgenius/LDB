@@ -143,6 +143,54 @@ struct LldbBreakpointCb {
   void*               baton     = nullptr;
 };
 
+// Per-target live-snapshot state for the v0.3 live-provenance model
+// (audit doc §6).
+//
+//   live:<gen>:<reg_digest>:<layout_digest>
+//
+// `gen` is a session-local monotonic counter, bumped on every observed
+// stopped→running→stopped transition AND on attach/launch (initial
+// value 0; first stop is gen=0). The digests are SHA-256 over the
+// canonicalised register state and module layout respectively. They
+// are computed lazily and cached per-`gen` so a hot loop of read-only
+// RPCs against a paused target hashes once.
+//
+// Cross-process equality in this slice is `(reg_digest, layout_digest)`
+// only — `gen` is session-local and explicitly excluded. The slice 1c
+// determinism gate is what enforces the cross-process invariant.
+struct LiveSnapshotState {
+  std::uint64_t gen           = 0;
+  std::string   reg_digest;        // 64 lowercase hex chars
+  std::string   layout_digest;     // 64 lowercase hex chars
+  bool          digests_valid = false;
+};
+
+namespace {
+
+// On every observed stopped→running→stopped transition (continue,
+// step, attach, launch), invalidate the digest cache so the next
+// snapshot_for_target recomputes against the new state. The bump is
+// what makes <gen> visible to agents without paying the digest cost
+// when nothing has changed. The caller MUST hold the impl mutex
+// guarding the LiveSnapshotState map.
+inline void bump_live_gen_locked(LiveSnapshotState& st) {
+  ++st.gen;
+  st.reg_digest.clear();
+  st.layout_digest.clear();
+  st.digests_valid = false;
+}
+
+// Reset live-state on a fresh attach / launch — wipes the previous
+// process's digest and starts gen at 0 again. mu MUST be held.
+inline void reset_live_state_locked(LiveSnapshotState& st) {
+  st.gen = 0;
+  st.reg_digest.clear();
+  st.layout_digest.clear();
+  st.digests_valid = false;
+}
+
+}  // namespace
+
 struct LldbBackend::Impl {
   lldb::SBDebugger debugger;
   std::mutex mu;
@@ -160,6 +208,10 @@ struct LldbBackend::Impl {
   // to produce the cores-only `_provenance.snapshot` value per plan §3.5.
   // Absent for targets that weren't created via load_core.
   std::unordered_map<TargetId, std::string> core_sha256;
+  // Per-target live-snapshot state. Reset on attach / launch_process,
+  // bumped by continue_process / step_thread, invalidated by
+  // detach / kill / close_target. Guarded by `mu`.
+  std::unordered_map<TargetId, LiveSnapshotState> live_state;
   std::atomic<TargetId> next_id{1};
 
   // Breakpoint callback registry. A separate mutex from `mu` so the
@@ -380,6 +432,13 @@ std::vector<Module> LldbBackend::list_modules(TargetId tid) {
     auto m = target.GetModuleAtIndex(i);
     if (m.IsValid()) out.push_back(convert_module(m));
   }
+  // Stable ordering (audit §3.3 / R4): sort by module path ascending.
+  // LLDB's load-order iteration is per-target and stable, but two
+  // attaches to the same binary can shuffle module order in the
+  // presence of dlopen / lazy module discovery. Path sort is the
+  // canonical key.
+  std::sort(out.begin(), out.end(),
+            [](const Module& a, const Module& b) { return a.path < b.path; });
   return out;
 }
 
@@ -1268,6 +1327,11 @@ ProcessStatus LldbBackend::launch_process(TargetId tid,
                 (err.GetCString() ? err.GetCString() : "unknown error"));
   }
 
+  // Fresh process → reset live snapshot state (gen=0, digests cleared).
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    reset_live_state_locked(impl_->live_state[tid]);
+  }
   return snapshot(proc);
 }
 
@@ -1308,6 +1372,12 @@ ProcessStatus LldbBackend::continue_process(TargetId tid) {
     throw Error(std::string("continue failed: ") +
                 (err.GetCString() ? err.GetCString() : "unknown"));
   }
+  // Stopped→running→stopped (LLDB is in synchronous mode, so Continue()
+  // returns only after the next stop event). Bump <gen>.
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    bump_live_gen_locked(impl_->live_state[tid]);
+  }
   return snapshot(proc);
 }
 
@@ -1334,6 +1404,13 @@ ProcessStatus LldbBackend::kill_process(TargetId tid) {
   if (err.Fail()) {
     throw Error(std::string("kill failed: ") +
                 (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  // Process gone → live state is meaningless from now until a new
+  // attach/launch. Erase the entry; snapshot_for_target will return
+  // "none".
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->live_state.erase(tid);
   }
   return snapshot(proc);
 }
@@ -1381,6 +1458,11 @@ ProcessStatus LldbBackend::attach(TargetId tid, std::int32_t pid) {
     throw Error(std::string("attach failed: ") +
                 (err.GetCString() ? err.GetCString() : "unknown"));
   }
+  // Fresh attach → reset live snapshot state (gen=0).
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    reset_live_state_locked(impl_->live_state[tid]);
+  }
   return snapshot(proc);
 }
 
@@ -1405,6 +1487,12 @@ ProcessStatus LldbBackend::detach_process(TargetId tid) {
   if (err.Fail()) {
     throw Error(std::string("detach failed: ") +
                 (err.GetCString() ? err.GetCString() : "unknown"));
+  }
+  // Detach terminates the live-snapshot identity. Subsequent
+  // snapshot_for_target calls will return "none" until a re-attach.
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->live_state.erase(tid);
   }
   return snapshot(proc);
 }
@@ -1491,6 +1579,11 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
         (void)lldb::SBProcess::GetStateFromEvent(ev);
       }
     }
+  }
+  // Fresh remote attach → reset live snapshot state.
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    reset_live_state_locked(impl_->live_state[tid]);
   }
   return snapshot(proc);
 }
@@ -1749,6 +1842,16 @@ std::vector<ThreadInfo> LldbBackend::list_threads(TargetId tid) {
     auto thr = proc.GetThreadAtIndex(i);
     if (thr.IsValid()) out.push_back(to_thread_info(thr));
   }
+  // Stable ordering (audit §3.5 / R4): sort by ascending kernel tid.
+  // The kernel hands tids out in scheduling order — that's the
+  // smallest cross-LLDB-version-stable key we have. Cross-process the
+  // tid drifts (N1), but identical-snapshot replay consults the
+  // snapshot's reg_digest so the relative ordering remains a
+  // semantically meaningful index for agents.
+  std::sort(out.begin(), out.end(),
+            [](const ThreadInfo& a, const ThreadInfo& b) {
+              return a.tid < b.tid;
+            });
   return out;
 }
 
@@ -1824,6 +1927,14 @@ ProcessStatus LldbBackend::step_thread(TargetId tid, ThreadId thread_id,
   // SBThread::Step* returns void; failures surface as the post-step
   // process state (e.g. eStateInvalid) or via the thread's stop reason.
   // Snapshot the process and let the caller examine state / stop_reason.
+  // Step is a stopped→running→stopped cycle just like continue — bump
+  // <gen> regardless of whether the step landed at a new PC. The
+  // register digest will reflect any actual state change on the next
+  // snapshot_for_target call.
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    bump_live_gen_locked(impl_->live_state[tid]);
+  }
   return snapshot(proc);
 }
 
@@ -2325,6 +2436,13 @@ LldbBackend::list_regions(TargetId tid) {
     if (const char* nm = info.GetName(); nm && *nm) r.name = nm;
     out.push_back(std::move(r));
   }
+  // Stable ordering (audit §3.7 / R4): sort by base address ascending.
+  // /proc/maps is already sorted on Linux but LLDB's enumeration on
+  // remote / non-Linux backends isn't guaranteed.
+  std::sort(out.begin(), out.end(),
+            [](const MemoryRegion& a, const MemoryRegion& b) {
+              return a.base < b.base;
+            });
   return out;
 }
 
@@ -2653,6 +2771,7 @@ void LldbBackend::close_target(TargetId tid) {
       impl_->target_resources.erase(rit);
     }
     impl_->core_sha256.erase(tid);
+    impl_->live_state.erase(tid);
   }
   // Reap any breakpoint-callback records associated with this target.
   // The target's SBBreakpoints go away with DeleteTarget; the records
@@ -2671,11 +2790,211 @@ void LldbBackend::close_target(TargetId tid) {
   while (!resources.empty()) resources.pop_back();
 }
 
+namespace {
+
+// Append a primitive value to the digest buffer in a fixed canonical
+// form. The hash input is intentionally a contiguous byte stream — no
+// separators between fields, just length-prefixed strings and
+// little-endian fixed-width integers. This locks the encoding so a
+// future LLDB change in iteration order or a register-name string
+// can't silently shift the digest.
+void hash_u64_le(util::Sha256& h, std::uint64_t v) {
+  std::uint8_t buf[8];
+  for (int i = 0; i < 8; ++i) buf[i] = static_cast<std::uint8_t>(v >> (8 * i));
+  h.update(buf, sizeof(buf));
+}
+
+void hash_lp_string(util::Sha256& h, std::string_view s) {
+  hash_u64_le(h, s.size());
+  h.update(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+}
+
+// Read a register's raw bytes via SBData. SBValue::GetData() requires a
+// valid SBExecutionContext on some LLDB releases; on others the bare
+// .GetData() works. We fall back to the textual GetValue() if the byte
+// path is unavailable, which is what list_registers does for reporting.
+std::vector<std::uint8_t> register_bytes(lldb::SBValue reg) {
+  std::vector<std::uint8_t> out;
+  if (!reg.IsValid()) return out;
+  lldb::SBError err;
+  auto data = reg.GetData();
+  if (!data.IsValid()) {
+    if (const char* sv = reg.GetValue()) {
+      out.assign(reinterpret_cast<const std::uint8_t*>(sv),
+                 reinterpret_cast<const std::uint8_t*>(sv + std::strlen(sv)));
+    }
+    return out;
+  }
+  std::size_t n = data.GetByteSize();
+  if (n == 0) return out;
+  // Cap per-register read at 1 KiB — far above any real GP register.
+  if (n > 1024) n = 1024;
+  out.resize(n);
+  data.ReadRawData(err, /*offset=*/0, out.data(), n);
+  if (err.Fail()) out.clear();
+  return out;
+}
+
+// Compute the all-thread, all-GP-register digest. Threads are sorted
+// by ascending kernel tid before hashing so the digest is invariant
+// under LLDB's iteration order. Each thread contributes
+//   <tid : u64 LE>
+//   <num_registers : u64 LE>
+//   for each register, sorted by name:
+//     <name : LP string>
+//     <byte length : u64 LE> <bytes>
+std::string compute_reg_digest(lldb::SBProcess proc) {
+  if (!proc.IsValid()) return std::string(64, '0');
+
+  struct ThreadView {
+    std::uint64_t tid = 0;
+    lldb::SBThread thr;
+  };
+  std::vector<ThreadView> tviews;
+  std::uint32_t nthreads = proc.GetNumThreads();
+  tviews.reserve(nthreads);
+  for (std::uint32_t i = 0; i < nthreads; ++i) {
+    lldb::SBThread thr = proc.GetThreadAtIndex(i);
+    if (!thr.IsValid()) continue;
+    tviews.push_back({thr.GetThreadID(), thr});
+  }
+  std::sort(tviews.begin(), tviews.end(),
+            [](const ThreadView& a, const ThreadView& b) {
+              return a.tid < b.tid;
+            });
+
+  util::Sha256 h;
+  hash_u64_le(h, tviews.size());
+  for (auto& tv : tviews) {
+    hash_u64_le(h, tv.tid);
+    auto frame = tv.thr.GetFrameAtIndex(0);
+    if (!frame.IsValid()) {
+      hash_u64_le(h, 0);  // num_registers
+      continue;
+    }
+    auto gpr_set = frame.GetRegisters().GetFirstValueByName(
+        "General Purpose Registers");
+    // Some platforms report the GPR set under a slightly different
+    // name; fall back to "Generic Purpose Registers" / "Generic
+    // Registers" / first set.
+    if (!gpr_set.IsValid()) {
+      auto sets = frame.GetRegisters();
+      if (sets.GetSize() > 0) gpr_set = sets.GetValueAtIndex(0);
+    }
+    if (!gpr_set.IsValid()) {
+      hash_u64_le(h, 0);
+      continue;
+    }
+    // Collect regs into a name-sorted vector so the digest doesn't
+    // depend on LLDB's set-internal child ordering.
+    struct RegEntry {
+      std::string name;
+      std::vector<std::uint8_t> bytes;
+    };
+    std::vector<RegEntry> regs;
+    std::uint32_t nr = gpr_set.GetNumChildren();
+    regs.reserve(nr);
+    for (std::uint32_t j = 0; j < nr; ++j) {
+      auto reg = gpr_set.GetChildAtIndex(j);
+      if (!reg.IsValid()) continue;
+      const char* nm = reg.GetName();
+      RegEntry e;
+      e.name  = nm ? nm : "";
+      e.bytes = register_bytes(reg);
+      regs.push_back(std::move(e));
+    }
+    std::sort(regs.begin(), regs.end(),
+              [](const RegEntry& a, const RegEntry& b) {
+                return a.name < b.name;
+              });
+    hash_u64_le(h, regs.size());
+    for (auto& r : regs) {
+      hash_lp_string(h, r.name);
+      hash_u64_le(h, r.bytes.size());
+      h.update(r.bytes.data(), r.bytes.size());
+    }
+  }
+  return util::sha256_hex(h.finalize());
+}
+
+// Compute the module layout digest. Modules are sorted by path
+// ascending. Each entry is
+//   <path : LP string> <load_address : u64 LE>
+// where load_address captures the post-ASLR slide. dlopen invalidates
+// this set; the per-`gen` cache is the right granularity for v0.3
+// — this slice does not yet listen for eBroadcastBitModulesLoaded
+// (deferred; see worklog).
+std::string compute_layout_digest(lldb::SBTarget target) {
+  if (!target.IsValid()) return std::string(64, '0');
+
+  struct ModEntry {
+    std::string path;
+    std::uint64_t load_address = 0;
+  };
+  std::vector<ModEntry> mods;
+  std::uint32_t n = target.GetNumModules();
+  mods.reserve(n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto m = target.GetModuleAtIndex(i);
+    if (!m.IsValid()) continue;
+    auto fs = m.GetFileSpec();
+    std::string path;
+    if (const char* p = fs.GetDirectory(); p && *p) {
+      path = std::string(p) + "/";
+    }
+    if (const char* fn = fs.GetFilename(); fn && *fn) {
+      path += fn;
+    }
+    ModEntry e;
+    e.path = std::move(path);
+    e.load_address = 0;
+    // First section's load address as the module's effective slide
+    // proxy — convert_module() uses GetObjectFileHeaderAddress() but
+    // that returns a file_addr+slide via SBSection lookup. For the
+    // digest we want a stable function of the runtime layout, so use
+    // the first non-zero section load_addr.
+    std::size_t ns = m.GetNumSections();
+    for (std::size_t s = 0; s < ns; ++s) {
+      auto sec = m.GetSectionAtIndex(s);
+      if (!sec.IsValid()) continue;
+      auto la = sec.GetLoadAddress(target);
+      if (la != LLDB_INVALID_ADDRESS) {
+        e.load_address = la;
+        break;
+      }
+    }
+    mods.push_back(std::move(e));
+  }
+  std::sort(mods.begin(), mods.end(),
+            [](const ModEntry& a, const ModEntry& b) {
+              return a.path < b.path;
+            });
+
+  util::Sha256 h;
+  hash_u64_le(h, mods.size());
+  for (auto& m : mods) {
+    hash_lp_string(h, m.path);
+    hash_u64_le(h, m.load_address);
+  }
+  return util::sha256_hex(h.finalize());
+}
+
+bool process_is_live(lldb::SBProcess proc) {
+  if (!proc.IsValid()) return false;
+  auto state = proc.GetState();
+  return state != lldb::eStateInvalid &&
+         state != lldb::eStateUnloaded &&
+         state != lldb::eStateExited &&
+         state != lldb::eStateDetached;
+}
+
+}  // namespace
+
 std::string LldbBackend::snapshot_for_target(TargetId tid) {
-  // Cores-only MVP per plan §3.5. Best-effort metadata: if anything
-  // unusual happens (target gone mid-call, SBProcess invalid) we
-  // degrade to "none" rather than throw — the dispatcher calls this on
-  // every successful response and a thrown exception would poison it.
+  // Best-effort metadata: if anything unusual happens (target gone
+  // mid-call, SBProcess invalid) we degrade to "none" rather than
+  // throw — the dispatcher calls this on every successful response and
+  // a thrown exception would poison it.
   lldb::SBTarget target;
   std::string core_hex;
   {
@@ -2696,20 +3015,40 @@ std::string LldbBackend::snapshot_for_target(TargetId tid) {
   if (!core_hex.empty()) {
     return "core:" + core_hex;
   }
-  // Live target → live process attached → "live"; otherwise (target
-  // exists but no process: e.g. target.open without launch/attach) →
-  // "none".
-  if (target.IsValid()) {
-    auto proc = target.GetProcess();
-    if (proc.IsValid()) {
-      auto state = proc.GetState();
-      if (state != lldb::eStateInvalid && state != lldb::eStateUnloaded &&
-          state != lldb::eStateExited && state != lldb::eStateDetached) {
-        return "live";
-      }
+  // Live target → "live:<gen>:<reg_digest>:<layout_digest>"; otherwise
+  // (target exists but no process: e.g. target.open without launch
+  // /attach, or process exited) → "none".
+  if (!target.IsValid()) return "none";
+  auto proc = target.GetProcess();
+  if (!process_is_live(proc)) return "none";
+
+  // Compute (or reuse cached) digests for the current `gen`. The cache
+  // is invalidated by attach / launch / continue / step / detach /
+  // close; see those entry points.
+  std::uint64_t gen = 0;
+  std::string reg_hex;
+  std::string layout_hex;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto& st = impl_->live_state[tid];  // value-init on first sight
+    if (!st.digests_valid) {
+      st.reg_digest    = compute_reg_digest(proc);
+      st.layout_digest = compute_layout_digest(target);
+      st.digests_valid = true;
     }
+    gen        = st.gen;
+    reg_hex    = st.reg_digest;
+    layout_hex = st.layout_digest;
   }
-  return "none";
+  std::string out;
+  out.reserve(5 /*"live:"*/ + 20 + 1 + 64 + 1 + 64);
+  out  = "live:";
+  out += std::to_string(gen);
+  out += ':';
+  out += reg_hex;
+  out += ':';
+  out += layout_hex;
+  return out;
 }
 
 void LldbBackend::attach_target_resource(

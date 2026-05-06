@@ -58,6 +58,7 @@ set(LDB_UNIT_SOURCES
   test_util_sha256.cpp
   test_protocol_provenance.cpp
   test_backend_provenance.cpp
+  test_live_provenance.cpp
   test_audit_bugfixes.cpp
 )
 
