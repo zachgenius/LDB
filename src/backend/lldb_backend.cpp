@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -10,6 +11,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string_view>
+#include <tuple>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -528,6 +531,14 @@ bool is_print_ascii(unsigned char c) {
 }
 
 // True if section's classified type is "data" (per our M0 classification).
+//
+// LLDB's SectionType enum is Mach-O-leaning: eSectionTypeDataCString covers
+// __TEXT/__cstring and __DATA/__cstring, but ELF .rodata (and .data.rel.ro
+// on glibc-style toolchains) is reported as eSectionTypeOther. Without a
+// name-based fallback, string.list and string.xref find nothing on Linux.
+// We accept the explicit "data"-typed cases AND named ELF read-only-data
+// sections; we deliberately do NOT accept all eSectionTypeOther sections
+// (that would scan .interp / .plt / .got / .eh_frame and produce noise).
 bool is_data_section(lldb::SBSection sec) {
   switch (sec.GetSectionType()) {
     case lldb::eSectionTypeData:
@@ -539,6 +550,14 @@ bool is_data_section(lldb::SBSection sec) {
     case lldb::eSectionTypeData16:
     case lldb::eSectionTypeDataPointers:
       return true;
+    case lldb::eSectionTypeOther: {
+      const char* nm = sec.GetName();
+      if (!nm) return false;
+      std::string_view n(nm);
+      if (n == ".rodata" || n.rfind(".rodata.", 0) == 0) return true;
+      if (n == ".data.rel.ro" || n.rfind(".data.rel.ro.", 0) == 0) return true;
+      return false;
+    }
     default:
       return false;
   }
@@ -651,12 +670,24 @@ void scan_module_for_strings(lldb::SBModule mod, lldb::SBTarget target,
     if (!sec.IsValid()) continue;
 
     if (!q.section_name.empty()) {
-      // Top-level + recursive descent finds the named section anywhere.
-      // Walk the tree depth-first; only scan the matching node (no
-      // siblings).
+      // Match by either the full hierarchical name (e.g.
+      // "__TEXT/__cstring", "PT_LOAD[2]/.rodata") or the leaf name
+      // alone (".rodata", "__cstring"). The leaf form is more
+      // ergonomic for callers and the only sensible cross-platform
+      // option, since LLDB invents segment-style parents on ELF
+      // ("PT_LOAD[N]") that callers can't reasonably know.
+      std::function<bool(lldb::SBSection)> name_matches =
+          [&](lldb::SBSection s) {
+            if (full_section_name(s) == q.section_name) return true;
+            if (const char* leaf = s.GetName();
+                leaf && q.section_name == leaf) {
+              return true;
+            }
+            return false;
+          };
       std::function<void(lldb::SBSection)> visit = [&](lldb::SBSection s) {
         if (!s.IsValid()) return;
-        if (full_section_name(s) == q.section_name) {
+        if (name_matches(s)) {
           scan_section_for_strings(s, target, q, module_path, out);
           return;
         }
@@ -819,6 +850,103 @@ bool string_references_address(const std::string& s, std::uint64_t needle) {
   return false;
 }
 
+// On x86-64 ELF, references to .rodata strings are RIP-relative:
+//   leaq 0x2e5a(%rip), %rax       (AT&T)
+//   lea  rax, [rip + 0x2e5a]      (Intel)
+//   lea  rax, [rip - 0x2e5a]
+//
+// The operand carries an offset, NOT the absolute target. The actual
+// target address is `next_insn_addr + signed_offset`, where
+// next_insn_addr is the address of the *following* instruction
+// (= insn_addr + insn_byte_size). This is the same convention x86-64
+// uses for RIP-relative addressing.
+//
+// We parse both AT&T and Intel forms because LLDB's disassembler can
+// be configured either way and we shouldn't depend on the syntax flag.
+bool rip_relative_targets(const std::string& operands,
+                          std::uint64_t insn_addr,
+                          std::uint32_t insn_byte_size,
+                          std::uint64_t needle) {
+  if (operands.empty()) return false;
+  if (operands.find("rip") == std::string::npos &&
+      operands.find("RIP") == std::string::npos) {
+    return false;
+  }
+
+  const std::uint64_t next_addr = insn_addr + insn_byte_size;
+
+  // Parse a hex offset starting at position `pos` (the '0x'). Returns
+  // {found, value, end_pos}.
+  auto parse_hex = [&](size_t pos) -> std::tuple<bool, std::uint64_t, size_t> {
+    if (pos + 2 > operands.size()) return {false, 0, pos};
+    if (operands[pos] != '0' ||
+        (operands[pos + 1] != 'x' && operands[pos + 1] != 'X'))
+      return {false, 0, pos};
+    size_t hs = pos + 2;
+    std::uint64_t value = 0;
+    size_t digits = 0;
+    while (hs < operands.size() && digits < 16) {
+      char c = operands[hs];
+      unsigned int d;
+      if (c >= '0' && c <= '9')      d = static_cast<unsigned int>(c - '0');
+      else if (c >= 'a' && c <= 'f') d = static_cast<unsigned int>(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') d = static_cast<unsigned int>(c - 'A' + 10);
+      else                            break;
+      value = (value << 4) | d;
+      ++hs;
+      ++digits;
+    }
+    if (digits == 0) return {false, 0, pos + 2};
+    return {true, value, hs};
+  };
+
+  // AT&T:  "...0xOFFSET(%rip)..."  or  "...-0xOFFSET(%rip)..."
+  // Look for "%rip" or "(rip" or "(%rip" — the rip token.
+  size_t i = 0;
+  while (i < operands.size()) {
+    size_t hex_pos = std::string::npos;
+    {
+      size_t a = operands.find("0x", i);
+      size_t b = operands.find("0X", i);
+      if (b != std::string::npos && (a == std::string::npos || b < a)) a = b;
+      hex_pos = a;
+    }
+    if (hex_pos == std::string::npos) break;
+
+    bool negative = false;
+    if (hex_pos > 0 && operands[hex_pos - 1] == '-') {
+      negative = true;
+    }
+
+    auto [ok, value, end] = parse_hex(hex_pos);
+    if (!ok) { i = hex_pos + 2; continue; }
+
+    // Look ahead from `end` for either "(%rip)" / "(rip)" (AT&T) or
+    // back to find a "[rip" / "[ rip" pattern (Intel) within reasonable
+    // window. Simplest: accept if "rip" appears anywhere within ~16
+    // chars after `end`, or before `hex_pos` for Intel form.
+    auto window_has_rip = [&](size_t start, size_t len) {
+      size_t lim = std::min(operands.size(), start + len);
+      std::string_view chunk(operands.data() + start, lim - start);
+      return chunk.find("rip") != std::string_view::npos ||
+             chunk.find("RIP") != std::string_view::npos;
+    };
+    bool is_rip_relative =
+        window_has_rip(end, 16) ||
+        (hex_pos >= 8 && window_has_rip(hex_pos - 8, 8));
+
+    if (is_rip_relative) {
+      std::int64_t off = static_cast<std::int64_t>(value);
+      if (negative) off = -off;
+      std::uint64_t resolved = next_addr + static_cast<std::uint64_t>(off);
+      if (resolved == needle) return true;
+    }
+
+    i = std::max(hex_pos + 1, end);
+  }
+  return false;
+}
+
 std::string function_name_at(lldb::SBTarget target, lldb::SBAddress addr) {
   if (!addr.IsValid()) return {};
   auto sc = target.ResolveSymbolContextForAddress(
@@ -868,7 +996,9 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
         auto insns = disassemble_range(tid, start, start + size);
         for (const auto& i : insns) {
           if (string_references_address(i.operands, target_addr) ||
-              string_references_address(i.comment,  target_addr)) {
+              string_references_address(i.comment,  target_addr) ||
+              rip_relative_targets(i.operands, i.address, i.byte_size,
+                                    target_addr)) {
             XrefMatch m;
             m.address   = i.address;
             m.byte_size = i.byte_size;
@@ -1291,10 +1421,33 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
                 (err.GetCString() ? err.GetCString() : "unknown"));
   }
 
-  // ConnectRemote may return with the process in eStateConnected (which
-  // map_state coerces to kRunning); some plugins immediately report
-  // stopped. Either is a valid post-connect state. The caller can pump
-  // get_process_state / list_threads to discover more.
+  // ConnectRemote returns with proc.GetState() == eStateInvalid on
+  // gdb-remote-protocol servers (lldb-server gdbserver, gdbserver,
+  // debugserver) because the initial stop notification arrives as an
+  // event on the shared listener — SBProcess won't update its cached
+  // state until the event is dequeued. Pump the listener until we see
+  // a real state or a deadline expires. Without this every caller
+  // would have to call get_process_state in a loop themselves.
+  {
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::seconds(2);
+    while (clock::now() < deadline) {
+      auto st = proc.GetState();
+      if (st != lldb::eStateInvalid &&
+          st != lldb::eStateUnloaded &&
+          st != lldb::eStateConnected) {
+        break;
+      }
+      lldb::SBEvent ev;
+      // 100ms blocking wait; if the server is reachable the initial
+      // stop event arrives within a few ms.
+      listener.WaitForEvent(/*num_seconds=*/1u, ev);
+      if (ev.IsValid() && lldb::SBProcess::EventIsProcessEvent(ev)) {
+        // Apply the event so SBProcess reflects it.
+        (void)lldb::SBProcess::GetStateFromEvent(ev);
+      }
+    }
+  }
   return snapshot(proc);
 }
 
