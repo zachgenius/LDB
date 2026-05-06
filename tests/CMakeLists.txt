@@ -310,6 +310,15 @@ set_tests_properties(smoke_describe_endpoints PROPERTIES
   TIMEOUT 15
 )
 
+add_test(
+  NAME smoke_ldbpack
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_ldbpack.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_ldbpack PROPERTIES
+  TIMEOUT 30
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)
 

@@ -321,6 +321,135 @@ struct SessionExport {
   throw backend::Error("pack: sqlite open: " + p.string());
 }
 
+// Build a fresh, coherent per-session sqlite db (in a temp file) from
+// an existing SessionExport's rows. Returns the file's bytes. We do
+// this on the export side so the bytes shipped in the tar are a clean
+// non-WAL snapshot — the live source db may have its newest rows still
+// sitting in `<id>.db-wal`, and copying just `<id>.db` would miss them.
+std::vector<std::uint8_t>
+materialize_session_db(const SessionExport& src,
+                       std::string_view name) {
+  namespace fs = std::filesystem;
+  fs::path tmp = fs::temp_directory_path() /
+      ("ldbpack_export_" + std::string(name) + "_" +
+       std::to_string(static_cast<std::uint64_t>(
+           std::chrono::system_clock::now().time_since_epoch().count()))
+       + ".db");
+
+  sqlite3* db = nullptr;
+  int rc = sqlite3_open(tmp.c_str(), &db);
+  if (rc != SQLITE_OK) {
+    if (db) sqlite3_close(db);
+    std::error_code ignore;
+    fs::remove(tmp, ignore);
+    throw backend::Error("pack: sqlite open " + tmp.string());
+  }
+
+  auto exec = [&](const char* sql) {
+    char* err = nullptr;
+    int r = sqlite3_exec(db, sql, nullptr, nullptr, &err);
+    if (r != SQLITE_OK) {
+      std::string m = "pack: sqlite exec: ";
+      m.append(err ? err : sqlite3_errmsg(db));
+      sqlite3_free(err);
+      sqlite3_close(db);
+      std::error_code ignore;
+      fs::remove(tmp, ignore);
+      throw backend::Error(m);
+    }
+  };
+
+  // Use rollback journal mode (default) — we want a single-file db,
+  // not a WAL pair, and the destination won't be written to after this.
+  exec("PRAGMA journal_mode=DELETE;");
+  exec("PRAGMA synchronous=NORMAL;");
+  exec(
+    "CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);"
+    "CREATE TABLE rpc_log("
+    "  seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  ts_ns INTEGER NOT NULL,"
+    "  method TEXT NOT NULL,"
+    "  request TEXT NOT NULL,"
+    "  response TEXT NOT NULL,"
+    "  ok INTEGER NOT NULL,"
+    "  duration_us INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX idx_rpc_method ON rpc_log(method);"
+  );
+
+  auto put_meta = [&](const char* k, const std::string& v) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2);",
+            -1, &stmt, nullptr) != SQLITE_OK) {
+      sqlite3_close(db);
+      std::error_code ignore;
+      fs::remove(tmp, ignore);
+      throw backend::Error("pack: prepare meta insert");
+    }
+    sqlite3_bind_text(stmt, 1, k, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, v.c_str(), static_cast<int>(v.size()),
+                      SQLITE_TRANSIENT);
+    int r = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (r != SQLITE_DONE) {
+      sqlite3_close(db);
+      std::error_code ignore;
+      fs::remove(tmp, ignore);
+      throw backend::Error("pack: meta insert failed");
+    }
+  };
+  put_meta("schema_version", "1");
+  put_meta("name", src.name);
+  put_meta("created_at", std::to_string(src.created_at));
+  if (src.target_id.has_value()) put_meta("target_id", *src.target_id);
+
+  if (!src.rows.empty()) {
+    exec("BEGIN IMMEDIATE;");
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db,
+        "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
+        "                    duration_us) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6);", -1, &stmt, nullptr) != SQLITE_OK) {
+      sqlite3_close(db);
+      std::error_code ignore;
+      fs::remove(tmp, ignore);
+      throw backend::Error("pack: prepare rpc_log insert");
+    }
+    for (const auto& r : src.rows) {
+      sqlite3_reset(stmt);
+      sqlite3_clear_bindings(stmt);
+      sqlite3_bind_int64(stmt, 1, r.ts_ns);
+      sqlite3_bind_text (stmt, 2, r.method.c_str(),
+                         static_cast<int>(r.method.size()),
+                         SQLITE_TRANSIENT);
+      sqlite3_bind_text (stmt, 3, r.request_json.c_str(),
+                         static_cast<int>(r.request_json.size()),
+                         SQLITE_TRANSIENT);
+      sqlite3_bind_text (stmt, 4, r.response_json.c_str(),
+                         static_cast<int>(r.response_json.size()),
+                         SQLITE_TRANSIENT);
+      sqlite3_bind_int  (stmt, 5, r.ok ? 1 : 0);
+      sqlite3_bind_int64(stmt, 6, r.duration_us);
+      if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        std::error_code ignore;
+        fs::remove(tmp, ignore);
+        throw backend::Error("pack: rpc_log insert failed");
+      }
+    }
+    sqlite3_finalize(stmt);
+    exec("COMMIT;");
+  }
+
+  sqlite3_close(db);
+  auto bytes = read_file_all(tmp);
+  std::error_code ignore;
+  fs::remove(tmp, ignore);
+  return bytes;
+}
+
 SessionExport read_session_db(const std::filesystem::path& dbpath) {
   SessionExport out;
   sqlite3* db = nullptr;
@@ -650,10 +779,23 @@ PackResult pack_session(SessionStore& sessions,
   std::vector<TarEntry> tar;
   auto manifest = make_manifest_skeleton();
 
-  // session db + meta sidecar.
+  // session db + meta sidecar. Read the rows via sqlite read-only,
+  // then materialize a clean non-WAL .db in a temp file and ship those
+  // bytes — copying the live <id>.db verbatim would miss committed
+  // rows still sitting in <id>.db-wal.
+  auto src = read_session_db(info->path);
+  // Source's metadata wins for the in-pack copy; the index data lives
+  // outside the per-session db and is only relevant for the index row
+  // we stash in the manifest.
+  if (src.name.empty()) src.name = info->name;
+  if (!src.target_id.has_value() && info->target_id.has_value()) {
+    src.target_id = info->target_id;
+  }
+  if (src.created_at == 0) src.created_at = info->created_at;
+  auto db_bytes = materialize_session_db(src, info->id);
+
   std::string db_name = "sessions/" + info->id + ".db";
   std::string mt_name = "sessions/" + info->id + ".meta.json";
-  auto db_bytes = read_file_all(info->path);
 
   TarEntry db_entry;
   db_entry.name  = db_name;
