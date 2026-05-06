@@ -4,6 +4,36 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §13: rr integration via rr:// URL scheme (Tier 4)
+
+**Goal:** `target.connect_remote` with an `rr://` URL spawns `rr replay` and tunnels its gdb-remote-protocol port back to LLDB's gdb-remote client. Reverse execution falls out from the LLDB client side — the daemon doesn't need its own reverse-exec endpoints. Roadmap framing (`docs/03-ldb-full-roadmap.md` Track B): "rr is just another `target.connect_remote` URL."
+
+**Done:**
+- `src/transport/rr.{h,cpp}` — `parse_rr_url` (strict: absolute trace dir required, only `port=N` query, unknown query keys throw), `find_rr_binary` (LDB_RR_BIN → /usr/bin/rr → /usr/local/bin/rr → `command -v rr` on PATH), `pick_ephemeral_port_local` (bind 0 → getsockname → close), and `RrReplayProcess` long-lived RAII wrapper that spawns `rr replay --dbgport=<port> -k <trace_dir>` with stdout pinned to /dev/null. Same teardown discipline as `SshTunneledCommand`: SIGTERM → 250 ms grace → SIGKILL. Stderr captured (64 KiB cap) for the diagnostic when the gdb-remote port never opens. 12 unit cases in `tests/unit/test_rr_url_parser.cpp`. Commit `6a2adf8`.
+- `src/backend/lldb_backend.cpp::connect_remote_target` — URL-scheme dispatch: if `url` starts with `rr://`, parse → discover → spawn → rewrite to `connect://127.0.0.1:<port>` → fall through to existing `SBTarget::ConnectRemote`. The `RrReplayProcess` is bound to the target's lifetime via `attach_target_resource` after a successful connect, so `close_target` SIGTERMs it via the resource dtor. If `ConnectRemote` throws, the local `unique_ptr` dtor reaps the rr child on the way out — no leaks. 4 unit cases in `tests/unit/test_backend_connect_remote_rr.cpp` (2 always-on, 2 gated on `requires_rr`). Smoke `tests/smoke/test_connect_rr.py` SKIPs cleanly when rr is missing. Commit (this).
+- `src/daemon/dispatcher.cpp` — `target.connect_remote` description amended to mention `rr://<absolute-trace-dir>[?port=N]` and reverse-execution semantics. `describe.endpoints` reflects it.
+
+**Decisions:**
+- **URL syntax:** `rr://<absolute-trace-dir>[?port=N]`. Absolute path is required (not "accepted") — relative paths surface as a sharp parse error rather than a downstream "trace not found." Only `port=N` is a recognized query key; unknown keys throw to avoid silently swallowing typos. RFC 3986 says `rr://relative/path` parses as authority=`relative`, path=`/path`; we explicitly refuse that ambiguity.
+- **Port pick policy:** if `?port=N` is provided, use it. Otherwise bind 127.0.0.1:0, getsockname, close, hand the port to rr. Same TOCTOU race as ssh's `pick_remote_free_port` (another process can grab the port between close and rr's bind); acceptable for MVP, rr will fail loudly on EADDRINUSE.
+- **rr discovery order:** `LDB_RR_BIN` env override (so the test can stub it / the operator can pin a non-distro build) → `/usr/bin/rr` → `/usr/local/bin/rr` → `command -v rr` on PATH. The well-known absolute paths are checked before PATH so a sandboxed PATH doesn't shadow a distro install.
+- **rr CLI flag:** `--dbgport=<port>` (the canonical rr flag for "open gdb-remote on this port"). Confirmed via `rr replay --help` reference in upstream docs. Not `--debugger-port=`.
+- **`-k`** ("keep-alive on debugger detach") added so the rr child doesn't unilaterally exit if the LLDB client briefly disconnects during ConnectRemote handshake. The daemon owns the rr lifetime via `attach_target_resource`; -k just avoids racy mid-handshake teardown.
+- **Reverse-execution endpoint surface:** DEFERRED. LLDB SBAPI does NOT expose `Reverse*` methods on `SBProcess` / `SBThread` (verified by grep against /opt/llvm-22 headers). The gdb-remote client may understand `bs`/`bc` packets internally for the LLDB CLI's `process continue --reverse`, but exposing reverse-step / reverse-continue at our protocol level would require either subclassing or gdb-remote-packet poking — neither is "a few lines." Per scope, defer. Agents using LDB+rr today get reverse semantics via the LLDB `process continue --reverse` CLI path or by talking gdb-remote directly.
+- **No new endpoint.** `target.connect_rr` was rejected in favor of URL-scheme dispatch on `target.connect_remote`. Agents who learn `target.connect_remote` get rr support automatically; the URL is the discriminator.
+
+**Surprises / blockers:**
+- **rr not installed on this Pop!_OS box.** Apt is unusable per the project's standing constraint (XRT pin); the standard install path here is manual deb extraction. The live unit case and the live smoke case both SKIP cleanly. Coverage on this box: 14 unit cases pass (URL parser, discovery, three of four backend cases), 2 unit cases SKIP (`requires_rr`), smoke SKIPs with a logged reason.
+- **CMake plumbing:** had to add `transport/rr.cpp` to BOTH `src/CMakeLists.txt` (the `ldbd` link) and `tests/unit/CMakeLists.txt` (`LDB_LIB_SOURCES` for the unit-test exe — no shared static lib yet, both targets link sources directly).
+
+**Verification:** ctest 49/49 PASS on this worktree (`worktree-agent-af93b6e305656933d`), ~33.6 s wall clock. Was 48/48 at master HEAD `d892d49`; +1 is `smoke_connect_rr`. Build first-party warning-clean. The live rr cases ran SKIP (rr not installed) — see "Surprises" above.
+
+**Sibling slice:** §14 non-stop (parallel agent).
+
+**Deferred:** `process.reverse_continue` / `process.reverse_step` (LLDB SBAPI gap — not a few lines), `rr record` orchestration (out of scope; the agent records out-of-band), multi-trace-per-target, bookmarks beyond what gdb-remote offers natively.
+
+---
+
 ## 2026-05-07 — post-v0.1 §12: semantic queries v1, scoped to static.globals_of_type (Tier 3)
 
 **Goal:** Ship one semantic query — globals filtered by type — using DWARF + SBValue introspection. heap walk, mutex graph, dataflow queries deferred to v0.5+ per the roadmap.

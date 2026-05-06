@@ -20,6 +20,7 @@ set(LDBD_SOURCES
   transport/ssh.cpp
   transport/local_exec.cpp
   transport/streaming_exec.cpp
+  transport/rr.cpp
   observers/proc.cpp
   observers/net_sockets.cpp
   observers/net_tcpdump.cpp

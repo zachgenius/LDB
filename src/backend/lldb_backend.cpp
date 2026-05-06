@@ -1,5 +1,6 @@
 #include "backend/lldb_backend.h"
 
+#include "transport/rr.h"
 #include "transport/ssh.h"
 
 #include <algorithm>
@@ -1671,6 +1672,39 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
     }
   }
 
+  // rr:// URL-scheme dispatch (Tier 4 §13). Per the roadmap, "Reverse
+  // execution via rr is just another `target.connect_remote` URL."
+  // Parse the rr:// URL, locate the rr binary, spawn `rr replay` on a
+  // free port, then rewrite `url` to a local connect:// pointing at
+  // the replay's gdb-remote port. The rr replay subprocess is bound
+  // to the target's lifetime via attach_target_resource so close_target
+  // tears it down (SIGTERM → SIGKILL after 250 ms).
+  std::string effective_url = url;
+  std::unique_ptr<transport::RrReplayProcess> rr_replay;
+  if (url.size() >= 5 && url.compare(0, 5, "rr://") == 0) {
+    transport::RrUrl parsed = transport::parse_rr_url(url);
+
+    std::string rr_bin = transport::find_rr_binary();
+    if (rr_bin.empty()) {
+      throw Error(
+          "rr not installed (no $LDB_RR_BIN, no /usr/bin/rr, no "
+          "/usr/local/bin/rr, not on PATH); install via your distro "
+          "or grab a static binary from https://rr-project.org");
+    }
+
+    std::uint16_t port = parsed.port.value_or(0);
+    if (port == 0) {
+      port = transport::pick_ephemeral_port_local();
+    }
+
+    // Spawn rr replay; the ctor blocks until the gdb-remote port is
+    // accepting connections (or rr exits / setup_timeout elapses).
+    rr_replay = std::make_unique<transport::RrReplayProcess>(
+        rr_bin, parsed.trace_dir, port);
+
+    effective_url = "connect://127.0.0.1:" + std::to_string(port);
+  }
+
   // Default plugin is gdb-remote, which handles lldb-server, gdbserver,
   // debugserver, qemu-gdbstub, and friends. Empty plugin_name → default.
   const char* plugin = plugin_name.empty() ? "gdb-remote" : plugin_name.c_str();
@@ -1688,7 +1722,7 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
 
   lldb::SBListener listener = impl_->debugger.GetListener();
   lldb::SBError err;
-  auto proc = target.ConnectRemote(listener, url.c_str(), plugin, err);
+  auto proc = target.ConnectRemote(listener, effective_url.c_str(), plugin, err);
 
   if (saved_stdout >= 0) {
     ::dup2(saved_stdout, STDOUT_FILENO);
@@ -1733,6 +1767,21 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
     reset_live_state_locked(impl_->live_state[tid]);
   }
   subscribe_modules_loaded(impl_->module_listener, target);
+
+  // Bind the rr replay subprocess (if any) to the target's lifetime.
+  // Done AFTER ConnectRemote succeeds — if ConnectRemote throws, the
+  // rr_replay unique_ptr's dtor SIGTERMs the child on the way out, so
+  // we never leak. close_target → resource dtor on success.
+  if (rr_replay) {
+    struct RrReplayResource final : DebuggerBackend::TargetResource {
+      explicit RrReplayResource(std::unique_ptr<transport::RrReplayProcess> p)
+          : replay(std::move(p)) {}
+      std::unique_ptr<transport::RrReplayProcess> replay;
+    };
+    attach_target_resource(
+        tid, std::make_unique<RrReplayResource>(std::move(rr_replay)));
+  }
+
   return snapshot(proc);
 }
 

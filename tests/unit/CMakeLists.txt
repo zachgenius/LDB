@@ -53,6 +53,7 @@ set(LDB_UNIT_SOURCES
   test_transport_ssh_tunneled.cpp
   test_backend_connect_remote_ssh.cpp
   test_rr_url_parser.cpp
+  test_backend_connect_remote_rr.cpp
   test_observers_parsers.cpp
   test_observers_live.cpp
   test_streaming_exec.cpp

@@ -759,11 +759,15 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   add("target.connect_remote",
       "Connect to a remote debug server (lldb-server, gdbserver, "
       "debugserver, qemu-gdbstub) over its gdb-remote-protocol "
-      "endpoint. URL forms accepted: \"connect://host:port\" or "
-      "\"host:port\". plugin defaults to \"gdb-remote\".",
+      "endpoint. URL forms accepted: \"connect://host:port\", "
+      "\"host:port\", or \"rr://<absolute-trace-dir>[?port=N]\" — "
+      "the rr:// form spawns `rr replay` against the trace and "
+      "tunnels to its gdb-remote port, giving the LLDB client "
+      "reverse-execution semantics. plugin defaults to \"gdb-remote\".",
       obj({
           {"target_id", target_id_param()},
-          {"url",       str("connect://host:port or host:port.")},
+          {"url",       str("connect://host:port, host:port, or "
+                            "rr://<trace-dir>[?port=N].")},
           {"plugin",    str("gdb-remote (default), kdp-remote, etc.")},
       }, {"target_id", "url"}),
       obj({
