@@ -143,6 +143,45 @@ TEST_CASE("describe.endpoints returns the catalog with new schema shape",
   }
 }
 
+TEST_CASE("describe.endpoints schema for hello documents handshake",
+          "[describe][schema][hello]") {
+  auto be = std::make_shared<ldb::backend::LldbBackend>();
+  ldb::daemon::Dispatcher d{be};
+  auto resp = d.dispatch(make_req("describe.endpoints"));
+  REQUIRE(resp.ok);
+  const auto e = find_endpoint(resp.data["endpoints"], "hello");
+
+  // params_schema: optional `protocol_min` string of form major.minor.
+  const auto& ps = e["params_schema"];
+  REQUIRE(ps["type"] == "object");
+  REQUIRE(ps["properties"].contains("protocol_min"));
+  const auto& pm = ps["properties"]["protocol_min"];
+  REQUIRE(pm["type"] == "string");
+  REQUIRE(pm.contains("pattern"));
+  REQUIRE(pm["pattern"].get<std::string>() == "^[0-9]+\\.[0-9]+$");
+  // protocol_min is optional: must NOT appear in required.
+  if (ps.contains("required")) {
+    for (const auto& k : ps["required"]) {
+      REQUIRE(k.get<std::string>() != "protocol_min");
+    }
+  }
+
+  // returns_schema: protocol object with version/major/minor/min_supported.
+  const auto& rs = e["returns_schema"];
+  REQUIRE(rs["type"] == "object");
+  REQUIRE(rs["properties"].contains("protocol"));
+  const auto& proto = rs["properties"]["protocol"];
+  REQUIRE(proto["type"] == "object");
+  REQUIRE(proto["properties"].contains("version"));
+  REQUIRE(proto["properties"].contains("major"));
+  REQUIRE(proto["properties"].contains("minor"));
+  REQUIRE(proto["properties"].contains("min_supported"));
+  REQUIRE(proto["properties"]["version"]["type"] == "string");
+  REQUIRE(proto["properties"]["major"]["type"] == "integer");
+  REQUIRE(proto["properties"]["minor"]["type"] == "integer");
+  REQUIRE(proto["properties"]["min_supported"]["type"] == "string");
+}
+
 TEST_CASE("describe.endpoints schema for target.open names path as required",
           "[describe][schema][target]") {
   auto be = std::make_shared<ldb::backend::LldbBackend>();

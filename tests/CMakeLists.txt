@@ -311,6 +311,15 @@ set_tests_properties(smoke_describe_endpoints PROPERTIES
 )
 
 add_test(
+  NAME smoke_hello_handshake
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_hello_handshake.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_hello_handshake PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_ldb_cli
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_ldb_cli.py"
           "$<TARGET_FILE:ldbd>"

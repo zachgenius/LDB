@@ -4,6 +4,49 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 — post-v0.1 §3a: protocol semver + hello handshake
+
+**Goal:** Wire `<major>.<minor>` protocol versioning into `hello`,
+accept `protocol_min` from clients, return mismatch errors as
+`-32011 kProtocolVersionMismatch`. Document the policy.
+
+**Done:**
+- `src/protocol/version.{h,cpp}` (commit `fcfdf30`): `kProtocolVersionMajor/Minor`, `kProtocolVersionString = "0.1"`, `kProtocolMinSupported{Major,Minor}`, `ProtocolVersion` POD with comparators, strict `parse_protocol_version` (`^[0-9]+\.[0-9]+$`). New `ErrorCode::kProtocolVersionMismatch = -32011` in `jsonrpc.h`.
+- `tests/unit/test_protocol_version.cpp` (commit `fcfdf30`): 6 cases / 39 assertions covering string<->major.minor consistency, min_supported invariants, parser happy/sad paths, comparator correctness, error code value.
+- `src/daemon/dispatcher.cpp::handle_hello` (commit `3d38d4b`): accepts optional `params.protocol_min`. Returns `data.protocol = {version, major, minor, min_supported}`. Mismatch on `requested > current` → `-32011`. Malformed string OR non-string → `-32602`. Error message names both sides ("client requires protocol >= X.Y; daemon is A.B").
+- `describe.endpoints` schema for `hello` (commit `3d38d4b`): params now declare optional `protocol_min` with the `^[0-9]+\.[0-9]+$` pattern. Returns `protocol` is now a closed object (was `obj_open()`) with `version/major/minor/min_supported` all required.
+- `tests/unit/test_dispatcher_hello.cpp` (commit `3d38d4b`): 9 cases — no-params baseline, equal/lower/higher floors, malformed string, numeric type, empty string, plus a doc-pinning case for the floor-vs-min_supported semantics.
+- `tests/unit/test_describe_endpoints_schema.cpp` (commit `3d38d4b`): new `[describe][schema][hello]` case asserting params + returns shape for hello.
+- `tests/smoke/test_hello_handshake.py` (commit `3d38d4b`): end-to-end via JSON-RPC against `ldbd --stdio`. Reads daemon's own current/min_supported from a baseline `hello` so the test stays correct as constants move.
+- `docs/05-protocol-versioning.md` (this commit): codifies the policy — version format, bump rules (no patch on protocol; minor = backward-compat addition; major = breaking), pre-1.0 caveat, the `daemon_current >= protocol_min` satisfy rule, and the deferred items (`protocol_max`, server-pushed migration hints, multi-minor daemon).
+
+**Decisions:**
+- **Start at `0.1`, not `1.0`.** Pre-stable; matches the daemon's v0.1 tag. Roadmap §4 explicitly allows pre-1.0 minor bumps to be breaking; documented in `05-protocol-versioning.md §2`.
+- **`min_supported` equals current minor for MVP.** Pinned in the constants. We ship exactly one minor; there is no compat code to maintain. A future daemon that keeps backward-compat code for older minors lowers it. The constant lives in the same header as the current version so the invariant is one-edit-away.
+- **`min_supported` is informational, not part of the satisfy check.** The negotiation rule is just `daemon_current >= protocol_min`. A client floor below ours is always satisfied because there's no shape difference to "forget" — `0.0` is a sentinel meaning "anything works." This resolves the contradiction in the brief between the bullet rule and the restated test cases (`protocol_min: "0.0"` → ok). Documented in `05-protocol-versioning.md §3`.
+- **`protocol_max` deferred.** Useful only when a multi-minor daemon exists; out of scope for MVP. Listed in `§3 What's deferred`.
+- **CLI not touched.** `tools/ldb/ldb` is schema-driven from `describe.endpoints`, so it picks up the new param automatically. No hand-edits needed.
+- **No new error code beyond `-32011`.** Malformed `protocol_min` is `-32602 kInvalidParams` (the param was syntactically wrong) — distinct from `-32011 kProtocolVersionMismatch` (the param was well-formed but the requested version isn't servable). The brief explicitly carves this distinction.
+- **Old `ldb::kProtocolMajor/Minor` constants in `include/ldb/version.h` retained.** They're referenced by `src/main.cpp` (the `--version` output, etc.) and the dispatcher's `kVersionString`. The new `ldb::protocol::kProtocolVersion*` are the canonical wire-protocol constants; the old ones live for daemon-build metadata. Keeping both avoids a sweeping rename for one slice; convergence can come later when an actual divergence exists.
+
+**Surprises / blockers:**
+- **The brief's negotiation rule contradicted itself.** The bullet "If client requires `(major, minor) < (0, kProtocolMinSupportedMinor)` → -32011" plus the restated tests "`protocol_min: 0.0` → ok (0.1 >= 0.0)" can't both hold when `min_supported = 0.1`. The "WAIT — re-read the contract" passage and the explicit test list make it clear the second rule (just `current >= protocol_min`) is canonical. Implemented and documented accordingly.
+- **`protocol_min` semantics** worth explaining for future readers: it's the client's FLOOR (lowest version it'll talk to), not a target version. So `protocol_min = "0.0"` means "I'll accept any daemon at 0.0 or higher" — which a 0.1 daemon trivially satisfies. The policy doc captures this in §3.
+- **Initial Edit-tool path mishap.** First Edit on `tests/unit/CMakeLists.txt` went to master, not the worktree, because I had previously Read the master path. Caught immediately on `git status`; reverted via `git checkout` + `rm` of the leaked file in master. From then on every absolute path was prefixed with `/home/zach/Develop/LDB/.claude/worktrees/agent-a7041ead1a14a3982/`. Final master tree is clean.
+
+**Verification:**
+- `cmake --build build && ctest --test-dir build --output-on-failure` → **40/40 PASS in ~31s** at HEAD `3d38d4b`. Baseline was 39/39; +1 = `smoke_hello_handshake`. Build warning-clean under GCC 13.3.0 + LLVM 22.1.5 prebuilt + the project's `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion` flags.
+- Hello-only filter: `ldb_unit_tests "[hello]"` → 9 cases / 26 assertions all pass.
+- Version-only filter: `ldb_unit_tests "[protocol][version]"` → 6 cases / 39 assertions all pass.
+- Round-trip via `ldbd --stdio`: `hello {protocol_min: "0.0"}` → ok with full protocol block; `hello {protocol_min: "0.2"}` → `{"error":{"code":-32011,"message":"client requires protocol >= 0.2; daemon is 0.1"}}`.
+
+**Next:**
+- §3b — GitHub Actions CI (Linux matrix). The workflow needs to: install LLVM (or fetch a prebuilt), `cmake -B build -G Ninja -DLDB_LLDB_ROOT=...`, build, ctest. macOS can wait for hardware sign-off (see Tier 1 §2 blockers).
+- §3c — `CONTRIBUTING.md` + commit-style guide + PR template. Pull from `CLAUDE.md`'s "Commits" section and the workflow rules.
+- (Reminder for future §3a follow-up): when the daemon's protocol version actually moves past `0.1`, audit every endpoint's response shape and decide if the bump should be minor (additive) or major (breaking). Update `05-protocol-versioning.md §2` with a concrete example each time.
+
+---
+
 ## 2026-05-06 — post-v0.1 Tier 1 §2: macOS arm64 hardening — Linux-side audit
 
 **Goal:** Audit every macOS-specific code path in the codebase for consistency, classify each into PR1 (Mac-specific code), PR2 (cross-platform branching on macOS), PR3 (doc reference only), or PR4 (recent Linux-targeted change with possible Mach-O regression risk). Document the validation gap honestly. Do NOT promote Tier 1 §2 to first-class — that requires real macOS arm64 hardware.
