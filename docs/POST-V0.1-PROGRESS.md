@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-1b-merge) |
-| **ctest at HEAD** | 36/36 green |
+| **HEAD now** | (updated post-1c-merge — Tier 1 §1 complete) |
+| **ctest at HEAD** | 39/39 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -29,7 +29,7 @@
 |---|---|---|---|---|---|
 | 1a | Live provenance — endpoint determinism audit | ✅ | `a05ab0000ec0248b1` | (inline review) | — |
 | 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | ✅ | `a1da55c9959d40268` | `a379567ea90e9472a` | (merge commit on master) |
-| 1c | Live provenance — CI determinism gate extended to live targets | — | — | — | — |
+| 1c | Live provenance — CI determinism gate extended to live targets | ✅ | `a715e629b235a9434` | `afc1d3706a3b11696` | (merge commit on master) |
 | 2 | macOS arm64 hardening pass (Linux-side fixes; macOS sign-off deferred to user) | — | — | — | — |
 | 3a | Public release polish — protocol semver + version handshake in `hello` | — | — | — | — |
 | 3b | Public release polish — GitHub Actions CI (Linux matrix) | — | — | — | — |
@@ -73,6 +73,14 @@
 ## Blockers / decisions surfaced for user
 
 _(none so far)_
+
+## 1c reviewer findings (tracked, none blocking)
+
+1. **Single-daemon dlopen-during-continue smoke deferred** — listener+drain mechanism has no end-to-end test that proves it correctly invalidates layout cache from within one daemon. Worker rationale ("drain runs on every snapshot") is plausible but unverified. Track for follow-up.
+2. **`module.list` exclusion docstring incomplete** — also drifts on `ld-linux-*.so.2` and a duplicate [vdso] entry, not just [vdso] + triple as documented.
+3. **`close_target` doesn't explicitly `StopListeningForEvents`** — broadcaster is destroyed by `DeleteTarget` so subscription becomes inert; not a correctness bug but tidier to teardown explicitly.
+4. **`describe.endpoints` size in worklog** — 56,724 vs actual 56,652. Minor doc nit.
+5. **Listener is per-backend not per-target** — defensible design choice, not what brief specified.
 
 ## 1b reviewer findings folded into slice 1c spec
 
