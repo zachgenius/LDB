@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (Tier 3 complete — cross-binary correlation + semantic queries v1 live) |
-| **ctest at HEAD** | 48/48 green |
+| **HEAD now** | (Tier 4 §13 + §14 merged — rr + non-stop scoped) |
+| **ctest at HEAD** | 50/50 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -58,11 +58,11 @@
 
 | # | Slice | Status | Worker | Reviewer | Merge commit |
 |---|---|---|---|---|---|
-| 13 | `rr` integration — replay via remote-target URL | — | — | — | — |
-| 14 | Non-stop debugging — per-thread state model | — | — | — | — |
-| 15 | Hardware tracing — Intel PT / ARM ETM as a probe source | — | — | — | — |
-| 16 | In-target conditional probes — agent-expression bytecode | — | — | — | — |
-| 17 | Tracepoints — no-stop collection | — | — | — | — |
+| 13 | `rr` integration — replay via remote-target URL | ✅ | `af93b6e305656933d` | `a2286eb8d676a6e1d` | (merge commit on master) |
+| 14 | Non-stop debugging — per-thread state model | ✅ (scoped to protocol surface) | `ab97e6099e494d4e2` | `a48f92ad478c03688` | (merge commit on master) |
+| 15 | Hardware tracing — Intel PT / ARM ETM as a probe source | ⏭ | — | — | (deferred — see rationale §) |
+| 16 | In-target conditional probes — agent-expression bytecode | ⏭ | — | — | (deferred — see rationale §) |
+| 17 | Tracepoints — no-stop collection | ⏭ | — | — | (deferred — see rationale §) |
 
 ## Deferral rationale
 
@@ -70,6 +70,9 @@
 |---|---|
 | **5 — Native libbpf probe agent** | The roadmap explicitly says replace `bpftrace` shellout "when measurement justifies it." We have no measurement evidence that the shellout is too slow. Speculative replacement violates the progressive-replacement strategy in §03 §7. Will revisit when a workload exposes the latency. |
 | **8 — Hot reload of Python extensions** | LDB picked the C++ baton path for probes (M3, slice 13) — no embedded Python extensions exist. The v0.4 roadmap pitch ("edit Python extension, hot-load without losing state") is moot until Python embedding lands. Re-evaluate when extension scripting is on the agenda. |
+| **15 — Hardware tracing (Intel PT / ARM ETM)** | Requires CPU support + kernel `msr` / `perf_event_paranoid` access + a non-trivial perf-data parser. Useful for high-volume tracing, but the scaffolding alone is multi-week and not testable on this dev box without bare-metal Intel PT. Defer to a session where Intel PT availability + perf permissions are established. The §15 design pitch in the roadmap is correct — treat as a high-volume probe source — but there's no v0.3-tractable scope. |
+| **16 — In-target conditional probes (agent-expression bytecode)** | Requires a small expression compiler that emits GDB-compatible agent-expression bytecode + a runtime to evaluate it inside the target. Both are substantial — the compiler alone (parse predicates like `arg0 == 5 && strcmp(arg1, "foo") == 0`, type-check against DWARF, emit bytecode per the [GDB Agent Expression](https://sourceware.org/gdb/onlinedocs/gdb/Agent-Expressions.html) spec) is multi-day work. Roadmap puts this at v0.8 — keeping that schedule. |
+| **17 — Tracepoints (no-stop collection)** | Builds on §16 (predicate bytecode runtime) AND §14's true async runtime. Both are deferred. Tracepoints without either reduce to "log_and_continue probes" which we already have via the M3 probe orchestrator. Roadmap puts this at v1.0 — keeping that schedule. |
 
 ## Blockers / decisions surfaced for user
 
