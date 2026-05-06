@@ -41,7 +41,7 @@
 |---|---|---|---|---|---|
 | 4 | DAP shim — auto-generated from `describe.endpoints` | — | — | — | — |
 | 5 | Native libbpf probe agent | ⏭ | — | — | — |
-| 6 | Probe recipes — promote replayable session traces to named recipes | — | — | — | — |
+| 6 | Probe recipes — promote replayable session traces to named recipes | 🔍 | `acf8f743ad7295e95` | — | (worktree-only) |
 
 ## Tier 3 — Differentiator wave
 
