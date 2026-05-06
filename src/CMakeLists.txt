@@ -17,6 +17,7 @@ set(LDBD_SOURCES
   observers/proc.cpp
   observers/net_sockets.cpp
   observers/net_tcpdump.cpp
+  observers/net_igmp.cpp
   util/log.cpp
 )
 

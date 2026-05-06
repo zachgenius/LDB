@@ -47,6 +47,8 @@ set(LDB_UNIT_SOURCES
   test_observer_tcpdump_parser.cpp
   test_observer_tcpdump_live.cpp
   test_dispatcher_tcpdump.cpp
+  test_observer_igmp_parser.cpp
+  test_dispatcher_igmp.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -65,6 +67,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/bpftrace_engine.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
+  ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.

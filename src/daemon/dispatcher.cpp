@@ -488,6 +488,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "observer.proc.status") return handle_observer_proc_status(req);
     if (req.method == "observer.net.sockets") return handle_observer_net_sockets(req);
     if (req.method == "observer.net.tcpdump") return handle_observer_net_tcpdump(req);
+    if (req.method == "observer.net.igmp")    return handle_observer_net_igmp(req);
 
     return protocol::make_err(req.id, ErrorCode::kMethodNotFound,
                               "unknown method: " + req.method);
@@ -1029,6 +1030,22 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       json{{"packets",
             "array of {ts,summary,iface?,src?,dst?,proto?,len?}"},
            {"total", "uint"}, {"truncated", "bool"}});
+
+  add("observer.net.igmp",
+      "Read /proc/net/igmp (and /proc/net/igmp6 if present) on the "
+      "target host and return parsed multicast memberships: "
+      "{idx, device, count?, querier?, addresses: [{address, users, "
+      "timer}, ...]}. V4 group hex words (kernel little-endian) are "
+      "converted to dotted-quad; V6 32-hex-char rows are rendered as "
+      "8 colon-separated 4-hex-char groups (no zero-compression). "
+      "Local dispatch reads /proc/net/igmp{,6} via ifstream — no "
+      "subprocess; remote dispatch shells out `cat` over ssh_exec. "
+      "Missing /proc/net/igmp6 is silently tolerated.",
+      json{{"host", "string?"}},
+      json{{"groups",
+            "array of {idx,device,count?,querier?,addresses:"
+            "[{address,users,timer}]}"},
+           {"total", "uint"}});
 
   json data;
   data["endpoints"] = std::move(eps);
@@ -3087,6 +3104,26 @@ json socket_entry_to_json(const ldb::observers::SocketEntry& s) {
   return j;
 }
 
+json igmp_address_to_json(const ldb::observers::IgmpAddress& a) {
+  json j;
+  j["address"] = a.address;
+  j["users"]   = a.users;
+  j["timer"]   = a.timer;
+  return j;
+}
+
+json igmp_group_to_json(const ldb::observers::IgmpGroup& g) {
+  json j;
+  j["idx"]    = g.idx;
+  j["device"] = g.device;
+  if (g.count.has_value())   j["count"]   = *g.count;
+  if (g.querier.has_value()) j["querier"] = *g.querier;
+  json arr = json::array();
+  for (const auto& a : g.addresses) arr.push_back(igmp_address_to_json(a));
+  j["addresses"] = std::move(arr);
+  return j;
+}
+
 }  // namespace
 
 Response Dispatcher::handle_observer_proc_fds(const Request& req) {
@@ -3249,6 +3286,22 @@ Response Dispatcher::handle_observer_net_tcpdump(const Request& req) {
   // which matches `r.total` — so we don't overwrite it.
   data["truncated"] = r.truncated;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_observer_net_igmp(const Request& req) {
+  // No required params; only optional `host`.
+  std::optional<ldb::transport::SshHost> remote;
+  if (req.params.is_object()) {
+    remote = observer_host_from_params(req.params);
+  }
+  auto view_spec = protocol::view::parse_from_params(
+      req.params.is_object() ? req.params : json::object());
+
+  auto r = ldb::observers::list_igmp(remote);
+  json arr = json::array();
+  for (const auto& g : r.groups) arr.push_back(igmp_group_to_json(g));
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "groups"));
 }
 
 }  // namespace ldb::daemon

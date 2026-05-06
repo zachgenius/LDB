@@ -125,3 +125,6 @@ third_party/install/
 .env
 .env.local
 config.local.*
+
+# Claude Code agent worktrees (transient)
+.claude/

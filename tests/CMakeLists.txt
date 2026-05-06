@@ -248,6 +248,15 @@ set_tests_properties(smoke_observer PROPERTIES
 )
 
 add_test(
+  NAME smoke_observer_igmp
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_observer_igmp.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_observer_igmp PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_uprobe_bpf
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_uprobe_bpf.py"
           "$<TARGET_FILE:ldbd>"
