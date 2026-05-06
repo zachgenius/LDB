@@ -19,7 +19,7 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-1c-merge — Tier 1 §1 complete) |
+| **HEAD now** | (updated post-§2-merge — Tier 1 §1 ✅, §2 audit ✅ / hw pending) |
 | **ctest at HEAD** | 39/39 green |
 | **Tag** | `v0.1` |
 
@@ -30,7 +30,7 @@
 | 1a | Live provenance — endpoint determinism audit | ✅ | `a05ab0000ec0248b1` | (inline review) | — |
 | 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | ✅ | `a1da55c9959d40268` | `a379567ea90e9472a` | (merge commit on master) |
 | 1c | Live provenance — CI determinism gate extended to live targets | ✅ | `a715e629b235a9434` | `afc1d3706a3b11696` | (merge commit on master) |
-| 2 | macOS arm64 hardening pass (Linux-side fixes; macOS sign-off deferred to user) | — | — | — | — |
+| 2 | macOS arm64 hardening pass — Linux-side audit ✅; **hardware sign-off pending user** (see Blockers § below; checklist at `docs/macos-arm64-status.md` §7) | ✅ (audit) | `aa58d23c1330389d6` | `ac66801b1b097bec0` | (merge commit on master) |
 | 3a | Public release polish — protocol semver + version handshake in `hello` | — | — | — | — |
 | 3b | Public release polish — GitHub Actions CI (Linux matrix) | — | — | — | — |
 | 3c | Public release polish — `CONTRIBUTING.md` + commit-style + PR template | — | — | — | — |
@@ -72,7 +72,27 @@
 
 ## Blockers / decisions surfaced for user
 
-_(none so far)_
+The Tier 1 §2 audit (commit at `aa58d23c1330389d6` review by `ac66801b1b097bec0`) surfaced 4 items that need your attention. **Slice 1c silently shipped a macOS arm64 regression that the autonomous reviewer missed because it had no Apple-silicon CI.** Full detail and the remediation checklist are in `docs/macos-arm64-status.md`.
+
+### B1 — HIGH: slice 1c dlopener fixture is a macOS arm64 build break
+
+`tests/fixtures/CMakeLists.txt:64` unconditionally `target_link_libraries(... PRIVATE dl)`; `tests/fixtures/c/dlopener.c:55` calls `dlopen("libpthread.so.0", ...)` (glibc SONAME); `tests/smoke/test_live_dlopen.py` has no `if sys.platform == 'darwin'` SKIP. Two failure modes on macOS arm64:
+1. Build break — macOS clang ld may reject `-ldl` (no `libdl.tbd` stub on some SDKs).
+2. Runtime — `dlopen("libpthread.so.0")` returns NULL on macOS; smoke fails before observation point.
+
+**Fix outline** in `docs/macos-arm64-status.md §5.2`. Three fix points: gate `target_link_libraries`, `#ifdef __APPLE__` branch in C, and gate `add_test`. **Must be fixed in a session with macOS hardware before any "Tier 1 §2 ✅" claim.**
+
+### B2 — MEDIUM: `compute_reg_digest` GPR-set-name fallback is unverified on macOS arm64
+
+If macOS LLDB names the GPR register set differently AND doesn't order it first, `<reg_digest>` silently hashes a non-GPR set, breaking cross-daemon `live:` snapshot equality without any visible error. Audit §3.7 / §8 row 3. Cleared by an explicit `tests/smoke/test_live_provenance.py` run on Apple silicon.
+
+### B3 — MEDIUM: live↔core determinism gate exclusion list is Linux-flavored
+
+`tests/smoke/test_live_determinism_gate.py` excludes `[vdso]`, kernel-side `threads[*].name`, triple-suffix drift — none of those exist on Mach-O. Included endpoints (`symbol.find`, `string.list`, `disasm.function`) should round-trip on macOS but unproven. Audit §5.3 / §7 checkbox 4.
+
+### B4 — LOW (informational): Tier 1 §2 cannot be promoted to ✅ without Apple silicon
+
+This audit closed the Linux-side static review and produced an actionable sign-off checklist (`docs/macos-arm64-status.md §7`). §2 stays at "audit ✅ / hw sign-off pending" until a session on Apple silicon clears the checklist. Lead-agent run continues with §3 (release polish) as the next slice.
 
 ## 1c reviewer findings (tracked, none blocking)
 
