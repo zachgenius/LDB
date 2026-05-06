@@ -514,6 +514,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "artifact.get")       return handle_artifact_get(req);
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
+    if (req.method == "artifact.delete")    return handle_artifact_delete(req);
     if (req.method == "artifact.export")    return handle_artifact_export(req);
     if (req.method == "artifact.import")    return handle_artifact_import(req);
 
@@ -1185,6 +1186,18 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"tags", arr_of(str())},
       }, {"id", "tags"}),
       obj({{"tags", arr_of(str())}}, {"tags"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("artifact.delete",
+      "Delete an artifact by id: drops the row, cascades its tags, and "
+      "unlinks the on-disk blob. Idempotent — deleting an already-gone id "
+      "returns deleted=false (not an error). The recipe.delete endpoint "
+      "is the high-level wrapper for recipe-format artifacts.",
+      obj({{"id", int_()}}, {"id"}),
+      obj({
+          {"id",      int_()},
+          {"deleted", bool_()},
+      }, {"id", "deleted"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== session.* ==============
@@ -2792,6 +2805,38 @@ Response Dispatcher::handle_artifact_tag(const Request& req) {
   auto out_tags = artifacts_->add_tags(id, tags);
   json data;
   data["tags"] = out_tags;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// Tier 2 §6 prep: artifact.delete is the GC sibling to artifact.put.
+// Recipes will pile up — without a delete path the only way to remove
+// one is editing the sqlite db by hand. Idempotent: deleting an
+// already-gone id returns {deleted:false} (not an error).
+Response Dispatcher::handle_artifact_delete(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'id'");
+  }
+  bool deleted = artifacts_->remove(id);
+  json data;
+  data["id"]      = id;
+  data["deleted"] = deleted;
   return protocol::make_ok(req.id, std::move(data));
 }
 

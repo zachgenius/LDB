@@ -103,6 +103,14 @@ class ArtifactStore {
   std::vector<std::string> add_tags(std::int64_t id,
                                      const std::vector<std::string>& tags);
 
+  // Drop an artifact: deletes the index row (cascading its tags via
+  // ON DELETE CASCADE) and unlinks the on-disk blob. Returns true if
+  // an artifact was found and deleted, false if [id] didn't exist.
+  // Idempotent. Tolerates a previously-deleted on-disk blob (best-effort
+  // unlink) so a corrupt store can still GC the dangling row.
+  // Throws backend::Error only on a hard sqlite failure.
+  bool remove(std::int64_t id);
+
   // Import an artifact from a `.ldbpack` archive (M5 part 5). Bypasses
   // the hashing + timestamp behavior of put() — the supplied [sha256]
   // and [created_at] are used verbatim, the supplied [tags] are
