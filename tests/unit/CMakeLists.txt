@@ -54,6 +54,7 @@ set(LDB_UNIT_SOURCES
   test_exec_allowlist.cpp
   test_dispatcher_observer_exec.cpp
   test_describe_endpoints_schema.cpp
+  test_pack.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -67,6 +68,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
+  ${CMAKE_SOURCE_DIR}/src/store/pack.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/ssh.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/local_exec.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/streaming_exec.cpp
@@ -102,6 +104,7 @@ target_link_libraries(ldb_unit_tests PRIVATE
   ldb_lldb
   ldb_warnings
   SQLite::SQLite3
+  ZLIB::ZLIB
 )
 
 # Fixture binaries consumed by tests at runtime. Paths are baked into

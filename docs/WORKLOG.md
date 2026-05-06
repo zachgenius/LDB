@@ -61,6 +61,74 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 22) — M5 part 5: .ldbpack format + session/artifact export/import
+
+**Goal:** Ship the `.ldbpack` portable bundle format from plan §8 plus the four JSON-RPC endpoints that produce / consume it (`session.export`, `session.import`, `artifact.export`, `artifact.import`). Reference workflow §5 ends at `session.export({id})`; this slice closes that loop.
+
+**Done:**
+
+- **`src/store/pack.{h,cpp}`** (new module, ~870 LoC including a private SHA-256). Three layered surfaces:
+  - `tar_pack` / `tar_unpack`: ~200 LoC POSIX-USTAR codec, magic + checksum, no extensions. Path-traversal defense rejects entries containing a `..` component or starting with `/`. Bad magic bytes throw. Header `typeflag` other than `'0'`/`'\0'` (regular file) refused — we only emit regular files, importers shouldn't accept directories or symlinks.
+  - `gzip_compress` / `gzip_decompress`: zlib `wbits=31` (max window + gzip wrapper). Decompressor enforces a 1 GiB cap by default (zip-bomb defense) and throws on truncated stream / corrupt input.
+  - High-level: `pack_session(SessionStore&, ArtifactStore&, id, out)` and `pack_artifacts(ArtifactStore&, build_id?, names?, out)` build a TarEntry list + manifest, gzip, write to disk; `unpack(SessionStore&, ArtifactStore&, in, ConflictPolicy)` walks the manifest and inserts via the import-side hooks below.
+- **`SessionStore::import_session(id, name, target_id?, created_at_ns, rows, overwrite)`** — public method. Builds a fresh per-session sqlite db at `${root}/sessions/<id>.db` (preserving the imported uuid so cross-pack references stay stable), bulk-inserts `rpc_log` rows verbatim, writes the index row. Under `overwrite=true`, drops the prior row + db file first.
+- **`ArtifactStore::import_artifact(build_id, name, bytes, sha256, format, meta, tags, created_at, overwrite)`** — public method. Direct row + blob write that bypasses the normal `put()` re-hash + re-stamp behavior so the imported entry preserves exactly what the producer captured. Same atomic-blob-write convention as `put()`.
+- **Dispatcher endpoints** (`src/daemon/dispatcher.{h,cpp}`):
+  - `session.export({id, path?}) → {path, byte_size, sha256, manifest}`. Default path is `${LDB_STORE_ROOT}/packs/<id>.ldbpack`. Validates the path is non-empty; the agent's filesystem permissions are the real backstop (we don't sandbox to the home dir).
+  - `session.import({path, conflict_policy?: error|skip|overwrite}) → {imported, skipped, policy}`. Pre-existence check returns `-32000` for missing file (vs. `pack::unpack` open-failure). Conflict policy is parsed via `parse_conflict_policy`; bad value → `-32602`.
+  - `artifact.export({build_id?, names?, path?}) → {path, byte_size, sha256, manifest}`. With both filters omitted, exports every artifact in the store.
+  - `artifact.import` is an alias for `session.import` — both endpoints accept the same `.ldbpack` shape and import every entry inside.
+  - `describe.endpoints` catalog grows from 58 → 62 entries; all four new methods schematized with proper draft-2020-12 schemas + `cost_hint=high`.
+- **Tests** (TDD red→green throughout):
+  - `tests/unit/test_pack.cpp` — 21 cases / 1101 assertions:
+    - tar round-trip: small file, multi-block 2 KB payload, nested path with embedded slashes, > 10 MB blob.
+    - tar security: rejects `../etc/passwd`, rejects `/etc/passwd`, rejects bad magic.
+    - gzip round-trip: empty, small string, highly compressible 100 k 'A's (verifies output < 1 KB → < 1 % ratio).
+    - gzip security: zip-bomb cap rejects oversize, truncated stream throws, malformed bytes throw.
+    - end-to-end pack_session → unpack into fresh store: metadata, blob bytes, format, target_id, meta all preserved; rpc_log rows preserved with correct call_count.
+    - pack_artifacts: omits sessions; build_id filter narrows.
+    - conflict policy: error aborts the whole import on duplicate (pre-walk); skip preserves local + lists skipped entries; overwrite replaces.
+  - `tests/smoke/test_ldbpack.py` — end-to-end through real `ldbd` subprocesses. Two daemons share no state: daemon #1 produces a pack from a fresh `LDB_STORE_ROOT`; daemon #2 imports against an empty root. Verifies session.list reflects the imported session with the right call_count, target_id, and that artifact.list shows both shipped artifacts. Negative paths: re-import with default policy → `-32000`; bad `conflict_policy` → `-32602`; missing file → `-32000`.
+- **Build:** `find_package(ZLIB REQUIRED)` added to top-level CMake. `ZLIB::ZLIB` linked into `ldbd` and `ldb_unit_tests`. zlib was already present transitively from libllvm; the explicit dep makes it intentional.
+
+**Decisions:**
+
+- **gzip over zstd.** Plan §8 says "tarball" without specifying compression. zstd is faster + smaller but adds a build-dep we don't need anywhere else; gzip is on every Linux/macOS dev box and `tar zxf foo.ldbpack` is the universal off-the-shelf debug-via-tar path. zstd can be a post-MVP transparent upgrade behind the same endpoint.
+- **Manifest shape: agent-introspectable index.** `manifest.json` is the first thing inside the tar. A consumer reads it once, decides what to import, *then* extracts only the relevant entries. The schema is sessions-array + artifacts-array + format-version. Not signed in MVP — signing is a separate, post-MVP slice (plan §8 says "signed against build-IDs included" but the threat model only matters once `.ldbpack` shows up in untrusted hands).
+- **Conflict policy default = `error`.** A plain `session.import({path})` with no second thought should refuse to clobber prior state. `skip` and `overwrite` are explicit opt-ins. Under `error`, the dispatcher pre-walks the manifest and aborts before mutating either store — the user gets a clean "this would conflict" error rather than a half-applied import.
+- **Include EVERY artifact across ALL build_ids on `session.export`.** Plan §5 says `session.export` is the "portable record of the investigation" — operationally that means every artifact the agent extracted. Narrowing to "artifacts whose build_id appears in the session's rpc_log" is heuristic and only useful if the operator has many unrelated build_ids stacked in one store. Documented as the simpler MVP behavior; `pack_artifacts({build_id})` is the sharp tool for the prune-by-build case.
+- **`artifact.import` is an alias for `session.import`.** Both accept the same `.ldbpack` and import every entry. The two endpoints exist to make the agent's intent readable in the rpc_log ("I'm importing artifacts" vs "I'm importing a whole session") but they share an implementation. If a future need arises for "import only artifacts from this pack, skip the session entries inside," that becomes a `kinds: ["artifact"]` parameter on the same handler.
+- **Materialize a clean non-WAL db on export, not a verbatim copy.** First implementation packed `<id>.db` raw — but the live source db has rows still sitting in `<id>.db-wal` (WAL is the per-session journal mode). Copying just the `.db` lost every row that hadn't been checkpointed. Fixed by reading rows via `read_session_db()` and re-emitting a fresh single-file `journal_mode=DELETE` db inside a temp file, then shipping those bytes. The destination side rebuilds via `import_session` so the choice is purely about what bytes get tarred.
+- **Path-traversal defense lives at unpack time, not import-validation time.** `pack.cpp::tar_unpack` walks every entry name through `name_is_safe` and refuses anything starting with `/` or containing a `..` component — this is the actual file-creation seam. The dispatcher validates the *output* `path` for export only as "non-empty"; the operator's filesystem permissions are the backstop for "where can ldbd write."
+
+**Surprises / blockers:**
+
+- **WAL invisibility on raw-file pack.** First version of `pack_session` packed `info->path` (the live `<id>.db` file) verbatim. Smoke test caught it: `call_count == 0` after import even though the source had `call_count == 4`. Confirmed via `sqlite3` standalone — the raw `.db` had zero rpc_log rows; all 4 lived in `.db-wal`. Fixed by going through the read-rows-and-rebuild path. **This is exactly the bug TDD is supposed to surface** — the silent zero-row import would have been invisible to anyone except an agent that re-checked `call_count` after import.
+- **Schema validation drift.** `describe.endpoints` schema test (3441 → 3832 assertions, +391) walks every nested schema. The four new endpoints picked up the catalog-wide structural check for free.
+- **No master-vs-worktree leak this session.** `git status` clean except for the changes I made; checked mid-session and at end.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **33/33 PASS in 25.54 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 32/32 → +1 for `smoke_ldbpack`.)
+  - `smoke_ldbpack`: 0.34 s.
+  - `unit_tests`: 13.87 s. **+21 cases / +1101 assertions** for the pack codec + e2e store round-trip.
+  - `[describe]` catalog walk: +391 assertions covering the four new endpoint schemas.
+- Build warning-clean (only the pre-existing nlohmann-json `-Wnull-dereference` from GCC 13).
+- Stdout discipline preserved: pack writes go to `out_path` (not stdout); decompress / extract logging is stderr-only.
+- `build/bin/ldbd --version` → 0.1.0.
+
+**Sibling slice:** `ldb` CLI (parallel agent) — wraps `session.export` / `session.import` in a one-shot CLI mode for shell scripting.
+
+**Deferred:**
+
+- **Signing.** Plan §8 says "signed against the build-IDs included" — post-MVP slice. MVP just emits + consumes the tarball; trust boundary is the operator's filesystem.
+- **Session-scoped artifact filtering.** `session.export` currently includes EVERY artifact. A future `session.export({id, scope: "session"})` could narrow to "artifacts whose build_id appeared in the rpc_log" — but the rpc_log doesn't currently surface build_ids in a structured way, so this would be a multi-slice feature.
+- **zstd compression.** Documented above — same wire format, smaller pack, transparent upgrade once any agent demands it.
+
+**Next:** M5 polish remaining is the `ldb` CLI (sibling agent) and any test corpus. After that, M5 closes out and we're in M6 territory.
+
+---
+
 ## 2026-05-06 (cont. 20a) — M5 part 1: cost-preview metadata
 
 **Goal:** Ship `_cost: {bytes, items, tokens_est}` on every successful response per plan §3.2 so an LLM agent can budget-check before pulling a big response.

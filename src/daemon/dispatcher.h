@@ -101,6 +101,10 @@ class Dispatcher {
   protocol::Response handle_session_detach(const protocol::Request& req);
   protocol::Response handle_session_list(const protocol::Request& req);
   protocol::Response handle_session_info(const protocol::Request& req);
+  protocol::Response handle_session_export(const protocol::Request& req);
+  protocol::Response handle_session_import(const protocol::Request& req);
+  protocol::Response handle_artifact_export(const protocol::Request& req);
+  protocol::Response handle_artifact_import(const protocol::Request& req);
 
   protocol::Response handle_probe_create(const protocol::Request& req);
   protocol::Response handle_probe_events(const protocol::Request& req);

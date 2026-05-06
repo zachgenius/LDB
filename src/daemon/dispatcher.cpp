@@ -8,6 +8,7 @@
 #include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
+#include "store/pack.h"
 #include "store/session_store.h"
 #include "transport/ssh.h"
 #include "util/log.h"
@@ -473,12 +474,16 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "artifact.get")       return handle_artifact_get(req);
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
+    if (req.method == "artifact.export")    return handle_artifact_export(req);
+    if (req.method == "artifact.import")    return handle_artifact_import(req);
 
     if (req.method == "session.create")     return handle_session_create(req);
     if (req.method == "session.attach")     return handle_session_attach(req);
     if (req.method == "session.detach")     return handle_session_detach(req);
     if (req.method == "session.list")       return handle_session_list(req);
     if (req.method == "session.info")       return handle_session_info(req);
+    if (req.method == "session.export")     return handle_session_export(req);
+    if (req.method == "session.import")     return handle_session_import(req);
 
     if (req.method == "probe.create")       return handle_probe_create(req);
     if (req.method == "probe.events")       return handle_probe_events(req);
@@ -1161,6 +1166,102 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"path",         str()},
       }, {"id", "name", "created_at", "call_count", "path"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== session.export / .import — `.ldbpack` (M5 part 5) ====
+
+  {
+    auto pack_manifest_schema = obj({
+        {"format",     str()},
+        {"created_at", int_()},
+        {"creator",    str()},
+        {"sessions",   arr_of(obj({
+            {"id",         str()},
+            {"name",       str()},
+            {"call_count", int_()},
+            {"path",       str()},
+            {"target_id",  str()},
+        }))},
+        {"artifacts",  arr_of(obj({
+            {"build_id",  str()},
+            {"name",      str()},
+            {"sha256",    str()},
+            {"byte_size", uint_()},
+            {"path",      str()},
+        }))},
+    }, {"format", "sessions", "artifacts"});
+
+    auto import_entry_schema = obj({
+        {"kind",   enum_str({"session", "artifact"})},
+        {"key",    str()},
+        {"reason", str()},
+    }, {"kind", "key"});
+
+    add("session.export",
+        "Bundle one session and every artifact in the store into a "
+        "gzip+tar `.ldbpack` archive (plan §8). Path defaults to "
+        "${LDB_STORE_ROOT}/packs/<id>.ldbpack. Produces a manifest the "
+        "agent can introspect before extracting on the import side.",
+        obj({
+            {"id",   str()},
+            {"path", str("Optional output path; defaults under store root.")},
+        }, {"id"}),
+        obj({
+            {"path",      str()},
+            {"byte_size", uint_()},
+            {"sha256",    str()},
+            {"manifest",  pack_manifest_schema},
+        }, {"path", "byte_size", "sha256", "manifest"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+    add("session.import",
+        "Import a `.ldbpack` archive: walk its manifest, insert every "
+        "session and artifact into the local stores. conflict_policy "
+        "controls duplicate handling (default 'error' aborts the whole "
+        "import; 'skip' preserves local entries; 'overwrite' replaces).",
+        obj({
+            {"path",            str()},
+            {"conflict_policy", enum_str({"error", "skip", "overwrite"})},
+        }, {"path"}),
+        obj({
+            {"imported", arr_of(import_entry_schema)},
+            {"skipped",  arr_of(import_entry_schema)},
+            {"policy",   str()},
+        }, {"imported", "skipped", "policy"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+    add("artifact.export",
+        "Bundle artifacts (no session) into a `.ldbpack`. With "
+        "build_id set, only that build's artifacts; with names set, "
+        "only those names; both empty exports every artifact in the "
+        "store.",
+        obj({
+            {"build_id", str()},
+            {"names",    arr_of(str())},
+            {"path",     str()},
+        }),
+        obj({
+            {"path",      str()},
+            {"byte_size", uint_()},
+            {"sha256",    str()},
+            {"manifest",  pack_manifest_schema},
+        }, {"path", "byte_size", "sha256", "manifest"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+    add("artifact.import",
+        "Alias of session.import — both endpoints accept the same "
+        "`.ldbpack` shape and import every entry inside. Conflict "
+        "policy semantics identical.",
+        obj({
+            {"path",            str()},
+            {"conflict_policy", enum_str({"error", "skip", "overwrite"})},
+        }, {"path"}),
+        obj({
+            {"imported", arr_of(import_entry_schema)},
+            {"skipped",  arr_of(import_entry_schema)},
+            {"policy",   str()},
+        }, {"imported", "skipped", "policy"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "high");
+  }
 
   // ============== probe.* ==============
 
@@ -2836,6 +2937,230 @@ Response Dispatcher::handle_session_info(const Request& req) {
   }
   data["path"]       = row->path;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+// ----------------------------------------------------------------------------
+// session.export / session.import / artifact.export / artifact.import
+// (M5 part 5) — `.ldbpack` round-trip across machines / restarts.
+
+namespace {
+
+// Default pack output dir under the store root. Created on first
+// export. Returning a relative path inside the store root is the safe
+// behavior — an agent that omits `path` won't accidentally drop a file
+// somewhere unexpected.
+std::filesystem::path default_pack_dir(
+    const std::shared_ptr<ldb::store::ArtifactStore>& art,
+    const std::shared_ptr<ldb::store::SessionStore>& sess) {
+  // Either store has the same root by construction (main.cpp).
+  std::filesystem::path root;
+  if (art)       root = art->root();
+  else if (sess) root = sess->root();
+  return root / "packs";
+}
+
+// Validate a caller-supplied [path]. Caller can drop a pack anywhere
+// they have permission to write; we only refuse the obviously hostile:
+// empty string. Path-traversal of the *contents* of a pack is enforced
+// during extract (in pack.cpp), not here.
+bool valid_pack_path(const std::string& s, std::string* err) {
+  if (s.empty()) { *err = "'path' must be non-empty"; return false; }
+  return true;
+}
+
+// Pull a {path, conflict_policy?} request body; returns the canonical
+// path and policy (default kError). On bad input, returns an Err
+// response wrapping the request id.
+struct ImportArgs {
+  std::filesystem::path        path;
+  ldb::store::ConflictPolicy   policy = ldb::store::ConflictPolicy::kError;
+};
+
+std::optional<Response>
+parse_import_args(const Request& req, ImportArgs* out) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* path = require_string(req.params, "path");
+  if (!path || path->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'path'");
+  }
+  std::string err;
+  if (!valid_pack_path(*path, &err)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+  }
+  out->path = *path;
+  if (auto it = req.params.find("conflict_policy");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'conflict_policy' must be a string");
+    }
+    auto s = it->get<std::string>();
+    if (!ldb::store::parse_conflict_policy(s, &out->policy)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'conflict_policy' must be one of: error, skip, overwrite");
+    }
+  }
+  return std::nullopt;
+}
+
+json import_entry_to_json(const ldb::store::ImportEntry& e) {
+  json j;
+  j["kind"] = e.kind;
+  j["key"]  = e.key;
+  if (!e.reason.empty()) j["reason"] = e.reason;
+  return j;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_session_export(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* id = require_string(req.params, "id");
+  if (!id || id->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'id'");
+  }
+
+  std::filesystem::path out_path;
+  if (auto it = req.params.find("path");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'path' must be a string");
+    }
+    auto s = it->get<std::string>();
+    std::string err;
+    if (!valid_pack_path(s, &err)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+    }
+    out_path = s;
+  } else {
+    auto dir = default_pack_dir(artifacts_, sessions_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    out_path = dir / (*id + ".ldbpack");
+  }
+
+  // pack_session throws backend::Error on a missing session id or any
+  // io / sqlite failure; the dispatch() catch maps that to -32000.
+  auto result = ldb::store::pack_session(*sessions_, *artifacts_, *id,
+                                          out_path);
+  json data;
+  data["path"]      = result.path.string();
+  data["byte_size"] = result.byte_size;
+  data["sha256"]    = result.sha256;
+  data["manifest"]  = result.manifest;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_export(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object() && !req.params.is_null()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::optional<std::string> build_id;
+  std::optional<std::vector<std::string>> names;
+  std::filesystem::path out_path;
+
+  if (req.params.is_object()) {
+    if (auto it = req.params.find("build_id");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'build_id' must be a string");
+      }
+      build_id = it->get<std::string>();
+    }
+    if (auto it = req.params.find("names");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_array()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'names' must be an array");
+      }
+      std::vector<std::string> nv;
+      for (const auto& n : *it) {
+        if (!n.is_string()) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "'names' entries must be strings");
+        }
+        nv.push_back(n.get<std::string>());
+      }
+      names = std::move(nv);
+    }
+    if (auto it = req.params.find("path");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'path' must be a string");
+      }
+      auto s = it->get<std::string>();
+      std::string err;
+      if (!valid_pack_path(s, &err)) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+      }
+      out_path = s;
+    }
+  }
+  if (out_path.empty()) {
+    auto dir = default_pack_dir(artifacts_, sessions_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::string fn = "artifacts";
+    if (build_id.has_value()) { fn += "-"; fn += *build_id; }
+    fn += ".ldbpack";
+    out_path = dir / fn;
+  }
+
+  auto result = ldb::store::pack_artifacts(*artifacts_, build_id,
+                                            std::move(names), out_path);
+  json data;
+  data["path"]      = result.path.string();
+  data["byte_size"] = result.byte_size;
+  data["sha256"]    = result.sha256;
+  data["manifest"]  = result.manifest;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_session_import(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  ImportArgs args;
+  if (auto err = parse_import_args(req, &args)) return *err;
+  // If the file isn't there, surface a typed error rather than letting
+  // pack::unpack's open-file failure bubble up.
+  if (!std::filesystem::exists(args.path)) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              "session.import: no such pack file: " +
+                              args.path.string());
+  }
+  auto report = ldb::store::unpack(*sessions_, *artifacts_, args.path,
+                                    args.policy);
+  json imported = json::array();
+  for (const auto& e : report.imported) imported.push_back(import_entry_to_json(e));
+  json skipped  = json::array();
+  for (const auto& e : report.skipped)  skipped.push_back(import_entry_to_json(e));
+  json data;
+  data["imported"] = std::move(imported);
+  data["skipped"]  = std::move(skipped);
+  data["policy"]   = ldb::store::conflict_policy_str(args.policy);
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_import(const Request& req) {
+  // Same shape as session.import but only reports the artifact rows
+  // (sessions in the pack, if any, are imported too — matches the
+  // simpler "import everything" semantics).
+  return handle_session_import(req);
 }
 
 // ----------------------------------------------------------------------------
