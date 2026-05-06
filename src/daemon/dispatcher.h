@@ -9,6 +9,7 @@
 namespace ldb::backend { class DebuggerBackend; }
 namespace ldb::store   { class ArtifactStore; }
 namespace ldb::probes  { class ProbeOrchestrator; }
+namespace ldb::observers { class ExecAllowlist; }
 
 namespace ldb::daemon {
 
@@ -29,7 +30,9 @@ class Dispatcher {
   explicit Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
                       std::shared_ptr<store::ArtifactStore> artifacts = {},
                       std::shared_ptr<store::SessionStore> sessions = {},
-                      std::shared_ptr<probes::ProbeOrchestrator> probes = {});
+                      std::shared_ptr<probes::ProbeOrchestrator> probes = {},
+                      std::shared_ptr<observers::ExecAllowlist>
+                          exec_allowlist = {});
   ~Dispatcher();
 
   protocol::Response dispatch(const protocol::Request& req);
@@ -39,6 +42,7 @@ class Dispatcher {
   std::shared_ptr<store::ArtifactStore>        artifacts_;
   std::shared_ptr<store::SessionStore>         sessions_;
   std::shared_ptr<probes::ProbeOrchestrator>   probes_;
+  std::shared_ptr<observers::ExecAllowlist>    exec_allowlist_;
   // Set by session.attach, cleared by session.detach. While set, every
   // dispatch result is appended to the session's rpc_log.
   std::unique_ptr<store::SessionStore::Writer> active_session_writer_;
@@ -109,6 +113,7 @@ class Dispatcher {
   protocol::Response handle_observer_proc_maps(const protocol::Request& req);
   protocol::Response handle_observer_proc_status(const protocol::Request& req);
   protocol::Response handle_observer_net_sockets(const protocol::Request& req);
+  protocol::Response handle_observer_exec(const protocol::Request& req);
 
   // The actual routing logic; dispatch() wraps this with rpc-log
   // bookkeeping when a session is attached.

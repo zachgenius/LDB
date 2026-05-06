@@ -16,6 +16,7 @@ set(LDBD_SOURCES
   transport/streaming_exec.cpp
   observers/proc.cpp
   observers/net_sockets.cpp
+  observers/exec_allowlist.cpp
   util/log.cpp
 )
 

@@ -44,6 +44,8 @@ set(LDB_UNIT_SOURCES
   test_bpftrace_program.cpp
   test_bpftrace_live.cpp
   test_dispatcher_uprobe_bpf.cpp
+  test_exec_allowlist.cpp
+  test_dispatcher_observer_exec.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -60,6 +62,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/transport/streaming_exec.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/proc.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
+  ${CMAKE_SOURCE_DIR}/src/observers/exec_allowlist.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/bpftrace_engine.cpp
 )
 

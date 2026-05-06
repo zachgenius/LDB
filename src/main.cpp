@@ -2,6 +2,7 @@
 #include "daemon/dispatcher.h"
 #include "daemon/stdio_loop.h"
 #include "ldb/version.h"
+#include "observers/exec_allowlist.h"
 #include "probes/probe_orchestrator.h"
 #include "store/artifact_store.h"
 #include "store/session_store.h"
@@ -20,7 +21,8 @@ void print_usage() {
   std::cerr <<
     "ldbd " << ldb::kVersionString << "\n"
     "Usage: ldbd [--stdio] [--log-level debug|info|warn|error]\n"
-    "            [--store-root <path>] [-h|--help]\n"
+    "            [--store-root <path>]\n"
+    "            [--observer-exec-allowlist <path>] [-h|--help]\n"
     "\n"
     "Modes:\n"
     "  --stdio    Read JSON-RPC from stdin, write responses to stdout (default)\n"
@@ -30,6 +32,14 @@ void print_usage() {
     "                        index + on-disk blobs). Overridden by the\n"
     "                        LDB_STORE_ROOT environment variable.\n"
     "                        Default: $HOME/.ldb\n"
+    "\n"
+    "Observer policy:\n"
+    "  --observer-exec-allowlist <path>\n"
+    "                        Path to a plaintext file of fnmatch glob\n"
+    "                        patterns enabling observer.exec. Without\n"
+    "                        this flag (or LDB_OBSERVER_EXEC_ALLOWLIST)\n"
+    "                        observer.exec returns -32002 on every call.\n"
+    "                        Env var takes precedence over the flag.\n"
     "\n"
     "Logs go to stderr; the JSON-RPC channel is exclusive on stdout.\n";
 }
@@ -60,11 +70,23 @@ std::filesystem::path resolve_store_root(const std::string& cli_arg) {
   return std::filesystem::path(".ldb");
 }
 
+// Same precedence rule as the store root: env var beats the CLI flag,
+// so a launcher can pin policy without rewriting argv. Empty string ⇒
+// not configured ⇒ observer.exec returns -32002.
+std::string resolve_observer_exec_allowlist(const std::string& cli_arg) {
+  if (const char* env = std::getenv("LDB_OBSERVER_EXEC_ALLOWLIST");
+      env && *env) {
+    return env;
+  }
+  return cli_arg;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
   std::string store_root_arg;
+  std::string observer_exec_allowlist_arg;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -85,6 +107,8 @@ int main(int argc, char** argv) {
       ldb::log::set_level(lvl);
     } else if (a == "--store-root" && i + 1 < argc) {
       store_root_arg = argv[++i];
+    } else if (a == "--observer-exec-allowlist" && i + 1 < argc) {
+      observer_exec_allowlist_arg = argv[++i];
     } else {
       std::cerr << "unknown argument: " << a << "\n\n";
       print_usage();
@@ -134,7 +158,33 @@ int main(int argc, char** argv) {
   auto probes = std::make_shared<ldb::probes::ProbeOrchestrator>(
       backend, artifacts);
 
-  ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes);
+  // observer.exec policy. Off by default; the operator opts in by
+  // pointing at a plaintext file of fnmatch glob patterns. We log
+  // (stderr) on either path so the operator gets one-line confirmation
+  // of policy at startup. If the file is configured but missing, we
+  // log and continue with no allowlist — the dispatcher's -32002 path
+  // still fires, and the agent never silently runs anything.
+  std::shared_ptr<ldb::observers::ExecAllowlist> exec_allowlist;
+  {
+    std::string al_path = resolve_observer_exec_allowlist(
+        observer_exec_allowlist_arg);
+    if (!al_path.empty()) {
+      auto al = ldb::observers::ExecAllowlist::from_file(al_path);
+      if (al.has_value()) {
+        exec_allowlist = std::make_shared<ldb::observers::ExecAllowlist>(
+            std::move(*al));
+        ldb::log::info("observer.exec allowlist loaded from " + al_path
+                       + " (" + std::to_string(exec_allowlist->pattern_count())
+                       + " patterns)");
+      } else {
+        ldb::log::warn("observer.exec allowlist file not readable: " + al_path
+                       + " — observer.exec will return -32002");
+      }
+    }
+  }
+
+  ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes,
+                                     exec_allowlist);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher);

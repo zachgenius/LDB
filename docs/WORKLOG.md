@@ -4,6 +4,62 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 19c) — M4 polish: observer.exec + allowlist
+
+**Goal:** Ship the operator-allowlisted `observer.exec` escape hatch from §4.6 — the deferred slice that the M4-3 typed observers were designed to *replace* but which the plan still calls out for "not every diagnostic fits a typed schema." Off by default; enabled only when the operator points at an allowlist file. Wires through the existing `local_exec` / `ssh_exec` transports — no new primitive needed.
+
+**Done:**
+
+- **`src/observers/exec_allowlist.{h,cpp}`** — pure-policy module:
+  - `ExecAllowlist::from_file(path)` → `optional<ExecAllowlist>`. nullopt iff the file can't be opened. EMPTY file is a valid allowlist that denies every command (default-deny). `#`-comments and blank lines ignored. Trailing whitespace (incl. `\r` from Windows line endings) stripped from each pattern.
+  - `ExecAllowlist::allows(argv)` joins argv with single spaces and calls POSIX `fnmatch(pattern, joined, FNM_PATHNAME)` against each pattern. Anchored end-to-end (no `FNM_LEADING_DIR`), so `/bin/sh` MUST NOT silently allow `/bin/sh -c rm -rf /`. Empty argv never matches.
+  - `run_observer_exec(allowlist, request)` does the transport-side work — `local_exec` when `remote==nullopt`, else `ssh_exec`. Reuses `transport::ExecOptions` defaults (4 MiB stdout cap, 1 MiB stderr cap). Caller is responsible for the allowlist check; this function is the bottom-half.
+- **`src/protocol/jsonrpc.h`** — new typed error code `kForbidden = -32003`. Distinct from `kBadState` (-32002, "not configured") so the agent can branch: -32002 ⇒ no allowlist at all (operator hasn't enabled the endpoint); -32003 ⇒ allowlist exists but this argv isn't on it.
+- **`src/main.cpp`** — `--observer-exec-allowlist <path>` CLI flag + `LDB_OBSERVER_EXEC_ALLOWLIST` env var (env wins, mirroring `--store-root` precedence). Loads at startup, logs a one-line confirmation to stderr (pattern count). Missing file ⇒ logged warning + dispatcher continues to return -32002 (the operator's intent failed; the agent must NOT silently get unrestricted exec).
+- **Dispatcher wiring** (`src/daemon/dispatcher.{h,cpp}`):
+  - `Dispatcher` ctor takes a fifth `shared_ptr<ExecAllowlist>` (default nullptr) so existing test sites compile unchanged.
+  - `handle_observer_exec`: if allowlist null ⇒ -32002 with the documented message ("observer.exec disabled — no allowlist configured. Set --observer-exec-allowlist or LDB_OBSERVER_EXEC_ALLOWLIST..."). Validates `argv` (non-empty array of string), `argv[0]` (absolute or basename — relative `./foo` is -32602, NOT a forbidden), `timeout_ms` (1..300000), `stdin` (≤64 KiB). Allowlist check is the LAST gate before transport; misses ⇒ -32003.
+  - Registered in routing AND `describe.endpoints` (56 endpoints, up from 55). Description names the env var, the flag, the error codes, and the matcher rule — but does NOT echo allowlist contents (operator policy isn't agent-introspectable; the agent learns by attempting).
+- **Tests** (TDD red→green):
+  - `tests/unit/test_exec_allowlist.cpp` — 8 cases on the pure logic: missing file → nullopt; empty file → default-deny; comments / blanks ignored; full-line anchoring (no `/bin/sh` ⇒ `/bin/sh -c …` leak); `*` glob inside argv; `FNM_PATHNAME` blocks `*` from spanning `/`; trailing-whitespace stripping; empty argv never matches. 34 assertions.
+  - `tests/unit/test_dispatcher_observer_exec.cpp` — 7 cases on the integration: no-allowlist → -32002; disallowed argv → -32003; happy path with `local_exec` against `/bin/echo`; missing/empty/non-string argv → -32602; relative `argv[0]` → -32602; oversized stdin (64 KiB + 1) → -32602; `describe.endpoints` lists `observer.exec`. 33 assertions.
+  - `tests/smoke/test_observer_exec.py` — end-to-end driver. Pass 1: env var unset, ldbd subprocess started, `observer.exec` ⇒ -32002 with "observer.exec disabled" message. Pass 2: env var set to a tmpfile allowing `/bin/echo hello`, NEW ldbd subprocess started, `observer.exec` runs echo and returns `stdout="hello\n"` + `exit_code=0` + `duration_ms`; `/bin/cat /etc/passwd` ⇒ -32003; `./bin/echo hello` ⇒ -32602. Restarts the daemon between passes because the env var is read at startup.
+  - **`tests/CMakeLists.txt`**: `smoke_observer_exec` registered with TIMEOUT 30, no per-test env tweak (the smoke test sets `LDB_OBSERVER_EXEC_ALLOWLIST` only inside its own subprocess env dict — the M3 closeout note says "set in subprocess env so it doesn't pollute other tests" and that's what we do).
+  - **`tests/unit/CMakeLists.txt`**: added `test_exec_allowlist.cpp` + `test_dispatcher_observer_exec.cpp` to `LDB_UNIT_SOURCES` and `observers/exec_allowlist.cpp` to `LDB_LIB_SOURCES`.
+  - **`src/CMakeLists.txt`**: added `observers/exec_allowlist.cpp` to `LDBD_SOURCES`.
+
+**Decisions:**
+
+- **POSIX `fnmatch(FNM_PATHNAME)` not regex.** Globs match the operator's mental model (this is the same syntax they use in `~/.ssh/config`, `.gitignore`, and shell). Regex would let an operator type `/bin/sh.*` thinking it's anchored when it actually isn't — a footgun for a security-shaped boundary. fnmatch's anchoring is end-to-end without an explicit `^…$`, which is exactly what we want.
+- **Env var wins over CLI flag** (mirrors `LDB_STORE_ROOT` precedence). A containerized launcher can pin policy without rewriting argv. The flag is for ad-hoc local runs.
+- **-32003 (kForbidden) distinct from -32002 (kBadState).** Two failure modes the agent should branch on: "this endpoint isn't configured at all" vs. "this argv specifically isn't allowed." Squashing both to one code would force the agent to text-match the message — fragile.
+- **Missing allowlist file ⇒ -32002 (still disabled), not startup failure.** Same posture as the artifact store: a missing/unreadable file is logged and we keep going with policy = "deny everything." If the operator's intent was "enable observer.exec" and the file is gone, the agent SEES the typed error and the operator sees the warning on stderr. Failing startup would also kill `target.*`, `mem.*`, and every other endpoint that has nothing to do with `observer.exec`.
+- **`argv[0]` rule documented in code comments.** Absolute path or bare basename only; relative `./foo`, `../foo` is -32602. The alternative (silently treat `./foo` as `foo` and probe PATH) is a footgun at the agent boundary because then the working directory of `ldbd` matters. We force the caller to be unambiguous.
+- **Allowlist contents are NEVER returned over the wire.** `describe.endpoints` describes the endpoint, but operator policy is not agent-introspectable. The agent's posture must be "try, see -32003, ask the operator" — same as how a human shell user discovers what's in `sudoers`.
+- **Smoke test restarts ldbd between passes** because the env var is read at startup. Not great for test wall-clock, but it's the only way to exercise both "configured" and "not configured" against the actual binary in a single test.
+- **No new transport primitive.** `local_exec` / `ssh_exec` already do exactly what we need (synchronous one-shot, bounded caps). `StreamingExec` would be wrong here — `observer.exec` is a request/response endpoint, not a stream.
+
+**Surprises / blockers:**
+
+- **First-pass got accidentally written into the `/home/zach/Develop/LDB` master worktree** rather than into my isolated `.claude/worktrees/agent-a3048d08e71d410de/` worktree because I started by editing absolute paths off the system reminders. Caught when `git worktree list` showed two parallel sibling agents touching the same master files. Recovered by copying my new files across to the right worktree and re-applying my modifications to its in-tree files. Master tree is left in whatever state the parent agent's coordination has produced — I did not revert sibling agents' work.
+- **Sibling agent independently added `observer.net.igmp` + `observer.net.tcpdump` to master**, including a `handle_observer_net_igmp` declaration in the dispatcher header that flashed up via a system reminder mid-edit. Separate slices; ours doesn't depend on theirs. My worktree's dispatcher.h has only the `observer.exec` handler.
+- **`exec_allowlist.cpp` lives outside the `LDB_OBSERVER_EXEC_ALLOWLIST` env-var test**: the smoke test sets the env var inside the subprocess env dict and never exports it to the parent / other tests. The CMake foreach loop at the bottom of `tests/CMakeLists.txt` (which sets `LDB_STORE_ROOT` per-test) is untouched — that's the right pattern; we shouldn't add observer-exec policy to every unrelated test.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **27/27 PASS in 24.30 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 26/26 → +1 for `smoke_observer_exec`.)
+  - `smoke_observer_exec`: 0.23 s (two ldbd restarts, 4 RPC round-trips each).
+  - `unit_tests`: 13.58 s. `[observers][exec][allowlist]` tag: 8 cases / 34 assertions. `[dispatcher][observers][exec]` tag: 7 cases / 33 assertions.
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` noise from GCC 13).
+- Stdout-discipline preserved: smoke test reads JSON-RPC line-by-line and got every response, no spurious bytes from `/bin/echo` bleeding into ldbd's stdout.
+- `build/bin/ldbd --help` shows the new flag; `build/bin/ldbd --version` → `0.1.0`.
+
+**Deferred:** observer.net.tcpdump (sibling agent), observer.net.igmp (sibling agent).
+
+**Next:** M4 is functionally closed once the parent agent merges this slice + the two sibling slices (igmp / tcpdump). Then the open M3-polish + M5 questions from cont. 18 reopen.
+
+---
+
 ## 2026-05-06 (cont. 18) — M4 part 4: BPF probe engine via bpftrace
 
 **Goal:** Land the second `probe.create` engine — `kind: "uprobe_bpf"` — alongside M3's `lldb_breakpoint`. The agent now picks low-rate / app-level (LLDB) vs. high-rate / syscall-level (BPF) per-probe; both flow into the same per-probe ring buffer and the same `ProbeEvent` shape (plan §7.2 + §7.3). bpftrace is shelled out as a long-lived subprocess; events stream back over a NEW transport primitive (`StreamingExec`).
