@@ -1,0 +1,129 @@
+name: Bug report
+description: Something in ldbd / the protocol / the CLI is broken or behaves wrong.
+title: "[bug] <one-line summary>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The more concrete the repro, the faster
+        the fix. Read `CONTRIBUTING.md` first if you haven't.
+
+        For wire-protocol bugs: include the exact JSON-RPC request that
+        produced the wrong response, and the response itself. Don't
+        paraphrase — the wire shape is the contract.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the bug. Include the exact behavior you observed.
+      placeholder: |
+        Calling `type.layout` with `name="dxp_login_frame"` returned `byte_size: 0`
+        for a struct that pahole reports as 128 bytes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened instead.
+      placeholder: |
+        `byte_size: 128` and the full field list, matching the DWARF.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro
+      description: |
+        Minimal steps to reproduce. Prefer a JSON-RPC transcript piped
+        into `ldbd --stdio` over a CLI invocation, since the CLI is a
+        thin wrapper. If the bug is in the CLI specifically, say so.
+      placeholder: |
+        ```bash
+        printf '%s\n' \
+          '{"jsonrpc":"2.0","id":1,"method":"target.open","params":{"path":"./bin/foo"}}' \
+          '{"jsonrpc":"2.0","id":2,"method":"type.layout","params":{"target_id":1,"name":"dxp_login_frame"}}' \
+          | build/bin/ldbd --stdio
+        ```
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: response
+    attributes:
+      label: Actual response (if applicable)
+      description: Paste the JSON response, including `_cost` and `_provenance` if present.
+      render: json
+
+  - type: input
+    id: ldbd-version
+    attributes:
+      label: ldbd version
+      description: Output of `build/bin/ldbd --version`.
+      placeholder: "ldbd 0.1.0 (commit abc1234)"
+    validations:
+      required: true
+
+  - type: input
+    id: protocol-version
+    attributes:
+      label: Protocol version
+      description: From `data.protocol.version` in `hello`. Skip if pre-`0.1` daemon.
+      placeholder: "0.1"
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux x86-64
+        - Linux arm64
+        - macOS arm64 (Apple silicon)
+        - macOS x86-64 (Intel)
+        - FreeBSD
+        - Windows
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: os-detail
+    attributes:
+      label: OS detail
+      description: Distro + version, kernel, libc. (e.g. `Pop!_OS 24.04 / 6.18.7 / glibc 2.39`)
+      placeholder: "Pop!_OS 24.04 / 6.18.7 / glibc 2.39"
+
+  - type: input
+    id: lldb-version
+    attributes:
+      label: LLDB / liblldb version
+      description: Whatever `LDB_LLDB_ROOT` resolves to. Output of `<llvm>/bin/lldb --version`.
+      placeholder: "lldb version 22.1.5"
+
+  - type: input
+    id: compiler
+    attributes:
+      label: Compiler
+      placeholder: "gcc 13.3.0 / clang 18.1.8"
+
+  - type: textarea
+    id: target
+    attributes:
+      label: Target binary (if relevant)
+      description: |
+        If the bug depends on a specific target, describe it: what language,
+        what compiler, what debug format, build flags. If you can attach a
+        minimal repro binary or the source, do so.
+      placeholder: |
+        Static C++ binary, gcc 13.3 -O0 -g, DWARF 5, ELF, x86-64.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Logs (stderr from `ldbd`), screenshots, links to related issues.
