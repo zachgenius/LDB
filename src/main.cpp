@@ -4,6 +4,7 @@
 #include "ldb/version.h"
 #include "observers/exec_allowlist.h"
 #include "probes/probe_orchestrator.h"
+#include "protocol/transport.h"
 #include "store/artifact_store.h"
 #include "store/session_store.h"
 #include "util/log.h"
@@ -20,12 +21,19 @@ namespace {
 void print_usage() {
   std::cerr <<
     "ldbd " << ldb::kVersionString << "\n"
-    "Usage: ldbd [--stdio] [--log-level debug|info|warn|error]\n"
+    "Usage: ldbd [--stdio] [--format json|cbor]\n"
+    "            [--log-level debug|info|warn|error]\n"
     "            [--store-root <path>]\n"
     "            [--observer-exec-allowlist <path>] [-h|--help]\n"
     "\n"
     "Modes:\n"
-    "  --stdio    Read JSON-RPC from stdin, write responses to stdout (default)\n"
+    "  --stdio          Read JSON-RPC from stdin, write responses to stdout\n"
+    "                   (default)\n"
+    "  --format <fmt>   Wire format on stdin/stdout. `json` (default) is\n"
+    "                   line-delimited JSON. `cbor` is length-prefixed RFC\n"
+    "                   8949 binary frames (4-byte big-endian uint32 length\n"
+    "                   followed by N bytes of CBOR). Per-session\n"
+    "                   negotiation via `hello` is post-MVP.\n"
     "\n"
     "Storage:\n"
     "  --store-root <path>   Directory for the artifact store (sqlite\n"
@@ -42,6 +50,12 @@ void print_usage() {
     "                        Env var takes precedence over the flag.\n"
     "\n"
     "Logs go to stderr; the JSON-RPC channel is exclusive on stdout.\n";
+}
+
+bool parse_wire_format(const std::string& s, ldb::protocol::WireFormat& out) {
+  if (s == "json") { out = ldb::protocol::WireFormat::kJson; return true; }
+  if (s == "cbor") { out = ldb::protocol::WireFormat::kCbor; return true; }
+  return false;
 }
 
 bool parse_log_level(const std::string& s, ldb::log::Level& out) {
@@ -87,6 +101,7 @@ int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
   std::string store_root_arg;
   std::string observer_exec_allowlist_arg;
+  ldb::protocol::WireFormat wire_format = ldb::protocol::WireFormat::kJson;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -98,6 +113,12 @@ int main(int argc, char** argv) {
       return 0;
     } else if (a == "--stdio") {
       stdio_mode = true;
+    } else if (a == "--format" && i + 1 < argc) {
+      if (!parse_wire_format(argv[++i], wire_format)) {
+        std::cerr << "invalid format: " << argv[i]
+                  << " (expected json|cbor)\n";
+        return 2;
+      }
     } else if (a == "--log-level" && i + 1 < argc) {
       ldb::log::Level lvl;
       if (!parse_log_level(argv[++i], lvl)) {
@@ -187,7 +208,7 @@ int main(int argc, char** argv) {
                                      exec_allowlist);
 
   if (stdio_mode) {
-    return ldb::daemon::run_stdio_loop(dispatcher);
+    return ldb::daemon::run_stdio_loop(dispatcher, wire_format);
   }
   return 0;
 }
