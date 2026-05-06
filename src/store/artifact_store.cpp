@@ -128,6 +128,25 @@ void migrate(ArtifactStore::Impl& I) {
     "  PRIMARY KEY(artifact_id, tag),"
     "  FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE"
     ");"
+    // Typed knowledge-graph edges (post-v0.1 §7). CASCADE on both
+    // endpoints so artifact.delete drops every relation involving it
+    // — the contract the caller relies on for GC.
+    "CREATE TABLE IF NOT EXISTS artifact_relations("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  from_id INTEGER NOT NULL,"
+    "  to_id INTEGER NOT NULL,"
+    "  predicate TEXT NOT NULL,"
+    "  meta TEXT,"
+    "  created_at INTEGER NOT NULL,"
+    "  FOREIGN KEY(from_id) REFERENCES artifacts(id) ON DELETE CASCADE,"
+    "  FOREIGN KEY(to_id)   REFERENCES artifacts(id) ON DELETE CASCADE"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_relations_from "
+    "  ON artifact_relations(from_id);"
+    "CREATE INDEX IF NOT EXISTS idx_relations_to "
+    "  ON artifact_relations(to_id);"
+    "CREATE INDEX IF NOT EXISTS idx_relations_pred "
+    "  ON artifact_relations(predicate);"
   );
 }
 
@@ -677,6 +696,221 @@ ArtifactStore::add_tags(std::int64_t id,
     throw;
   }
   return tags_for(*impl_, id);
+}
+
+// ----------------------------------------------------------------------------
+// Knowledge graph: typed relations (post-v0.1 §7).
+
+namespace {
+
+ArtifactRelation relation_from_stmt(sqlite3_stmt* s) {
+  ArtifactRelation r;
+  r.id         = sqlite3_column_int64(s, 0);
+  r.from_id    = sqlite3_column_int64(s, 1);
+  r.to_id      = sqlite3_column_int64(s, 2);
+  auto pred    = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
+  r.predicate  = pred ? pred : "";
+  if (sqlite3_column_type(s, 4) != SQLITE_NULL) {
+    auto m = reinterpret_cast<const char*>(sqlite3_column_text(s, 4));
+    if (m && *m) {
+      try { r.meta = nlohmann::json::parse(m); }
+      catch (const std::exception&) { r.meta = nlohmann::json::object(); }
+    }
+  }
+  r.created_at = sqlite3_column_int64(s, 5);
+  return r;
+}
+
+constexpr const char* kRelSelectCols =
+    "id, from_id, to_id, predicate, meta, created_at";
+
+bool artifact_exists(ArtifactStore::Impl& I, std::int64_t id) {
+  auto stmt = I.prepare("SELECT 1 FROM artifacts WHERE id = ?1;");
+  sqlite3_bind_int64(stmt.get(), 1, id);
+  int rc = sqlite3_step(stmt.get());
+  if (rc == SQLITE_ROW)  return true;
+  if (rc == SQLITE_DONE) return false;
+  throw_sqlite(I.db, "artifact_exists");
+}
+
+}  // namespace
+
+ArtifactRelation
+ArtifactStore::add_relation(std::int64_t from_id, std::int64_t to_id,
+                            std::string_view predicate,
+                            const nlohmann::json& meta) {
+  if (predicate.empty()) {
+    throw backend::Error("artifact_store.add_relation: predicate must "
+                         "be non-empty");
+  }
+  std::lock_guard<std::mutex> lk(impl_->mu);
+
+  // Pre-check both endpoints. The FK constraint also fires, but the
+  // explicit check produces a clearer error message.
+  if (!artifact_exists(*impl_, from_id)) {
+    throw backend::Error("artifact_store.add_relation: no such from_id: "
+                         + std::to_string(from_id));
+  }
+  if (!artifact_exists(*impl_, to_id)) {
+    throw backend::Error("artifact_store.add_relation: no such to_id: "
+                         + std::to_string(to_id));
+  }
+
+  auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+  std::string meta_str = meta.is_null() ? std::string("{}") : meta.dump();
+
+  std::int64_t new_id = 0;
+  {
+    auto ins = impl_->prepare(
+        "INSERT INTO artifact_relations(from_id, to_id, predicate, "
+        "                                meta, created_at) "
+        "VALUES(?1, ?2, ?3, ?4, ?5);");
+    sqlite3_bind_int64(ins.get(), 1, from_id);
+    sqlite3_bind_int64(ins.get(), 2, to_id);
+    sqlite3_bind_text (ins.get(), 3, predicate.data(),
+                       static_cast<int>(predicate.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text (ins.get(), 4, meta_str.c_str(),
+                       static_cast<int>(meta_str.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins.get(), 5, static_cast<sqlite3_int64>(now_ns));
+    if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "add_relation: insert");
+    }
+    new_id = sqlite3_last_insert_rowid(impl_->db);
+  }
+
+  ArtifactRelation r;
+  r.id         = new_id;
+  r.from_id    = from_id;
+  r.to_id      = to_id;
+  r.predicate  = std::string(predicate);
+  r.meta       = meta.is_null() ? nlohmann::json::object() : meta;
+  r.created_at = static_cast<std::int64_t>(now_ns);
+  return r;
+}
+
+std::vector<ArtifactRelation>
+ArtifactStore::list_relations(std::optional<std::int64_t> artifact_id,
+                              std::optional<std::string>  predicate,
+                              RelationDir                 direction) {
+  std::lock_guard<std::mutex> lk(impl_->mu);
+
+  std::string sql = std::string("SELECT ") + kRelSelectCols
+                    + " FROM artifact_relations";
+  std::vector<std::string> clauses;
+  if (artifact_id.has_value()) {
+    switch (direction) {
+      case RelationDir::kOut:  clauses.emplace_back("from_id = ?"); break;
+      case RelationDir::kIn:   clauses.emplace_back("to_id   = ?"); break;
+      case RelationDir::kBoth: clauses.emplace_back("(from_id = ? OR to_id = ?)");
+                                break;
+    }
+  }
+  if (predicate.has_value()) clauses.emplace_back("predicate = ?");
+
+  if (!clauses.empty()) {
+    sql += " WHERE ";
+    for (std::size_t i = 0; i < clauses.size(); ++i) {
+      if (i) sql += " AND ";
+      sql += clauses[i];
+    }
+  }
+  sql += " ORDER BY id ASC;";
+  auto stmt = impl_->prepare(sql);
+
+  int idx = 1;
+  if (artifact_id.has_value()) {
+    sqlite3_bind_int64(stmt.get(), idx++, *artifact_id);
+    if (direction == RelationDir::kBoth) {
+      sqlite3_bind_int64(stmt.get(), idx++, *artifact_id);
+    }
+  }
+  if (predicate.has_value()) {
+    sqlite3_bind_text(stmt.get(), idx++, predicate->c_str(),
+                      static_cast<int>(predicate->size()), SQLITE_TRANSIENT);
+  }
+
+  std::vector<ArtifactRelation> out;
+  for (;;) {
+    int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE) break;
+    if (rc != SQLITE_ROW) throw_sqlite(impl_->db, "list_relations step");
+    out.push_back(relation_from_stmt(stmt.get()));
+  }
+  return out;
+}
+
+bool ArtifactStore::remove_relation(std::int64_t id) {
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  // Detect existence so we can return false when the id is already gone
+  // (idempotent semantics, mirroring ArtifactStore::remove).
+  bool exists = false;
+  {
+    auto chk = impl_->prepare(
+        "SELECT 1 FROM artifact_relations WHERE id = ?1;");
+    sqlite3_bind_int64(chk.get(), 1, id);
+    int rc = sqlite3_step(chk.get());
+    if (rc == SQLITE_ROW)       exists = true;
+    else if (rc != SQLITE_DONE) throw_sqlite(impl_->db, "remove_relation: chk");
+  }
+  if (!exists) return false;
+  auto del = impl_->prepare(
+      "DELETE FROM artifact_relations WHERE id = ?1;");
+  sqlite3_bind_int64(del.get(), 1, id);
+  if (sqlite3_step(del.get()) != SQLITE_DONE) {
+    throw_sqlite(impl_->db, "remove_relation: delete");
+  }
+  return true;
+}
+
+ArtifactRelation
+ArtifactStore::import_relation(std::int64_t from_id, std::int64_t to_id,
+                               std::string_view predicate,
+                               const nlohmann::json& meta,
+                               std::int64_t created_at) {
+  if (predicate.empty()) {
+    throw backend::Error("artifact_store.import_relation: predicate "
+                         "must be non-empty");
+  }
+  std::lock_guard<std::mutex> lk(impl_->mu);
+
+  if (!artifact_exists(*impl_, from_id)) {
+    throw backend::Error("artifact_store.import_relation: no such from_id: "
+                         + std::to_string(from_id));
+  }
+  if (!artifact_exists(*impl_, to_id)) {
+    throw backend::Error("artifact_store.import_relation: no such to_id: "
+                         + std::to_string(to_id));
+  }
+
+  std::string meta_str = meta.is_null() ? std::string("{}") : meta.dump();
+  std::int64_t new_id = 0;
+  {
+    auto ins = impl_->prepare(
+        "INSERT INTO artifact_relations(from_id, to_id, predicate, "
+        "                                meta, created_at) "
+        "VALUES(?1, ?2, ?3, ?4, ?5);");
+    sqlite3_bind_int64(ins.get(), 1, from_id);
+    sqlite3_bind_int64(ins.get(), 2, to_id);
+    sqlite3_bind_text (ins.get(), 3, predicate.data(),
+                       static_cast<int>(predicate.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text (ins.get(), 4, meta_str.c_str(),
+                       static_cast<int>(meta_str.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins.get(), 5, static_cast<sqlite3_int64>(created_at));
+    if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+      throw_sqlite(impl_->db, "import_relation: insert");
+    }
+    new_id = sqlite3_last_insert_rowid(impl_->db);
+  }
+
+  ArtifactRelation r;
+  r.id         = new_id;
+  r.from_id    = from_id;
+  r.to_id      = to_id;
+  r.predicate  = std::string(predicate);
+  r.meta       = meta.is_null() ? nlohmann::json::object() : meta;
+  r.created_at = created_at;
+  return r;
 }
 
 }  // namespace ldb::store

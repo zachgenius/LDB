@@ -366,6 +366,17 @@ json artifact_row_to_list_json(const ldb::store::ArtifactRow& r) {
   return j;
 }
 
+json relation_to_json(const ldb::store::ArtifactRelation& r) {
+  json j;
+  j["id"]         = r.id;
+  j["from_id"]    = r.from_id;
+  j["to_id"]      = r.to_id;
+  j["predicate"]  = r.predicate;
+  j["meta"]       = r.meta;
+  j["created_at"] = r.created_at;
+  return j;
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -516,6 +527,9 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
     if (req.method == "artifact.delete")    return handle_artifact_delete(req);
+    if (req.method == "artifact.relate")    return handle_artifact_relate(req);
+    if (req.method == "artifact.relations") return handle_artifact_relations(req);
+    if (req.method == "artifact.unrelate")  return handle_artifact_unrelate(req);
     if (req.method == "artifact.export")    return handle_artifact_export(req);
     if (req.method == "artifact.import")    return handle_artifact_import(req);
 
@@ -1200,12 +1214,77 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
       "Delete an artifact by id: drops the row, cascades its tags, and "
       "unlinks the on-disk blob. Idempotent — deleting an already-gone id "
       "returns deleted=false (not an error). The recipe.delete endpoint "
-      "is the high-level wrapper for recipe-format artifacts.",
+      "is the high-level wrapper for recipe-format artifacts. ON DELETE "
+      "CASCADE also drops every artifact_relations row referencing this "
+      "artifact (post-v0.1 §7).",
       obj({{"id", int_()}}, {"id"}),
       obj({
           {"id",      int_()},
           {"deleted", bool_()},
       }, {"id", "deleted"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== artifact.relate / .relations / .unrelate (Tier 3 §7) =====
+
+  add("artifact.relate",
+      "Insert a typed relation from one artifact to another. Predicate is "
+      "a free-form short string ('parsed_by', 'extracted_from', "
+      "'called_by', 'ancestor_of', ...) — see "
+      "docs/09-artifact-knowledge-graph.md for common values. Both "
+      "endpoints must already exist in the store; missing ids surface as "
+      "-32000. Manual-attach in v0.3; auto-derivation from session logs "
+      "is a v0.5 follow-up.",
+      obj({
+          {"from_id",   int_()},
+          {"to_id",     int_()},
+          {"predicate", str("Free-form non-empty string.")},
+          {"meta",      obj_open("Optional small JSON object.")},
+      }, {"from_id", "to_id", "predicate"}),
+      obj({
+          {"relation_id", int_()},
+          {"from_id",     int_()},
+          {"to_id",       int_()},
+          {"predicate",   str()},
+          {"created_at",  int_("Unix epoch nanoseconds.")},
+      }, {"relation_id", "from_id", "to_id", "predicate", "created_at"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("artifact.relations",
+      "Enumerate relations. With artifact_id set, returns only edges "
+      "involving that artifact (filtered by direction: 'out' = from, "
+      "'in' = to, 'both' = either). With predicate set, exact-match "
+      "filter. The view spec (limit/offset/fields/summary) projects the "
+      "returned array. Single-hop only — recursive graph traversal is "
+      "deferred.",
+      obj({
+          {"artifact_id", int_("Filter to edges involving this artifact.")},
+          {"predicate",   str("Exact-match filter.")},
+          {"direction",   enum_str({"out", "in", "both"},
+                                   "Default 'both'.")},
+      }),
+      obj({
+          {"relations", arr_of(obj({
+              {"id",         int_()},
+              {"from_id",    int_()},
+              {"to_id",      int_()},
+              {"predicate",  str()},
+              {"meta",       obj_open()},
+              {"created_at", int_()},
+          }))},
+          {"total", uint_()},
+      }, {"relations", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("artifact.unrelate",
+      "Drop one relation by id. Idempotent — deleting an already-gone "
+      "id returns deleted=false (not an error). Use artifact.delete "
+      "to drop every relation involving an artifact at once via "
+      "ON DELETE CASCADE.",
+      obj({{"relation_id", int_()}}, {"relation_id"}),
+      obj({
+          {"relation_id", int_()},
+          {"deleted",     bool_()},
+      }, {"relation_id", "deleted"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== session.* ==============
@@ -1297,10 +1376,19 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
             {"byte_size", uint_()},
             {"path",      str()},
         }))},
+        {"relations",  arr_of(obj({
+            {"from_build_id", str()},
+            {"from_name",     str()},
+            {"to_build_id",   str()},
+            {"to_name",       str()},
+            {"predicate",     str()},
+            {"meta",          obj_open()},
+            {"created_at",    int_()},
+        }))},
     }, {"format", "sessions", "artifacts"});
 
     auto import_entry_schema = obj({
-        {"kind",   enum_str({"session", "artifact"})},
+        {"kind",   enum_str({"session", "artifact", "relation"})},
         {"key",    str()},
         {"reason", str()},
     }, {"kind", "key"});
@@ -2979,6 +3067,159 @@ Response Dispatcher::handle_artifact_delete(const Request& req) {
   json data;
   data["id"]      = id;
   data["deleted"] = deleted;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// --- artifact.relate / .relations / .unrelate (Tier 3 §7) -----------------
+//
+// Typed relations between artifacts form a queryable knowledge graph
+// ("this XML is the schema parsed_by xml_parse called_by init_schema").
+// Single-hop only in v0.3; recursive traversal is a v0.5 follow-up.
+// Predicate is a free-form string — common values are documented in
+// docs/09-artifact-knowledge-graph.md.
+//
+// Auto-derivation from session logs is deferred. This slice ships
+// manual-attach only: the agent (or a higher layer) issues
+// artifact.relate explicitly when it learns a fact.
+
+namespace {
+// Parse the optional [direction] param into the store enum. Defaults to
+// "both" when absent or null.
+bool parse_relation_dir(const json& params,
+                        ldb::store::RelationDir* out,
+                        std::string* err_msg) {
+  *out = ldb::store::RelationDir::kBoth;
+  auto it = params.find("direction");
+  if (it == params.end() || it->is_null()) return true;
+  if (!it->is_string()) {
+    *err_msg = "'direction' must be a string ('out'|'in'|'both')";
+    return false;
+  }
+  const auto& s = it->get_ref<const std::string&>();
+  if      (s == "out")  *out = ldb::store::RelationDir::kOut;
+  else if (s == "in")   *out = ldb::store::RelationDir::kIn;
+  else if (s == "both") *out = ldb::store::RelationDir::kBoth;
+  else {
+    *err_msg = "'direction' must be one of 'out'|'in'|'both'";
+    return false;
+  }
+  return true;
+}
+
+// Pull a signed integer id out of the params, accepting both
+// number_integer and number_unsigned representations. Returns true
+// only if the key was present and convertible.
+bool require_int64(const json& params, const char* key, std::int64_t* out) {
+  auto it = params.find(key);
+  if (it == params.end() || it->is_null()) return false;
+  if (it->is_number_integer())   { *out = it->get<std::int64_t>();          return true; }
+  if (it->is_number_unsigned())  { *out = static_cast<std::int64_t>(
+                                            it->get<std::uint64_t>());      return true; }
+  return false;
+}
+}  // namespace
+
+Response Dispatcher::handle_artifact_relate(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t from_id = 0, to_id = 0;
+  if (!require_int64(req.params, "from_id", &from_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'from_id'");
+  }
+  if (!require_int64(req.params, "to_id", &to_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'to_id'");
+  }
+  const auto* predicate = require_string(req.params, "predicate");
+  if (!predicate) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'predicate'");
+  }
+  if (predicate->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'predicate' must be non-empty");
+  }
+  json meta = json::object();
+  if (auto it = req.params.find("meta"); it != req.params.end() &&
+                                          !it->is_null()) {
+    if (!it->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'meta' must be an object");
+    }
+    meta = *it;
+  }
+
+  auto rel = artifacts_->add_relation(from_id, to_id, *predicate, meta);
+  json data;
+  data["relation_id"] = rel.id;
+  data["from_id"]     = rel.from_id;
+  data["to_id"]       = rel.to_id;
+  data["predicate"]   = rel.predicate;
+  data["created_at"]  = rel.created_at;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_relations(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object() && !req.params.is_null()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::optional<std::int64_t> artifact_id;
+  std::optional<std::string>  predicate;
+  ldb::store::RelationDir     dir = ldb::store::RelationDir::kBoth;
+
+  if (req.params.is_object()) {
+    if (auto it = req.params.find("artifact_id");
+        it != req.params.end() && !it->is_null()) {
+      std::int64_t v = 0;
+      if (!require_int64(req.params, "artifact_id", &v)) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'artifact_id' must be an integer");
+      }
+      artifact_id = v;
+    }
+    if (auto it = req.params.find("predicate");
+        it != req.params.end() && !it->is_null()) {
+      if (!it->is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "'predicate' must be a string");
+      }
+      predicate = it->get<std::string>();
+    }
+    std::string err_msg;
+    if (!parse_relation_dir(req.params, &dir, &err_msg)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err_msg);
+    }
+  }
+
+  auto rels = artifacts_->list_relations(artifact_id, predicate, dir);
+  json arr = json::array();
+  for (const auto& r : rels) arr.push_back(relation_to_json(r));
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  return protocol::make_ok(req.id,
+      protocol::view::apply_to_array(std::move(arr), view_spec, "relations"));
+}
+
+Response Dispatcher::handle_artifact_unrelate(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t rid = 0;
+  if (!require_int64(req.params, "relation_id", &rid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'relation_id'");
+  }
+  bool deleted = artifacts_->remove_relation(rid);
+  json data;
+  data["relation_id"] = rid;
+  data["deleted"]     = deleted;
   return protocol::make_ok(req.id, std::move(data));
 }
 

@@ -210,6 +210,15 @@ set_tests_properties(smoke_artifact PROPERTIES
 )
 
 add_test(
+  NAME smoke_artifact_relations
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_artifact_relations.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_artifact_relations PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_session
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_session.py"
           "$<TARGET_FILE:ldbd>"

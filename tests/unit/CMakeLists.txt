@@ -32,6 +32,8 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_view_retrofit.cpp
   test_fixture_sleeper.cpp
   test_artifact_store.cpp
+  test_artifact_relations.cpp
+  test_dispatcher_artifact_relate.cpp
   test_recipe_store.cpp
   test_dispatcher_recipe_guard.cpp
   test_session_store.cpp

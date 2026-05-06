@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -610,12 +611,20 @@ nlohmann::json make_manifest_skeleton() {
   m["creator"]     = "ldbd 0.1.0";
   m["sessions"]    = nlohmann::json::array();
   m["artifacts"]   = nlohmann::json::array();
+  // Relations live alongside artifacts (post-v0.1 §7). Endpoint ids on
+  // the wire are the SOURCE store's ids; on import they are remapped to
+  // the destination store's ids by looking up (build_id, name).
+  m["relations"]   = nlohmann::json::array();
   return m;
 }
 
 // Encode one artifact into both the manifest entry and the tar entries
 // (blob + meta sidecar). Pushes onto [tar] and returns the manifest
 // row.
+//
+// Relations are emitted later, after every artifact has been processed,
+// so we know the full id-set for the "both endpoints inside the export"
+// filter.
 nlohmann::json
 emit_artifact(std::vector<TarEntry>& tar,
               ArtifactStore& as,
@@ -662,6 +671,40 @@ emit_artifact(std::vector<TarEntry>& tar,
   mrow["byte_size"] = row.byte_size;
   mrow["path"]      = blob_name;
   return mrow;
+}
+
+// Walk the store's relations, drop edges whose endpoints aren't both in
+// [exported] (the rows we just emitted), and rewrite each endpoint to
+// (build_id, name). The destination side will resolve those back to its
+// own ids during unpack — this is the id-remap channel.
+nlohmann::json
+emit_relations_for(ArtifactStore& as,
+                   const std::vector<ArtifactRow>& exported) {
+  // Map source-store id → ArtifactRow* for both the in-set check and
+  // the (build_id, name) lookup. Linear over `exported` is fine — these
+  // sets are small (an investigation captures dozens, not millions).
+  std::unordered_map<std::int64_t, const ArtifactRow*> by_id;
+  by_id.reserve(exported.size());
+  for (const auto& r : exported) by_id.emplace(r.id, &r);
+
+  auto rels = as.list_relations(std::nullopt, std::nullopt,
+                                 RelationDir::kBoth);
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& rel : rels) {
+    auto fit = by_id.find(rel.from_id);
+    auto tit = by_id.find(rel.to_id);
+    if (fit == by_id.end() || tit == by_id.end()) continue;  // dangling
+    nlohmann::json e;
+    e["from_build_id"] = fit->second->build_id;
+    e["from_name"]     = fit->second->name;
+    e["to_build_id"]   = tit->second->build_id;
+    e["to_name"]       = tit->second->name;
+    e["predicate"]     = rel.predicate;
+    e["meta"]          = rel.meta;
+    e["created_at"]    = rel.created_at;
+    arr.push_back(std::move(e));
+  }
+  return arr;
 }
 
 }  // namespace
@@ -736,6 +779,11 @@ PackResult pack_session(SessionStore& sessions,
     manifest["artifacts"].push_back(std::move(mrow));
   }
 
+  // Knowledge-graph relations (post-v0.1 §7). Endpoints not in the
+  // exported artifact set are filtered out so the import side never has
+  // to chase a dangling id.
+  manifest["relations"] = emit_relations_for(artifacts, rows);
+
   // manifest goes first inside the tar (top-level introspection), but
   // building the tar requires knowing the manifest, so push it onto
   // the front now that everything else is known.
@@ -768,6 +816,7 @@ PackResult pack_artifacts(ArtifactStore& artifacts,
   auto manifest = make_manifest_skeleton();
 
   auto rows = artifacts.list(build_id, std::nullopt);
+  std::vector<ArtifactRow> exported;
   for (const auto& r : rows) {
     if (names.has_value()) {
       bool matched = false;
@@ -778,7 +827,9 @@ PackResult pack_artifacts(ArtifactStore& artifacts,
     }
     auto mrow = emit_artifact(tar, artifacts, r);
     manifest["artifacts"].push_back(std::move(mrow));
+    exported.push_back(r);
   }
+  manifest["relations"] = emit_relations_for(artifacts, exported);
 
   std::string manifest_str = manifest.dump();
   TarEntry m_entry;
@@ -1005,6 +1056,53 @@ ImportReport unpack(SessionStore& sessions,
                                  format, user_meta, tags, created_at,
                                  policy == ConflictPolicy::kOverwrite);
       report.imported.push_back({"artifact", bid + "/" + nm, ""});
+    }
+  }
+
+  // Knowledge-graph relations (post-v0.1 §7). Endpoints arrive as
+  // (build_id, name) pairs and are remapped here to the destination
+  // store's freshly-assigned ids. A relation whose endpoint isn't
+  // resolvable (artifact missing locally and not in this pack) is
+  // skipped with a deterministic reason — the typical case is a `skip`
+  // policy that landed on a duplicate artifact, leaving its relations
+  // dangling.
+  if (manifest.contains("relations") && manifest["relations"].is_array()) {
+    for (const auto& r : manifest["relations"]) {
+      if (!r.is_object() ||
+          !r.contains("from_build_id") || !r.contains("from_name") ||
+          !r.contains("to_build_id")   || !r.contains("to_name")   ||
+          !r.contains("predicate")) {
+        throw backend::Error("pack: malformed relation manifest entry");
+      }
+      std::string fb = r["from_build_id"].get<std::string>();
+      std::string fn = r["from_name"].get<std::string>();
+      std::string tb = r["to_build_id"].get<std::string>();
+      std::string tn = r["to_name"].get<std::string>();
+      std::string pred = r["predicate"].get<std::string>();
+
+      auto a = artifacts.get_by_name(fb, fn);
+      auto b = artifacts.get_by_name(tb, tn);
+      if (!a.has_value() || !b.has_value()) {
+        // Either endpoint is missing locally — happens under the skip
+        // policy when its anchor artifact was preserved-as-local.
+        report.skipped.push_back(
+            {"relation",
+             fb + "/" + fn + " -> " + tb + "/" + tn,
+             "endpoint not present after import"});
+        continue;
+      }
+
+      nlohmann::json meta = nlohmann::json::object();
+      if (r.contains("meta") && r["meta"].is_object()) meta = r["meta"];
+      std::int64_t created_at = 0;
+      if (r.contains("created_at") &&
+          r["created_at"].is_number_integer()) {
+        created_at = r["created_at"].get<std::int64_t>();
+      }
+
+      artifacts.import_relation(a->id, b->id, pred, meta, created_at);
+      report.imported.push_back(
+          {"relation", fb + "/" + fn + " -> " + tb + "/" + tn, ""});
     }
   }
 

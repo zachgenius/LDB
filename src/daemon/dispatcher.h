@@ -96,6 +96,9 @@ class Dispatcher {
   protocol::Response handle_artifact_list(const protocol::Request& req);
   protocol::Response handle_artifact_tag(const protocol::Request& req);
   protocol::Response handle_artifact_delete(const protocol::Request& req);
+  protocol::Response handle_artifact_relate(const protocol::Request& req);
+  protocol::Response handle_artifact_relations(const protocol::Request& req);
+  protocol::Response handle_artifact_unrelate(const protocol::Request& req);
 
   protocol::Response handle_session_create(const protocol::Request& req);
   protocol::Response handle_session_attach(const protocol::Request& req);
