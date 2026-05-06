@@ -533,6 +533,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
 
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
+    if (req.method == "thread.continue")    return handle_thread_continue(req);
 
     if (req.method == "frame.locals")       return handle_frame_locals(req);
     if (req.method == "frame.args")         return handle_frame_args(req);
@@ -1124,8 +1125,21 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
       /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
   add("process.continue",
-      "Resume a stopped process. Blocks until next stop or exit.",
-      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      "Resume a stopped process. Blocks until next stop or exit. "
+      "Optional `tid` selects a thread for per-thread resume — in v0.3 "
+      "this is SYNC PASSTHROUGH (whole-process continue regardless of "
+      "tid); v0.4+ will keep sibling threads stopped (true non-stop). "
+      "See docs/11-non-stop.md.",
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       uint_min(1, "Optional. Thread id to resume "
+                                    "(Tier 4 §14). v0.3: tid is logged "
+                                    "but the whole process resumes — "
+                                    "wire-shape parity with v0.4 async "
+                                    "mode. Future per-thread keep-running "
+                                    "lands when SBProcess::SetAsync(true) "
+                                    "ships.")},
+      }, {"target_id"}),
       process_state_def(),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
@@ -1188,6 +1202,21 @@ with_defs(      obj({{"threads", arr_of(ref("Thread"))}}, {"threads"}),
       }, {"target_id", "tid"}),
 with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
           {{"Frame", frame_info_def()}}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "medium");
+
+  add("thread.continue",
+      "Resume the given thread. WARNING: in v0.3 this is SYNC — all "
+      "threads resume together (passthrough into process.continue) "
+      "because the daemon runs LLDB in SBProcess::SetAsync(false). The "
+      "wire shape is async-ready: in v0.4+ when async mode lands this "
+      "endpoint will keep sibling threads stopped (true non-stop). "
+      "Agents should treat thread.continue as equivalent to "
+      "process.continue under v0.3 protocol. See docs/11-non-stop.md.",
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       tid_param()},
+      }, {"target_id", "tid"}),
+      process_state_def(),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("frame.locals",
@@ -2810,7 +2839,40 @@ Response Dispatcher::handle_process_continue(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint param 'target_id'");
   }
-  auto status = backend_->continue_process(static_cast<backend::TargetId>(tid));
+  // Optional `tid` (Tier 4 §14, scoped slice). When present, route to
+  // the per-thread continue path. In v0.3 this is a sync passthrough
+  // into continue_process — see backend::DebuggerBackend::continue_thread
+  // and docs/11-non-stop.md for the runtime-vs-protocol gap.
+  std::uint64_t thread_id = 0;
+  bool have_tid = require_uint(req.params, "tid", &thread_id);
+  backend::ProcessStatus status =
+      have_tid
+          ? backend_->continue_thread(static_cast<backend::TargetId>(tid),
+                                      static_cast<backend::ThreadId>(thread_id))
+          : backend_->continue_process(static_cast<backend::TargetId>(tid));
+  return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_thread_continue(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  std::uint64_t thread_id = 0;
+  if (!require_uint(req.params, "tid", &thread_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'tid'");
+  }
+  // Tier 4 §14: explicit per-thread resume. v0.3 sync passthrough —
+  // resumes the whole process. See docs/11-non-stop.md.
+  auto status = backend_->continue_thread(
+      static_cast<backend::TargetId>(target_id),
+      static_cast<backend::ThreadId>(thread_id));
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 

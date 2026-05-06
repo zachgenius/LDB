@@ -23,6 +23,8 @@ set(LDB_UNIT_SOURCES
   test_backend_process.cpp
   test_backend_threads.cpp
   test_backend_step.cpp
+  test_backend_continue_thread.cpp
+  test_dispatcher_thread_continue.cpp
   test_backend_frame_values.cpp
   test_backend_value_eval.cpp
   test_backend_value_read.cpp

@@ -498,6 +498,25 @@ class DebuggerBackend {
   // event. Throws if there is no process to continue.
   virtual ProcessStatus continue_process(TargetId tid) = 0;
 
+  // Resume a single thread (Tier 4 §14, scoped slice).
+  //
+  // v0.3 contract: SYNC PASSTHROUGH — equivalent to continue_process,
+  // because LldbBackend runs in SBProcess::SetAsync(false) and the
+  // whole-process Continue is the only resume path that actually works.
+  // The `thread_id` argument is reserved: in v0.4+ when the daemon
+  // moves to async mode this method will resume just `thread_id` while
+  // the rest of the process stays stopped (true non-stop debugging).
+  //
+  // The protocol surface (thread.continue, process.continue+tid) is
+  // wired to this method NOW so client code is async-ready and can
+  // switch behavior on a daemon-version handshake bump when v0.4 lands.
+  // See docs/11-non-stop.md.
+  //
+  // Throws backend::Error on invalid target_id, or if there is no live
+  // process to resume.
+  virtual ProcessStatus
+      continue_thread(TargetId target_id, ThreadId thread_id) = 0;
+
   // Terminate the target's process. Idempotent: returns
   // ProcessStatus{state=kNone} when there is no process.
   virtual ProcessStatus kill_process(TargetId tid) = 0;
