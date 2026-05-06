@@ -4,6 +4,63 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 21) — M5 part 4: ldb CLI
+
+**Goal:** Ship the operator-facing `ldb` command-line client (plan §11 M5: "thin client, mainly for humans / scripts"). Spawn `ldbd` as a child, fetch the catalog, dispatch one method, print the response. Schema-driven param parsing so new endpoints don't need CLI updates.
+
+**Done:**
+
+- **`tools/ldb/ldb`** — single-file Python 3 script (~470 lines, stdlib-only). Discovers `ldbd` via `--ldbd PATH`, then `$PATH`, then in-tree fallback `./build/bin/ldbd`. Spawns the daemon once per CLI invocation in `--stdio --format <fmt>` mode, sends ONE JSON-RPC call, prints stdout, exits. Daemon dies cleanly on stdin close.
+  - **Schema-driven param parsing.** First call to the daemon is always `describe.endpoints`; the catalog drives `--help`, per-method `--help`, and `key=value` type coercion (`integer` → `int(...)`, `boolean` → true/false/yes/no/1/0/on/off, `array` → comma-split or duplicate `--key value`, `object` → JSON, `string` → verbatim or JSON-literal). New endpoints work without CLI updates. Hex `0x...` accepted for ints.
+  - **View descriptors.** `--view k=v` (repeatable) collapses into `params.view = {fields: [...], limit: N, offset: N, summary: bool}`. Special-cases `fields` as comma-list and `limit`/`offset` as ints. Forwarded verbatim for unknown keys.
+  - **Output modes.** Default: pretty-prints `data` field of an `ok:true` response. `--raw`: full JSON-RPC envelope including `_cost` (and `_provenance` once it lands). Errors: stderr with `code` + `message`; exit 1.
+  - **Format negotiation.** `--format json|cbor` passes through to `ldbd --format`. CLI hand-rolls a minimal CBOR codec (RFC 8949 subset matching what nlohmann::to_cbor produces — same shape as `tests/smoke/test_cbor.py`).
+  - **Help.** Top-level `--help` lists every subcommand from the catalog with one-line summary, sorted alphabetically. Per-method `--help` prints params (name=type, required/optional, description) plus the view-descriptor cheat-sheet. Both reads from the live catalog, so help is always current.
+  - **Error mapping.** Required-param check is client-side too (not just daemon-side) so the user gets a nice message with `--help` hint without waiting for an `-32602` round-trip.
+  - **Stdout discipline preserved.** CLI's stdout = response payload; daemon traffic logged via `--verbose` to CLI's stderr; daemon's own stderr is captured but only surfaced when the daemon dies prematurely.
+- **`src/daemon/dispatcher.cpp::handle_describe_endpoints`** — added view-descriptor support. The catalog now flows through `protocol::view::apply_to_array(eps, view_spec, "endpoints")` so `--view fields=method,summary --view limit=3` works end-to-end. Without a view, the response shape goes from `{endpoints: [...]}` to `{endpoints: [...], total: 58}` — strictly additive, all existing tests still pass.
+- **`tests/smoke/test_ldb_cli.py`** — end-to-end test:
+  - happy-path `ldb hello`, `ldb target.open path=<fixture>`;
+  - error path `ldb type.layout target_id=1 name=…` against an empty daemon (exits non-zero, stderr names the failure);
+  - top-level `ldb --help` lists `hello`, `target.open`, `describe.endpoints`;
+  - per-method `ldb target.open --help` shows `path` as required;
+  - unknown method `ldb no.such.method` → exit 1, stderr;
+  - missing required `ldb target.open` → exit 2, stderr names the missing field;
+  - view descriptor `ldb describe.endpoints --view fields=method,summary --view limit=3` → exactly 3 items, each projected to `{method, summary}`, `total` present;
+  - CBOR transport `ldb --format=cbor hello` → same data shape;
+  - raw envelope `ldb --raw hello` → `_cost`, `data`, `ok:true` all present.
+- **`tests/CMakeLists.txt`** — registered `smoke_ldb_cli` (TIMEOUT 30) passing the ldbd binary, the in-source CLI script, and the structs fixture.
+
+**Decisions:**
+
+- **Python over C++.** The CLI is operator-facing and not perf-critical. Python iterates faster, has good arg parsing primitives, and we already use Python for smoke tests. Adding a second C++ build target for a thin wrapper would gain nothing. The C++ daemon stays the single binary that links liblldb.
+- **Hand-rolled arg parser, not `argparse` subparsers.** Subcommands are discovered at runtime from `describe.endpoints`; argparse subparsers expect a static command tree. Two-pass parser (top-level options, then `<method> [params...] [--view k=v]`) is ~80 lines and keeps subcommand discovery dynamic — the alternative was synthesizing an argparse parser per startup, which churns more code.
+- **View support added to `describe.endpoints` daemon-side**, not client-side. The CLI is thin by mandate; view descriptors are the canonical projection mechanism in this codebase, server-side. This is a one-line wrapper around the existing `protocol::view::apply_to_array`. Catalog response gains a `total` count which is strictly informative.
+- **One-shot per CLI invocation.** A REPL / `--script` mode would multiply test surface and isn't in M5 done-criteria. Operators who want to chain calls run multiple `ldb` commands; tooling clients write their own JSON-RPC drivers. Documented as deferred in the script's docstring.
+- **Catalog fetch on every invocation** (not cached on disk). The daemon's catalog is cheap to compute (~30 ms on this box) and the cost is paid once. Caching adds invalidation complexity (which build of `ldbd`?) and the gain is negligible against a typical user-facing latency floor.
+- **Hex / decimal / scientific accepted for integers.** `target_id=1` and `address=0x401234` both work. The daemon rejects bad ints with `-32602`; we trust schema's `type: integer` and let the daemon enforce ranges.
+- **`--format=cbor` survives a CBOR-only catalog fetch.** The CLI uses one CBOR connection for `describe.endpoints` and a fresh CBOR connection for the actual call. Could optimize by keeping the catalog connection open and pipelining the second call, but the daemon is single-stream and the cost is one extra fork+exec.
+
+**Surprises / blockers:**
+
+- **First-pass smoke test failed on view projection** — `describe.endpoints` didn't apply views (the handler returned `{endpoints: eps}` without going through `apply_to_array`). TDD caught it: smoke test asserted exact projected key sets, observed the full schema came back. Fix is one-line wrapping in the dispatcher; backward-compatible because all existing tests probe `data["endpoints"]` (the array's still there) and don't assert no extra keys.
+- **target_id state across CLI calls.** Each `ldb` invocation spawns a new daemon, so target_id from a previous `ldb target.open` doesn't survive into the next call. Smoke test acknowledges this — the `type.layout` case exercises the wire path via the empty-daemon error response (-32000 "unknown target_id"), not a positive layout query. A multi-call mode with persistent daemon is the natural next step.
+- **No worktree/master leak.** All edits stayed in `agent-affe0fb6aa8489d42`; `git status` mid-session and at end shows only the worktree branch touched.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **33/33 PASS in 27.07 s wall** on Pop!_OS 24.04 / GCC 13.3.0. (was 32/32 → +1 for `smoke_ldb_cli`.)
+  - `smoke_ldb_cli`: 2.17 s — spawns ldbd many times for the various sub-cases.
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` from GCC 13).
+- Manual smoke: `ldb hello` returns version JSON; `ldb --help` lists 58 subcommands; `ldb target.open --help` shows `path required`; `ldb describe.endpoints --view fields=method,cost_hint --view limit=5` returns 5 projected items.
+- `build/bin/ldbd --version` → 0.1.0; `tools/ldb/ldb --version` → 0.1.0.
+
+**Sibling slice:** `.ldbpack` + session.export/import (parallel agent).
+
+**Next:** M5 polish remaining: public test corpus + replayable goldens, cores-only `_provenance.snapshot`, MVP tag.
+
+---
+
 ## 2026-05-06 (cont. 20a) — M5 part 1: cost-preview metadata
 
 **Goal:** Ship `_cost: {bytes, items, tokens_est}` on every successful response per plan §3.2 so an LLM agent can budget-check before pulling a big response.
