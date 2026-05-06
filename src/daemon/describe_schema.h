@@ -324,6 +324,22 @@ inline json symbol_match_def() {
   });
 }
 
+inline json global_var_match_def() {
+  return obj({
+      {"name",      str()},
+      {"type",      str("DWARF type name as SBValue::GetTypeName() "
+                        "reports it (verbatim).")},
+      {"addr",      uint_("File (unrelocated) address.")},
+      {"load_addr", uint_("Runtime address. Present only when the "
+                          "target has an attached process.")},
+      {"sz",        uint_()},
+      {"module",    str("Basename of the owning module.")},
+      {"file",      str("Declaration source file basename, when DWARF "
+                        "carries it.")},
+      {"line",      uint_("Declaration line, when DWARF carries it.")},
+  });
+}
+
 inline json string_entry_def() {
   return obj({
       {"text",    str()},

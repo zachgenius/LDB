@@ -668,6 +668,108 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
 
 namespace {
 
+// Build a GlobalVarMatch from an SBValue produced by FindGlobalVariables.
+// Best-effort decoration: any field that LLDB can't supply stays at its
+// default (empty string / 0 / nullopt) so the wire response carries the
+// gap honestly rather than synthesizing a value.
+GlobalVarMatch to_global_match(lldb::SBValue v) {
+  GlobalVarMatch g;
+  if (const char* nm = v.GetName())     g.name = nm;
+  if (const char* tn = v.GetTypeName()) g.type = tn;
+  g.size = static_cast<std::uint32_t>(v.GetByteSize());
+
+  auto addr = v.GetAddress();
+  if (addr.IsValid()) {
+    g.file_address = addr.GetFileAddress();
+    auto mod = addr.GetModule();
+    if (mod.IsValid()) {
+      auto fs = mod.GetFileSpec();
+      if (fs.IsValid()) {
+        if (const char* mn = fs.GetFilename()) g.module = mn;
+      }
+    }
+  }
+  // GetLoadAddress on an unloaded global returns LLDB_INVALID_ADDRESS.
+  // Only populate load_address when a real mapping exists.
+  lldb::addr_t la = v.GetLoadAddress();
+  if (la != LLDB_INVALID_ADDRESS) {
+    g.load_address = static_cast<std::uint64_t>(la);
+  }
+
+  auto decl = v.GetDeclaration();
+  if (decl.IsValid()) {
+    auto fs = decl.GetFileSpec();
+    if (fs.IsValid()) {
+      if (const char* fn = fs.GetFilename()) g.file = fn;
+    }
+    g.line = decl.GetLine();
+  }
+  return g;
+}
+
+}  // namespace
+
+std::vector<GlobalVarMatch>
+LldbBackend::find_globals_of_type(TargetId tid, std::string_view type_name,
+                                  bool& strict_out) {
+  if (type_name.empty()) {
+    throw Error("type_name must be non-empty");
+  }
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // Enumerate every global with a wildcard regex. SBTarget's variant
+  // that takes MatchType is the only call that gives us the whole
+  // catalogue in one pass — FindGlobalVariables(name, max) treats
+  // `name` as an exact ident, so ".*" without the regex flag returns
+  // nothing.
+  auto vlist = target.FindGlobalVariables(
+      ".*", kGlobalsOfTypeMaxMatches, lldb::eMatchTypeRegex);
+
+  // First pass: exact match. Greedy on success.
+  std::vector<GlobalVarMatch> exact;
+  std::vector<GlobalVarMatch> all;  // retained for substring fallback
+  uint32_t n = vlist.GetSize();
+  exact.reserve(n);
+  all.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    auto v = vlist.GetValueAtIndex(i);
+    if (!v.IsValid()) continue;
+    const char* tn = v.GetTypeName();
+    if (!tn) continue;
+    GlobalVarMatch g = to_global_match(v);
+    if (type_name == tn) {
+      exact.push_back(g);
+    }
+    all.push_back(std::move(g));
+  }
+
+  if (!exact.empty()) {
+    strict_out = true;
+    return exact;
+  }
+
+  // Substring fallback (plain `find`, no regex per scope).
+  strict_out = false;
+  std::vector<GlobalVarMatch> sub;
+  std::string needle(type_name);
+  for (auto& g : all) {
+    if (g.type.find(needle) != std::string::npos) {
+      sub.push_back(std::move(g));
+    }
+  }
+  return sub;
+}
+
+namespace {
+
 bool is_print_ascii(unsigned char c) {
   // strings(1) treats tab as printable. We accept space..~ plus tab.
   return c == 0x09 || (c >= 0x20 && c <= 0x7E);
