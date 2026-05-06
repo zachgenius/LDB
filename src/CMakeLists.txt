@@ -10,6 +10,7 @@ set(LDBD_SOURCES
   probes/probe_orchestrator.cpp
   store/artifact_store.cpp
   store/session_store.cpp
+  transport/ssh.cpp
   util/log.cpp
 )
 

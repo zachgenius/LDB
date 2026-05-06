@@ -34,6 +34,7 @@ set(LDB_UNIT_SOURCES
   test_probe_orchestrator.cpp
   test_dispatcher_probes.cpp
   test_dispatcher_mem_dump.cpp
+  test_transport_ssh.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -45,6 +46,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
+  ${CMAKE_SOURCE_DIR}/src/transport/ssh.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.

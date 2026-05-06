@@ -4,6 +4,54 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 15) — M4 part 1: SSH transport primitive
+
+**Goal:** Land the internal C++ SSH primitive that M4-2 (`target.connect_remote_ssh`) and M4-3 (typed observers) will build on. Plan §9 has the daemon running on the operator's machine with target hosts reached via SSH; the transport is the load-bearing piece that ties the rest of M4 together.
+
+**Done:**
+
+- **`src/transport/ssh.{h,cpp}`** — three-call surface:
+  - `ssh_exec(host, argv, opts)` → spawn ssh, run argv, capture stdio, deadline-cancel.
+  - `ssh_probe(host, timeout)` → cheap reachability check (runs `/bin/true` over ssh).
+  - `SshPortForward(host, local, remote, setup_timeout)` → RAII `-N -L` tunnel, with `local_port=0` honoring kernel-assigned-then-passed-to-ssh.
+- **`src/CMakeLists.txt`**: wired `transport/ssh.cpp` into `ldbd`. **`tests/unit/CMakeLists.txt`**: wired the test source AND the cpp into the unit-test binary's `LDB_LIB_SOURCES` (matches the existing pattern of compiling sources directly into the test exe).
+- **`tests/unit/test_transport_ssh.cpp`** — 7 cases / 25 assertions:
+  - `[transport][ssh][error]` bogus-host (`nosuchhost.invalid`) → exit_code != 0, non-empty stderr, no throw.
+  - `[transport][ssh][timeout]` 192.0.2.1 (RFC 5737 TEST-NET-1, guaranteed unroutable) with 200ms deadline → `timed_out=true` in <1.5s wall.
+  - `[transport][ssh][probe]` `ssh_probe(bogus, 1.5s)` → ok=false + non-empty detail.
+  - `[transport][ssh][live][requires_local_sshd]` four cases gated on `ssh_probe(localhost,1s)`, with explicit `SKIP("local sshd not configured for key-based passwordless auth — set up ssh-keygen + ~/.ssh/authorized_keys to enable")`: echo round-trip, stdout-cap truncation (yes | head -c 65536 → cap 1024), non-zero remote exit propagation, port-forward end-to-end via in-process EchoServer.
+- **NOT exposed as a JSON-RPC endpoint.** `ssh_exec` is unbounded code execution — §4.6 reserves only narrow allow-listed observers for the wire. The header documents this explicitly and `dispatcher.cpp` was not touched.
+
+**Decisions:**
+
+- **`posix_spawnp` over `fork()+execvp`.** Dispatcher is single-threaded today, but probe callbacks already fire on LLDB's thread. Async-signal-safety between fork and exec is a known footgun; spawn dodges it entirely. POSIX_SPAWN_SETSIGDEF resets SIGPIPE in the child (we ignore it in the parent) so the child gets default SIGPIPE behavior.
+- **SIGPIPE = SIG_IGN at module init** via `std::call_once`. Cheaper than tagging every write with MSG_NOSIGNAL, and stdout/stderr writes from the I/O pump need it too. Already a no-op for ldbd's existing stdio loop.
+- **Default ssh args**: `-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -T`. BatchMode is non-negotiable — without it ssh prompts and hangs. StrictHostKeyChecking=accept-new auto-trusts first-seen but refuses on key change. **Caller's `ssh_options` go BEFORE our defaults** because ssh applies the first occurrence of any `-o` key — so callers can override (e.g. tests override `ConnectTimeout=1` to keep the bogus-host error case fast).
+- **`ssh_exec` shell-quotes argv** before handing it to ssh. ssh concatenates trailing tokens with spaces and re-parses on the remote with `/bin/sh -c`; without quoting, `"/tmp/dir with space/binary"` becomes three positional args remotely. We use POSIX `'...'` quoting with `'\''` for embedded single quotes.
+- **Spawn-side errors throw `backend::Error`**; remote-side errors (auth, host down, non-zero exit, timeout) are reflected in the `ExecResult`. Matches the rest of the project's "exceptions only across module boundaries for catastrophic local failures" convention.
+- **Port-forward setup probe is a TCP `connect()` against the assigned local port.** This works for any service that handles each connection independently (lldb-server, http, …). It DOES consume one connection through the tunnel, which the header documents: a "one-shot" remote server (close-after-first-connection) will be drained by the probe and never see the caller's connect. The unit test originally used a one-shot echo server and hit exactly this footgun; switched to a multi-accept `EchoServer` and added the warning to the header so M4-2 doesn't trip on it.
+- **Local-port kernel-assignment**: when `local_port=0`, we bind a TCP socket on 127.0.0.1:0, read the assigned port via `getsockname`, close, and pass to `ssh -L`. Tiny race vs. another process binding the same port between our close and ssh's bind — header documents it, and `ExitOnForwardFailure=yes` makes ssh exit fast on collision (which `alive()` detects).
+- **Test gating**: live tests SKIP cleanly via `local_sshd_available()` (calls `ssh_probe(localhost, 1s)`). On this Pop!_OS box with passwordless ssh-to-localhost configured, all 7 cases EXERCISED. On a machine without that setup, the 4 `[live]` cases SKIP and the 3 non-live cases still pass.
+
+**Surprises / blockers:**
+
+- **TDD red→green confirmed at compile time first**: cmake --build failed with "Cannot find source file: src/transport/ssh.cpp" before the impl existed (expected reason).
+- **First test failure: `ssh_exec` timeout test against `nosuchhost.invalid`** returned `timed_out=false` because `.invalid` (RFC 6761) NXDOMAIN'd faster than the 200ms budget. Switched to TEST-NET-1 (192.0.2.1) which is guaranteed unroutable — connect() blocks until the kernel SYN retry runs out, and our deadline fires first.
+- **Second test failure: SshPortForward end-to-end test SIGTERM'd** mid-test. The signal source turned out to be the surrounding `timeout 30` wrapper hitting its timeout — the actual issue was the test's `recv()` hanging because the in-process `EchoOnceServer` had already accepted (and closed) its single connection in response to the SshPortForward constructor's TCP-connect setup probe. Fix: `EchoServer` now multi-accepts. Documented in the header so M4-2 doesn't repeat the mistake.
+- **GCC 13 `-Wnull-dereference` inside `nlohmann/json.hpp`** still present (10 instances, pre-existing). Did not block the build; project tolerates it (worklog 2026-05-06 explicitly notes this).
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **23/23 PASS in 17.63s wall** on Pop!_OS 24.04 / GCC 13.3.0.
+- `ldb_unit_tests` → 218 cases / 1815 assertions (was 211/1655 pre-change). +7 new cases / +25 new assertions for the transport module; remaining delta is from prior assertion counting differences.
+- All 4 `[live][requires_local_sshd]` cases EXERCISED on this box (passwordless ssh-to-localhost was already configured during yesterday's bring-up). On boxes without that setup, those 4 SKIP cleanly.
+- Build warning-clean under `-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual -Wconversion -Wsign-conversion -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wmisleading-indentation` (only the pre-existing `nlohmann/json.hpp` null-deref noise).
+- `build/bin/ldbd --version` → 0.1.0 (binary still links and runs; transport sources compiled into ldbd).
+
+**Next:** M4 part 2 — `target.connect_remote_ssh` endpoint. Spawn `lldb-server platform` over `ssh_exec` (or `ssh -f` background), open an `SshPortForward` to its gdbserver port, then call the existing `connect_remote_target` against `127.0.0.1:<local_port>`. The hard parts are sequencing (server must be listening before forward opens) and teardown (forward + server lifetimes tied to the `target.disconnect` call). The transport piece is now done.
+
+---
+
 ## 2026-05-06 — Linux dev-host bring-up + ELF/x86-64 portability fixes
 
 **Goal:** Bring the project up on a fresh Pop!_OS 24.04 dev host (apt was unusable due to Xilinx XRT pinning the package state) and run the full ctest suite green. M2/M3 had been developed on macOS arm64; some Mach-O assumptions had baked into the backend and tests.
