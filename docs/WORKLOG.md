@@ -4,6 +4,57 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 20b) — M5 part 2: JSON Schema in describe.endpoints
+
+**Goal:** Upgrade `describe.endpoints` to emit proper JSON Schema (draft 2020-12) for every endpoint, plus per-entry `requires_stopped` and `cost_hint` metadata so a planning agent can read the catalog once at session start and avoid expensive trial-and-error calls. Plan §4.8.
+
+**Done:**
+
+- **All 58/58 endpoints fully schematized.** No TODOs left for partial coverage. Every entry now carries `params_schema` + `returns_schema` (JSON Schema draft 2020-12), `requires_target` (kept), `requires_stopped` (NEW), `cost_hint` (NEW: low/medium/high/unbounded). The informal `params: {key:"type-name"}` shape is dropped wholesale — pre-MVP, no clients in the wild, the schema form fully supersedes it.
+- **`src/daemon/describe_schema.h`** — new helper module. Free functions in `ldb::daemon::schema` namespace: primitive type builders (`str`, `uint_`, `bool_`, `enum_str`, `hex_string`, `uint_range`, ...), composite builders (`obj`, `obj_open`, `arr_of`, `ref`), and reusable parameter / return definitions (`target_id_param`, `tid_param`, `host_param`, `view_param`, `module_def`, `field_def`, `value_info_def`, `thread_info_def`, `frame_info_def`, `memory_region_def`, `disasm_insn_def`, `symbol_match_def`, `string_entry_def`, `xref_match_def`, `process_state_def`). Pattern: `obj({{"target_id", target_id_param()}, {"name", str()}}, {"target_id", "name"})` reads almost like prose. Plus `with_defs(schema, {{"X", X_def()}, ...})` for attaching a `$defs` block — needed because nlohmann's own `merge_patch` returns void.
+- **`src/daemon/dispatcher.cpp::handle_describe_endpoints`** — full rewrite. The lambda's `add` signature changed from `(name, summary, params_json, returns_json)` to `(name, summary, params_schema, returns_schema, requires_target, requires_stopped, cost_hint)`. The old "implicit requires_target heuristic" (everything except hello/describe/target.open and observer.*) is replaced by an explicit per-endpoint flag — the heuristic was already wrong for `observer.exec` (kept the special-case). Catalog now grouped by section with `// ============== <section> ==============` banners (target.*, static analysis, process.*, thread/frame/value, mem.*, artifact.*, session.*, probe.*, observer.*).
+- **`tests/unit/test_describe_endpoints_schema.cpp`** — 8 cases / 3441 assertions:
+  - **Catalog-wide structural check** walks every endpoint, confirms top-level keys exist, types are right, `cost_hint` is one of the 4 enum values, then recursively walks every nested schema. The recursive `check_schema_shape` enforces: `type` present (or it's a `$ref` leaf), `required` is an array of strings each in `properties`, array `items` schemas are themselves valid, `$defs` entries get walked too. ≥ 50 entries asserted (we have 58).
+  - **Spot checks** on `target.open` (`path` required + string), `mem.read` (target_id/address/size required, returns address+bytes-string, cost_hint=high), `probe.create` (kind+where required), `observer.exec` (argv array of strings, requires_target=false).
+  - **`requires_stopped` lock-down** — frame.locals/args/registers/value.eval/value.read all flagged true; hello/describe.endpoints/type.layout/module.list/string.list/disasm.range/symbol.find all flagged false.
+  - **Draft tag check** — at least one schema advertises `https://json-schema.org/draft/2020-12/schema`.
+- **`tests/smoke/test_describe_endpoints.py`** — end-to-end smoke against a live `ldbd` subprocess: counts ≥ 50 entries, every entry has the 7 required keys, cost_hint enum is honored, params_schema/returns_schema are object-typed at top level, draft tag present, spot-checks `describe.endpoints` self-entry (cost=low, requires_target=false). Registered as `smoke_describe_endpoints` in `tests/CMakeLists.txt` (TIMEOUT 15).
+- **`tests/unit/test_dispatcher_tcpdump.cpp`** — updated the one existing dispatcher test that grepped the old `params`/`returns` keys to look at the new `params_schema`/`returns_schema`/`requires_stopped`/`cost_hint` keys instead.
+
+**Decisions:**
+
+- **Drop the informal `params`/`returns` form entirely** rather than emit both. Pre-MVP, no clients in the wild; emitting both doubles the catalog size and confuses agents about which is canonical. The unit test enforces this — any future regression that re-introduces `params: {...}` will silently break nothing, but agents that read the new shape get a single source of truth.
+- **Schema helper module as a header (`describe_schema.h`)**, not a `.cpp`. Every function is one-liner-trivial; `inline` keeps them in the dispatcher.cpp TU. No new build target needed; the existing dispatcher.cpp build line picks it up via the `daemon/describe_schema.h` include.
+- **`with_defs` instead of `.merge_patch()`.** First pass naively chained `.merge_patch(json{{"$defs", ...}})` after `obj(...)` — but nlohmann's `merge_patch` returns `void` (mutates in place). Refactored to `with_defs(obj(...), {{"X", X_def()}})` which takes the schema by value, attaches the `$defs` block, returns by value. Cleaner anyway.
+- **`$defs` is per-endpoint, not catalog-global.** I considered hoisting `Module`, `ValueInfo`, etc. to a single top-level `$defs` referenced by every endpoint via `#/$defs/X`. Rejected: `describe.endpoints` would lose the property that each endpoint's `returns_schema` is self-contained — agents could no longer `get(["endpoints", i, "returns_schema"])` and have a complete schema. The repetition cost is small (a few KB per response) and only paid by the planning agent at session start.
+- **`cost_hint` buckets**: `low` for trivial responses (hello, process.state, target.close, probe.{disable,enable,delete,list}), `medium` for typical reads (type.layout, frame.*, mem.read_cstr, observer.proc.status), `high` for things that can return many KB (mem.read up to 1 MiB, mem.search, module.list, string.list, disasm.*, observer.proc.maps), `unbounded` for streaming / long-running (probe.events, observer.net.tcpdump). The buckets are intentionally coarse — agents that want exact bytes-per-call can read the response.
+- **`requires_stopped` decisions**: `process.continue` (yes — you can only continue from stopped), `process.step` (yes), `process.save_core` (yes — typical core-save APIs require frozen process), `process.kill`/`detach` (no — orthogonal to stop state), `frame.*` and `value.*` (yes — you can't read frames of a running process safely), `thread.list`/`thread.frames` (yes — same reason), `mem.read` and friends (no — LLDB will read process memory live; the bytes may be racy but that's documented elsewhere). `target.attach` is `no` (it brings the process to stopped as a side effect).
+- **`$ref` schema leaf** in the unit-test structural walker. JSON Schema 2020-12 allows `{"$ref": "#/$defs/X"}` as a complete schema with no `type`. The walker treats `$ref` as a leaf and walks the actual definition via the `$defs` block on the surrounding schema. Without this exception, every shared-type return shape would fail the test.
+
+**Surprises / blockers:**
+
+- **`merge_patch` returns void.** nlohmann::json's `merge_patch` mutates and returns `void`, not `basic_json&`. First-pass chained `.merge_patch(...)` builder calls all failed to compile with the very satisfying GCC error `cannot bind ‘void’ to non-const lvalue reference`. Refactored to a free `with_defs(...)` helper that takes by value, attaches `$defs`, returns by value.
+- **GCC 13 `-Wdangling-reference`** on the test helper `find_endpoint` when it returned `const json&` and callers chained `find_endpoint(resp.data["endpoints"], "...")` — the `[]` operator yields a reference into a temporary chain. Switched to return-by-value (small catalog, doesn't matter) plus updated all callers to `const auto e =` instead of `const auto& e =`.
+- **JSON Schema dialect tag is per-schema, but agents only need one anchor.** I tag the `params_schema` with `$schema: "https://json-schema.org/draft/2020-12/schema"` but don't repeat it on the `returns_schema`. Same dialect, smaller payload. The unit test verifies at least one schema has the tag — agents that want to be paranoid can fall back to the assumption that all schemas in the catalog share the same draft.
+
+**Verification:**
+
+- `cmake --build build` clean from scratch — no warnings.
+- `ctest --test-dir build --output-on-failure` → **30/30 PASS in 24.5 s wall** (was 29/29 → +1 for `smoke_describe_endpoints`). Unit suite: 317 cases / 7256 assertions (was 282/3522 — +35 cases / +3734 assertions, the spike is the catalog-wide schema walk that hits every nested property).
+- End-to-end JSON-RPC sanity: `echo '{"jsonrpc":"2.0","id":"1","method":"describe.endpoints"}' | ldbd --stdio` returns 58 entries, each with the 7 expected keys + draft-2020-12 schemas. Sample type.layout entry has `params_schema.required = ["target_id", "name"]`, `returns_schema.$defs.Field` with offset/size descriptions.
+- `ldbd --version` → 0.1.0.
+- Stdout-discipline preserved (the catalog goes through the same JSON-RPC channel as every other response; daemon stderr unchanged).
+
+**Coverage report:** 58/58 endpoints fully schematized. None left informal. The set: hello, describe.endpoints, target.{open,create_empty,attach,connect_remote,connect_remote_ssh,load_core,close}, module.list, type.layout, symbol.find, string.list, disasm.{range,function}, xref.addr, string.xref, process.{launch,state,continue,kill,detach,save_core,step}, thread.{list,frames}, frame.{locals,args,registers}, value.{eval,read}, mem.{read,read_cstr,regions,search,dump_artifact}, artifact.{put,get,list,tag}, session.{create,attach,detach,list,info}, probe.{create,events,list,disable,enable,delete}, observer.{proc.fds,proc.maps,proc.status,net.sockets,net.tcpdump,net.igmp,exec}.
+
+**Sibling slices:** cost-preview metadata on every response (M5 deliverable, separate slice — this one only adds the *advertised* cost_hint, not per-call bytes-returned), CBOR transport (M5 deliverable, separate slice). Both can be done independently of this work.
+
+**Deferred:** none. Schema validator vendoring (valijson, json-schema-validator) explicitly NOT pulled in — structural test in our own code is sufficient and avoids a build-tree dep we'd have to maintain.
+
+**Next:** M5 cost-preview metadata or CBOR transport. Both are independent of this slice and don't interact.
+
+---
+
 ## 2026-05-06 (cont. 19a) — M4 polish: observer.net.tcpdump
 
 **Goal:** Ship the deferred §4.6 streaming-capture observer. Close out the M4 typed-observer surface with the live-capture endpoint that pairs with `observer.net.sockets` for the agent's "what's actually on the wire" workflow.

@@ -283,6 +283,15 @@ set_tests_properties(smoke_observer_exec PROPERTIES
   TIMEOUT 30
 )
 
+add_test(
+  NAME smoke_describe_endpoints
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_describe_endpoints.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_describe_endpoints PROPERTIES
+  TIMEOUT 15
+)
+
 # Unit tests — Catch2 against compiled-in source modules.
 add_subdirectory(unit)
 
