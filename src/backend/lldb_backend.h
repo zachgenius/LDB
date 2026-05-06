@@ -44,6 +44,8 @@ class LldbBackend final : public DebuggerBackend {
                                const LaunchOptions& opts) override;
   ProcessStatus get_process_state(TargetId tid) override;
   ProcessStatus continue_process(TargetId tid) override;
+  ProcessStatus continue_thread(TargetId target_id,
+                                ThreadId thread_id) override;
   ProcessStatus kill_process(TargetId tid) override;
   ProcessStatus attach(TargetId tid, std::int32_t pid) override;
   ProcessStatus detach_process(TargetId tid) override;

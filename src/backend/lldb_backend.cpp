@@ -1527,6 +1527,27 @@ ProcessStatus LldbBackend::continue_process(TargetId tid) {
   return snapshot(proc);
 }
 
+// Tier 4 §14, scoped slice: in v0.3 LldbBackend runs in SetAsync(false),
+// so per-thread keep-running is not realizable at the LLDB layer. The
+// passthrough here ships the protocol shape (thread.continue,
+// process.continue+tid) for agents while the runtime stays sync. When
+// v0.4 enables SBProcess::SetAsync(true), this is the expansion point:
+// resolve the SBThread by `thread_id`, set thread-suspend states on the
+// siblings (SBThread::Suspend()), and Continue the process with only
+// `thread_id` Resumed. The wire surface won't change — that's the
+// whole point of shipping the shape now.
+//
+// `thread_id` is logged to ease post-hoc diagnostics; we deliberately
+// don't validate it against the live thread set in v0.3 because
+// validation would diverge from the v0.4 contract (v0.4 must validate)
+// and v0.3's whole-process resume doesn't need it.
+ProcessStatus LldbBackend::continue_thread(TargetId tid, ThreadId thread_id) {
+  log::info(std::string("continue_thread: target=") + std::to_string(tid) +
+            " tid=" + std::to_string(thread_id) +
+            " (v0.3 sync passthrough)");
+  return continue_process(tid);
+}
+
 ProcessStatus LldbBackend::kill_process(TargetId tid) {
   lldb::SBTarget target;
   {
