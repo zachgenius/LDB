@@ -4,9 +4,10 @@
 // Spec:      docs/POST-V0.1-PROGRESS.md "Audit-driven corrections folded
 //            into slice 1b spec".
 //
-// Replaces the cores-only "live" sentinel with the real shape:
+// Replaces the cores-only "live" sentinel with the real shape (slice
+// 1c extends the original 4-component form with <bp_digest>):
 //
-//     live:<gen>:<reg_digest>:<layout_digest>
+//     live:<gen>:<reg_digest>:<layout_digest>:<bp_digest>
 //
 // Determinism contract for this slice:
 //   * <gen>            → monotonic per-target counter; bumps on every
@@ -16,10 +17,12 @@
 //                        tuples. Cached per <gen>.
 //   * <layout_digest>  → SHA-256 of canonicalised module layout tuples.
 //                        Cached per <gen>.
+//   * <bp_digest>      → SHA-256 of active SW-breakpoint addresses.
+//                        Computed fresh per call (slice 1c).
 //
-// Cross-process equality is `(reg_digest, layout_digest)` only — `<gen>`
-// is session-local and explicitly excluded from cross-daemon comparisons
-// (documented as a deferral in the worklog).
+// Cross-process equality is `(reg_digest, layout_digest, bp_digest)`
+// only — `<gen>` is session-local and explicitly excluded from
+// cross-daemon comparisons.
 
 #include <catch_amalgamated.hpp>
 
@@ -55,9 +58,10 @@ TEST_CASE("snapshot_for_target: live snapshot has shape live:<gen>:<hex>:<hex>",
 
   std::string snap = be->snapshot_for_target(open.target_id);
 
-  // Shape: "live:" + decimal gen + ":" + 64 lower-hex + ":" + 64 lower-hex.
+  // Shape (slice 1c): "live:" + decimal gen + ":" + 64 lower-hex +
+  // ":" + 64 lower-hex + ":" + 64 lower-hex (bp_digest).
   static const std::regex kLiveRe(
-      R"(^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}$)");
+      R"(^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$)");
   CAPTURE(snap);
   CHECK(std::regex_match(snap, kLiveRe));
 

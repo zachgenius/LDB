@@ -59,6 +59,7 @@ set(LDB_UNIT_SOURCES
   test_protocol_provenance.cpp
   test_backend_provenance.cpp
   test_live_provenance.cpp
+  test_live_provenance_bp.cpp
   test_audit_bugfixes.cpp
 )
 
