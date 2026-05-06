@@ -11,6 +11,7 @@ set(LDBD_SOURCES
   store/artifact_store.cpp
   store/session_store.cpp
   transport/ssh.cpp
+  transport/local_exec.cpp
   util/log.cpp
 )
 

@@ -49,6 +49,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/ssh.cpp
+  ${CMAKE_SOURCE_DIR}/src/transport/local_exec.cpp
 )
 
 # Catch2 amalgamated lives in third_party/.
