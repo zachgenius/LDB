@@ -19,8 +19,8 @@
 | | |
 |---|---|
 | **HEAD at run start** | `c16adf0` (formal README post-MVP-cut) |
-| **HEAD now** | (updated post-§2-merge — Tier 1 §1 ✅, §2 audit ✅ / hw pending) |
-| **ctest at HEAD** | 39/39 green |
+| **HEAD now** | (updated post-§3a-merge — protocol versioning live) |
+| **ctest at HEAD** | 40/40 green |
 | **Tag** | `v0.1` |
 
 ## Tier 1 — Foundational
@@ -31,7 +31,7 @@
 | 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | ✅ | `a1da55c9959d40268` | `a379567ea90e9472a` | (merge commit on master) |
 | 1c | Live provenance — CI determinism gate extended to live targets | ✅ | `a715e629b235a9434` | `afc1d3706a3b11696` | (merge commit on master) |
 | 2 | macOS arm64 hardening pass — Linux-side audit ✅; **hardware sign-off pending user** (see Blockers § below; checklist at `docs/macos-arm64-status.md` §7) | ✅ (audit) | `aa58d23c1330389d6` | `ac66801b1b097bec0` | (merge commit on master) |
-| 3a | Public release polish — protocol semver + version handshake in `hello` | — | — | — | — |
+| 3a | Public release polish — protocol semver + version handshake in `hello` | ✅ | `a7041ead1a14a3982` | `a78224fdd55f8d151` | (merge commit on master) |
 | 3b | Public release polish — GitHub Actions CI (Linux matrix) | — | — | — | — |
 | 3c | Public release polish — `CONTRIBUTING.md` + commit-style + PR template | — | — | — | — |
 
