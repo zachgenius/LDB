@@ -47,6 +47,9 @@ class LldbBackend final : public DebuggerBackend {
   ProcessStatus connect_remote_target(TargetId tid,
                                       const std::string& url,
                                       const std::string& plugin_name) override;
+  ConnectRemoteSshResult
+      connect_remote_target_ssh(TargetId tid,
+                                const ConnectRemoteSshOptions& opts) override;
   bool save_core(TargetId tid, const std::string& path) override;
 
   std::vector<ThreadInfo> list_threads(TargetId tid) override;
@@ -97,6 +100,9 @@ class LldbBackend final : public DebuggerBackend {
                               const std::string& name) override;
 
   void close_target(TargetId tid) override;
+
+  void attach_target_resource(TargetId tid,
+                              std::unique_ptr<TargetResource> r) override;
 
  private:
   struct Impl;

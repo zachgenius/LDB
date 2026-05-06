@@ -36,6 +36,7 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_mem_dump.cpp
   test_transport_ssh.cpp
   test_transport_ssh_tunneled.cpp
+  test_backend_connect_remote_ssh.cpp
 )
 
 set(LDB_LIB_SOURCES

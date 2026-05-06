@@ -4,6 +4,56 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 16) — M4 part 2: target.connect_remote_ssh
+
+**Goal:** Land the end-to-end remote-debug endpoint that ties M4-1's SSH transport to the existing `connect_remote_target` LLDB pathway. The operator's `ldbd` runs locally, the target host runs `lldb-server gdbserver`, the agent issues one RPC and gets a debuggable target.
+
+**Done:**
+
+- **`src/transport/ssh.{h,cpp}`** — two new primitives:
+  - `pick_remote_free_port(host, timeout)` — runs `python3 -c '...bind(0)...'` on the remote first; falls back to `ss -tln | awk` when python3 isn't available (Alpine `ash`-only sshds). Throws `backend::Error` with combined diagnostics if both fail.
+  - `SshTunneledCommand(host, local_port, remote_port, remote_argv, setup_timeout, probe_kind)` — single ssh subprocess that holds `-L LOCAL:127.0.0.1:REMOTE` AND runs `remote_argv` on the remote in foreground. RAII teardown sends SIGHUP to the remote command. `ProbeKind::kTunneledConnect` is the default destructive probe (multi-accept servers); `ProbeKind::kAliveOnly` skips the probe and just verifies ssh stayed up past auth (single-accept servers like `lldb-server gdbserver`).
+- **Backend interface (`debugger_backend.h`)**:
+  - `ConnectRemoteSshOptions{host, port?, ssh_options, remote_lldb_server, inferior_path, inferior_argv, setup_timeout}` and `ConnectRemoteSshResult{status, local_tunnel_port}`.
+  - New virtual `connect_remote_target_ssh(tid, opts)`.
+  - **Generic per-target out-of-band resource hook**: `TargetResource` base type + `attach_target_resource(tid, unique_ptr<TargetResource>)`. Future endpoints (scp'd probe agents, helper subprocesses) will reuse this. Resources drop in reverse-attach order on `close_target` / dtor.
+- **`LldbBackend::connect_remote_target_ssh`**: pick remote port → spawn `SshTunneledCommand(kAliveOnly)` running `lldb-server gdbserver 127.0.0.1:RPORT -- INFERIOR ARGV...` → retry `connect_remote_target("connect://127.0.0.1:LOCAL")` with backoff (80ms + 50ms*attempt) until lldb-server binds — typically succeeds on attempt 0 or 1 → `attach_target_resource(tid, SshTunnelResource{tunnel})` so the tunnel lives as long as the target. On any failure, `tunnel` goes out of scope and ssh dies — no leaked remote lldb-server.
+- **`Dispatcher::handle_target_connect_remote_ssh`**: thin parse-and-dispatch handler. `target.connect_remote_ssh` registered in routing AND `describe.endpoints` (51 endpoints, up from 50). Required strings (`host`, `inferior_path`) → `-32602`. Backend errors → `-32000`.
+- **Tests** (TDD red→green):
+  - `tests/unit/test_transport_ssh_tunneled.cpp` — 5 cases / 19 assertions: `pick_remote_free_port` happy + bad-host error; `SshTunneledCommand` end-to-end via Python multi-accept TCP echo; setup-timeout throws when remote command never binds the port; RAII teardown closes the local forward.
+  - `tests/unit/test_backend_connect_remote_ssh.cpp` — 4 cases / 10 assertions: bogus-host error, empty-inferior-path rejected, bad target_id rejected, **live e2e**: connect_remote_target_ssh against `localhost` + `/opt/llvm-22/bin/lldb-server` + sleeper fixture → state ∈ {stopped, running}, pid > 0, local_tunnel_port > 0; detach.
+  - `tests/smoke/test_connect_remote_ssh.py` — describe-endpoints check, missing-inferior_path → -32602, bogus-host → -32000, **live e2e** (gated): full create_empty → connect_remote_ssh → detach → close. Wired into `tests/CMakeLists.txt` with `TIMEOUT 60`.
+- **Live tests gated on**: passwordless ssh-to-localhost (`ssh_probe(localhost,1s)`) AND lldb-server discovery (`LDB_LLDB_SERVER` env, `LDB_LLDB_ROOT/bin/lldb-server`, then PATH). All gates pass on this Pop!_OS box; on a less-configured host the live cases SKIP cleanly with a logged reason.
+
+**Decisions:**
+
+- **Single ssh subprocess (not two).** Could have been an `SshPortForward` PLUS a separate `ssh_exec` running lldb-server, but that's two ssh sessions, two failure surfaces, and explicit lifetime coupling. One ssh that does `-L` AND a foreground remote command is one PID — kill it and SIGHUP cascades to lldb-server. Documented in `ssh.h` "Why one subprocess" block.
+- **Probe-kind discriminator on `SshTunneledCommand`** instead of a hardcoded probe. `lldb-server gdbserver` is single-accept — its first connection-then-close is interpreted as "client done, exit". A tunneled-connect setup probe would drain the only accept and leave the inferior orphaned. The `kAliveOnly` mode lets the caller (here `connect_remote_target_ssh`) replace the probe with a real ConnectRemote retry loop. Multi-accept servers (HTTP, lldb-server platform, the python tests) keep using the destructive probe — it's faster and gives clearer "remote isn't listening" failures.
+- **`pick_remote_free_port` does python3 first, ss fallback.** Per the task brief. Python3 is on every modern Linux distro and macOS; the ss-based AWK scan covers Alpine / busybox-only. Both probes return the chosen port via stdout; we strtol-parse with bounds checking. **TOCTOU race documented**: another process can grab the port between our probe close and lldb-server's bind. For MVP acceptable; ssh's `ExitOnForwardFailure=yes` makes the failure loud.
+- **Generic `TargetResource` interface, not LldbBackend-specific.** Future backends (gdbstub, native v1.0+) will need to bind helper subprocesses (probe agents, scp'd binaries, observer trampolines) to targets. Putting the interface on `DebuggerBackend` keeps the dispatcher backend-agnostic. The dtor order (resources before SBTarget) matters — close_target runs `DeleteTarget` THEN drops resources, so any "talk to remote" inside SBTarget happens before SIGHUP cascades.
+- **Retry-with-backoff at the connect_remote_target_ssh layer**, NOT in `connect_remote_target` itself. The original `connect_remote_target` is also called by users with already-listening servers (the existing `target.connect_remote` smoke test) — adding retry there would slow the negative path. Keeping retry localized to the SSH path lets each layer own its own timing assumptions.
+- **Inferior path is REMOTE-side absolute path**, not local. The endpoint description in `describe.endpoints` says so. Plumbing remote-side path resolution (e.g. "scp my local binary first") is M4 part 3 territory.
+
+**Surprises / blockers:**
+
+- **First red→green attempt failed because of the destructive probe.** Initial setup probe was a TCP `connect()`-only check; that always succeeded (ssh opens the local port immediately, before the remote command runs), so the probe returned ok=true even when nothing was listening on the remote. Switched to a connect-then-poll-for-EOF probe (`try_tunneled_connect_local`), which correctly distinguishes "remote listening" from "remote dead, ssh just routes the connect to a dead port and the peer hangs up". That worked for the multi-accept Python test, but then the e2e against `lldb-server gdbserver` failed: the probe consumed the single connection and ConnectRemote saw "Connection shut down by remote side while waiting for reply to initial handshake packet". Fix: `ProbeKind::kAliveOnly` mode + retry the actual ConnectRemote in the caller.
+- **Remote `lldb-server` runs cleanly via absolute path** because the `/opt/llvm-22` prebuilt has rpath `$ORIGIN/../lib`. Did not need `LD_LIBRARY_PATH=` wrapping or `-o SetEnv=`. If a future remote ships lldb-server outside its rpath universe, the caller can wrap via `inferior_argv` of a `bash -c '...'` form — but that's a caller concern, not a transport one.
+- **Catch2 SKIP semantics**: each `[live][requires_local_sshd]` case checks `local_sshd_available()` (or `find_lldb_server()` for the e2e) at entry and calls `SKIP("...")`. On this box all gates pass and the cases EXERCISED.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **24/24 PASS in 23.30s wall** on Pop!_OS 24.04 / GCC 13.3.0.
+  - smoke_connect_remote_ssh: 1.33s (live e2e exercised).
+  - unit_tests: 13.33s (227 cases / 1844 assertions; was 218/1815 — +9 cases, +29 assertions).
+- All `[live]` and `[requires_local_sshd]` cases EXERCISED on this box.
+- Build warning-clean (only the pre-existing `nlohmann/json.hpp` `-Wnull-dereference` noise).
+- Stdout-discipline preserved: smoke test reads JSON-RPC line-by-line and got every response, no spurious bytes from ssh / lldb-server bleeding into ldbd's stdout.
+- `build/bin/ldbd --version` → 0.1.0 (binary still links and runs).
+
+**Next:** M4 part 3 — typed observers (`observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets`, `observer.net.tcpdump`). All of these are pure `ssh_exec`-based remote shell commands with structured-JSON parsers; no LLDB integration required. The transport surface is now sufficient for that work.
+
+---
+
 ## 2026-05-06 (cont. 15) — M4 part 1: SSH transport primitive
 
 **Goal:** Land the internal C++ SSH primitive that M4-2 (`target.connect_remote_ssh`) and M4-3 (typed observers) will build on. Plan §9 has the daemon running on the operator's machine with target hosts reached via SSH; the transport is the load-bearing piece that ties the rest of M4 together.

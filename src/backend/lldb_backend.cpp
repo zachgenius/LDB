@@ -1,6 +1,9 @@
 #include "backend/lldb_backend.h"
 
+#include "transport/ssh.h"
+
 #include <algorithm>
+#include <thread>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -143,6 +146,14 @@ struct LldbBackend::Impl {
   lldb::SBDebugger debugger;
   std::mutex mu;
   std::unordered_map<TargetId, lldb::SBTarget> targets;
+  // Out-of-band per-target RAII handles (SSH tunnels, helper
+  // subprocesses, etc.). Vector preserves attach order so close_target
+  // can drop them in reverse — important when one handle depends on
+  // another (e.g. a future scp'd helper binary that's used by the
+  // ssh-tunneled lldb-server).
+  std::unordered_map<TargetId,
+                     std::vector<std::unique_ptr<DebuggerBackend::TargetResource>>>
+      target_resources;
   std::atomic<TargetId> next_id{1};
 
   // Breakpoint callback registry. A separate mutex from `mu` so the
@@ -219,10 +230,17 @@ LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
 
 LldbBackend::~LldbBackend() {
   if (!impl_) return;
+  // Drop per-target resources (SSH tunnels, etc.) BEFORE the SBTargets
+  // and the debugger — same reasoning as close_target. The bookkeeping
+  // map is moved out so the unique_ptrs run their dtors with no lock
+  // held.
+  decltype(impl_->target_resources) resources_by_target;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
+    resources_by_target = std::move(impl_->target_resources);
     impl_->targets.clear();
   }
+  resources_by_target.clear();
   if (impl_->debugger.IsValid()) {
     lldb::SBDebugger::Destroy(impl_->debugger);
   }
@@ -1451,6 +1469,123 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
   return snapshot(proc);
 }
 
+namespace {
+
+// RAII wrapper so the SSH tunnel can be stuffed into the backend's
+// generic per-target-resource bucket. The tunnel's dtor does the real
+// teardown; this just supplies the type-erasure.
+struct SshTunnelResource final : DebuggerBackend::TargetResource {
+  explicit SshTunnelResource(std::unique_ptr<transport::SshTunneledCommand> t)
+      : tunnel(std::move(t)) {}
+  std::unique_ptr<transport::SshTunneledCommand> tunnel;
+};
+
+}  // namespace
+
+ConnectRemoteSshResult
+LldbBackend::connect_remote_target_ssh(TargetId tid,
+                                       const ConnectRemoteSshOptions& opts) {
+  if (opts.host.empty()) {
+    throw Error("connect_remote_ssh: host must not be empty");
+  }
+  if (opts.inferior_path.empty()) {
+    throw Error("connect_remote_ssh: inferior_path must not be empty");
+  }
+  // Validate target_id up front so a "bad target_id" error doesn't
+  // surface after we've already paid the ssh latency.
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    if (impl_->targets.find(tid) == impl_->targets.end()) {
+      throw Error("connect_remote_ssh: unknown target_id");
+    }
+  }
+
+  transport::SshHost ssh_host;
+  ssh_host.host        = opts.host;
+  ssh_host.port        = opts.port;
+  ssh_host.ssh_options = opts.ssh_options;
+
+  // Step 1: ask the remote for a free port.
+  std::uint16_t remote_port = transport::pick_remote_free_port(
+      ssh_host, /*timeout=*/std::chrono::seconds(10));
+
+  // Step 2: build the remote argv. We launch lldb-server in gdbserver
+  // mode listening on the chosen port. Use the absolute server path if
+  // the caller supplied one — that lets the prebuilt LLVM tarball at
+  // /opt/llvm-22/bin/lldb-server work via its $ORIGIN/../lib rpath
+  // without us having to set LD_LIBRARY_PATH.
+  std::string server_bin = opts.remote_lldb_server.empty()
+                               ? std::string("lldb-server")
+                               : opts.remote_lldb_server;
+  std::vector<std::string> remote_argv;
+  remote_argv.push_back(server_bin);
+  remote_argv.push_back("gdbserver");
+  remote_argv.push_back("127.0.0.1:" + std::to_string(remote_port));
+  remote_argv.push_back("--");
+  remote_argv.push_back(opts.inferior_path);
+  for (const auto& a : opts.inferior_argv) remote_argv.push_back(a);
+
+  // Step 3: spawn the single ssh-with-port-forward subprocess. We use
+  // ProbeKind::kAliveOnly because lldb-server gdbserver is a SINGLE-
+  // ACCEPT server — a destructive TCP probe through the tunnel would
+  // consume its only connection and leave the inferior orphaned.
+  // Instead, we spawn-and-trust, then retry ConnectRemote with
+  // backoff to absorb the 50–200 ms it takes lldb-server to bind.
+  auto tunnel = std::make_unique<transport::SshTunneledCommand>(
+      ssh_host,
+      /*local_port=*/0,
+      remote_port,
+      remote_argv,
+      opts.setup_timeout,
+      transport::ProbeKind::kAliveOnly);
+  std::uint16_t local_port = tunnel->local_port();
+
+  // Step 4: drive the existing connect_remote_target with a short
+  // retry loop. lldb-server takes ~50–200ms to bind after the ssh
+  // handshake; before that, ConnectRemote sees ECONNRESET / "shut
+  // down by remote side". Retry-with-backoff hides the race.
+  // Total budget: setup_timeout (defaults to 10s).
+  std::string url = "connect://127.0.0.1:" + std::to_string(local_port);
+  ProcessStatus status;
+  bool connected = false;
+  std::string last_err;
+  const auto deadline =
+      std::chrono::steady_clock::now() + opts.setup_timeout;
+  for (int attempt = 0; std::chrono::steady_clock::now() < deadline; ++attempt) {
+    if (!tunnel->alive()) {
+      throw Error("connect_remote_ssh: ssh subprocess died before remote "
+                  "lldb-server became reachable" +
+                  (last_err.empty() ? std::string{} : ": " + last_err));
+    }
+    try {
+      status = connect_remote_target(tid, url, /*plugin_name=*/"");
+      connected = true;
+      break;
+    } catch (const Error& e) {
+      last_err = e.what();
+      // Cap retries at ~10 over the budget; sleep grows from 80ms.
+      auto delay = std::chrono::milliseconds(80 + 50 * attempt);
+      std::this_thread::sleep_for(delay);
+    }
+  }
+  if (!connected) {
+    throw Error(std::string("connect_remote_ssh: ConnectRemote retries "
+                            "exhausted: ") + last_err);
+  }
+
+  // Step 5: bind the tunnel's lifetime to the target. Now the agent
+  // can do anything with the target (process.continue, mem.read, ...);
+  // when they finally close_target / dtor the backend, the tunnel goes
+  // away which kills lldb-server via SIGHUP.
+  attach_target_resource(tid,
+                         std::make_unique<SshTunnelResource>(std::move(tunnel)));
+
+  ConnectRemoteSshResult out;
+  out.status            = std::move(status);
+  out.local_tunnel_port = local_port;
+  return out;
+}
+
 bool LldbBackend::save_core(TargetId tid, const std::string& path) {
   lldb::SBTarget target;
   {
@@ -2472,12 +2607,22 @@ LldbBackend::read_register(TargetId tid, ThreadId thread_id,
 
 void LldbBackend::close_target(TargetId tid) {
   lldb::SBTarget target;
+  // Move the resources out under the lock; we'll drop them OUTSIDE the
+  // lock so a long-running dtor (e.g. ssh teardown) doesn't block other
+  // backend operations. Reverse-attach order matters when one handle
+  // depends on another — pop_back in a loop is the cheap way.
+  std::vector<std::unique_ptr<DebuggerBackend::TargetResource>> resources;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
     auto it = impl_->targets.find(tid);
     if (it == impl_->targets.end()) return;
     target = it->second;
     impl_->targets.erase(it);
+    if (auto rit = impl_->target_resources.find(tid);
+        rit != impl_->target_resources.end()) {
+      resources = std::move(rit->second);
+      impl_->target_resources.erase(rit);
+    }
   }
   // Reap any breakpoint-callback records associated with this target.
   // The target's SBBreakpoints go away with DeleteTarget; the records
@@ -2491,6 +2636,20 @@ void LldbBackend::close_target(TargetId tid) {
     }
   }
   impl_->debugger.DeleteTarget(target);
+  // Drop resources in reverse-attach order. Tearing down LAST so the
+  // SBTarget delete doesn't try to talk to a dead remote first.
+  while (!resources.empty()) resources.pop_back();
+}
+
+void LldbBackend::attach_target_resource(
+    TargetId tid, std::unique_ptr<DebuggerBackend::TargetResource> r) {
+  if (!r) return;
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  auto it = impl_->targets.find(tid);
+  if (it == impl_->targets.end()) {
+    throw Error("attach_target_resource: unknown target_id");
+  }
+  impl_->target_resources[tid].push_back(std::move(r));
 }
 
 }  // namespace ldb::backend

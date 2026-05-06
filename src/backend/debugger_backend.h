@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -310,6 +312,26 @@ struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// Parameters for connect_remote_target_ssh — bundle them in a struct
+// because there are many optional fields and call-site readability
+// matters more than ABI stability for an internal interface.
+struct ConnectRemoteSshOptions {
+  std::string                         host;        // "user@hostname" or "hostname"
+  std::optional<int>                  port;        // ssh port (defaults to 22 / ~/.ssh/config)
+  std::vector<std::string>            ssh_options; // extra `-o`/etc. args, pass-through
+  std::string                         remote_lldb_server;  // empty → "lldb-server" on PATH
+  std::string                         inferior_path;       // absolute path on remote
+  std::vector<std::string>            inferior_argv;       // optional argv tail for the inferior
+  std::chrono::milliseconds           setup_timeout{10000};
+};
+
+// Result mirrors ProcessStatus but adds the local tunnel port the
+// caller can use for diagnostics (e.g. `lsof -i :<port>`).
+struct ConnectRemoteSshResult {
+  ProcessStatus  status;
+  std::uint16_t  local_tunnel_port = 0;
+};
+
 class DebuggerBackend {
  public:
   virtual ~DebuggerBackend() = default;
@@ -590,6 +612,38 @@ class DebuggerBackend {
 
   // Drop a target.
   virtual void close_target(TargetId tid) = 0;
+
+  // --- Out-of-band target-bound resources ------------------------------
+  //
+  // Some endpoints (e.g. target.connect_remote_ssh) need to keep an
+  // RAII handle alive for as long as the target exists — the SSH
+  // tunneled lldb-server, in that case, dies the moment we drop our
+  // ssh subprocess. The target itself doesn't know about these
+  // handles (they're outside SBAPI), so the backend exposes a generic
+  // "attach this opaque destructor to a target" surface. Resources
+  // are dropped in reverse-attach order on close_target / dtor.
+  //
+  // This is interface-level (not LldbBackend-specific) because future
+  // backends (gdbstub, native) will also need to bind helper
+  // subprocesses (probe agents, scp'd binaries, ...). Keep it generic.
+  struct TargetResource {
+    virtual ~TargetResource() = default;
+  };
+  virtual void
+      attach_target_resource(TargetId tid,
+                             std::unique_ptr<TargetResource> r) = 0;
+
+  // SSH-tunneled remote connect. Spawns a single ssh subprocess that
+  // simultaneously holds a `-L` port forward and runs `lldb-server
+  // gdbserver` on the remote against [inferior_path]. The tunnel
+  // handle's lifetime is bound to the target via attach_target_resource:
+  // close_target / dtor tears it down, which kills the remote
+  // lldb-server via SIGHUP.
+  // Throws backend::Error on bad params, ssh failure, lldb-server
+  // failure, or timeout.
+  virtual ConnectRemoteSshResult
+      connect_remote_target_ssh(TargetId tid,
+                                const ConnectRemoteSshOptions& opts) = 0;
 };
 
 }  // namespace ldb::backend

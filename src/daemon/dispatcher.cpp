@@ -424,6 +424,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "target.attach")      return handle_target_attach(req);
     if (req.method == "target.connect_remote")
       return handle_target_connect_remote(req);
+    if (req.method == "target.connect_remote_ssh")
+      return handle_target_connect_remote_ssh(req);
     if (req.method == "target.load_core")   return handle_target_load_core(req);
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "module.list")        return handle_module_list(req);
@@ -556,6 +558,24 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
            {"plugin", "string?"}},
       json{{"state", "string"}, {"pid", "int"},
            {"stop_reason", "string?"}});
+
+  add("target.connect_remote_ssh",
+      "End-to-end remote debugging over SSH. Spawns a single ssh "
+      "subprocess that simultaneously port-forwards a kernel-assigned "
+      "local port to a chosen remote port AND runs `lldb-server "
+      "gdbserver 127.0.0.1:<remote_port> -- <inferior_path> "
+      "<inferior_argv...>` on the target host. The local end of the "
+      "tunnel is then connected via the existing gdb-remote pathway. "
+      "Tunnel lifetime is bound to the target: target.close (and the "
+      "daemon shutting down) tears the ssh subprocess down, which kills "
+      "lldb-server on the remote via SIGHUP.",
+      json{{"target_id", "uint64"}, {"host", "string"},
+           {"port", "int?"}, {"ssh_options", "array?"},
+           {"remote_lldb_server", "string?"},
+           {"inferior_path", "string"}, {"inferior_argv", "array?"},
+           {"setup_timeout_ms", "uint?"}},
+      json{{"target_id", "uint64"}, {"state", "string"}, {"pid", "int"},
+           {"stop_reason", "string?"}, {"local_tunnel_port", "uint16"}});
 
   add("target.load_core",
       "Load a postmortem core file as a fresh target with frozen "
@@ -1005,6 +1025,77 @@ Response Dispatcher::handle_target_connect_remote(const Request& req) {
   auto status = backend_->connect_remote_target(
       static_cast<backend::TargetId>(tid), *url, plugin);
   return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_target_connect_remote_ssh(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* host = require_string(req.params, "host");
+  if (!host || host->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'host'");
+  }
+  const auto* inferior_path = require_string(req.params, "inferior_path");
+  if (!inferior_path || inferior_path->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'inferior_path'");
+  }
+
+  backend::ConnectRemoteSshOptions opts;
+  opts.host          = *host;
+  opts.inferior_path = *inferior_path;
+
+  if (auto it = req.params.find("port");
+      it != req.params.end() && it->is_number_integer()) {
+    auto v = it->get<std::int64_t>();
+    if (v < 0 || v > 65535) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "param 'port' out of range");
+    }
+    opts.port = static_cast<int>(v);
+  }
+  if (auto it = req.params.find("ssh_options");
+      it != req.params.end() && it->is_array()) {
+    for (const auto& e : *it) {
+      if (!e.is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "param 'ssh_options' must be array of strings");
+      }
+      opts.ssh_options.push_back(e.get<std::string>());
+    }
+  }
+  if (auto it = req.params.find("remote_lldb_server");
+      it != req.params.end() && it->is_string()) {
+    opts.remote_lldb_server = it->get<std::string>();
+  }
+  if (auto it = req.params.find("inferior_argv");
+      it != req.params.end() && it->is_array()) {
+    for (const auto& e : *it) {
+      if (!e.is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "param 'inferior_argv' must be array of strings");
+      }
+      opts.inferior_argv.push_back(e.get<std::string>());
+    }
+  }
+  std::uint64_t timeout_ms = 0;
+  if (require_uint(req.params, "setup_timeout_ms", &timeout_ms) && timeout_ms > 0) {
+    opts.setup_timeout = std::chrono::milliseconds(timeout_ms);
+  }
+
+  auto result = backend_->connect_remote_target_ssh(
+      static_cast<backend::TargetId>(tid), opts);
+  json data = process_status_to_json(result.status);
+  data["target_id"]         = tid;
+  data["local_tunnel_port"] = result.local_tunnel_port;
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_process_detach(const Request& req) {
