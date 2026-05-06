@@ -84,7 +84,7 @@ add_test(
   NAME smoke_view_module_list
   COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_module_list.sh"
           "$<TARGET_FILE:ldbd>"
-          "$<TARGET_FILE:ldb_fix_structs>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
 )
 set_tests_properties(smoke_view_module_list PROPERTIES
   TIMEOUT 30

@@ -5,9 +5,13 @@
 //   * bogus URL (port with nothing listening) → backend::Error promptly.
 //   * malformed URL → backend::Error.
 //
-// The positive case spawns lldb-server gdbserver against the structs
-// fixture on a chosen port (port 0 → kernel-allocated). It's gated on
-// the discovery of an lldb-server binary at:
+// The positive case spawns lldb-server gdbserver against the sleeper
+// fixture on a chosen port (port 0 → kernel-allocated). The sleeper is
+// long-running so we don't race with the inferior exiting before we
+// finish ConnectRemote — which is what happened with the structs
+// fixture (~1ms execution time) and made state=kExited the typical
+// post-connect observation. It's gated on the discovery of an
+// lldb-server binary at:
 //   1. ${LDB_LLDB_SERVER_PATH} (CMake-baked, from LDB_LLDB_ROOT)
 //   2. $LDB_LLDB_SERVER (env override)
 //   3. lldb-server on PATH
@@ -38,7 +42,8 @@ using ldb::backend::ProcessState;
 
 namespace {
 
-constexpr const char* kStructsPath = LDB_FIXTURE_STRUCTS_PATH;
+constexpr const char* kStructsPath  = LDB_FIXTURE_STRUCTS_PATH;
+constexpr const char* kSleeperPath  = LDB_FIXTURE_SLEEPER_PATH;
 
 #ifndef LDB_LLDB_SERVER_PATH
 #define LDB_LLDB_SERVER_PATH ""
@@ -144,7 +149,7 @@ std::unique_ptr<SpawnedServer> spawn_gdbserver(const std::string& server) {
     argv.push_back(pipe_arg);
     argv.push_back("127.0.0.1:0");
     argv.push_back("--");
-    argv.push_back(kStructsPath);
+    argv.push_back(kSleeperPath);
     argv.push_back(nullptr);
 
     ::execv(server.c_str(),
@@ -291,8 +296,10 @@ TEST_CASE("target.connect_remote: connects to lldb-server gdbserver",
   auto status = be->connect_remote_target(open.target_id, url, "");
   // After ConnectRemote against an lldb-server gdbserver that has a
   // launched-but-stopped inferior, state is typically kStopped. Some
-  // servers report eStateConnected (which maps to kRunning) until a
-  // subsequent operation pumps the state.
+  // servers leave it in kRunning until a continue/halt is issued.
+  // The backend pumps the listener until state settles out of
+  // eStateInvalid (see connect_remote_target impl), so we should see a
+  // real state here.
   CHECK((status.state == ProcessState::kStopped ||
          status.state == ProcessState::kRunning));
   CHECK(status.pid >= 0);
