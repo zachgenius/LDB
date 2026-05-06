@@ -151,3 +151,56 @@ TEST_CASE("round-trip: request → dispatched-elsewhere → response → parse",
   REQUIRE(reparsed["id"] == "abc");
   REQUIRE(reparsed["data"]["name"] == "ldbd");
 }
+
+// --- Cost-preview metadata (M5 part 1, plan §3.2) ----------------------
+
+TEST_CASE("serialize_response: ok response carries _cost",
+          "[protocol][serialize][cost]") {
+  Response r = make_ok(json("r9"), json{{"hello", "world"}});
+  std::string s = serialize_response(r);
+  json j = json::parse(s);
+  REQUIRE(j["ok"] == true);
+  REQUIRE(j.contains("_cost"));
+  REQUIRE(j["_cost"].contains("bytes"));
+  REQUIRE(j["_cost"].contains("tokens_est"));
+  // `data` here has no arrays, so `items` MUST be absent.
+  REQUIRE_FALSE(j["_cost"].contains("items"));
+  // bytes is exact serialized length of data.
+  std::string data_dump = json{{"hello", "world"}}.dump();
+  REQUIRE(j["_cost"]["bytes"].get<std::size_t>() == data_dump.size());
+  // tokens_est = ceil(bytes/4).
+  REQUIRE(j["_cost"]["tokens_est"].get<std::size_t>()
+          == (data_dump.size() + 3) / 4);
+}
+
+TEST_CASE("serialize_response: ok response with array key populates items",
+          "[protocol][serialize][cost]") {
+  Response r = make_ok(json("r1"),
+                       json{{"modules", json::array({"a", "b", "c"})}});
+  std::string s = serialize_response(r);
+  json j = json::parse(s);
+  REQUIRE(j["_cost"].contains("items"));
+  REQUIRE(j["_cost"]["items"].get<std::size_t>() == 3);
+}
+
+TEST_CASE("serialize_response: error response has no _cost",
+          "[protocol][serialize][cost]") {
+  Response r = make_err(json(7), ErrorCode::kMethodNotFound,
+                        "no such method 'foo'");
+  std::string s = serialize_response(r);
+  json j = json::parse(s);
+  REQUIRE(j["ok"] == false);
+  REQUIRE_FALSE(j.contains("_cost"));
+}
+
+TEST_CASE("serialize_response: ok with empty data still carries _cost",
+          "[protocol][serialize][cost]") {
+  // An empty object IS valid data — the helper should still report bytes=2
+  // (the literal "{}") so the agent has a number to budget against.
+  Response r = make_ok(json("r1"), json::object());
+  std::string s = serialize_response(r);
+  json j = json::parse(s);
+  REQUIRE(j.contains("_cost"));
+  REQUIRE(j["_cost"]["bytes"].get<std::size_t>() == 2);
+  REQUIRE_FALSE(j["_cost"].contains("items"));
+}
