@@ -40,6 +40,13 @@ struct Response {
   ErrorCode error_code = ErrorCode::kInternalError;
   std::string error_message;              // when !ok
   std::optional<json> error_data;
+
+  // Provenance metadata (plan §3.5, cores-only MVP). Set by the
+  // dispatcher per request. Only emitted on successful (ok=true)
+  // responses, alongside `_cost`. Default "none" so handlers that
+  // forget to set it produce a sentinel rather than something
+  // misleadingly empty.
+  std::string provenance_snapshot = "none";
 };
 
 // Parse one JSON message into a Request. Throws on malformed.

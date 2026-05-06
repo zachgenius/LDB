@@ -56,12 +56,14 @@ set(LDB_UNIT_SOURCES
   test_describe_endpoints_schema.cpp
   test_pack.cpp
   test_util_sha256.cpp
+  test_protocol_provenance.cpp
   test_backend_provenance.cpp
 )
 
 set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/jsonrpc.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/cost.cpp
+  ${CMAKE_SOURCE_DIR}/src/protocol/provenance.cpp
   ${CMAKE_SOURCE_DIR}/src/util/sha256.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/transport.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/view.cpp

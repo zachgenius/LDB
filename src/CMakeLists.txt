@@ -6,6 +6,7 @@ set(LDBD_SOURCES
   daemon/dispatcher.cpp
   protocol/jsonrpc.cpp
   protocol/cost.cpp
+  protocol/provenance.cpp
   protocol/transport.cpp
   protocol/view.cpp
   backend/lldb_backend.cpp
