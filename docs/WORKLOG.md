@@ -4,6 +4,51 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 — Linux dev-host bring-up + ELF/x86-64 portability fixes
+
+**Goal:** Bring the project up on a fresh Pop!_OS 24.04 dev host (apt was unusable due to Xilinx XRT pinning the package state) and run the full ctest suite green. M2/M3 had been developed on macOS arm64; some Mach-O assumptions had baked into the backend and tests.
+
+**Done:**
+
+- **Apt-free toolchain provisioning.** LLVM 22.1.5 prebuilt tarball extracted to `/opt/llvm-22`; ninja static binary into `~/.local/bin`; libsqlite3-dev deb extracted to `/usr/local/{include,lib}` with the `libsqlite3.so` link pointed at the system runtime at `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6`. `liblldb.so` needed `libpython3.11.so.1.0` plus the 3.11 stdlib at `/usr/lib/python3.11/`; both extracted from old-releases.ubuntu.com Mantic debs (`libpython3.11{,-minimal,-stdlib}_3.11.6-3ubuntu0.1`). No apt invocation, no `dpkg --configure`.
+- **`kernel.yama.ptrace_scope=0`** so attach-to-non-child works (default Pop!_OS / Ubuntu is 1).
+- **Backend Linux ELF coverage** (commit `e1cf38f`): three real Mach-O assumptions removed.
+  - `is_data_section` now also accepts `eSectionTypeOther` named `.rodata*` / `.data.rel.ro*`. LLDB classifies ELF read-only data as `eSectionTypeOther`; the existing predicate only knew Mach-O typed cstring/data sections. Without this the default `string.list` scan returned `[]` on Linux.
+  - Section-name filter now matches by leaf in addition to full hierarchical name. `q.section_name = ".rodata"` matches `PT_LOAD[2]/.rodata`. ELF callers can't reasonably know LLDB's invented `PT_LOAD[N]` parent names.
+  - `xref_address` now resolves x86-64 RIP-relative operands. `leaq 0x2e5a(%rip), %rax` carries an *offset*, not the absolute target. The new `rip_relative_targets` helper parses AT&T (`0xN(%rip)`) and Intel (`[rip + 0xN]`) forms, computes `next_insn_addr + signed_offset`, and matches against the needle. macOS arm64 ADRP+ADD references continue to work via the existing absolute-hex path because LLDB annotates them with the resolved hex address in the comment.
+  - `connect_remote_target` now pumps the SBListener with `WaitForEvent` until the process state settles out of `eStateInvalid` (2s deadline). gdb-remote-protocol servers (lldb-server gdbserver) deliver the initial stop as an event; SBProcess won't update its cached state until the event is dequeued, so callers were getting `kInvalid` back. Without this fix every caller would have had to loop on `get_process_state` themselves.
+- **Test fixtures** (commit `455b770`): two fixture/cardinality assumptions removed.
+  - `smoke_view_module_list` now uses sleeper + `process.launch stop_at_entry=true` so the dynamic loader is present as a second module on both Linux and macOS. Pagination assertion lowered to `limit=1 → next_offset=1` (works for any total>=2). Cleanup via `process.kill`.
+  - `target.connect_remote: connects to lldb-server gdbserver` switched from the structs fixture to sleeper. Structs runs to completion in <1ms; the inferior was exiting before ConnectRemote returned, leaving state=`kExited`.
+
+**Decisions:**
+
+- **Hand-extract debs over apt.** XRT had pinned `libboost`/`libssl`/`libelf` versions; any apt-install attempt risked breaking the operator's U50-related tooling. `dpkg-deb -x` reads the package contents without involving the package manager's resolver.
+- **Install Python 3.11 stdlib alongside system 3.12** at `/usr/lib/python3.11/`. Doesn't conflict with system 3.12 (different directory). `liblldb.so` depends on Python 3.11 specifically (the prebuilt tarball was linked against it); embedded Python is initialized at SBDebugger::Initialize and refuses to start without the full stdlib (the `encodings` module is the critical one).
+- **Don't extend `is_data_section` to all `eSectionTypeOther`.** That predicate gates the *default* string scan. Accepting all "Other" sections would scan `.interp` / `.plt` / `.eh_frame` and return noise. Name-based dispatch keeps the default scan focused on actual string-bearing sections.
+- **Pump the listener with a deadline, not indefinitely.** Some servers may never transition state (e.g. broken gdbservers); 2s with `WaitForEvent(1u, ev)` retry yields ~2 attempts in the worst case, both of which a healthy server completes within ms.
+- **`Co-Authored-By` trailer kept** even though commits are made via `git -c user.email/name` per-call (CLAUDE.md says NEVER update git config — this respects that on the new host while still attributing the agent author).
+
+**Surprises / blockers:**
+
+- **The prebuilt LLVM tarball depends on libpython3.11**, not 3.12. Even running `lldb --version` failed without the full Python 3.11 stdlib because CPython initializes `encodings` during `Py_Initialize`. Symlinking `libpython3.12.so → libpython3.11.so.1.0` would have hit ABI mismatches; only the matching-major install works.
+- **`SBTarget::ConnectRemote` on lldb-server gdbserver returns with `eStateInvalid`** until the listener is pumped. Fixed in the backend; the agent who originally wrote the endpoint had predicted this in a code comment but punted to "the caller can pump get_process_state". Now the backend handles it so callers get a real state.
+- **Linux x86-64 `lldb-server` works correctly here** — the macOS arm64 Homebrew bug we hit before doesn't apply. The connect_remote positive-path test now runs live for the first time.
+- **GCC 13 flags `-Wnull-dereference` inside nlohmann/json.hpp** template instantiations (third-party). False positive from GCC's stricter null-deref analysis on heavily-templated code; not present under Apple clang. Did not block the build (just one warning), but worth flagging if we tighten `-Werror` later. Not addressed in this session — it'd require either a vendor patch or upgrading the json.hpp version.
+- **`dpkg-deb -x` has a permissions quirk**: the deb's `libsqlite3.so` symlink points at `libsqlite3.so.0.8.6` *relatively*, which doesn't exist in `/usr/local/lib`. Resolved by overwriting it with an absolute-path link to `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6`. CMake's `find_package(SQLite3)` picks it up cleanly.
+
+**Verification:**
+
+- `ctest --test-dir build` → **23/23 PASS** in 15.87s (was failing 7/23 at start, 4/23 after ptrace_scope, 2/23 after string fix, 1/23 after RIP-relative fix, 0/23 after state-settle fix).
+- unit_tests: 211 cases / 1655 assertions (post-fixture-switches; up from 1655→1665 if assertions counted differently). 1 case still SKIPPED: only the gated old-server-crash path that doesn't apply here.
+- `connect_remote` positive-path test EXERCISED for the first time — Pop!_OS lldb-server-22 works.
+
+**M3 status:** Unchanged — closed end-to-end (artifacts, sessions, probes, mem.dump_artifact). Linux is now a viable dev/test host with the M3 surface intact.
+
+**Next:** Per pre-Linux-move plan, remaining backlog is M3 polish (`session.fork`/`replay`/`export`/`import`, `.ldbpack` format) and M4 (SSH transport + remote target + typed observers + BPF probe engine). User's stated workflow targets a remote host so the M4 path (specifically `target.connect_remote` over SSH-tunneled lldb-server) is the architecturally meaningful next slice.
+
+---
+
 ## 2026-05-06 (cont. 14) — M3 closeout: mem.dump_artifact
 
 **Goal:** Ship the last §4.4 endpoint to close out M3 core scope. `mem.dump_artifact({target_id, addr, len, build_id, name, format?, meta?})` reads `len` bytes at `addr` from the live target and persists them under `(build_id, name)` in the artifact store, returning `{artifact_id, byte_size, sha256, name}`. Pure composition of the existing `read_memory` and `ArtifactStore::put` paths — no new backend or store APIs.
