@@ -351,8 +351,16 @@ std::optional<SessionRow> SessionStore::info(std::string_view id) {
 
 std::vector<SessionRow> SessionStore::list() {
   std::lock_guard<std::mutex> lk(impl_->mu);
+  // Audit §11.2 (revised by reviewer): the secondary key was previously
+  // `id ASC`, but `id` is a 32-hex-char random uuid, which turns the
+  // tiebreak into a non-deterministic shuffle when two sessions share
+  // a `created_at` ns. Use the operator-supplied `name` as the
+  // deterministic secondary key; fall back to `id` only when both
+  // `created_at` and `name` collide (vanishingly rare — same operator
+  // typed the same name twice within the same wall-clock ns).
   std::string sql = std::string("SELECT ") + kSelectIndexCols +
-                    " FROM sessions ORDER BY created_at DESC, id ASC;";
+                    " FROM sessions ORDER BY created_at DESC, "
+                    "name ASC, id ASC;";
   auto stmt = prepare_or_throw(impl_->index_db, sql);
   std::vector<SessionRow> out;
   for (;;) {

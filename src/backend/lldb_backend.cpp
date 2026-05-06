@@ -1216,7 +1216,10 @@ ProcessStatus snapshot(lldb::SBProcess proc) {
     if (thr.IsValid()) {
       char buf[256];
       size_t n = thr.GetStopDescription(buf, sizeof(buf));
-      if (n > 0) s.stop_reason.assign(buf, std::min(n, sizeof(buf) - 1));
+      // SBThread::GetStopDescription returns a length that may include
+      // the trailing NUL on some LLDB releases (audit §11.1). Use
+      // strnlen so we never carry a NUL byte inside the std::string.
+      if (n > 0) s.stop_reason.assign(buf, ::strnlen(buf, std::min(n, sizeof(buf))));
     }
   }
   return s;
@@ -1673,7 +1676,10 @@ ThreadInfo to_thread_info(lldb::SBThread thr) {
 
   char buf[256];
   size_t n = thr.GetStopDescription(buf, sizeof(buf));
-  if (n > 0) t.stop_reason.assign(buf, std::min(n, sizeof(buf) - 1));
+  // Same trailing-NUL guard as ProcessStatus::stop_reason above
+  // (audit §11.1). strnlen finds the real C-string length within the
+  // returned byte count.
+  if (n > 0) t.stop_reason.assign(buf, ::strnlen(buf, std::min(n, sizeof(buf))));
 
   return t;
 }
