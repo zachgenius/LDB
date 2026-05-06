@@ -239,7 +239,7 @@ are not tolerated and are grounds for removal from the project.
 
 A full Code of Conduct will be adopted before the project hits broader
 public exposure. Until then, treat the above as the working policy and
-escalate concerns to the maintainer (`@zachw` on GitHub).
+escalate concerns to the maintainer (`@zachgenius` on GitHub).
 
 ---
 
