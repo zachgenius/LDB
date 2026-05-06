@@ -58,6 +58,31 @@ struct ArtifactRow {
   std::string                  stored_path;       // absolute path to blob
 };
 
+// One typed edge in the artifact knowledge graph (post-v0.1 §7).
+//
+// Relations are free-form: predicate is a short string ("parsed_by",
+// "extracted_from", "called_by", "ancestor_of"), not a closed enum.
+// Common predicates are documented in docs/09-artifact-knowledge-graph.md.
+//
+// `created_at` is unix epoch nanoseconds (matches session_store ns
+// timestamps; ArtifactRow's created_at is *seconds*, but per-relation
+// timestamps want sub-second resolution for ordering when relations are
+// added in a tight loop).
+struct ArtifactRelation {
+  std::int64_t   id          = 0;
+  std::int64_t   from_id     = 0;
+  std::int64_t   to_id       = 0;
+  std::string    predicate;
+  nlohmann::json meta = nlohmann::json::object();
+  std::int64_t   created_at  = 0;     // unix epoch ns
+};
+
+enum class RelationDir {
+  kBoth,   // any relation involving artifact_id (default)
+  kOut,    // only relations whose from_id == artifact_id
+  kIn,     // only relations whose to_id   == artifact_id
+};
+
 class ArtifactStore {
  public:
   // Open (or create) a store rooted at [root]. Creates intermediate
@@ -126,6 +151,44 @@ class ArtifactStore {
                               const std::vector<std::string>& tags,
                               std::int64_t created_at,
                               bool overwrite);
+
+  // -------- knowledge graph (post-v0.1 §7) --------
+  //
+  // Relations are stored alongside artifacts in the same index.db with
+  // an ON DELETE CASCADE foreign key — deleting either endpoint via
+  // ArtifactStore::remove drops every relation referencing it. The
+  // schema is single-hop and queryable; recursive graph traversal
+  // (transitive closure, SHORTEST PATH) is deferred.
+
+  // Insert an edge from [from_id] to [to_id] with [predicate]. Both
+  // endpoints must exist; otherwise throws backend::Error. Predicate
+  // must be non-empty; meta defaults to {} if null is passed.
+  ArtifactRelation add_relation(std::int64_t from_id,
+                                 std::int64_t to_id,
+                                 std::string_view predicate,
+                                 const nlohmann::json& meta);
+
+  // Read relations. With [artifact_id] set, returns edges involving it
+  // (filtered by [direction]); when artifact_id is nullopt, [direction]
+  // is ignored and every relation is returned. With [predicate] set,
+  // only edges whose predicate matches exactly. Sorted by id ASC.
+  std::vector<ArtifactRelation>
+  list_relations(std::optional<std::int64_t> artifact_id,
+                 std::optional<std::string>  predicate,
+                 RelationDir                 direction);
+
+  // Delete one relation by id. Returns true if a row existed.
+  bool remove_relation(std::int64_t id);
+
+  // Bulk-import a relation from a `.ldbpack` archive (Tier 3 §7).
+  // Bypasses the timestamp behavior of add_relation — the supplied
+  // [created_at] is used verbatim, the new id is assigned by sqlite.
+  // Both endpoints must exist; FK enforcement throws on a dangling id.
+  ArtifactRelation
+  import_relation(std::int64_t from_id, std::int64_t to_id,
+                  std::string_view predicate,
+                  const nlohmann::json& meta,
+                  std::int64_t created_at);
 
   // Resolve the configured store root (post-canonicalization). Useful
   // for tests and the --help output.
