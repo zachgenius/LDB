@@ -295,6 +295,10 @@ Undecided. LLDB is Apache 2.0 with LLVM exception, so an LDB built atop it is
 unencumbered. GPLv3 is *not* required and would foreclose embedding LLDB-
 derived code into proprietary clients — that option is being kept open.
 
+Contributors: see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow,
+required tests, the PR checklist, and the implicit license-grant policy
+that applies until a license is formally adopted.
+
 ---
 
 ## References

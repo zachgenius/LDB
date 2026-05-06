@@ -3,6 +3,11 @@
 This file is loaded automatically by Claude Code (and similar agent harnesses).
 Read it before doing any work in this repo.
 
+> Human contributors: see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
+> external-facing workflow guide. This file is the internal AI-agent
+> surface; both files agree on the hard requirements (TDD, warning-clean
+> build, ctest green, stdout reserved for JSON-RPC, WHY-not-WHAT commits).
+
 ## Project
 
 LDB is an LLM/agent-first universal debugger. C++17/20 daemon (`ldbd`)
