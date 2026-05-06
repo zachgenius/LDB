@@ -133,4 +133,49 @@ SocketsResult fetch_net_sockets(const std::optional<transport::SshHost>& remote,
 
 SocketsResult parse_ss_tunap(const std::string& ss_output);
 
+
+// ---- net.igmp ----------------------------------------------------------
+//
+// /proc/net/igmp + /proc/net/igmp6 (the latter optional). We read
+// these as static text — no subprocess needed locally — and merge V4
+// and V6 results into a single `groups` array. For V4 each per-
+// interface header line begins a group with one or more indented
+// address rows; for V6 each line is a single membership and we surface
+// it as its own group with one address.
+//
+// Address byte order: kernel prints the IPv4 group as a hex word in
+// little-endian (`010000E0` ⇒ 224.0.0.1). The IPv6 address is 32 hex
+// chars in network order, which we render as 8 colon-separated groups
+// of 4 (no zero-compression — tooling that wants the canonical form
+// can post-process).
+struct IgmpAddress {
+  std::string   address;        // dotted-quad (V4) or "ffff:...:0001" (V6)
+  std::uint32_t users = 0;
+  std::uint64_t timer = 0;
+};
+
+struct IgmpGroup {
+  std::uint32_t                idx     = 0;
+  std::string                  device;     // "lo", "eth0", ...
+  std::optional<std::uint32_t> count;      // V4 only (header column)
+  std::optional<std::string>   querier;    // V4 only ("V3" | "V2" | "V1")
+  std::vector<IgmpAddress>     addresses;
+};
+
+struct IgmpEntry {
+  std::vector<IgmpGroup> groups;
+  std::uint64_t          total = 0;
+};
+
+// Local: ifstream from /proc/net/igmp and (if present) /proc/net/igmp6.
+// Remote: `cat /proc/net/igmp` and `cat /proc/net/igmp6` over ssh_exec;
+// igmp6 absence is tolerated. Throws backend::Error only on
+// hard remote-transport failure for the V4 path.
+IgmpEntry list_igmp(const std::optional<transport::SshHost>& remote);
+
+// Pure parsers. Exposed so tests can exercise the parsing layer with
+// canned input and zero filesystem / subprocess access.
+IgmpEntry parse_proc_net_igmp(const std::string& v4_text);
+IgmpEntry parse_proc_net_igmp6(const std::string& v6_text);
+
 }  // namespace ldb::observers

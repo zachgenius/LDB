@@ -109,6 +109,7 @@ class Dispatcher {
   protocol::Response handle_observer_proc_maps(const protocol::Request& req);
   protocol::Response handle_observer_proc_status(const protocol::Request& req);
   protocol::Response handle_observer_net_sockets(const protocol::Request& req);
+  protocol::Response handle_observer_net_igmp(const protocol::Request& req);
 
   // The actual routing logic; dispatch() wraps this with rpc-log
   // bookkeeping when a session is attached.

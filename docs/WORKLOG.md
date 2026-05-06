@@ -4,6 +4,55 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-06 (cont. 19b) — M4 polish: observer.net.igmp
+
+**Goal:** Ship the small deferred §4.6 multicast observer — typed parse of `/proc/net/igmp` plus `/proc/net/igmp6` if present. Sibling parser to the M4-3 `observer.proc.*` and `observer.net.sockets` family.
+
+**Done:**
+
+- **`src/observers/net_igmp.cpp`** — two pure parsers + one fetcher.
+  - `parse_proc_net_igmp` walks the kernel's two-level format: header line per interface (`<idx>\t<device>: <count> <querier>`), then indented address rows. Tokenization decision is "leading whitespace ⇒ continuation row, else header." The column header (`Idx\tDevice ... Reporter`) is detected by the literal `Idx` prefix + `Device` substring and skipped silently. Group hex column is reversed byte-by-byte (`010000E0` ⇒ `224.0.0.1`) — kernel emits little-endian on every architecture (it's `htohl()` output, not byte-pun); we always reverse regardless of build host. Address row's third token (`0:00000000`) is split on the colon and the right side parsed as a hex u64 timer.
+  - `parse_proc_net_igmp6` whitespace-tokenizes each row as `<idx> <device> <addr32hex> <users> <src> <timer>`. Rows with `addr.size() != 32` are skipped. Address is rendered as 8 colon-separated 4-hex-char groups, lowercased, no zero-compression — keeps test assertions deterministic and lets the agent normalize via its own tooling if desired.
+  - `list_igmp(remote)`: empty `host` → `std::ifstream` from `/proc/net/igmp{,6}` directly (no subprocess; the files are static text). Remote `host` → `cat /proc/net/igmp` over `transport::ssh_exec`. `/proc/net/igmp6` absence is silently tolerated in both modes (not all hosts have IPv6 multicast). Hard V4 transport failure → `backend::Error`. Off-Linux (no `/proc/net/igmp` at all) → returns empty result, NOT an error — same contract as the other observers when /proc is missing.
+- **`src/observers/observers.h`** — three new structs (`IgmpAddress`, `IgmpGroup`, `IgmpEntry`) + the three function declarations (`list_igmp`, `parse_proc_net_igmp`, `parse_proc_net_igmp6`). `count` and `querier` are `optional<>` since they're V4-only — V6 has no per-interface header line.
+- **Dispatcher wiring** (`src/daemon/dispatcher.cpp`):
+  - `observer.net.igmp` registered in routing AND `describe.endpoints` (56 total endpoints, up from 55).
+  - `igmp_group_to_json` / `igmp_address_to_json` shape converters; `groups[]` runs through `protocol::view::apply_to_array("groups")` so the standard `view: {limit, offset, fields, summary}` controls work.
+  - `requires_target = false` (the existing `observer.*` prefix exclusion already handles it).
+- **Tests** (TDD red→green):
+  - `tests/unit/test_observer_igmp_parser.cpp` — 9 cases: synthetic 2-interface input; little-endian hex byte order; real `proc_net_igmp.txt` fixture (asserts lo has 224.0.0.1); header-only input → empty; empty input → empty; synthetic V6 input; real `proc_net_igmp6.txt` fixture (asserts lo has `ff02::1`); empty V6 input; long no-whitespace device names like `enx323e48ab03da`.
+  - `tests/unit/test_dispatcher_igmp.cpp` — 3 cases: describe.endpoints listing + `requires_target=false`; live local invocation returns `{groups, total}` shape with `total == groups.size()`; `view: {limit:1}` truncates `groups`.
+  - `tests/smoke/test_observer_igmp.py` — describe.endpoints listing, live local call, view-limit application; gates on `/proc/net/igmp` existence so off-Linux SKIPs cleanly.
+  - Fixtures `tests/fixtures/text/proc_net_igmp.txt` + `proc_net_igmp6.txt` captured live on this Pop!_OS box at TDD time and committed.
+
+**Decisions:**
+
+- **V4 + V6 union into a single `groups` array.** The plan's table just says `observer.net.igmp({})`; nothing forces split V4/V6 endpoints. Merging matches `lsof`-style "all multicast memberships" intent — agents who need V4-only filter on `count.has_value()` (V6 entries have it absent), and IPv6 addresses are obviously colon-formatted. Keeps the response shape flat and pageable.
+- **`std::ifstream` locally, not `cat` over `local_exec`.** `/proc/net/igmp` is a static text file; spawning `cat` would burn ~1 ms of fork overhead per call for nothing. Remote still goes through `ssh_exec(cat)` because we don't have an "ssh-fetch-file-content" primitive yet (would be a useful M5 addition).
+- **Address byte-order reversal is unconditional.** I considered `#ifdef LITTLE_ENDIAN` to compile out the byte-swap on big-endian hosts, but the kernel emits the same `htohl()` output everywhere — it's a hex render of the host word, which on every Linux/x86 box is little-endian. Reversing always is the correct + portable choice.
+- **No zero-compression on V6 addresses.** The "canonical form" from RFC 5952 (e.g., `ff02::1`) is what humans expect, but it's not deterministic when emitted by the parser without an extra normalization pass. Keeping all 8 groups lets test fixtures match exact-strings; agents who want canonical can post-process.
+- **Off-Linux returns empty, not error.** Matches the other observers' behavior. The dispatcher integration test gates the live cases on `std::filesystem::exists("/proc/net/igmp")` so the suite SKIPs cleanly on macOS/BSD when v0.3 lands there.
+
+**Surprises / blockers:**
+
+- **Initial harness mismatch:** I edited files at the main-repo absolute paths instead of the worktree paths for the first half of the session — Read/Edit/Write all wrote to `/home/zach/Develop/LDB/...` while the actual worktree was at `/home/zach/Develop/LDB/.claude/worktrees/agent-.../...`. Caught on first build attempt (link error from a sibling agent's exec_allowlist work in main repo). Recovered by redoing all file ops with worktree-prefixed paths. No data lost; main-repo edits are stale and orthogonal.
+- **GCC 13 `-Wnull-dereference` noise on `nlohmann/json.hpp`** persists — pre-existing, not from this change.
+
+**Verification:**
+
+- `ctest --test-dir build --output-on-failure` → **27/27 PASS in 24.49 s** (Pop!_OS 24.04 / GCC 13.3.0). Was 26 → +1 for `smoke_observer_igmp`.
+- `[igmp]` filter: 8 cases / 142 assertions (parser cases — dispatcher cases are tagged `[dispatcher]`).
+- `[dispatcher][igmp]` filter: 3 cases — describe + live + view.
+- Build warning-clean (only the pre-existing nlohmann-json `-Wnull-dereference` noise).
+- `build/bin/ldbd describe.endpoints` reports 56 endpoints including `observer.net.igmp` with full param/return schema.
+- Live invocation against current host returns 5 V4 groups + 19 V6 memberships (lo, enp8s0, enx*, wlp9s0, zth*).
+
+**Deferred:** `observer.net.tcpdump` (sibling agent), `observer.exec` (sibling agent).
+
+**Next:** Sibling agents' tcpdump + exec close out M4. Master can then either polish M3 (`.ldbpack`, `session.fork`/replay) or pivot to M5 (CBOR transport, CLI).
+
+---
+
 ## 2026-05-06 (cont. 18) — M4 part 4: BPF probe engine via bpftrace
 
 **Goal:** Land the second `probe.create` engine — `kind: "uprobe_bpf"` — alongside M3's `lldb_breakpoint`. The agent now picks low-rate / app-level (LLDB) vs. high-rate / syscall-level (BPF) per-probe; both flow into the same per-probe ring buffer and the same `ProbeEvent` shape (plan §7.2 + §7.3). bpftrace is shelled out as a long-lived subprocess; events stream back over a NEW transport primitive (`StreamingExec`).
