@@ -12,6 +12,7 @@ set(LDBD_SOURCES
   store/session_store.cpp
   transport/ssh.cpp
   transport/local_exec.cpp
+  transport/streaming_exec.cpp
   observers/proc.cpp
   observers/net_sockets.cpp
   util/log.cpp
