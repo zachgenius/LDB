@@ -69,6 +69,12 @@ class Dispatcher {
   protocol::Response handle_xref_addr(const protocol::Request& req);
   protocol::Response handle_string_xref(const protocol::Request& req);
 
+  // Cross-binary correlation (Tier 3 §10, scoped). Pure dispatcher
+  // composition over existing primitives — no new backend methods.
+  protocol::Response handle_correlate_types(const protocol::Request& req);
+  protocol::Response handle_correlate_symbols(const protocol::Request& req);
+  protocol::Response handle_correlate_strings(const protocol::Request& req);
+
   protocol::Response handle_process_launch(const protocol::Request& req);
   protocol::Response handle_process_state(const protocol::Request& req);
   protocol::Response handle_process_continue(const protocol::Request& req);

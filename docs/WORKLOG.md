@@ -4,6 +4,39 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — post-v0.1 §10: cross-binary correlation v0.3 (Tier 3, scoped)
+
+**Goal:** Three composition endpoints for type/symbol/string correlation across multiple targets. Scope is "the same primitives the agent already uses, batched across N target_ids" — full DWARF type-hash + function fingerprinting deferred to Tier 5 §21. Sibling slice §12 (semantic queries v1) running in parallel.
+
+**Done:**
+- `src/daemon/dispatcher.{h,cpp}` — three new endpoints with full draft-2020-12 schemas in `describe.endpoints`: `correlate.types`, `correlate.symbols`, `correlate.strings`. Pure dispatcher composition over the existing per-target primitives (`find_type_layout`, `find_symbols`, `find_string_xrefs`); no new backend methods. Shared preflight (`parse_target_ids` + `first_unknown_target_id`) extracts the deduped id list and rejects unknown ids with `-32602` carrying the offender id in the message. Per-target rows for `correlate.types` distinguish three statuses: `found` (layout populated), `missing` (`layout: null`, type not in this target), and `backend_error` (lookup threw — `error` carries the message; the per-target failure does not poison the batch). `view::apply_to_array` retrofit on the `results` array of all three endpoints; `total` on the `symbols` and `strings` shapes is the cross-target sum of matches/callsites for at-a-glance sizing.
+- Drift detection: `detect_drift_reason` walks the found-set with priority `byte_size > alignment > fields_count > field_offsets > field_types`. First difference wins; deterministic so tests don't depend on hash iteration order. With fewer than two found rows the comparison is short-circuited (`drift=false`, no `drift_reason` emitted).
+- 19 unit cases / 119 assertions in `tests/unit/test_correlate.cpp`. Real LldbBackend with `structs` + `sleeper` fixtures for the wire-shape cases; a small `StubBackend` (sufficient virtual overrides + a `std::map`-keyed `find_type_layout`) for the five drift_reason failure modes — exercising those with two real ELF fixtures would have meant hand-crafted DWARF.
+- Smoke `tests/smoke/test_correlate.py` (TIMEOUT 30) drives the full wire including the asymmetric path (`LDB_SLEEPER_MARKER_v1` present in sleeper, absent in structs) and the "structs-only `point2`" missing-in-sleeper case.
+- Wired into `tests/CMakeLists.txt` (smoke) and `tests/unit/CMakeLists.txt` (unit).
+
+**Decisions:**
+- **drift_reason priority:** `byte_size > alignment > fields_count > field_offsets > field_types`. First difference wins. Picked this order so the coarsest mismatch is reported first; an alignment delta with the same byte_size is rare but if both differ the agent likely cares more about the byte_size. Documented in the schema description.
+- **Duplicate target_ids: silently dedupe.** First-occurrence order preserved. The alternative (hard `-32602`) treats a noop input as an error, which doesn't match the tone of the rest of the API. Caller gets one row per distinct target.
+- **Missing-type behavior:** per-row `status:"missing"` with `layout:null`. Out-of-band signaling vs. just-leave-it-out; the agent gets one row per requested id, in caller order, and can iterate without bookkeeping. Matches the `"backend_error"` row shape so all three statuses look the same to a structural validator.
+- **`drift=false` when fewer than two targets have the type.** Nothing meaningful to compare; declaring drift on a single found row would be a category error. `drift_reason` is omitted in this case so a presence check doubles as a "did we detect divergence" predicate.
+- **Backend exceptions are data, not transport-level.** Wrapped in try/catch per target so a single malformed binary doesn't 500 the whole batch. Mirrors the contract `evaluate_expression` already uses (`EvalResult.ok=false` is data).
+- **`correlate.strings` callsite shape:** `{addr, function?}` only. The brief specified `{addr, function?, file?, line?}` but `XrefMatch` doesn't carry file/line — they aren't resolved at the disassembler-comment-text path that powers `find_string_xrefs`. Adding them would mean `SBLineEntry` resolution per-callsite (a real backend change). Deferred to a follow-up that touches `XrefMatch`.
+
+**Surprises / blockers:**
+- StubBackend's first attempt didn't override `list_targets` and the dispatcher's preflight rejected every id as unknown. Caught immediately by the failing tests; added a one-line override that surfaces registered ids.
+- The `detect_drift_reason` priority test cases needed StubBackend rather than real fixtures because provoking `byte_size`-but-not-`alignment` drift between two real ELF binaries means hand-rolling DWARF — not in scope for a v0.3 slice.
+
+**Verification:** ctest 47/47 PASS on this worktree branch (was 46/46 at master HEAD `c694a3c`); the new `smoke_correlate` is the +1. Wall clock ~33s. Build warning-clean (only pre-existing `third_party/nlohmann/json.hpp` warnings; project source untouched).
+
+**Sibling slice:** §12 semantic queries v1 (parallel agent).
+
+**Deferred:** DWARF type-hash matching (Tier 5 §21), function fingerprinting (control-flow graph hashing), recursive type comparison (nested-struct drift is the agent's responsibility today), build-ID-keyed correlation (recipe pattern, not an endpoint), `XrefMatch` carrying file+line for fully-populated callsites.
+
+**Next:** lead-agent merge gate for §10. Tier 3 §13/§16/§17 remain on the roadmap.
+
+---
+
 ## 2026-05-07 — post-v0.1 §9: multi-binary sessions (Tier 3)
 
 **Goal:** Inventory + naming for multi-target sessions. `target.list`, `target.label`, `session.targets`. Cross-target join queries (§10) explicitly out of scope.

@@ -247,6 +247,20 @@ set_tests_properties(smoke_multi_binary PROPERTIES
   TIMEOUT 30
 )
 
+# Cross-binary correlation (Tier 3 §10, post-v0.1 scoped slice). Drives
+# correlate.types/symbols/strings against structs+sleeper to exercise
+# both symmetric and asymmetric lookup paths.
+add_test(
+  NAME smoke_correlate
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_correlate.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_correlate PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_recipe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe.py"
