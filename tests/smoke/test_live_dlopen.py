@@ -37,6 +37,7 @@ dlopen() runs (some glibc layouts), the test SKIPs cleanly.
 """
 import json
 import os
+import platform
 import re
 import signal
 import subprocess
@@ -45,6 +46,12 @@ import time
 
 
 LIVE_RE = re.compile(r"^live:([0-9]+):([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{64})$")
+
+# Platform-specific DSO that dlopener.c loads and that is NOT pre-loaded
+# in a minimal C binary on the given OS.
+#   Linux: libpthread.so.0 (glibc separate DSO, see fixture source)
+#   macOS: /usr/lib/libz.dylib (separate from libSystem)
+_DLOPEN_MODULE = "libz" if platform.system() == "Darwin" else "libpthread"
 
 
 def usage():
@@ -155,8 +162,8 @@ def main():
                            for m in ml_pre["data"].get("modules", [])
                            if m.get("path")}
 
-            if any("libpthread" in p for p in modules_pre):
-                print("SKIP: libpthread.so already loaded pre-dlopen")
+            if any(_DLOPEN_MODULE in p for p in modules_pre):
+                print(f"SKIP: {_DLOPEN_MODULE} already loaded pre-dlopen")
                 d.call("process.detach", {"target_id": target_id})
                 return
 
@@ -191,8 +198,8 @@ def main():
             modules_post = {m["path"]
                             for m in ml_post["data"].get("modules", [])
                             if m.get("path")}
-            expect(any("libpthread" in p for p in modules_post),
-                   f"libpthread NOT in post-dlopen module.list "
+            expect(any(_DLOPEN_MODULE in p for p in modules_post),
+                   f"{_DLOPEN_MODULE} NOT in post-dlopen module.list "
                    f"({len(modules_post)} modules)")
             expect(layout_pre != layout_post,
                    f"layout_digest unchanged across dlopen — slice-1c "

@@ -186,19 +186,52 @@ target_compile_definitions(ldb_unit_tests PRIVATE
 # LLDB_DEBUGSERVER_PATH into every test's environment (smoke + unit).
 set(LDB_LLDB_SERVER_BIN "${LDB_LLDB_SERVER_BIN}" PARENT_SCOPE)
 
+# LLDB_DEBUGSERVER_PATH: the binary LLDB spawns to launch/attach to local
+# processes.  On Linux this is lldb-server (same binary, different role).
+# On macOS it must be Apple's codesigned debugserver — Homebrew's lldb-server
+# does NOT have the task_for_pid entitlement and silently fails for local
+# process launch/attach.
+if(APPLE)
+  set(LDB_DEBUGSERVER_BIN "")
+  foreach(_ds
+    "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Versions/A/Resources/debugserver"
+    "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver"
+  )
+    if(EXISTS "${_ds}")
+      set(LDB_DEBUGSERVER_BIN "${_ds}")
+      break()
+    endif()
+  endforeach()
+  if(LDB_DEBUGSERVER_BIN)
+    message(STATUS "ldb: Apple debugserver at ${LDB_DEBUGSERVER_BIN} (LLDB_DEBUGSERVER_PATH for tests)")
+  else()
+    message(WARNING "ldb: Apple debugserver not found; local process tests will fail. Install Xcode CLT.")
+  endif()
+else()
+  set(LDB_DEBUGSERVER_BIN "${LDB_LLDB_SERVER_BIN}")
+endif()
+set(LDB_DEBUGSERVER_BIN "${LDB_DEBUGSERVER_BIN}" PARENT_SCOPE)
+
 add_test(
   NAME unit_tests
   COMMAND ldb_unit_tests --reporter console::out=- --reporter junit::out=${CMAKE_BINARY_DIR}/unit-tests.xml
 )
+# macOS: debugserver startup + codesign checks add ~3x wall-clock overhead
+# vs Linux lldb-server.  Use a generous platform-aware timeout.
+if(APPLE)
+  set(_UNIT_TIMEOUT 240)
+else()
+  set(_UNIT_TIMEOUT 90)
+endif()
 set_tests_properties(unit_tests PROPERTIES
-  TIMEOUT 90
+  TIMEOUT ${_UNIT_TIMEOUT}
   ENVIRONMENT "LDB_STORE_ROOT=${LDB_TEST_STORE_ROOT}"
 )
 # get_directory_property(TESTS) in the parent does NOT include tests defined
 # in subdirectories (CMake docs: "Tests defined in subdirectories are not
 # included"), so the foreach in tests/CMakeLists.txt never stamps
 # LLDB_DEBUGSERVER_PATH on this test.  Do it directly here.
-if(LDB_LLDB_SERVER_BIN)
+if(LDB_DEBUGSERVER_BIN)
   set_property(TEST unit_tests APPEND PROPERTY
-    ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LDB_LLDB_SERVER_BIN}")
+    ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LDB_DEBUGSERVER_BIN}")
 endif()

@@ -4,6 +4,36 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — macOS arm64 hardware sign-off + CI matrix
+
+**Goal:** Run through the Tier 1 §2 sign-off checklist (`docs/macos-arm64-status.md §7`) on real Apple silicon, fix any regressions found, and gate macOS into CI.
+
+**Done:**
+- Fixed 4 transport files (`ssh.cpp`, `rr.cpp`, `local_exec.cpp`, `streaming_exec.cpp`): `::sigemptyset` / `::sigaddset` with global-namespace prefix fail on macOS because the POSIX signal functions are macros, not functions. Fix: drop the `::` prefix.
+- Fixed `tests/unit/test_util_sha256.cpp`: added `#include <unistd.h>` for `::getpid` — on Linux this leaks in transitively, on macOS it does not.
+- Fixed `tests/unit/test_rr_url_parser.cpp`: `/bin/true` doesn't exist on macOS; changed to `/usr/bin/true`.
+- Fixed `tests/unit/CMakeLists.txt`: added `LDB_DEBUGSERVER_BIN` discovery block — on macOS this resolves to Apple's codesigned `debugserver` (CLT or Xcode path), on Linux it aliases `LDB_LLDB_SERVER_BIN`. The key insight: `LLDB_DEBUGSERVER_PATH` on macOS must point at Apple's `debugserver` (which has `task_for_pid` entitlement), NOT Homebrew's `lldb-server` (which doesn't). The old code injected `lldb-server` into all test environments, which caused every unit test that launched a process to fail with "handshake timeout". Increased `unit_tests` TIMEOUT from 90→240s on macOS (Apple debugserver startup adds ~3× wall-clock overhead; total unit-test wall time is ~107s vs ~33s on Linux).
+- Fixed `tests/CMakeLists.txt`: use `LDB_DEBUGSERVER_BIN` (not `LDB_LLDB_SERVER_BIN`) when stamping `LLDB_DEBUGSERVER_PATH` into smoke-test environments.
+- Ported `dlopener` fixture for macOS: gated `-ldl` link on `NOT APPLE` (libdl is part of libSystem on macOS); `dlopener.c` uses `#ifdef __APPLE__` to dlopen `/usr/lib/libz.dylib` instead of `libpthread.so.0` (glibc SONAME); `test_live_dlopen.py` uses `platform.system()` to check for `libz` vs `libpthread` in module.list.
+- Added macOS arm64 CI job to `.github/workflows/ci.yml` (`macos-14`, 60-min timeout, `brew install llvm`); updated `docs/06-ci.md`.
+- Marked all B1–B4 blockers resolved in `docs/POST-V0.1-PROGRESS.md`; updated Tier 1 §2 to ✅.
+- Updated `docs/macos-arm64-status.md §7` checklist: all 8 items green.
+
+**Decisions:**
+- **`LDB_DEBUGSERVER_BIN` separate from `LDB_LLDB_SERVER_BIN`.** These are conceptually different binaries: `LDB_LLDB_SERVER_BIN` is the gdb-remote protocol server for `target.connect_remote`; `LDB_DEBUGSERVER_BIN` is the local process attach/launch agent. On Linux these happen to be the same binary (`lldb-server`); on macOS they are distinct (debugserver vs. lldb-server). Keeping them separate in CMake makes the distinction explicit and allows future paths to diverge without confusion.
+- **`/usr/lib/libz.dylib` as the macOS dlopen target.** Reliably present on all macOS versions, NOT part of libSystem (so it's a distinct entry in the module list), NOT pre-loaded by a minimal C binary that only links libSystem. `libpthread.dylib` would be a re-export of libSystem and always loaded. `libcurl.dylib` would also work but has version-specific dylib names across macOS releases. zlib is stable.
+- **unit_tests timeout 240s on macOS.** Measured wall time ~107s; 240s = 2.25× overhead buffer. Could be 180s but macOS CI runners vary in speed; extra margin costs nothing.
+
+**Surprises / blockers:**
+- The `::` prefix on POSIX signal macros is a subtle gotcha: on Linux these are often implemented as real functions and `::sigemptyset(...)` compiles fine, but on macOS they're `#define`d macros and the preprocessor expands `::sigaddset(...)` to `::*(set) |= ...` which isn't valid C++. The same pattern exists in `ssh.cpp`, `rr.cpp`, `local_exec.cpp`, and `streaming_exec.cpp` — all written in the Linux era.
+- CMake injects `LLDB_DEBUGSERVER_PATH=${LDB_LLDB_SERVER_BIN}` into every test environment. On macOS this overrides the `maybe_seed_apple_debugserver()` auto-detection (which exits early if the env var is set). The runtime function was correct; the CMake injection was wrong.
+
+**Verification:** ctest **50/50 PASS** on Apple M4, macOS 15.3, Homebrew LLVM 20. Total wall clock ~157s. All smoke tests either pass or SKIP cleanly (bpftrace, igmp, SSH, rr — all tools not present on macOS or not configured).
+
+**Next:** macOS CI job will confirm on the `macos-14` GitHub runner. Any Tier 5/6 work (capstone disasm, Linux arm64 readiness) can proceed — the macOS gate is clear.
+
+---
+
 ## 2026-05-07 — Claude Code `/re-analyze` skill
 
 **Goal:** Make LDB's RE capabilities directly invocable by any Claude Code user who clones the repo via a project-level slash command.

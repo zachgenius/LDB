@@ -47,18 +47,24 @@ int main(void) {
     while (!g_kicked) pause();
     g_kicked = 0;
 
-    /* dlopen a library that isn't already loaded. libpthread is a
-     * reliable pick on glibc Linux: it's a separate DSO and isn't
-     * pulled in by libc + libdl alone for a non-threaded fixture. If
-     * it IS already there (some glibc configurations), the test will
-     * SKIP at the harness level. */
-    void *h = dlopen("libpthread.so.0", RTLD_NOW | RTLD_GLOBAL);
+    /* dlopen a library that isn't already loaded.
+     * Linux: libpthread.so.0 (separate glibc DSO, not pre-loaded for a
+     *        non-threaded fixture; SKIP if already present on some configs).
+     * macOS: /usr/lib/libz.dylib (separate from libSystem, not linked by
+     *        this minimal fixture). */
+#ifdef __APPLE__
+    const char *dlopen_target = "/usr/lib/libz.dylib";
+#else
+    const char *dlopen_target = "libpthread.so.0";
+#endif
+    void *h = dlopen(dlopen_target, RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
         const char *e = dlerror();
         fprintf(stderr, "dlopen failed: %s\n", e ? e : "<unknown>");
         return 1;
     }
 
+    printf("LOADED=%s\n", dlopen_target);
     printf("READY=POST_DLOPEN\n");
     fflush(stdout);
 

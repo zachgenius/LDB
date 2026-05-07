@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using ldb::util::Sha256;

@@ -1,12 +1,8 @@
-# LDB CI — Linux x86-64
+# LDB CI — Linux x86-64 + macOS arm64
 #
-# Builds and tests `ldbd` on every push and pull request against
-# `master`, plus a tag-driven job that uploads the binary as an
-# artifact for `v*.*` tags. macOS arm64 is intentionally NOT in the
-# matrix yet — see Tier 1 §2 in `docs/POST-V0.1-PROGRESS.md` (gated on
-# B1 hardware sign-off).
-#
-# Documented in `docs/06-ci.md` and reproduced locally per that doc.
+# Builds and tests `ldbd` on every push and PR against `master`.
+# A tag-driven release job uploads the Linux binary for `v*.*` tags.
+# Documented in `docs/06-ci.md`.
 
 name: CI
 
@@ -90,6 +86,45 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-failure-logs
+          path: |
+            build/Testing/
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+            build/.ninja_log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  macos:
+    name: macOS arm64 (macos-14, Homebrew LLVM)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build + test dependencies (Homebrew)
+        run: |
+          brew install llvm ninja cmake
+
+      - name: Configure (CMake + Ninja, Homebrew LLVM)
+        run: |
+          cmake -B build -G Ninja \
+            -DLDB_LLDB_ROOT="$(brew --prefix llvm)"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Verify daemon (--version smoke)
+        run: build/bin/ldbd --version
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload failure artifacts (build + ctest logs)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-failure-logs
           path: |
             build/Testing/
             build/CMakeFiles/CMakeOutput.log

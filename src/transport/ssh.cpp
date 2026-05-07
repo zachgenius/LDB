@@ -204,8 +204,8 @@ SpawnedChild spawn_with_pipes(const std::vector<std::string>& argv,
   // Reset SIGPIPE in the child so it inherits default behavior; we
   // ignore SIGPIPE in the parent only.
   sigset_t default_sigs;
-  ::sigemptyset(&default_sigs);
-  ::sigaddset(&default_sigs, SIGPIPE);
+  sigemptyset(&default_sigs);
+  sigaddset(&default_sigs, SIGPIPE);
   ::posix_spawnattr_setsigdefault(&attr, &default_sigs);
   short flags = POSIX_SPAWN_SETSIGDEF;
   ::posix_spawnattr_setflags(&attr, flags);

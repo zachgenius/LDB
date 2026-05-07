@@ -357,8 +357,8 @@ StreamingExec::StreamingExec(std::optional<SshHost>          remote,
   posix_spawnattr_t attr;
   ::posix_spawnattr_init(&attr);
   sigset_t default_sigs;
-  ::sigemptyset(&default_sigs);
-  ::sigaddset(&default_sigs, SIGPIPE);
+  sigemptyset(&default_sigs);
+  sigaddset(&default_sigs, SIGPIPE);
   ::posix_spawnattr_setsigdefault(&attr, &default_sigs);
   // Put the child in its OWN process group so we can `kill(-pgid, ...)`
   // and reap any grand-children (sh -> sleep, bpftrace -> child workers).

@@ -90,12 +90,11 @@ TEST_CASE("parse_rr_url: unknown query key rejected",
 
 TEST_CASE("find_rr_binary: env override honored when executable",
           "[transport][rr][discovery]") {
-  // Use /bin/true as a stand-in: it's executable on every Linux box.
-  // We only care that find_rr_binary HONORS the env var, not that it
-  // actually validates the binary is rr (the live test does that).
-  ::setenv("LDB_RR_BIN", "/bin/true", /*overwrite=*/1);
+  // Use a stand-in executable that exists on both Linux (/usr/bin/true)
+  // and macOS (/usr/bin/true — macOS does not have /bin/true).
+  ::setenv("LDB_RR_BIN", "/usr/bin/true", /*overwrite=*/1);
   auto got = find_rr_binary();
-  CHECK(got == "/bin/true");
+  CHECK(got == "/usr/bin/true");
   ::unsetenv("LDB_RR_BIN");
 }
 

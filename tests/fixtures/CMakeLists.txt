@@ -61,7 +61,11 @@ target_compile_options(ldb_fix_dlopener PRIVATE
   -fno-omit-frame-pointer
   -fno-eliminate-unused-debug-types
 )
-target_link_libraries(ldb_fix_dlopener PRIVATE dl)
+if(NOT APPLE)
+  # macOS: dlopen lives in libSystem; no separate -ldl needed (and some ld
+  # versions reject it). The #ifdef in dlopener.c picks a macOS-native DSO.
+  target_link_libraries(ldb_fix_dlopener PRIVATE dl)
+endif()
 
 # Slice 1c continue-round-trip fixture. main() calls work_step in a
 # bounded hot loop with usleep cooperation; the harness sets a bp on

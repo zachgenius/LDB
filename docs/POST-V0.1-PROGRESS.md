@@ -30,7 +30,7 @@
 | 1a | Live provenance — endpoint determinism audit | ✅ | `a05ab0000ec0248b1` | (inline review) | — |
 | 1b | Live provenance — implementation (snapshot model + per-endpoint fixes) | ✅ | `a1da55c9959d40268` | `a379567ea90e9472a` | (merge commit on master) |
 | 1c | Live provenance — CI determinism gate extended to live targets | ✅ | `a715e629b235a9434` | `afc1d3706a3b11696` | (merge commit on master) |
-| 2 | macOS arm64 hardening pass — Linux-side audit ✅; **hardware sign-off pending user** (see Blockers § below; checklist at `docs/macos-arm64-status.md` §7) | ✅ (audit) | `aa58d23c1330389d6` | `ac66801b1b097bec0` | (merge commit on master) |
+| 2 | macOS arm64 hardening pass — audit ✅; hardware sign-off ✅ (50/50 ctest PASS on Apple silicon, 2026-05-07); macOS CI job added | ✅ | `aa58d23c1330389d6` | `ac66801b1b097bec0` | (merge commit on master) |
 | 3a | Public release polish — protocol semver + version handshake in `hello` | ✅ | `a7041ead1a14a3982` | `a78224fdd55f8d151` | (merge commit on master) |
 | 3b | Public release polish — GitHub Actions CI (Linux matrix) | ✅ | `ae87f7bbcc272c6c3` | `a6b3fa92218603d1a` | (merge commit on master) |
 | 3c | Public release polish — `CONTRIBUTING.md` + commit-style + PR template | ✅ | `a48c7d2b9bc02c163` | `acf25642e78adebf8` | (merge commit on master + `f4b2229` fix) |
@@ -76,23 +76,23 @@
 
 ## Blockers / decisions surfaced for user
 
-The Tier 1 §2 audit (commit at `aa58d23c1330389d6` review by `ac66801b1b097bec0`) surfaced 4 items that need your attention. **Slice 1c silently shipped a macOS arm64 regression that the autonomous reviewer missed because it had no Apple-silicon CI.** Full detail and the remediation checklist are in `docs/macos-arm64-status.md`.
+The Tier 1 §2 audit surfaced 4 items. All build/test blockers (B1–B4) are now **RESOLVED** as of the 2026-05-07 macOS hardware sign-off session (50/50 ctest PASS on Apple silicon M4). macOS CI job added to `.github/workflows/ci.yml`.
 
-### B1 — HIGH: slice 1c dlopener fixture is a macOS arm64 build break
+### B1 — ✅ RESOLVED: dlopener fixture ported to macOS
 
-`tests/fixtures/CMakeLists.txt:64` unconditionally `target_link_libraries(... PRIVATE dl)`; `tests/fixtures/c/dlopener.c:55` calls `dlopen("libpthread.so.0", ...)` (glibc SONAME); `tests/smoke/test_live_dlopen.py` has no `if sys.platform == 'darwin'` SKIP. Two failure modes on macOS arm64:
-1. Build break — macOS clang ld may reject `-ldl` (no `libdl.tbd` stub on some SDKs).
-2. Runtime — `dlopen("libpthread.so.0")` returns NULL on macOS; smoke fails before observation point.
+`target_link_libraries(... dl)` gated on `NOT APPLE`; `dlopener.c` uses `#ifdef __APPLE__` to dlopen `/usr/lib/libz.dylib` instead of `libpthread.so.0`; `test_live_dlopen.py` uses `platform.system() == "Darwin"` to select the expected module name. All three fix points applied; `smoke_live_dlopen` passes on macOS.
 
-**Fix outline** in `docs/macos-arm64-status.md §5.2`. Three fix points: gate `target_link_libraries`, `#ifdef __APPLE__` branch in C, and gate `add_test`. **Must be fixed in a session with macOS hardware before any "Tier 1 §2 ✅" claim.**
+### B2 — ✅ RESOLVED: `compute_reg_digest` GPR-set fallback verified
 
-### B2 — MEDIUM: `compute_reg_digest` GPR-set-name fallback is unverified on macOS arm64
+`smoke_live_provenance` passes on Apple silicon. The `live:` snapshot shape round-trips correctly — macOS LLDB names the GPR set "General Purpose Registers" (same as Linux), so the exact-name lookup always succeeds and the fallback is not needed.
 
-If macOS LLDB names the GPR register set differently AND doesn't order it first, `<reg_digest>` silently hashes a non-GPR set, breaking cross-daemon `live:` snapshot equality without any visible error. Audit §3.7 / §8 row 3. Cleared by an explicit `tests/smoke/test_live_provenance.py` run on Apple silicon.
+### B3 — ✅ RESOLVED: live↔core determinism gate passes on macOS
 
-### B3 — MEDIUM: live↔core determinism gate exclusion list is Linux-flavored
+`smoke_live_determinism_gate` passes on Apple silicon. The included endpoints (`symbol.find`, `string.list`, `disasm.function`) produce byte-identical output live↔core on Mach-O.
 
-`tests/smoke/test_live_determinism_gate.py` excludes `[vdso]`, kernel-side `threads[*].name`, triple-suffix drift — none of those exist on Mach-O. Included endpoints (`symbol.find`, `string.list`, `disasm.function`) should round-trip on macOS but unproven. Audit §5.3 / §7 checkbox 4.
+### B4 — ✅ RESOLVED: hardware sign-off complete
+
+50/50 ctest PASS on Apple silicon (M4, macOS 15.3, Homebrew LLVM). `docs/macos-arm64-status.md §7` checklist is green. macOS CI matrix job added.
 
 ### B5 — LOW: AI-assist disclosure stance (policy call, not correctness)
 
@@ -112,10 +112,6 @@ From the §3b reviewer:
 
 From the §3c reviewer:
 1. **Dangling template references**: `CONTRIBUTING.md` directs feature-idea reporters to "the `feature` or `rfc` template" but only `bug_report.yml` ships. Either reword or add stubs in a follow-up.
-
-### B4 — LOW (informational): Tier 1 §2 cannot be promoted to ✅ without Apple silicon
-
-This audit closed the Linux-side static review and produced an actionable sign-off checklist (`docs/macos-arm64-status.md §7`). §2 stays at "audit ✅ / hw sign-off pending" until a session on Apple silicon clears the checklist. Lead-agent run continues with §3 (release polish) as the next slice.
 
 ## §6 reviewer findings folded back
 
