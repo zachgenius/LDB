@@ -4,6 +4,23 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — Claude Code `/re-analyze` skill
+
+**Goal:** Make LDB's RE capabilities directly invocable by any Claude Code user who clones the repo via a project-level slash command.
+
+**Done:**
+- Created `.claude/commands/re-analyze.md` — a Claude Code skill file encoding the full §5 reference workflow from `docs/02-ldb-mvp-plan.md`. Any user in this repo can now run `/re-analyze <binary> <goal>` in Claude Code and get a guided investigation.
+- Updated `.gitignore` to track `.claude/commands/` while still ignoring worktrees, projects, and other local agent state.
+- Skill covers all five phases: static orientation (target.open, module.list, type.layout, string.list, xref, disasm), live attach/probe, network/OS observers (tcpdump, proc.fds, uprobe.bpf), artifact capture, and session export.
+
+**Decisions:**
+- Skill uses `tools/ldb/ldb` (the thin Python client) as the primary driver — it's the user-facing interface, schema-driven, no dependencies beyond stdlib, and one call per invocation which suits the REPL-style workflow a Claude Code agent naturally runs.
+- Report template is embedded in the skill so every investigation ends with a consistent artifact regardless of who runs it.
+
+**Next:** Tier 5/6 (Capstone disasm, Linux arm64 readiness) deferred until usage resets (May 9).
+
+---
+
 ## 2026-05-07 — post-v0.1 §14: non-stop debugging, scoped to protocol surface (Tier 4)
 
 **Goal:** Ship the agent-visible per-thread continue surface (`thread.continue`, `process.continue+tid`) so client code is async-ready. True async runtime (`SBProcess::SetAsync(true)` + event-loop pump) deferred to v0.4 — touching every endpoint that depends on sync.

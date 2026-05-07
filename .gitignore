@@ -126,5 +126,8 @@ third_party/install/
 .env.local
 config.local.*
 
-# Claude Code agent worktrees (transient)
-.claude/
+# Claude Code local state (transient) — but commands/ is shared
+.claude/worktrees/
+.claude/projects/
+.claude/statsig/
+.claude/ide/
