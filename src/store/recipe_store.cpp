@@ -284,4 +284,52 @@ bool RecipeStore::remove(std::int64_t id) {
   return store_->remove(id);
 }
 
+// ── lint_recipe ────────────────────────────────────────────────────────────
+
+namespace {
+
+void collect_placeholders(const nlohmann::json& v,
+                          std::vector<std::string>& out) {
+  if (v.is_string()) {
+    auto name = match_placeholder(v.get<std::string>());
+    if (!name.empty()) out.push_back(name);
+  } else if (v.is_object()) {
+    for (auto it = v.begin(); it != v.end(); ++it)
+      collect_placeholders(it.value(), out);
+  } else if (v.is_array()) {
+    for (const auto& el : v) collect_placeholders(el, out);
+  }
+}
+
+}  // namespace
+
+std::vector<LintWarning> lint_recipe(const Recipe& r) {
+  std::set<std::string> declared;
+  for (const auto& p : r.parameters) declared.insert(p.name);
+
+  std::set<std::string> used;
+  std::vector<LintWarning> warnings;
+
+  for (int i = 0; i < static_cast<int>(r.calls.size()); ++i) {
+    std::vector<std::string> found;
+    collect_placeholders(r.calls[static_cast<std::size_t>(i)].params, found);
+    for (const auto& name : found) {
+      if (declared.count(name) == 0) {
+        warnings.push_back({i, "unknown placeholder: {" + name + "}"});
+      } else {
+        used.insert(name);
+      }
+    }
+  }
+
+  for (const auto& p : r.parameters) {
+    if (used.count(p.name) == 0) {
+      warnings.push_back(
+          {-1, "declared slot {" + p.name + "} is unused in all steps"});
+    }
+  }
+
+  return warnings;
+}
+
 }  // namespace ldb::store

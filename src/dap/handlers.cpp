@@ -429,16 +429,32 @@ DapResult Session::on_continue(const json&) {
   DapResult r;
   r.body = json{{"allThreadsContinued", true}};
   if (state == "stopped") {
+    // Resolve the stopped thread's ID via thread.list; use the first
+    // thread whose state is "stopped". Falls back to 0 if thread.list
+    // fails (e.g. target already closed) — clients tolerate that.
+    std::int64_t stop_tid = 0;
+    auto tl = channel_.call("thread.list", {{"target_id", target_id_}});
+    if (tl.ok) {
+      if (auto arr = tl.data.find("threads");
+          arr != tl.data.end() && arr->is_array()) {
+        for (const auto& t : *arr) {
+          if (get_string(t, "state") == "stopped") {
+            stop_tid = get_int(t, "tid");
+            break;
+          }
+        }
+      }
+    }
     r.events.push_back(json{
         {"event", "stopped"},
         {"body", {{"reason", get_string(final_state, "stop_reason", "step")},
-                  {"threadId", 0},
+                  {"threadId", stop_tid},
                   {"allThreadsStopped", true}}},
     });
   } else if (state == "exited" || state == "crashed") {
     r.events.push_back(json{
         {"event", "exited"},
-        {"body", {{"exitCode", 0}}},
+        {"body", {{"exitCode", get_int(final_state, "exit_code", 0)}}},
     });
   }
   return r;
@@ -468,7 +484,8 @@ DapResult Session::do_step(const json& args, const std::string& kind) {
     });
   } else if (state == "exited" || state == "crashed") {
     r.events.push_back(json{
-        {"event", "exited"}, {"body", {{"exitCode", 0}}},
+        {"event", "exited"},
+        {"body", {{"exitCode", get_int(resp.data, "exit_code", 0)}}},
     });
   }
   return r;

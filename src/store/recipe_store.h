@@ -99,6 +99,18 @@ SubstitutionResult substitute_params(const nlohmann::json&            params,
                                      const std::vector<RecipeParameter>& slots,
                                      const nlohmann::json&             caller_args);
 
+// One lint finding from lint_recipe(). `step_index` is the 0-based index
+// of the offending call, or -1 for recipe-level findings (unused slots).
+struct LintWarning {
+  int         step_index = 0;
+  std::string message;
+};
+
+// Walk every step's params and report:
+//   - any {placeholder} whose name is not in the recipe's declared slots
+//   - any declared slot that appears in no step's params
+std::vector<LintWarning> lint_recipe(const Recipe& r);
+
 // Manage recipes on top of an ArtifactStore.
 class RecipeStore {
  public:

@@ -4,6 +4,31 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-07 — non-blocking follow-up fixes (B5/B6/B7, §4 DAP, §6 recipe.lint)
+
+**Goal:** Clear all tracked non-blocking items from the post-v0.1 autonomous run before Tier 5/6 work.
+
+**Done:**
+- **B5**: Softened AI-assist co-author rule in `CONTRIBUTING.md` from hard-required to "strongly encouraged" (policy: enforceability is zero anyway).
+- **B6**: Added "Versioning and release tags" section to `CONTRIBUTING.md` explaining that `v*.*` CI pattern requires semver with at least one dot — bare `v1` won't trigger a release.
+- **B7**: Added `.github/ISSUE_TEMPLATE/feature_request.yml` and `rfc.yml` stub templates; `CONTRIBUTING.md` now has real targets for its "feature or rfc template" references.
+- **§4 DAP — `stopped` event `threadId`**: `on_continue()` now calls `thread.list` after `process.state` returns "stopped", finds the first thread with `state=="stopped"`, and uses its `tid` in the DAP `stopped` event body. Was hardcoded `0`.
+- **§4 DAP — `exitCode`**: `on_continue()` reads `exit_code` from the `process.state` JSON when state is "exited"; `do_step()` reads it from `process.step`'s response. Both were hardcoded `0`.
+- **§6 recipe.lint**: New endpoint `recipe.lint({recipe_id})` that walks all steps' params, finds `{placeholder}` strings not matching any declared slot (typos pass through silently in substitute_walk), and finds declared slots never referenced in any step. Returns `{warnings: [{step_index, message}], warning_count}`. `lint_recipe()` lives in `recipe_store.h/cpp`; 11 unit cases + `describe.endpoints` entry.
+
+**Decisions:**
+- **`threadId` via `thread.list` round-trip, not a backend field change.** Adding `stop_tid` to `ProcessStatus` would touch 10+ files. A `thread.list` call is one extra RPC inside the DAP shim and correct — the stopped thread is always the first one with `state=="stopped"` in LLDB's thread list. Adding it to `ProcessStatus` is the right long-term fix but a non-blocking item doesn't justify the churn.
+- **`lint_recipe()` as a free function, not a `RecipeStore` method.** It operates purely on the in-memory `Recipe` struct with no store access; free function keeps the class boundary clean and allows testing without an artifact store.
+- **Unused-slot warning at `step_index == -1`.** A sentinel that distinguishes recipe-level findings from per-step findings without a separate list. The endpoint schema documents this.
+
+**Surprises / blockers:** None — all three workstreams were independent and completed cleanly.
+
+**Verification:** ctest **50/50 PASS**, 105s wall clock. `unit_tests` grew from 568 to 579 test cases (+11 recipe.lint, +3 DAP).
+
+**Next:** Tier 5/6 — capstone disasm and Linux arm64 readiness (deferred from prior session).
+
+---
+
 ## 2026-05-07 — macOS arm64 hardware sign-off + CI matrix
 
 **Goal:** Run through the Tier 1 §2 sign-off checklist (`docs/macos-arm64-status.md §7`) on real Apple silicon, fix any regressions found, and gate macOS into CI.

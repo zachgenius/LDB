@@ -326,7 +326,7 @@ TEST_CASE("on_evaluate: value.eval with frameId context", "[dap][handlers]") {
   REQUIRE(ch.calls.back().params["expr"] == "1+6");
 }
 
-TEST_CASE("on_continue: process.continue + emit stopped event",
+TEST_CASE("on_continue: process.continue + emit stopped event with real threadId",
           "[dap][handlers]") {
   StubChannel ch;
   ch.on_ok("target.create_empty",
@@ -338,6 +338,12 @@ TEST_CASE("on_continue: process.continue + emit stopped event",
   ch.on_ok("process.state",
            json{{"state", "stopped"}, {"stop_reason", "breakpoint"},
                 {"pid", 1}});
+  // thread.list called to resolve the stopped thread's id.
+  ch.on_ok("thread.list",
+           json{{"threads", json::array(
+               {{{"tid", 7777}, {"index", 0}, {"name", "main"},
+                 {"state", "stopped"}, {"pc", 0}, {"sp", 0}}})},
+               {"total", 1}});
 
   Session s(ch);
   s.on_attach({{"processId", 1}});
@@ -347,15 +353,58 @@ TEST_CASE("on_continue: process.continue + emit stopped event",
   REQUIRE(r.success);
   REQUIRE(r.body["allThreadsContinued"] == true);
 
-  // Continue itself plus at least one process.state poll.
-  REQUIRE(ch.calls.size() >= 2);
   REQUIRE(ch.calls[0].method == "process.continue");
   REQUIRE(ch.calls[0].params["target_id"] == 1);
 
-  // A "stopped" event should be queued.
   REQUIRE_FALSE(r.events.empty());
-  REQUIRE(r.events.back()["event"] == "stopped");
-  REQUIRE(r.events.back()["body"]["reason"] == "breakpoint");
+  auto& ev = r.events.back();
+  REQUIRE(ev["event"] == "stopped");
+  REQUIRE(ev["body"]["reason"] == "breakpoint");
+  // threadId must reflect the actual stopped thread, not a hardcoded 0.
+  REQUIRE(ev["body"]["threadId"] == 7777);
+}
+
+TEST_CASE("on_continue: exited event carries real exitCode",
+          "[dap][handlers]") {
+  StubChannel ch;
+  ch.on_ok("target.create_empty",
+           {{"target_id", 2}, {"triple", "x"}, {"modules", json::array()}});
+  ch.on_ok("target.attach", {{"state", "stopped"}, {"pid", 2}});
+  ch.on_ok("process.continue", json{{"state", "running"}, {"pid", 2}});
+  ch.on_ok("process.state",
+           json{{"state", "exited"}, {"exit_code", 42}, {"pid", 2}});
+
+  Session s(ch);
+  s.on_attach({{"processId", 2}});
+  ch.calls.clear();
+
+  auto r = s.on_continue({});
+  REQUIRE(r.success);
+  REQUIRE_FALSE(r.events.empty());
+  auto& ev = r.events.back();
+  REQUIRE(ev["event"] == "exited");
+  REQUIRE(ev["body"]["exitCode"] == 42);
+}
+
+TEST_CASE("on_next: exited event carries real exitCode",
+          "[dap][handlers]") {
+  StubChannel ch;
+  ch.on_ok("target.create_empty",
+           {{"target_id", 3}, {"triple", "x"}, {"modules", json::array()}});
+  ch.on_ok("target.attach", {{"state", "stopped"}, {"pid", 3}});
+  ch.on_ok("process.step",
+           json{{"state", "exited"}, {"exit_code", 5}, {"pid", 3}});
+
+  Session s(ch);
+  s.on_attach({{"processId", 3}});
+  ch.calls.clear();
+
+  auto r = s.on_next({{"threadId", 1}});
+  REQUIRE(r.success);
+  REQUIRE_FALSE(r.events.empty());
+  auto& ev = r.events.back();
+  REQUIRE(ev["event"] == "exited");
+  REQUIRE(ev["body"]["exitCode"] == 5);
 }
 
 TEST_CASE("on_next/stepIn/stepOut: process.step with kind", "[dap][handlers]") {

@@ -115,7 +115,7 @@ From the §3c reviewer:
 The §6 reviewer surfaced a HIGH-severity SIGSEGV (`recipe.run` recursing into itself crashes the daemon). Reviewer marked tracked-not-blocking; lead overrode and shipped a fix-up commit (`a440a51`) — daemon-crash from agent-supplied input violates the run's "TDD-strict, maintain all features working" mandate. Fix: reject any `recipe.*` sub-call in `handle_recipe_run` with `-32003 kForbidden`. 2 unit cases pin the contract.
 
 Other §6 reviewer items (still tracked, non-blocking):
-1. **MEDIUM** — Unknown placeholder is silently a literal (e.g. `"{patH}"` with no slot named `patH` passes through verbatim, masking typos). Worker documented; consider a `recipe.lint` follow-up.
+1. ✅ **MEDIUM — `recipe.lint` shipped** — `recipe.lint({recipe_id})` endpoint walks all step params, reports `{placeholder}` strings whose names don't match any declared slot (unknown placeholders) and declared slots never referenced in any step (unused slots). 11 unit cases. `describe.endpoints` updated.
 2. **PROCESS** — Worker edited `docs/POST-V0.1-PROGRESS.md` against the brief (line marking §6 as 🔍). Lead-agent territory; absorbed in this update.
 3. **LOW** — `artifact.delete` blob-unlink failure leaves dangling blob (best-effort; mirrors `put`-replace semantics).
 4. **LOW** — `recipe.from_session` empty-extraction returns `-32602` (kInvalidParams) rather than `-32000`; consistent with other dispatcher patterns.
@@ -124,7 +124,7 @@ Other §6 reviewer items (still tracked, non-blocking):
 ## §4 reviewer findings (tracked, non-blocking)
 
 1. `evaluate` always returns `variablesReference: 0` — structs render as flat strings. Future child-expansion work.
-2. `stopped` event hardcodes `threadId: 0` and `exitCode: 0` rather than the actually-stopped thread / exit code.
+2. ✅ **FIXED** — `stopped` event now carries the real stopped thread's `threadId` (via `thread.list` lookup) and `exited` event carries the real `exitCode` from `process.state`/`process.step` response. 3 unit cases added.
 3. `evaluate` with no `frameId` silently uses `tid=0, frame_index=0`. Worker disclosed.
 4. 5s polling cap on `on_continue` — long-running breakpoints further than 5s out emit no `stopped` event. Needs push-based daemon events.
 5. **IDE-validation gap** — shim isn't tested against real VS Code/Zed. Manual VS Code test plan or typed-mock client is a follow-up.

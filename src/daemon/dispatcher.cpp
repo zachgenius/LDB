@@ -575,6 +575,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "recipe.get")          return handle_recipe_get(req);
     if (req.method == "recipe.run")          return handle_recipe_run(req);
     if (req.method == "recipe.delete")       return handle_recipe_delete(req);
+    if (req.method == "recipe.lint")         return handle_recipe_lint(req);
 
     if (req.method == "probe.create")       return handle_probe_create(req);
     if (req.method == "probe.events")       return handle_probe_events(req);
@@ -1892,6 +1893,26 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
             {"recipe_id", int_()},
             {"deleted",   bool_()},
         }, {"recipe_id", "deleted"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+    add("recipe.lint",
+        "Validate a recipe's placeholder names against its declared parameter "
+        "slots. Returns warnings for: (1) any {placeholder} string in a step's "
+        "params that doesn't match any declared slot name (likely a typo — "
+        "substitute_walk silently passes unknown placeholders through as "
+        "literals); (2) any declared slot whose name never appears as a "
+        "{placeholder} in any step (dead parameter). "
+        "step_index is the 0-based call index; -1 for recipe-level warnings "
+        "(unused slots). An empty warnings array means the recipe is clean.",
+        obj({{"recipe_id", int_()}}, {"recipe_id"}),
+        obj({
+            {"recipe_id",    int_()},
+            {"warning_count", int_()},
+            {"warnings",     arr_of(obj({
+                {"step_index", int_()},
+                {"message",    str()},
+            }, {}))},
+        }, {"recipe_id", "warning_count", "warnings"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "low");
   }
 
@@ -4888,6 +4909,48 @@ Response Dispatcher::handle_recipe_delete(const Request& req) {
   json data;
   data["recipe_id"] = id;
   data["deleted"]   = deleted;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_lint(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("recipe_id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'recipe_id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'recipe_id'");
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  auto r = rs.get(id);
+  if (!r.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              "recipe not found: " + std::to_string(id));
+  }
+
+  auto warnings = ldb::store::lint_recipe(*r);
+  json warn_arr = json::array();
+  for (const auto& w : warnings) {
+    warn_arr.push_back(json{{"step_index", w.step_index},
+                            {"message",    w.message}});
+  }
+  json data;
+  data["recipe_id"]    = id;
+  data["warning_count"] = static_cast<int>(warnings.size());
+  data["warnings"]     = std::move(warn_arr);
   return protocol::make_ok(req.id, std::move(data));
 }
 
