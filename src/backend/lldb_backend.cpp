@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string_view>
 #include <tuple>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -1580,6 +1581,23 @@ ProcessStatus LldbBackend::kill_process(TargetId tid) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->live_state.erase(tid);
   }
+  // LLDB 18 on Linux delivers eStateExited asynchronously after Kill().
+  // Drain the listener until the process reaches a terminal state.
+  {
+    auto listener = impl_->debugger.GetListener();
+    using clock = std::chrono::steady_clock;
+    auto deadline = clock::now() + std::chrono::seconds(5);
+    while (clock::now() < deadline) {
+      auto s = proc.GetState();
+      if (s == lldb::eStateExited || s == lldb::eStateCrashed ||
+          s == lldb::eStateDetached || s == lldb::eStateInvalid)
+        break;
+      lldb::SBEvent ev;
+      listener.WaitForEvent(1u, ev);
+      if (ev.IsValid() && lldb::SBProcess::EventIsProcessEvent(ev))
+        (void)lldb::SBProcess::GetStateFromEvent(ev);
+    }
+  }
   return snapshot(proc);
 }
 
@@ -1652,6 +1670,8 @@ ProcessStatus LldbBackend::detach_process(TargetId tid) {
       st == lldb::eStateInvalid) {
     return snapshot(proc);
   }
+  // Save PID before detach; proc.GetProcessID() may return 0 afterwards.
+  auto det_pid = proc.GetProcessID();
   lldb::SBError err = proc.Detach();
   if (err.Fail()) {
     throw Error(std::string("detach failed: ") +
@@ -1663,7 +1683,22 @@ ProcessStatus LldbBackend::detach_process(TargetId tid) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->live_state.erase(tid);
   }
-  return snapshot(proc);
+#ifdef __linux__
+  // LLDB 18 on Linux delivers SIGSTOP to threads before calling
+  // PTRACE_DETACH.  After PTRACE_DETACH the pending SIGSTOP is received
+  // by the process, leaving it stopped with no debugger watching it.
+  // Send SIGCONT to ensure the inferior resumes after detach.
+  if (det_pid > 0)
+    ::kill(static_cast<::pid_t>(det_pid), SIGCONT);
+#endif
+  // Return kDetached directly — after a successful Detach() the semantic
+  // state is always kDetached.  Avoid snapshot(proc) here: on LLDB 18
+  // the state machine hasn't transitioned yet and proc.GetState() still
+  // reports eStateStopped.
+  ProcessStatus ps;
+  ps.state = ProcessState::kDetached;
+  ps.pid = static_cast<std::int32_t>(det_pid);
+  return ps;
 }
 
 ProcessStatus LldbBackend::connect_remote_target(TargetId tid,

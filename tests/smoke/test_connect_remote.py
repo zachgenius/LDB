@@ -18,8 +18,10 @@ just the negative cases verified.
 import json
 import os
 import re
+import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -32,6 +34,11 @@ def usage():
 
 def find_lldb_server():
     env = os.environ.get("LDB_LLDB_SERVER", "")
+    if env and os.access(env, os.X_OK):
+        return env
+    # LLDB_DEBUGSERVER_PATH: set by our ctest harness to the exact binary
+    # used by liblldb itself — doubles as lldb-server gdbserver.
+    env = os.environ.get("LLDB_DEBUGSERVER_PATH", "")
     if env and os.access(env, os.X_OK):
         return env
     root = os.environ.get("LDB_LLDB_ROOT", "")
@@ -56,78 +63,82 @@ def try_positive_path(call, expect, server, fixture):
     Returns False if we couldn't get the server up (treated as a
     benign skip).
     """
-    # Use a fixed port range; we'll retry a few candidates if the first
-    # is in use. Avoids needing --pipe / --named-pipe whose semantics
-    # vary across lldb-server builds.
-    for port in (32401, 32411, 32421, 32431):
+    # Use --pipe to learn the server's port without a socket probe.
+    # A socket probe would connect-then-disconnect to lldb-server, which
+    # causes it to exit (gdbserver accepts exactly one debug session).
+    # With port=0 the kernel assigns a free port; lldb-server writes it
+    # as a binary little-endian uint16 (or ASCII decimal, depending on
+    # version) to the pipe fd.
+    pipe_r, pipe_w = os.pipe()
+    try:
         proc = subprocess.Popen(
-            [server, "gdbserver", f"127.0.0.1:{port}", "--", fixture],
+            [server, "gdbserver",
+             "--pipe", str(pipe_w),
+             "127.0.0.1:0", "--", fixture],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            text=True,
+            pass_fds=(pipe_w,),
         )
-        # Wait for the server to start listening (or crash).
-        deadline = time.time() + 3.0
-        listening = False
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                # Crashed / exited.
-                break
-            # Probe the port: a successful TCP connect means lldb-server
-            # is listening. Use a short timeout.
-            import socket
-            try:
-                with socket.create_connection(("127.0.0.1", port),
-                                              timeout=0.2) as s:
-                    listening = True
-                    break
-            except OSError:
-                time.sleep(0.1)
-        if listening:
-            try:
-                # Now actually drive the daemon.
-                r = call("target.create_empty", {})
-                expect(r["ok"], f"create_empty: {r}")
-                tid = r["data"]["target_id"]
+    except OSError:
+        os.close(pipe_r)
+        os.close(pipe_w)
+        return False
+    os.close(pipe_w)
 
-                r2 = call("target.connect_remote",
-                          {"target_id": tid,
-                           "url": f"connect://127.0.0.1:{port}"})
-                expect(r2["ok"], f"connect_remote: {r2}")
-                expect(r2["data"]["state"] in ("stopped", "running"),
-                       f"unexpected post-connect state: {r2['data']}")
+    # Read the port with a 3-second timeout.
+    port = None
+    ready, _, _ = select.select([pipe_r], [], [], 3.0)
+    if ready:
+        try:
+            raw = os.read(pipe_r, 64)
+            # ASCII decimal first (LLVM 22+); fall back to binary uint16 LE
+            # (older lldb-server versions).
+            text = raw.rstrip(b"\x00 \t\n\r")
+            if text and all(48 <= b <= 57 for b in text):
+                p = int(text)
+                if 1 <= p <= 65535:
+                    port = p
+            if port is None and len(raw) >= 2:
+                p = struct.unpack_from("<H", raw)[0]
+                if 1 <= p <= 65535:
+                    port = p
+        except (OSError, ValueError, struct.error):
+            pass
+    os.close(pipe_r)
 
-                # Detach to release.
-                r3 = call("process.detach", {"target_id": tid})
-                expect(r3["ok"], f"detach after connect_remote: {r3}")
-                return True
-            finally:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        else:
-            # Server didn't come up. If it crashed, try next port — but
-            # if the crash repeats, we know we're on a broken platform.
+    if port is None or proc.poll() is not None:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return False
+
+    try:
+        r = call("target.create_empty", {})
+        expect(r["ok"], f"create_empty: {r}")
+        tid = r["data"]["target_id"]
+
+        r2 = call("target.connect_remote",
+                  {"target_id": tid,
+                   "url": f"connect://127.0.0.1:{port}"})
+        expect(r2["ok"], f"connect_remote: {r2}")
+        if r2.get("ok"):
+            expect(r2["data"]["state"] in ("stopped", "running"),
+                   f"unexpected post-connect state: {r2['data']}")
+
+        r3 = call("process.detach", {"target_id": tid})
+        expect(r3["ok"], f"detach after connect_remote: {r3}")
+        return True
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
             try:
                 proc.kill()
-                proc.wait(timeout=2)
             except Exception:
                 pass
-            # Continue to next port only if address-in-use was the cause;
-            # otherwise bail out (a crash on every port is just noise).
-            stderr = ""
-            try:
-                stderr = proc.stderr.read() if proc.stderr else ""
-            except Exception:
-                pass
-            if "Address already in use" not in stderr:
-                return False
-    return False
 
 
 def main():
