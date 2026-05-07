@@ -57,9 +57,13 @@ TEST_CASE("sqlite3: library version is reachable",
   // 3.7.0; we'll rely on it for the artifact store).
   CHECK(SQLITE_VERSION_NUMBER >= 3'007'000);
 
-  // Runtime version must agree with the compile-time header (catches
-  // ABI mismatch where headers and library disagree).
+  // Runtime library must be at least as new as the headers we compiled
+  // against.  On macOS the system SQLite runtime may be newer than the
+  // SDK-bundled headers (Apple ships them independently), so a strict
+  // string equality check fails by design. Using version numbers lets
+  // us catch real ABI regressions (runtime older than headers) without
+  // failing on the intentional forward-compatible discrepancy.
   const char* rv = sqlite3_libversion();
   REQUIRE(rv != nullptr);
-  CHECK(std::strcmp(rv, SQLITE_VERSION) == 0);
+  CHECK(sqlite3_libversion_number() >= SQLITE_VERSION_NUMBER);
 }

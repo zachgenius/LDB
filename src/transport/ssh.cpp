@@ -856,10 +856,15 @@ SshTunneledCommand::SshTunneledCommand(
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       continue;
     }
-    // 60ms grace is enough for ssh's RST to round-trip from the remote
-    // when the remote endpoint isn't listening; lldb-server takes
-    // ~50–200ms to bind, so a few of these probes are normal.
-    if (try_tunneled_connect_local(local_port, std::chrono::milliseconds(60))) {
+    // 200ms grace: if the remote port isn't listening, the SSH client
+    // receives connection-refused from the remote and closes the -L
+    // forward within a round-trip (loopback ≈ microseconds). Using
+    // 200ms instead of 60ms makes the negative case robust on loaded CI
+    // runners where the SSH process itself may be slow to deliver the
+    // close event. The positive case (remote IS listening) hits the
+    // poll timeout and returns true, so lldb-server / Python server
+    // start latency is unaffected.
+    if (try_tunneled_connect_local(local_port, std::chrono::milliseconds(200))) {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));

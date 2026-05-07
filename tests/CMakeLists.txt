@@ -149,6 +149,10 @@ add_test(
 set_tests_properties(smoke_core PROPERTIES
   TIMEOUT 60
 )
+if(APPLE)
+  # macOS CI runner (macos-14) is ~3x slower than Linux for LLDB/core ops.
+  set_tests_properties(smoke_core PROPERTIES TIMEOUT 180)
+endif()
 
 add_test(
   NAME smoke_step
@@ -432,6 +436,9 @@ add_test(
 set_tests_properties(smoke_provenance_replay PROPERTIES
   TIMEOUT 60
 )
+if(APPLE)
+  set_tests_properties(smoke_provenance_replay PROPERTIES TIMEOUT 180)
+endif()
 
 add_test(
   NAME smoke_live_provenance
@@ -462,6 +469,9 @@ add_test(
 set_tests_properties(smoke_live_determinism_gate PROPERTIES
   TIMEOUT 90
 )
+if(APPLE)
+  set_tests_properties(smoke_live_determinism_gate PROPERTIES TIMEOUT 240)
+endif()
 
 add_test(
   NAME smoke_live_continue_provenance

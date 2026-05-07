@@ -220,7 +220,8 @@ add_test(
 # macOS: debugserver startup + codesign checks add ~3x wall-clock overhead
 # vs Linux lldb-server.  Use a generous platform-aware timeout.
 if(APPLE)
-  set(_UNIT_TIMEOUT 240)
+  # macos-14 CI runner is ~3x slower than local M4; 240s was too tight.
+  set(_UNIT_TIMEOUT 360)
 else()
   set(_UNIT_TIMEOUT 90)
 endif()
