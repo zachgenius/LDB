@@ -178,6 +178,9 @@ endif()
 target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_LLDB_SERVER_PATH="${LDB_LLDB_SERVER_BIN}"
 )
+# Bubble the resolved path up so tests/CMakeLists.txt can inject
+# LLDB_DEBUGSERVER_PATH into every test's environment (smoke + unit).
+set(LDB_LLDB_SERVER_BIN "${LDB_LLDB_SERVER_BIN}" PARENT_SCOPE)
 
 add_test(
   NAME unit_tests
