@@ -94,24 +94,21 @@ The Tier 1 §2 audit surfaced 4 items. All build/test blockers (B1–B4) are now
 
 50/50 ctest PASS on Apple silicon (M4, macOS 15.3, Homebrew LLVM). `docs/macos-arm64-status.md §7` checklist is green. macOS CI matrix job added.
 
-### B5 — LOW: AI-assist disclosure stance (policy call, not correctness)
+### B5 — ✅ RESOLVED: AI-assist disclosure stance softened to "strongly encouraged"
 
-Per §3c the worker made AI-assist co-author trailer **hard-required** in `CONTRIBUTING.md`. This matches `CLAUDE.md`'s internal rule and the project's agent-first stance, but a drive-by external typo-fixer using Copilot autocomplete now hits a hard policy gate. The §3c reviewer flagged this as a policy call worth surfacing — not a correctness issue. Options:
-- **Keep as hard-required** (current state). Consistent with internal rule.
-- **Soften to "strongly encouraged"** — easier on drive-by contributions, still nudges honesty.
-The rule is unenforceable in practice (you can't tell), so the practical difference is the tone of the doc. Your call.
+Per §3c the worker made AI-assist co-author trailer **hard-required** in `CONTRIBUTING.md`. The §3c reviewer flagged this as a policy call. Resolved by softening the language in `CONTRIBUTING.md §11` to "strongly encouraged" — drive-by contributions using light AI autocomplete no longer hit a hard policy gate, while the disclosure nudge for substantive AI work is preserved.
 
-### B6 — TRACKED: §3b minor follow-ups (not blocking)
+### B6 — ✅ RESOLVED (item 1): §3b minor follow-ups
 
 From the §3b reviewer:
-1. **`tags: "v*.*"`** matches `v0.2.0` / `v1.0` but not `v1` (single segment). Confirm versioning convention before tagging anything that could trip this.
+1. **`tags: "v*.*"`** matches `v0.2.0` / `v1.0` but not `v1` (single segment). ✅ RESOLVED — `CONTRIBUTING.md §8` now documents that LDB uses semantic versioning and release tags must be `v<major>.<minor>` or `v<major>.<minor>.<patch>`; bare single-segment tags are explicitly prohibited.
 2. **First push will be the live CI validation.** `check_ci_yaml` is structural only; semantic CI failures (wrong action input names, etc.) only surface on the runner. Worker disclosed; track whether the first run lands green.
 3. **`actions/upload-artifact@v4` retention defaults differ from v3** — explicitly set; future v5 migration needs re-checking.
 
-### B7 — TRACKED: §3c minor follow-ups (not blocking)
+### B7 — ✅ RESOLVED: §3c minor follow-ups
 
 From the §3c reviewer:
-1. **Dangling template references**: `CONTRIBUTING.md` directs feature-idea reporters to "the `feature` or `rfc` template" but only `bug_report.yml` ships. Either reword or add stubs in a follow-up.
+1. **Dangling template references**: `CONTRIBUTING.md` directs feature-idea reporters to "the `feature` or `rfc` template" but only `bug_report.yml` shipped. ✅ RESOLVED — Added `.github/ISSUE_TEMPLATE/feature_request.yml` and `.github/ISSUE_TEMPLATE/rfc.yml` stub templates; both are styled to match `bug_report.yml` and include LDB-specific guidance (wire shape, cost analysis, determinism fields).
 
 ## §6 reviewer findings folded back
 

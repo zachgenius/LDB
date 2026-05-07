@@ -1,0 +1,72 @@
+name: RFC / Design proposal
+description: Propose a design change that requires discussion before implementation.
+title: "rfc: <one-line summary>"
+labels: ["rfc"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for changes that require pre-code design discussion
+        per §4 of `CONTRIBUTING.md`: new or changed endpoint shapes, schema
+        changes to `describe.endpoints`, new external dependencies, protocol
+        version bumps, component-ownership swaps, or determinism-contract
+        changes.
+
+        Fill in as much as you know. Partial RFCs are fine — the goal is to
+        start the conversation, not to arrive with a finished design.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What hurts today? Link to issues or transcripts if available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed design
+      description: |
+        Wire shape (request / response / errors) with a draft-2020-12 schema
+        if applicable. Plain English is fine for early-stage RFCs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: Cost analysis
+      description: |
+        Estimated bytes, tokens_est, and round-trips for typical use.
+        `cost_hint`: `low` / `medium` / `high` / `unbounded` and why.
+
+  - type: textarea
+    id: requires-stopped
+    attributes:
+      label: requires_stopped semantics
+      description: |
+        Does the new/changed endpoint require a stopped target, a running
+        target, or both? Default is `false` (does not require stop).
+
+  - type: textarea
+    id: determinism
+    attributes:
+      label: Determinism
+      description: |
+        Is the response deterministic against `(method, params, snapshot)`?
+        If not, is the non-determinism fenced (e.g. live-only)?
+
+  - type: textarea
+    id: test-plan
+    attributes:
+      label: Test plan
+      description: |
+        What unit / smoke / golden tests will cover this? Note any new
+        harness infrastructure needed.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other designs and why you ruled them out.

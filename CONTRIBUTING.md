@@ -100,7 +100,7 @@ Subject lines are short and prefixed (`feat(daemon): …`, `fix(probes): …`,
 that was hiding — not a restatement of the diff. Reference the milestone
 (M0–M5 or post-v0.1 slice) and the endpoint or component when relevant.
 
-If an AI agent did substantive work, add a co-author trailer (see §10).
+If an AI agent did substantive work, add a co-author trailer (see §11).
 
 ---
 
@@ -232,7 +232,20 @@ stays linear).
 
 ---
 
-## 8. Code of conduct
+## 8. Versioning and release tags
+
+LDB uses **semantic versioning** (`MAJOR.MINOR.PATCH`). Release tags must
+be in `v<major>.<minor>` or `v<major>.<minor>.<patch>` form — for example
+`v0.2`, `v0.2.1`, `v1.0`, `v1.0.0`.
+
+The CI release workflow uses the pattern `tags: ["v*.*"]`. This pattern
+requires **at least one dot** after the `v` prefix. A bare single-segment
+tag like `v1` will not trigger the release workflow. Do not create bare
+single-segment tags for releases.
+
+---
+
+## 9. Code of conduct
 
 Be respectful. Harassment, discriminatory language, or personal attacks
 are not tolerated and are grounds for removal from the project.
@@ -243,7 +256,7 @@ escalate concerns to the maintainer (`@zachgenius` on GitHub).
 
 ---
 
-## 9. License
+## 10. License
 
 The project license is **currently undecided** (see `README.md`). Apache
 2.0 with LLVM exception is the leading candidate, matching the LLDB
@@ -260,19 +273,23 @@ ceremony for now. This may change before 1.0.
 
 ---
 
-## 10. AI-assisted contributions
+## 11. AI-assisted contributions
 
 LDB is an agent-first project; using AI tools to help author contributions
 is welcome and expected.
 
-**If an AI agent did substantive work on a commit, disclose it via a
-co-author trailer:**
+**If an AI agent did substantive work on a commit, adding a co-author
+trailer is strongly encouraged:**
 
 ```
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
 
 (or the appropriate model line — `Claude Sonnet 4.5`, `GPT-5`, etc.)
+
+The disclosure helps reviewers calibrate; it is not a black mark. It is
+not enforced — a drive-by typo fix with Copilot autocomplete doesn't
+need a trailer — but if AI tooling did the heavy lifting, please say so.
 
 The internal-agent workflow (TDD-strict, commit-per-slice, worklog every
 session) is codified in `CLAUDE.md` and is loaded automatically by Claude
@@ -281,12 +298,11 @@ Code. External contributors using AI tools should follow the spirit of it
 even if the harness isn't enforcing it.
 
 A PR that is mostly AI-authored is fine. A PR that fakes its commit
-authorship to hide that fact is not. The disclosure helps reviewers
-calibrate; it is not a black mark.
+authorship to hide that fact is not.
 
 ---
 
-## 11. Where to ask questions
+## 12. Where to ask questions
 
 - **Bug?** Open an issue with the `bug` template
   (`.github/ISSUE_TEMPLATE/bug_report.yml`).

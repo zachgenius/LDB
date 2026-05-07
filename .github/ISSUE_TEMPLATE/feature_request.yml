@@ -1,0 +1,61 @@
+name: Feature request
+description: Propose a new capability or enhancement to ldbd / the protocol.
+title: "[feat] <one-line summary>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the feature idea. If the change touches the wire protocol,
+        endpoint shapes, or architecture, please read §4 of `CONTRIBUTING.md`
+        first — those require an RFC discussion before code.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem does this solve? Who benefits and how?
+      placeholder: |
+        When debugging a multi-binary session, there is no way to correlate
+        symbols across targets without calling `symbol.find` N times and
+        joining the results client-side. A cross-target symbol index would
+        let the agent issue a single RPC instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        Describe the change at the level of detail you have. Wire shape
+        sketches, pseudocode, or plain English are all fine. If you have a
+        full draft-2020-12 schema, paste it here.
+      placeholder: |
+        Add a `symbol.find_cross` method that accepts `target_ids: [int]`
+        and returns a merged result set with a `target_id` field on each hit.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about and why you ruled them out.
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: Cost / token impact
+      description: |
+        Rough estimate of response size and `cost_hint` category
+        (`low` / `medium` / `high` / `unbounded`). Skip if unknown.
+
+  - type: checkboxes
+    id: rfc-needed
+    attributes:
+      label: RFC required?
+      options:
+        - label: >
+            This touches the wire protocol or architecture — I understand a
+            design RFC (§4 of CONTRIBUTING.md) is needed before code lands.
