@@ -74,7 +74,16 @@ jobs:
         run: build/bin/ldbd --version
 
       - name: Test (ctest)
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          # On Ubuntu apt LLDB, the debugserver binary lives under
+          # /usr/lib/llvm-18/bin/ which is not on the shell PATH, so LLDB
+          # cannot locate it automatically.  Export the path explicitly so
+          # every test process (unit_tests binary and ldbd subprocesses
+          # spawned by smoke tests) sees LLDB_DEBUGSERVER_PATH.
+          LLDB_DEBUGSERVER_PATH=/usr/lib/llvm-18/bin/lldb-server
+          export LLDB_DEBUGSERVER_PATH
+          echo "LLDB_DEBUGSERVER_PATH=${LLDB_DEBUGSERVER_PATH}"
+          ctest --test-dir build --output-on-failure
 
       - name: Upload failure artifacts (build + ctest logs)
         if: ${{ failure() }}

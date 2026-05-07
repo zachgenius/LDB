@@ -163,7 +163,11 @@ set(LDB_LLDB_SERVER_BIN "")
 if(LDB_LLDB_ROOT AND EXISTS "${LDB_LLDB_ROOT}/bin/lldb-server")
   set(LDB_LLDB_SERVER_BIN "${LDB_LLDB_ROOT}/bin/lldb-server")
 else()
-  find_program(LDB_LLDB_SERVER_FOUND lldb-server)
+  # Use HINTS so apt Ubuntu layout (/usr/lib/llvm-18/bin) is found even
+  # when that directory isn't on the shell PATH.
+  find_program(LDB_LLDB_SERVER_FOUND lldb-server
+    HINTS "${LDB_LLDB_ROOT}/bin"
+  )
   if(LDB_LLDB_SERVER_FOUND)
     set(LDB_LLDB_SERVER_BIN "${LDB_LLDB_SERVER_FOUND}")
   endif()
@@ -190,3 +194,11 @@ set_tests_properties(unit_tests PROPERTIES
   TIMEOUT 90
   ENVIRONMENT "LDB_STORE_ROOT=${LDB_TEST_STORE_ROOT}"
 )
+# get_directory_property(TESTS) in the parent does NOT include tests defined
+# in subdirectories (CMake docs: "Tests defined in subdirectories are not
+# included"), so the foreach in tests/CMakeLists.txt never stamps
+# LLDB_DEBUGSERVER_PATH on this test.  Do it directly here.
+if(LDB_LLDB_SERVER_BIN)
+  set_property(TEST unit_tests APPEND PROPERTY
+    ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LDB_LLDB_SERVER_BIN}")
+endif()
