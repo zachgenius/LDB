@@ -64,7 +64,16 @@ TEST_CASE("hello: no params returns protocol block",
   REQUIRE(resp.data["name"] == "ldbd");
   REQUIRE(resp.data.contains("version"));      // daemon version
   REQUIRE(resp.data.contains("formats"));
+  REQUIRE(resp.data.contains("capabilities"));
   REQUIRE(resp.data.contains("protocol"));
+  const auto& caps = resp.data["capabilities"];
+#ifdef LDB_HAVE_CAPSTONE
+  REQUIRE(caps["disasm_backend"].get<std::string>() == "capstone");
+  REQUIRE(caps["disasm_fallback"].get<bool>());
+#else
+  REQUIRE(caps["disasm_backend"].get<std::string>() == "lldb");
+  REQUIRE_FALSE(caps.contains("disasm_fallback"));
+#endif
   const auto& p = resp.data["protocol"];
   REQUIRE(p["major"].get<int>() == kProtocolVersionMajor);
   REQUIRE(p["minor"].get<int>() == kProtocolVersionMinor);

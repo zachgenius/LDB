@@ -151,7 +151,8 @@ set_tests_properties(smoke_core PROPERTIES
 )
 if(APPLE)
   # macOS CI runner (macos-14) is ~3x slower than Linux for LLDB/core ops.
-  set_tests_properties(smoke_core PROPERTIES TIMEOUT 180)
+  # Hosted runners have also shown core save/load spikes beyond 180s.
+  set_tests_properties(smoke_core PROPERTIES TIMEOUT 600)
 endif()
 
 add_test(
@@ -437,7 +438,9 @@ set_tests_properties(smoke_provenance_replay PROPERTIES
   TIMEOUT 60
 )
 if(APPLE)
-  set_tests_properties(smoke_provenance_replay PROPERTIES TIMEOUT 180)
+  # Replays include core-backed provenance checks; keep this aligned with
+  # smoke_core's macOS budget.
+  set_tests_properties(smoke_provenance_replay PROPERTIES TIMEOUT 600)
 endif()
 
 add_test(

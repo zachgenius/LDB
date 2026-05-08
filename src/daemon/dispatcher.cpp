@@ -644,6 +644,14 @@ Response Dispatcher::handle_hello(const Request& req) {
       {"minor",         protocol::kProtocolVersionMinor},
       {"min_supported", protocol::kProtocolMinSupported.to_string()},
   };
+  data["capabilities"] = {
+#ifdef LDB_HAVE_CAPSTONE
+      {"disasm_backend", "capstone"},
+      {"disasm_fallback", true},
+#else
+      {"disasm_backend", "lldb"},
+#endif
+  };
   data["formats"] = json::array({"json"});  // CBOR / json-compact / tabular: post-M0
   return protocol::make_ok(req.id, std::move(data));
 }
@@ -698,6 +706,14 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
           {"name",     str()},
           {"version",  str("Daemon version (separate from protocol version).")},
           {"formats",  arr_of(str(), "Supported wire formats.")},
+          {"capabilities", obj({
+              {"disasm_backend", str(
+                  "Active disassembly backend for disasm.range and "
+                  "disasm.function: \"lldb\" or \"capstone\".")},
+              {"disasm_fallback", bool_(
+                  "Present and true when Capstone can fall back to LLDB "
+                  "for unsupported arch/mode or decode/read failures.")},
+          }, {"disasm_backend"})},
           {"protocol", obj({
               {"version",       str_pattern("^[0-9]+\\.[0-9]+$",
                                             "Current wire-protocol version.")},

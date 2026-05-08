@@ -1,29 +1,26 @@
 # LDB CI — Linux x86-64 + Linux arm64 + macOS arm64
 #
-# Builds and tests `ldbd` on every push and PR against `master`.
-# A tag-driven release job uploads the Linux binary for `v*.*` tags.
+# Builds and tests `ldbd` only on pushes to `master` or manual runs
+# from `master`.
 # Documented in `docs/06-ci.md`.
 
 name: CI
 
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - master
-    tags:
-      - "v*.*"
-  pull_request:
     branches:
       - master
 
 # Don't pile up redundant runs on a fast-pushing branch.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   linux:
     name: Linux x86-64 (Ubuntu 24.04, gcc-13, apt LLDB 18)
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -102,6 +99,7 @@ jobs:
 
   linux-arm64:
     name: Linux arm64 (Ubuntu 24.04, apt LLDB 18)
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -173,8 +171,83 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  linux-capstone:
+    name: Linux x86-64 Capstone disasm (Ubuntu 24.04, gcc-13, apt LLDB 18)
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build + test dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build cmake build-essential \
+            liblldb-dev lldb \
+            libcapstone-dev \
+            libsqlite3-dev zlib1g-dev \
+            python3 \
+            bpftrace tcpdump \
+            openssh-server openssh-client
+
+      - name: Disable Yama ptrace_scope (live attach tests)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cat /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Configure local sshd + key auth (target.connect_remote_ssh)
+        run: |
+          sudo systemctl start ssh || sudo service ssh start
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          CI_SSH_KEY="${RUNNER_TEMP}/ldb-ci-ed25519"
+          ssh-keygen -t ed25519 -f "${CI_SSH_KEY}" -N "" -q
+          cat "${CI_SSH_KEY}.pub" >> ~/.ssh/authorized_keys
+          chmod go-w "$HOME"
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -t ed25519 localhost >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -i "${CI_SSH_KEY}" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            runner@localhost true
+
+      - name: Configure Capstone build (CMake + Ninja, apt LLDB 18)
+        run: |
+          cmake -B build-capstone -G Ninja \
+            -DLDB_LLDB_ROOT=/usr/lib/llvm-18 \
+            -DCMAKE_PREFIX_PATH=/usr \
+            -DLDB_ENABLE_CAPSTONE=ON
+
+      - name: Build
+        run: cmake --build build-capstone --parallel
+
+      - name: Test Capstone disasm smoke + units
+        run: |
+          LLDB_DEBUGSERVER_PATH=/usr/lib/llvm-18/bin/lldb-server
+          export LLDB_DEBUGSERVER_PATH
+          echo "LLDB_DEBUGSERVER_PATH=${LLDB_DEBUGSERVER_PATH}"
+          ctest --test-dir build-capstone --output-on-failure \
+            -R "smoke_disasm|unit_tests"
+
+      - name: Upload failure artifacts (build + ctest logs)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-capstone-failure-logs
+          path: |
+            build-capstone/Testing/
+            build-capstone/CMakeFiles/CMakeOutput.log
+            build-capstone/CMakeFiles/CMakeError.log
+            build-capstone/.ninja_log
+          if-no-files-found: ignore
+          retention-days: 14
+
   macos:
     name: macOS arm64 (macos-14, Homebrew LLVM)
+    if: github.ref == 'refs/heads/master'
     runs-on: macos-14
     timeout-minutes: 90
     steps:
@@ -212,51 +285,5 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  release:
-    name: Tagged release artifact (ldbd binary)
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: linux
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install build dependencies (apt)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ninja-build cmake build-essential \
-            liblldb-dev lldb \
-            libsqlite3-dev zlib1g-dev \
-            python3
-
-      - name: Configure (Release)
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLDB_LLDB_ROOT=/usr/lib/llvm-18 \
-            -DCMAKE_PREFIX_PATH=/usr
-
-      - name: Build ldbd
-        run: cmake --build build --parallel --target ldbd
-
-      - name: Stage release artifact
-        id: stage
-        run: |
-          tag="${GITHUB_REF##*/}"
-          stage="ldbd-${tag}-linux-x86_64"
-          mkdir -p "dist/${stage}"
-          cp build/bin/ldbd "dist/${stage}/ldbd"
-          cp README.md "dist/${stage}/README.md"
-          (cd dist && tar -czf "${stage}.tar.gz" "${stage}")
-          ls -la dist/
-          echo "name=${stage}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload ldbd binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.stage.outputs.name }}
-          path: dist/${{ steps.stage.outputs.name }}.tar.gz
           if-no-files-found: error
           retention-days: 90

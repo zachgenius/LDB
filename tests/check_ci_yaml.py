@@ -9,16 +9,13 @@ notices structural rot before pushing.
 Asserts:
 - File exists and parses as valid YAML.
 - Top-level `name`, `on`, `jobs` keys exist.
-- `on` triggers include `push`, `pull_request`, and a tag-push job.
+- `on` triggers only include pushes to `master` and manual dispatch.
 - The Linux x86-64 build job runs on `ubuntu-24.04`, has a 30-minute timeout,
   uses `actions/checkout@v4`, installs the documented apt deps, sets
   `kernel.yama.ptrace_scope=0`, configures `ldbd` against
   `/usr/lib/llvm-18`, builds, and runs `ctest`.
 - The Linux arm64 build job runs on `ubuntu-24.04-arm`, has a 45-minute
   timeout, and mirrors the same apt/LLDB/build/test shape.
-- A tag-release job exists, triggers on `v*.*` tags, and uploads
-  `ldbd` as an artifact via `actions/upload-artifact@v4`.
-
 The intent is not to lint every YAML detail — `actionlint` does that on
 the runner side — but to fail loudly if a future edit silently drops
 the steps the docs promise.
@@ -76,35 +73,35 @@ def main():
         fail("missing `on:` triggers block")
     if not isinstance(on_block, dict):
         fail("`on:` is not a mapping")
-    for trig in ("push", "pull_request"):
-        if trig not in on_block:
-            fail(f"`on:` missing trigger: {trig}")
+    if set(on_block.keys()) != {"push", "workflow_dispatch"}:
+        fail(
+            "`on:` must only contain push and workflow_dispatch triggers; "
+            f"got {sorted(on_block.keys())!r}"
+        )
 
-    # Push trigger must include both branches and tags (tags drive the
-    # release job).
+    # Push trigger must be restricted to the master branch.
     push_block = on_block["push"]
     if not isinstance(push_block, dict):
-        fail("`on.push` must be a mapping (branches + tags)")
-    if "tags" not in push_block:
-        fail("`on.push` missing `tags` (tagged-release job needs it)")
-    tag_patterns = push_block["tags"]
-    if not isinstance(tag_patterns, list) or not any(
-        "v" in p for p in tag_patterns
-    ):
-        fail(f"`on.push.tags` must list a v*-style pattern; got {tag_patterns!r}")
+        fail("`on.push` must be a mapping with branches")
+    branches = push_block.get("branches")
+    if branches != ["master"]:
+        fail(f"`on.push.branches` must be exactly ['master']; got {branches!r}")
+    if "tags" in push_block:
+        fail("`on.push` must not include tags")
 
     jobs = doc["jobs"]
     if not isinstance(jobs, dict) or not jobs:
         fail("`jobs:` must be a non-empty mapping")
 
-    # Identify the Linux build/test job and the tag-release job by
-    # shape rather than name, so a future rename doesn't false-fail.
+    # Identify the Linux build/test jobs by shape rather than name, so
+    # a future rename doesn't false-fail.
     linux_job = None
     linux_arm_job = None
-    release_job = None
     for jname, jdef in jobs.items():
         if not isinstance(jdef, dict):
             fail(f"job `{jname}` is not a mapping")
+        if jdef.get("if") != "github.ref == 'refs/heads/master'":
+            fail(f"job `{jname}` must be guarded to run only on master")
         runs_on = jdef.get("runs-on", "")
         steps = jdef.get("steps", []) or []
         step_text = " ".join(
@@ -116,15 +113,11 @@ def main():
             linux_job = (jname, jdef, steps, step_text)
         if runs_on_s == "ubuntu-24.04-arm" and "ctest" in step_text:
             linux_arm_job = (jname, jdef, steps, step_text)
-        if "upload-artifact" in step_text and "ldbd" in step_text:
-            release_job = (jname, jdef, steps, step_text)
 
     if linux_job is None:
         fail("no job runs ctest on ubuntu-24.04")
     if linux_arm_job is None:
         fail("no job runs ctest on ubuntu-24.04-arm")
-    if release_job is None:
-        fail("no job uploads `ldbd` via actions/upload-artifact")
 
     _, ldef, lsteps, ltext = linux_job
     _, adef, _, atext = linux_arm_job
@@ -162,14 +155,6 @@ def main():
         fail("Linux job has no upload-artifact step (failure log capture)")
     if "upload-artifact" not in atext:
         fail("Linux arm64 job has no upload-artifact step (failure log capture)")
-
-    # Tag-release job sanity — same os family, uploads ldbd binary.
-    _, rdef, _, rtext = release_job
-    if "ubuntu" not in str(rdef.get("runs-on", "")):
-        fail("release job must run on Ubuntu")
-    for needle in ("cmake --build build", "ldbd"):
-        if needle not in rtext:
-            fail(f"release job missing expected content: {needle!r}")
 
     print(f"check_ci_yaml: ok ({len(jobs)} jobs, {len(lsteps)} steps in linux job)")
 

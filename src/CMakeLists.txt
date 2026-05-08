@@ -39,6 +39,7 @@ target_include_directories(ldbd PRIVATE
 
 target_link_libraries(ldbd PRIVATE
   ldb_lldb
+  ldb_capstone
   ldb_json
   ldb_warnings
   SQLite::SQLite3

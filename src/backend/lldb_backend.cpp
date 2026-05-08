@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef LDB_HAVE_CAPSTONE
+#include <capstone/capstone.h>
+#endif
+
 #include <lldb/API/LLDB.h>
 
 #include "util/log.h"
@@ -996,6 +1000,22 @@ LldbBackend::find_strings(TargetId tid, const StringQuery& query) {
   return out;
 }
 
+namespace {
+
+std::vector<DisasmInsn>
+disassemble_range_lldb(lldb::SBTarget target,
+                       std::uint64_t start_addr,
+                       std::uint64_t end_addr);
+
+#ifdef LDB_HAVE_CAPSTONE
+std::optional<std::vector<DisasmInsn>>
+disassemble_range_capstone(lldb::SBTarget target,
+                           std::uint64_t start_addr,
+                           std::uint64_t end_addr);
+#endif
+
+}  // namespace
+
 std::vector<DisasmInsn>
 LldbBackend::disassemble_range(TargetId tid,
                                std::uint64_t start_addr,
@@ -1010,6 +1030,20 @@ LldbBackend::disassemble_range(TargetId tid,
     target = it->second;
   }
 
+#ifdef LDB_HAVE_CAPSTONE
+  if (auto capstone = disassemble_range_capstone(target, start_addr, end_addr)) {
+    return *capstone;
+  }
+#endif
+  return disassemble_range_lldb(target, start_addr, end_addr);
+}
+
+namespace {
+
+std::vector<DisasmInsn>
+disassemble_range_lldb(lldb::SBTarget target,
+                       std::uint64_t start_addr,
+                       std::uint64_t end_addr) {
   std::vector<DisasmInsn> out;
   if (start_addr >= end_addr) return out;
 
@@ -1041,6 +1075,7 @@ LldbBackend::disassemble_range(TargetId tid,
     DisasmInsn di;
     di.address   = addr_val;
     di.byte_size = static_cast<std::uint32_t>(insn.GetByteSize());
+    if (di.byte_size == 0 || di.address + di.byte_size > end_addr) break;
 
     if (const char* m = insn.GetMnemonic(target))  di.mnemonic = m;
     if (const char* o = insn.GetOperands(target))  di.operands = o;
@@ -1048,11 +1083,11 @@ LldbBackend::disassemble_range(TargetId tid,
 
     auto data = insn.GetData(target);
     if (data.IsValid()) {
-      uint8_t buf[16] = {0};
+      std::vector<std::uint8_t> bytes(di.byte_size);
       lldb::SBError err;
-      size_t want = std::min<size_t>(di.byte_size, sizeof(buf));
-      size_t got  = data.ReadRawData(err, /*offset=*/0, buf, want);
-      if (!err.Fail()) di.bytes.assign(buf, buf + got);
+      size_t got = data.ReadRawData(err, /*offset=*/0, bytes.data(),
+                                    bytes.size());
+      if (!err.Fail() && got == bytes.size()) di.bytes = std::move(bytes);
     }
 
     out.push_back(std::move(di));
@@ -1061,7 +1096,119 @@ LldbBackend::disassemble_range(TargetId tid,
   return out;
 }
 
-namespace {
+#ifdef LDB_HAVE_CAPSTONE
+
+struct CapstoneHandle {
+  csh handle = 0;
+  CapstoneHandle() = default;
+  CapstoneHandle(const CapstoneHandle&) = delete;
+  CapstoneHandle& operator=(const CapstoneHandle&) = delete;
+  CapstoneHandle(CapstoneHandle&& other) noexcept : handle(other.handle) {
+    other.handle = 0;
+  }
+  CapstoneHandle& operator=(CapstoneHandle&& other) noexcept {
+    if (this != &other) {
+      if (handle != 0) cs_close(&handle);
+      handle = other.handle;
+      other.handle = 0;
+    }
+    return *this;
+  }
+  ~CapstoneHandle() {
+    if (handle != 0) cs_close(&handle);
+  }
+};
+
+std::optional<CapstoneHandle> open_capstone_for_target(lldb::SBTarget target) {
+  const char* triple_c = target.GetTriple();
+  if (triple_c == nullptr) return std::nullopt;
+  std::string triple = triple_c;
+
+  cs_arch arch;
+  cs_mode mode;
+  if (triple.rfind("x86_64", 0) == 0 || triple.rfind("amd64", 0) == 0) {
+    arch = CS_ARCH_X86;
+    mode = CS_MODE_64;
+  } else if (triple.rfind("aarch64", 0) == 0 ||
+             triple.rfind("arm64", 0) == 0) {
+    arch = CS_ARCH_ARM64;
+    mode = CS_MODE_LITTLE_ENDIAN;
+  } else {
+    return std::nullopt;
+  }
+
+  CapstoneHandle out;
+  if (cs_open(arch, mode, &out.handle) != CS_ERR_OK) return std::nullopt;
+  cs_option(out.handle, CS_OPT_DETAIL, CS_OPT_OFF);
+  return out;
+}
+
+std::optional<std::vector<std::uint8_t>>
+read_target_file_bytes(lldb::SBTarget target,
+                       std::uint64_t start_addr,
+                       std::uint64_t end_addr) {
+  if (start_addr >= end_addr) return std::vector<std::uint8_t>{};
+  lldb::SBAddress base = target.ResolveFileAddress(start_addr);
+  if (!base.IsValid()) return std::nullopt;
+
+  std::uint64_t span64 = end_addr - start_addr;
+  if (span64 > static_cast<std::uint64_t>(std::numeric_limits<size_t>::max())) {
+    return std::nullopt;
+  }
+  const size_t span = static_cast<size_t>(span64);
+  std::vector<std::uint8_t> bytes(span);
+
+  lldb::SBError err;
+  size_t got = target.ReadMemory(base, bytes.data(), bytes.size(), err);
+  if (err.Fail() || got != bytes.size()) return std::nullopt;
+  return bytes;
+}
+
+std::optional<std::vector<DisasmInsn>>
+disassemble_range_capstone(lldb::SBTarget target,
+                           std::uint64_t start_addr,
+                           std::uint64_t end_addr) {
+  if (start_addr >= end_addr) return std::vector<DisasmInsn>{};
+
+  auto handle = open_capstone_for_target(target);
+  if (!handle.has_value()) return std::nullopt;
+  auto bytes = read_target_file_bytes(target, start_addr, end_addr);
+  if (!bytes.has_value()) return std::nullopt;
+
+  cs_insn* raw_insns = nullptr;
+  size_t n = cs_disasm(handle->handle, bytes->data(), bytes->size(),
+                       start_addr, /*count=*/0, &raw_insns);
+  if (n == 0 || raw_insns == nullptr) return std::nullopt;
+
+  std::vector<DisasmInsn> out;
+  out.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    const cs_insn& ci = raw_insns[i];
+    if (ci.address >= end_addr || ci.size == 0) break;
+    if (ci.address + ci.size > end_addr) break;
+
+    std::uint64_t offset64 = ci.address - start_addr;
+    if (offset64 > static_cast<std::uint64_t>(bytes->size())) break;
+    size_t offset = static_cast<size_t>(offset64);
+    if (offset + ci.size > bytes->size()) break;
+
+    DisasmInsn di;
+    di.address = ci.address;
+    di.byte_size = static_cast<std::uint32_t>(ci.size);
+    di.bytes.assign(bytes->begin() + static_cast<std::ptrdiff_t>(offset),
+                    bytes->begin() +
+                        static_cast<std::ptrdiff_t>(offset + ci.size));
+    di.mnemonic = ci.mnemonic;
+    di.operands = ci.op_str;
+    out.push_back(std::move(di));
+  }
+  cs_free(raw_insns, n);
+
+  if (out.empty()) return std::nullopt;
+  return out;
+}
+
+#endif  // LDB_HAVE_CAPSTONE
 
 // Search `s` for a hex literal (0x... or 0X..., optionally preceded by '#')
 // that equals `needle`. Returns true on first match.
@@ -1240,7 +1387,7 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
       std::uint64_t start = sec.GetFileAddress();
       std::uint64_t size  = sec.GetByteSize();
       if (start != 0 && size > 0) {
-        auto insns = disassemble_range(tid, start, start + size);
+        auto insns = disassemble_range_lldb(target, start, start + size);
         for (const auto& i : insns) {
           if (string_references_address(i.operands, target_addr) ||
               string_references_address(i.comment,  target_addr) ||
@@ -1337,7 +1484,8 @@ LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
               std::uint64_t start = sec.GetFileAddress();
               std::uint64_t size  = sec.GetByteSize();
               if (start != 0 && size > 0) {
-                auto insns = disassemble_range(tid, start, start + size);
+                auto insns =
+                    disassemble_range_lldb(target, start, start + size);
                 for (const auto& i : insns) {
                   if (i.comment.find(quoted_needle) != std::string::npos) {
                     XrefMatch m;

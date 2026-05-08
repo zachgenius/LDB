@@ -15,6 +15,7 @@ Pre-v0.1. Design phase. The four documents in this folder define the work.
 | [`01-gdb-core-methodology.md`](./01-gdb-core-methodology.md) | Deep technical analysis of GDB 17.1's architecture. The 10 cross-cutting methodologies that define a real debugger, evidenced from `/Users/zach/Downloads/gdb-17.1`. Foundational reading. |
 | [`02-ldb-mvp-plan.md`](./02-ldb-mvp-plan.md) | The 8–10 week MVP. C++17/20 daemon (`ldbd`), LLDB SBAPI as backend, schema-first JSON-RPC + CBOR protocol, build-ID-keyed artifact store, sessions, probes, typed observers. Includes the full RPC surface and the reference workflow that gates "MVP done." |
 | [`03-ldb-full-roadmap.md`](./03-ldb-full-roadmap.md) | The trajectory beyond MVP: progressive replacement of LLDB components as measurement justifies, never a from-scratch rewrite. Three parallel tracks (coverage, power features, LLM differentiators). Process for tracking GDB and LLDB upstream. |
+| [`12-capstone-disasm.md`](./12-capstone-disasm.md) | Opt-in Capstone disassembly backend behavior, fallback rules, supported architectures, and hello capability reporting. |
 
 ## Architecture in one diagram
 

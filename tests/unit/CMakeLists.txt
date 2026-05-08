@@ -137,6 +137,7 @@ target_link_libraries(ldb_unit_tests PRIVATE
   ldb_catch2
   ldb_json
   ldb_lldb
+  ldb_capstone
   ldb_warnings
   SQLite::SQLite3
   ZLIB::ZLIB
@@ -220,8 +221,10 @@ add_test(
 # macOS: debugserver startup + codesign checks add ~3x wall-clock overhead
 # vs Linux lldb-server.  Use a generous platform-aware timeout.
 if(APPLE)
-  # macos-14 CI runner is ~3x slower than local M4; 240s was too tight.
-  set(_UNIT_TIMEOUT 360)
+  # macos-14 CI runners can spend several minutes in LLDB/core-backed
+  # tests under load. Keep Linux tight, but give the hosted macOS leg
+  # enough room to report real assertion failures instead of CTest kills.
+  set(_UNIT_TIMEOUT 900)
 else()
   set(_UNIT_TIMEOUT 90)
 endif()

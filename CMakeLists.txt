@@ -9,6 +9,7 @@ project(ldb
 
 option(LDB_BUILD_TESTS "Build LDB tests" ON)
 option(LDB_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(LDB_ENABLE_CAPSTONE "Enable the opt-in Capstone disassembly backend" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -117,6 +118,57 @@ endif()
 
 message(STATUS "ldb: liblldb at ${LDB_LLDB_LIBRARY}")
 message(STATUS "ldb: lldb headers at ${LDB_LLDB_INCLUDE_DIR}")
+
+# ----- Capstone ------------------------------------------------------------
+#
+# Optional disassembly backend. LLDB remains the default when this is OFF.
+
+add_library(ldb_capstone INTERFACE)
+if(LDB_ENABLE_CAPSTONE)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LDB_CAPSTONE QUIET capstone)
+  endif()
+
+  if(LDB_CAPSTONE_FOUND)
+    target_include_directories(ldb_capstone SYSTEM INTERFACE
+      ${LDB_CAPSTONE_INCLUDE_DIRS}
+    )
+    target_link_directories(ldb_capstone INTERFACE
+      ${LDB_CAPSTONE_LIBRARY_DIRS}
+    )
+    target_link_libraries(ldb_capstone INTERFACE
+      ${LDB_CAPSTONE_LIBRARIES}
+    )
+    target_compile_options(ldb_capstone INTERFACE
+      ${LDB_CAPSTONE_CFLAGS_OTHER}
+    )
+    target_compile_definitions(ldb_capstone INTERFACE LDB_HAVE_CAPSTONE=1)
+    message(STATUS "ldb: capstone via pkg-config (${LDB_CAPSTONE_VERSION})")
+  else()
+    find_path(LDB_CAPSTONE_INCLUDE_DIR
+      NAMES capstone/capstone.h
+    )
+    find_library(LDB_CAPSTONE_LIBRARY
+      NAMES capstone
+    )
+    if(NOT LDB_CAPSTONE_INCLUDE_DIR OR NOT LDB_CAPSTONE_LIBRARY)
+      message(FATAL_ERROR
+        "LDB_ENABLE_CAPSTONE=ON but Capstone was not found. Install "
+        "capstone development headers/libraries or set CMAKE_PREFIX_PATH.")
+    endif()
+    target_include_directories(ldb_capstone SYSTEM INTERFACE
+      "${LDB_CAPSTONE_INCLUDE_DIR}"
+    )
+    target_link_libraries(ldb_capstone INTERFACE
+      "${LDB_CAPSTONE_LIBRARY}"
+    )
+    target_compile_definitions(ldb_capstone INTERFACE LDB_HAVE_CAPSTONE=1)
+    message(STATUS "ldb: capstone at ${LDB_CAPSTONE_LIBRARY}")
+  endif()
+else()
+  message(STATUS "ldb: capstone disabled (set -DLDB_ENABLE_CAPSTONE=ON to enable)")
+endif()
 
 # ----- Vendored deps ------------------------------------------------------
 
