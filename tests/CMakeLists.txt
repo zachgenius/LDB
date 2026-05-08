@@ -21,6 +21,16 @@ set_tests_properties(smoke_hello PROPERTIES
 )
 
 add_test(
+  NAME smoke_hello_capabilities
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_hello_capabilities.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<IF:$<BOOL:${LDB_ENABLE_CAPSTONE}>,capstone,lldb>"
+)
+set_tests_properties(smoke_hello_capabilities PROPERTIES
+  TIMEOUT 30
+)
+
+add_test(
   NAME smoke_type_layout
   COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_type_layout.sh"
           "$<TARGET_FILE:ldbd>"

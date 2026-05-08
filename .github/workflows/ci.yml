@@ -224,13 +224,13 @@ jobs:
       - name: Build
         run: cmake --build build-capstone --parallel
 
-      - name: Test Capstone disasm smoke + units
+      - name: Test Capstone hello/disasm smoke + units
         run: |
           LLDB_DEBUGSERVER_PATH=/usr/lib/llvm-18/bin/lldb-server
           export LLDB_DEBUGSERVER_PATH
           echo "LLDB_DEBUGSERVER_PATH=${LLDB_DEBUGSERVER_PATH}"
           ctest --test-dir build-capstone --output-on-failure \
-            -R "smoke_disasm|unit_tests"
+            -R "smoke_hello_capabilities|smoke_disasm|unit_tests"
 
       - name: Upload failure artifacts (build + ctest logs)
         if: ${{ failure() }}
