@@ -16,6 +16,7 @@ Pre-v0.1. Design phase. The four documents in this folder define the work.
 | [`02-ldb-mvp-plan.md`](./02-ldb-mvp-plan.md) | The 8–10 week MVP. C++17/20 daemon (`ldbd`), LLDB SBAPI as backend, schema-first JSON-RPC + CBOR protocol, build-ID-keyed artifact store, sessions, probes, typed observers. Includes the full RPC surface and the reference workflow that gates "MVP done." |
 | [`03-ldb-full-roadmap.md`](./03-ldb-full-roadmap.md) | The trajectory beyond MVP: progressive replacement of LLDB components as measurement justifies, never a from-scratch rewrite. Three parallel tracks (coverage, power features, LLM differentiators). Process for tracking GDB and LLDB upstream. |
 | [`12-capstone-disasm.md`](./12-capstone-disasm.md) | Opt-in Capstone disassembly backend behavior, fallback rules, supported architectures, and hello capability reporting. |
+| [`13-v1-readiness.md`](./13-v1-readiness.md) | Concrete V1 release gates: supported matrix, validation commands, known limitations, and cut criteria. |
 
 ## Architecture in one diagram
 
