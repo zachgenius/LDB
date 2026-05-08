@@ -22,8 +22,8 @@
 //                               GATE on `ssh_probe(localhost, 1s)` and
 //                               SKIP cleanly when not configured (do NOT
 //                               weaken the assertion). Set up via
-//                               `ssh-keygen -t ed25519 && cat ~/.ssh/
-//                               id_ed25519.pub >> ~/.ssh/authorized_keys`.
+//                               `ssh-keygen -t ed25519 -f /tmp/ldb-ssh &&
+//                               cat /tmp/ldb-ssh.pub >> ~/.ssh/authorized_keys`.
 
 #include <catch_amalgamated.hpp>
 

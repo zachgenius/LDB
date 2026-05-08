@@ -51,12 +51,13 @@ jobs:
           sudo systemctl start ssh || sudo service ssh start
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
-          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          CI_SSH_KEY="${RUNNER_TEMP}/ldb-ci-ed25519"
+          ssh-keygen -t ed25519 -f "${CI_SSH_KEY}" -N "" -q
+          cat "${CI_SSH_KEY}.pub" >> ~/.ssh/authorized_keys
           chmod go-w "$HOME"
           chmod 600 ~/.ssh/authorized_keys
           ssh-keyscan -t ed25519 localhost >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -i ~/.ssh/id_ed25519 \
+          ssh -i "${CI_SSH_KEY}" \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=no \
@@ -128,12 +129,13 @@ jobs:
           sudo systemctl start ssh || sudo service ssh start
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
-          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          CI_SSH_KEY="${RUNNER_TEMP}/ldb-ci-ed25519"
+          ssh-keygen -t ed25519 -f "${CI_SSH_KEY}" -N "" -q
+          cat "${CI_SSH_KEY}.pub" >> ~/.ssh/authorized_keys
           chmod go-w "$HOME"
           chmod 600 ~/.ssh/authorized_keys
           ssh-keyscan -t ed25519 localhost >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -i ~/.ssh/id_ed25519 \
+          ssh -i "${CI_SSH_KEY}" \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=no \
