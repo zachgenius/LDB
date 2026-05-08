@@ -10,10 +10,12 @@ Asserts:
 - File exists and parses as valid YAML.
 - Top-level `name`, `on`, `jobs` keys exist.
 - `on` triggers include `push`, `pull_request`, and a tag-push job.
-- The Linux-build job runs on `ubuntu-24.04`, has a 30-minute timeout,
+- The Linux x86-64 build job runs on `ubuntu-24.04`, has a 30-minute timeout,
   uses `actions/checkout@v4`, installs the documented apt deps, sets
   `kernel.yama.ptrace_scope=0`, configures `ldbd` against
   `/usr/lib/llvm-18`, builds, and runs `ctest`.
+- The Linux arm64 build job runs on `ubuntu-24.04-arm`, has a 45-minute
+  timeout, and mirrors the same apt/LLDB/build/test shape.
 - A tag-release job exists, triggers on `v*.*` tags, and uploads
   `ldbd` as an artifact via `actions/upload-artifact@v4`.
 
@@ -98,6 +100,7 @@ def main():
     # Identify the Linux build/test job and the tag-release job by
     # shape rather than name, so a future rename doesn't false-fail.
     linux_job = None
+    linux_arm_job = None
     release_job = None
     for jname, jdef in jobs.items():
         if not isinstance(jdef, dict):
@@ -108,22 +111,33 @@ def main():
             s.get("run", "") + " " + s.get("uses", "")
             for s in steps if isinstance(s, dict)
         )
-        if "ubuntu-24.04" in str(runs_on) and "ctest" in step_text:
+        runs_on_s = str(runs_on)
+        if runs_on_s == "ubuntu-24.04" and "ctest" in step_text:
             linux_job = (jname, jdef, steps, step_text)
+        if runs_on_s == "ubuntu-24.04-arm" and "ctest" in step_text:
+            linux_arm_job = (jname, jdef, steps, step_text)
         if "upload-artifact" in step_text and "ldbd" in step_text:
             release_job = (jname, jdef, steps, step_text)
 
     if linux_job is None:
         fail("no job runs ctest on ubuntu-24.04")
+    if linux_arm_job is None:
+        fail("no job runs ctest on ubuntu-24.04-arm")
     if release_job is None:
         fail("no job uploads `ldbd` via actions/upload-artifact")
 
     _, ldef, lsteps, ltext = linux_job
+    _, adef, _, atext = linux_arm_job
 
     if ldef.get("timeout-minutes") not in (30, "30"):
         fail(
             "Linux job missing 30-minute timeout-minutes "
             f"(got {ldef.get('timeout-minutes')!r})"
+        )
+    if adef.get("timeout-minutes") not in (45, "45"):
+        fail(
+            "Linux arm64 job missing 45-minute timeout-minutes "
+            f"(got {adef.get('timeout-minutes')!r})"
         )
 
     required_substrings = [
@@ -140,10 +154,14 @@ def main():
     for needle in required_substrings:
         if needle not in ltext:
             fail(f"Linux job missing expected step content: {needle!r}")
+        if needle not in atext:
+            fail(f"Linux arm64 job missing expected step content: {needle!r}")
 
     # Failure-only artifact upload step.
     if "upload-artifact" not in ltext:
         fail("Linux job has no upload-artifact step (failure log capture)")
+    if "upload-artifact" not in atext:
+        fail("Linux arm64 job has no upload-artifact step (failure log capture)")
 
     # Tag-release job sanity — same os family, uploads ldbd binary.
     _, rdef, _, rtext = release_job

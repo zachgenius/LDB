@@ -1,4 +1,4 @@
-# LDB CI — Linux x86-64 + macOS arm64
+# LDB CI — Linux x86-64 + Linux arm64 + macOS arm64
 #
 # Builds and tests `ldbd` on every push and PR against `master`.
 # A tag-driven release job uploads the Linux binary for `v*.*` tags.
@@ -86,6 +86,73 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-failure-logs
+          path: |
+            build/Testing/
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+            build/.ninja_log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  linux-arm64:
+    name: Linux arm64 (Ubuntu 24.04, apt LLDB 18)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build + test dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build cmake build-essential \
+            liblldb-dev lldb \
+            libsqlite3-dev zlib1g-dev \
+            python3 \
+            bpftrace tcpdump \
+            openssh-server openssh-client
+
+      - name: Disable Yama ptrace_scope (live attach tests)
+        run: |
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cat /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Configure local sshd + key auth (target.connect_remote_ssh)
+        run: |
+          sudo systemctl start ssh || sudo service ssh start
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan -t ed25519 localhost >> ~/.ssh/known_hosts 2>/dev/null
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=no localhost true
+
+      - name: Configure (CMake + Ninja, apt LLDB 18)
+        run: |
+          cmake -B build -G Ninja \
+            -DLDB_LLDB_ROOT=/usr/lib/llvm-18 \
+            -DCMAKE_PREFIX_PATH=/usr
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Verify daemon (--version smoke)
+        run: build/bin/ldbd --version
+
+      - name: Test (ctest)
+        run: |
+          LLDB_DEBUGSERVER_PATH=/usr/lib/llvm-18/bin/lldb-server
+          export LLDB_DEBUGSERVER_PATH
+          echo "LLDB_DEBUGSERVER_PATH=${LLDB_DEBUGSERVER_PATH}"
+          ctest --test-dir build --output-on-failure
+
+      - name: Upload failure artifacts (build + ctest logs)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-failure-logs
           path: |
             build/Testing/
             build/CMakeFiles/CMakeOutput.log

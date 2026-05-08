@@ -4,6 +4,27 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-08 — Tier 6 Linux arm64 CI leg
+
+**Goal:** Take the next small Tier 5/6 step after macOS arm64 sign-off by adding Linux arm64 validation to CI.
+
+**Done:**
+- Added `.github/workflows/ci.yml` job `linux-arm64` on GitHub's hosted `ubuntu-24.04-arm` runner. It mirrors the Linux x86-64 apt dependency set, Yama setup, localhost sshd/key-auth setup, CMake configure against `/usr/lib/llvm-18`, build, `ldbd --version`, and `ctest`.
+- Updated `docs/06-ci.md` to document the new Linux arm64 leg, its 45-minute timeout, and the fact that it is validation-only, not a release artifact job.
+- Updated `tests/check_ci_yaml.py` so local ctest fails if either the x86-64 or arm64 Linux CI shape silently disappears.
+
+**Decisions:**
+- **Validation first, packaging later.** The tag release job still ships only `ldbd-<tag>-linux-x86_64`. Adding an arm64 release artifact should wait until the first hosted arm64 run proves the full suite green.
+- **Mirror the x86-64 job instead of using a matrix immediately.** The two jobs have different timeout budgets and release dependencies. Keeping them explicit makes the new leg easier to disable or tune if hosted arm64 exposes runner-specific LLDB behavior.
+
+**Surprises / blockers:** None locally. The actual arm64 signal requires the GitHub-hosted runner.
+
+**Verification:** `python3 tests/check_ci_yaml.py /home/zach/Develop/LDB` passes (`4 jobs` detected). Local Linux x86-64 `ctest --test-dir build --output-on-failure` passes **50/50** in 34.92s.
+
+**Next:** If the arm64 hosted run is green, consider adding a Linux arm64 tagged artifact. Capstone disasm remains the larger Tier 5 component-swap slice.
+
+---
+
 ## 2026-05-07 — non-blocking follow-up fixes (B5/B6/B7, §4 DAP, §6 recipe.lint)
 
 **Goal:** Clear all tracked non-blocking items from the post-v0.1 autonomous run before Tier 5/6 work.
