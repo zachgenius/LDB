@@ -6,17 +6,25 @@ It is *not* a GDB clone. It is a GDB-class tool with a different primary user: a
 
 ## Status
 
-Pre-v0.1. Design phase. The four documents in this folder define the work.
+V1 hardening complete. `master` is the V1 release candidate; all CI legs green.
+See [`13-v1-readiness.md`](./13-v1-readiness.md) for the gate checklist.
 
 ## Documents
 
 | File | Purpose |
 |---|---|
-| [`01-gdb-core-methodology.md`](./01-gdb-core-methodology.md) | Deep technical analysis of GDB 17.1's architecture. The 10 cross-cutting methodologies that define a real debugger, evidenced from `/Users/zach/Downloads/gdb-17.1`. Foundational reading. |
-| [`02-ldb-mvp-plan.md`](./02-ldb-mvp-plan.md) | The 8–10 week MVP. C++17/20 daemon (`ldbd`), LLDB SBAPI as backend, schema-first JSON-RPC + CBOR protocol, build-ID-keyed artifact store, sessions, probes, typed observers. Includes the full RPC surface and the reference workflow that gates "MVP done." |
-| [`03-ldb-full-roadmap.md`](./03-ldb-full-roadmap.md) | The trajectory beyond MVP: progressive replacement of LLDB components as measurement justifies, never a from-scratch rewrite. Three parallel tracks (coverage, power features, LLM differentiators). Process for tracking GDB and LLDB upstream. |
-| [`12-capstone-disasm.md`](./12-capstone-disasm.md) | Opt-in Capstone disassembly backend behavior, fallback rules, supported architectures, and hello capability reporting. |
-| [`13-v1-readiness.md`](./13-v1-readiness.md) | Concrete V1 release gates: supported matrix, validation commands, known limitations, and cut criteria. |
+| [`01-gdb-core-methodology.md`](./01-gdb-core-methodology.md) | Deep technical analysis of GDB 17.1's architecture — the 10 cross-cutting methodologies that define a real debugger. Foundational reading. |
+| [`02-ldb-mvp-plan.md`](./02-ldb-mvp-plan.md) | The MVP plan: C++17/20 daemon, LLDB SBAPI, JSON-RPC + CBOR, artifact store, sessions, probes, observers. Full RPC surface spec. |
+| [`03-ldb-full-roadmap.md`](./03-ldb-full-roadmap.md) | Post-MVP trajectory: progressive LLDB component replacement, three parallel tracks, upstream tracking strategy. |
+| [`04-determinism-audit.md`](./04-determinism-audit.md) | Live-provenance determinism audit — per-endpoint analysis of what breaks byte-identity when lifting snapshot model to live targets. |
+| [`05-protocol-versioning.md`](./05-protocol-versioning.md) | Wire-shape freeze rules, semver policy, backward-compatibility contract for the JSON-RPC protocol. |
+| [`06-ci.md`](./06-ci.md) | CI matrix: jobs, timeouts, dependency setup for Linux x86-64, Linux arm64, macOS arm64, and Capstone opt-in legs. |
+| [`07-dap-shim.md`](./07-dap-shim.md) | DAP shim architecture: how `ldbd` translates Debug Adapter Protocol into LDB JSON-RPC. |
+| [`08-probe-recipes.md`](./08-probe-recipes.md) | Probe recipe design: named, parameterized, replayable session traces promoted to stored recipes. |
+| [`09-artifact-knowledge-graph.md`](./09-artifact-knowledge-graph.md) | Artifact knowledge graph: typed relation model, traversal API, and schema. |
+| [`11-non-stop.md`](./11-non-stop.md) | Non-stop / per-thread state model: protocol surface design and sync-backed V1 limitations. |
+| [`12-capstone-disasm.md`](./12-capstone-disasm.md) | Opt-in Capstone disassembly backend: fallback rules, supported architectures, hello capability reporting. |
+| [`13-v1-readiness.md`](./13-v1-readiness.md) | V1 release gates: supported matrix, validation commands, known limitations, cut criteria. All gates green. |
 
 ## Architecture in one diagram
 
@@ -70,4 +78,4 @@ Pre-v0.1. Design phase. The four documents in this folder define the work.
 
 ## License
 
-To be decided. LLDB is Apache 2.0 with LLVM exception, so an LDB built atop it is unencumbered. GPLv3 is *not* required and would foreclose embedding LLDB-derived code into proprietary clients — keep that option open.
+Apache 2.0 — see [`LICENSE`](../LICENSE) at the repo root.
