@@ -438,6 +438,18 @@ set_tests_properties(smoke_ldbpack PROPERTIES
   TIMEOUT 30
 )
 
+# V1 gate: one agent-style static RE workflow plus durable session
+# export/import across a daemon restart.
+add_test(
+  NAME smoke_agent_workflow
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_agent_workflow.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_agent_workflow PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"

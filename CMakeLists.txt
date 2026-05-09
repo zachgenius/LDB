@@ -131,8 +131,23 @@ if(LDB_ENABLE_CAPSTONE)
   endif()
 
   if(LDB_CAPSTONE_FOUND)
+    set(LDB_CAPSTONE_SYSTEM_INCLUDE_DIRS "")
+    foreach(_inc IN LISTS LDB_CAPSTONE_INCLUDE_DIRS)
+      # Homebrew's capstone.pc reports .../include/capstone as the
+      # include dir, but the source includes <capstone/capstone.h>.
+      # Normalize that case back to the parent include root so both the
+      # pkg-config and find_path branches agree on the public header
+      # layout.
+      if(EXISTS "${_inc}/capstone.h" AND NOT EXISTS "${_inc}/capstone/capstone.h")
+        get_filename_component(_inc_parent "${_inc}" DIRECTORY)
+        list(APPEND LDB_CAPSTONE_SYSTEM_INCLUDE_DIRS "${_inc_parent}")
+      else()
+        list(APPEND LDB_CAPSTONE_SYSTEM_INCLUDE_DIRS "${_inc}")
+      endif()
+    endforeach()
+    list(REMOVE_DUPLICATES LDB_CAPSTONE_SYSTEM_INCLUDE_DIRS)
     target_include_directories(ldb_capstone SYSTEM INTERFACE
-      ${LDB_CAPSTONE_INCLUDE_DIRS}
+      ${LDB_CAPSTONE_SYSTEM_INCLUDE_DIRS}
     )
     target_link_directories(ldb_capstone INTERFACE
       ${LDB_CAPSTONE_LIBRARY_DIRS}

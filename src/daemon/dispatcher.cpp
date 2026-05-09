@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "daemon/dispatcher.h"
 
 #include "backend/debugger_backend.h"
@@ -652,7 +653,7 @@ Response Dispatcher::handle_hello(const Request& req) {
       {"disasm_backend", "lldb"},
 #endif
   };
-  data["formats"] = json::array({"json"});  // CBOR / json-compact / tabular: post-M0
+  data["formats"] = json::array({"json", "cbor"});
   return protocol::make_ok(req.id, std::move(data));
 }
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the `hello` handshake (Tier 1 §3a, plan §3 + roadmap §4).
 //
 // `hello` carries protocol-version negotiation: the daemon advertises
@@ -66,6 +67,11 @@ TEST_CASE("hello: no params returns protocol block",
   REQUIRE(resp.data.contains("formats"));
   REQUIRE(resp.data.contains("capabilities"));
   REQUIRE(resp.data.contains("protocol"));
+  const auto& formats = resp.data["formats"];
+  REQUIRE(formats.is_array());
+  REQUIRE(formats.size() == 2);
+  REQUIRE(formats[0].get<std::string>() == "json");
+  REQUIRE(formats[1].get<std::string>() == "cbor");
   const auto& caps = resp.data["capabilities"];
 #ifdef LDB_HAVE_CAPSTONE
   REQUIRE(caps["disasm_backend"].get<std::string>() == "capstone");

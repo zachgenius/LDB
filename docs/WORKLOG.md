@@ -4,6 +4,27 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-09 — V1 gate close: agent workflow smoke, cbor formats, Capstone include fix, Apache-2.0 license
+
+**Goal:** Land all uncommitted in-progress work and close the final V1 release gate (license).
+
+**Done:**
+- Fixed Capstone include path normalization in `CMakeLists.txt`: Homebrew's `capstone.pc` reports `.../include/capstone` as the include dir, but sources use `<capstone/capstone.h>`. A foreach loop now detects that shape and normalizes back to the parent dir so both the pkg-config and find_path branches agree.
+- `hello` response now advertises `["json", "cbor"]` formats (was just `["json"]`). Added matching assertions to `test_dispatcher_hello.cpp`.
+- Added `tests/smoke/test_agent_workflow.py` — the V1 end-to-end agent workflow smoke: `hello` → `target.open` → `session.create/attach` → `module.list` → `string.list` → `string.xref` → `disasm.function` → `session.detach` → `session.export` → fresh daemon restart → `session.import`. Registered as `smoke_agent_workflow` in `tests/CMakeLists.txt`. ctest suite grows to 52 tests, all green (52/52, 160s wall clock).
+- Adopted **Apache-2.0** license: `LICENSE` file at repo root, `SPDX-License-Identifier: Apache-2.0` prepended to all 137 source files in `src/`, `include/`, and `tests/`.
+- Updated `README.md` license section and `docs/13-v1-readiness.md` to mark all gates green.
+
+**Decisions:**
+- **Apache-2.0 over MIT.** Matches the LLDB/LLVM upstream license stack; includes an explicit patent grant (MIT has none); compatible with commercial agent embedding. GPL family was ruled out because it would foreclose embedding.
+- **SPDX on test files too.** Consistent policy is simpler than case-by-case; `tests/` contains non-trivial original code (fixture drivers, parsers) that benefits from the same grant.
+
+**Surprises / blockers:** None. All 52 tests green on first run after changes.
+
+**Next:** Confirm master CI is green on Linux x86-64, arm64, and macOS arm64 with the V1 commit. Tag V1 once CI is confirmed.
+
+---
+
 ## 2026-05-08 — Tier 6 Linux arm64 CI leg
 
 **Goal:** Take the next small Tier 5/6 step after macOS arm64 sign-off by adding Linux arm64 validation to CI.

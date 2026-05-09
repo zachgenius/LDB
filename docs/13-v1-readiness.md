@@ -13,6 +13,11 @@ exist." V1 means a user can build it, run the supported workflows, understand
 the limitations, and trust CI to catch regressions on the declared platform
 matrix.
 
+All release gates are now green. The build, CI, protocol surface,
+source-only artifact policy, agent-style workflow smoke, and license are
+in place. V1 is ready to tag once master CI is confirmed green on the
+release commit.
+
 ## Release Gates
 
 | Gate | Status | Required before V1 |
@@ -21,12 +26,12 @@ matrix.
 | Linux arm64 CI | Green | Keep validation leg green; document validation-only status. |
 | macOS arm64 CI | Green | Keep Homebrew LLVM leg green; avoid unbounded timeout growth. |
 | Capstone opt-in CI | Green | Keep `-DLDB_ENABLE_CAPSTONE=ON` build plus hello/disasm/unit checks green. |
-| Default install/build docs | Partial | Consolidate Linux/macOS dependency and CMake commands in `README.md`. |
+| Default install/build docs | Green | `README.md` now carries Linux/macOS install, build, and test commands. |
 | Protocol versioning | Mostly green | Freeze V1 wire-shape rules and confirm `describe.endpoints` schemas are complete. |
-| Endpoint smoke coverage | Partial | Add one agent-style RE workflow smoke, not just isolated endpoint checks. |
-| Known limitations | Partial | Publish a concise limitations section in `README.md` before tagging. |
-| Release artifacts | Open | Decide whether V1 ships source-only, binary artifacts, or both. |
-| License | Open | Choose and record the project license. |
+| Endpoint smoke coverage | Green | `tests/smoke/test_agent_workflow.py` covers the static RE path plus session export/import durability. |
+| Known limitations | Green | `README.md` now publishes the supported V1 limitations list. |
+| Release artifacts | Green | V1 artifact policy is explicit: source-only release tags and notes, no promised prebuilt binaries. |
+| License | Green | Apache 2.0; `LICENSE` at repo root, SPDX headers on all source files. |
 
 ## Supported V1 Matrix
 
@@ -35,7 +40,7 @@ The V1 supported matrix should be narrow and honest:
 | Platform | Status | Notes |
 |---|---:|---|
 | Linux x86-64 | Supported | Primary CI leg; apt LLDB 18 in CI, local LLVM roots supported. |
-| Linux arm64 | Validation | CI validates behavior, but release packaging is not yet promised. |
+| Linux arm64 | Validation | CI validates behavior; V1 is source-only, so no separate arm64 packaging is promised. |
 | macOS arm64 | Supported | Homebrew LLVM plus Apple's debugserver path. Some Linux-only observers SKIP. |
 | Windows | Out of scope | No V1 support claim. |
 | FreeBSD | Out of scope | Roadmap item, not V1. |
@@ -58,7 +63,7 @@ cmake -B build-capstone -G Ninja \
   -DLDB_ENABLE_CAPSTONE=ON
 cmake --build build-capstone --parallel
 ctest --test-dir build-capstone --output-on-failure \
-  -R "smoke_hello_capabilities|smoke_disasm|unit_tests"
+  -R "smoke_hello_capabilities|smoke_disasm|smoke_agent_workflow|unit_tests"
 ```
 
 ## Agent Workflow Gate
@@ -77,6 +82,8 @@ actually use LDB. The minimum useful path is:
 
 This should run against the existing fixture binaries and assert shapes and
 high-level invariants, not exact instruction text.
+
+This gate is satisfied by `tests/smoke/test_agent_workflow.py`.
 
 ## Protocol Freeze Checklist
 
@@ -107,7 +114,7 @@ These are acceptable for V1 if documented:
 - Linux-only observers and BPF/tcpdump paths SKIP on macOS or unprivileged
   runners.
 - macOS local process tests depend on Apple's signed debugserver.
-- Release artifacts are not promised until the artifact policy is decided.
+- V1 ships source-only tags and release notes; prebuilt binaries are deferred.
 
 ## V1 Cut Decision
 

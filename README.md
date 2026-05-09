@@ -20,17 +20,17 @@ graph that survives across sessions.
 
 ## Status
 
-**Version 0.1 (MVP).** Tagged `v0.1`. Feature-complete against the
-[reference workflow](docs/02-ldb-mvp-plan.md#5-the-reference-workflow-as-rpc-trace)
-defined in the MVP plan.
+**Pre-V1 hardening.** The tagged `v0.1.0` cut is the MVP baseline; current
+`master` is closing the operational V1 gates tracked in
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md).
 
 | | |
 |---|---|
-| **Test suite** | 35/35 passing on Pop!_OS 24.04 / Ubuntu 24.04 / GCC 13.3.0 / LLVM 22.1.5 |
+| **Validation** | Default `ctest` suite plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
 | **Endpoints** | 65 across target / process / thread / frame / value / memory / probe / observer / session / artifact |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
-| **Determinism** | Cores-only provenance; cross-process byte-identical replay verified in CI |
+| **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
 
 ---
 
@@ -109,6 +109,39 @@ appropriate capabilities) for non-child target processes.
 
 ---
 
+## Install
+
+Linux (Ubuntu 24.04-class host):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  ninja-build cmake build-essential \
+  liblldb-dev lldb \
+  libsqlite3-dev zlib1g-dev \
+  python3 \
+  bpftrace tcpdump \
+  openssh-server openssh-client
+```
+
+macOS (Apple Silicon / Homebrew):
+
+```bash
+brew install llvm ninja cmake sqlite
+```
+
+Optional Capstone backend:
+
+```bash
+brew install capstone pkgconf
+```
+
+`bpftrace`, `tcpdump`, `lldb-server`, and `openssh-server` are only needed for
+their respective live probe / observer / remote-connection paths; the static
+analysis and core-backed paths build without them.
+
+---
+
 ## Build
 
 ```bash
@@ -134,6 +167,44 @@ prebuilt tarballs from `releases.llvm.org` it is the extracted directory.
 
 `CMAKE_PREFIX_PATH=/usr/local` is needed only when SQLite headers were
 installed to `/usr/local` (e.g. via manual deb extraction).
+
+---
+
+## Test
+
+Default suite:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Capstone-enabled build:
+
+```bash
+cmake -B build-capstone -G Ninja \
+  -DLDB_LLDB_ROOT=/path/to/llvm-prefix \
+  -DLDB_ENABLE_CAPSTONE=ON
+cmake --build build-capstone --parallel
+ctest --test-dir build-capstone --output-on-failure \
+  -R "smoke_hello_capabilities|smoke_disasm|smoke_agent_workflow|unit_tests"
+```
+
+See [docs/06-ci.md](docs/06-ci.md) for the exact CI matrix, SKIP behavior, and
+reproduction notes.
+
+---
+
+## Supported platforms
+
+The intended V1 support matrix is intentionally narrow:
+
+| Platform | Status | Notes |
+|---|---:|---|
+| Linux x86-64 | Supported | Primary CI leg; apt LLDB 18 in CI, local LLVM roots supported |
+| Linux arm64 | Validation | CI validates behavior; V1 remains source-only and does not promise separate arm64 packaging |
+| macOS arm64 | Supported | Homebrew LLVM plus Apple's signed `debugserver`; some Linux-only observers SKIP |
+| Windows | Out of scope | No V1 support claim |
+| FreeBSD | Out of scope | Roadmap item, not a V1 promise |
 
 ---
 
@@ -204,6 +275,28 @@ code rather than prose. Codes used in the MVP:
 | `-32000` | Backend error (typed `backend::Error` from the daemon) |
 | `-32002` | Bad state (store / allowlist not configured) |
 | `-32003` | Forbidden (operator allowlist denied the argv) |
+
+---
+
+## Known limitations
+
+These are acceptable in the planned V1 cut and are part of the public contract:
+
+- LLDB remains the default backend and owns target, process, and DWARF semantics.
+- Capstone is opt-in and affects only `disasm.range` and `disasm.function`.
+- `xref.addr` and `string.xref` intentionally keep LLDB disassembly/comment semantics.
+- True async/non-stop runtime is deferred; the per-thread protocol surface is present but sync-backed.
+- rr support is exposed through `target.connect_remote` URLs; reverse execution endpoints remain deferred.
+- Linux-only observers and BPF/tcpdump paths SKIP on macOS or unprivileged runners.
+- macOS local-process tests depend on Apple's signed `debugserver`.
+
+---
+
+## Release artifact policy
+
+Planned V1 releases are **source-only**: semantic-version tags plus release
+notes, with no promise of prebuilt binary tarballs yet. Binary packaging can
+move to post-V1 without changing the wire contract.
 
 ---
 
@@ -296,13 +389,13 @@ Other deferrals:
 
 ## License
 
-Undecided. LLDB is Apache 2.0 with LLVM exception, so an LDB built atop it is
-unencumbered. GPLv3 is *not* required and would foreclose embedding LLDB-
-derived code into proprietary clients — that option is being kept open.
+Apache 2.0 — see [`LICENSE`](LICENSE).
+
+Matches the upstream LLDB/LLVM license stack; includes an explicit patent
+grant. Compatible with proprietary agent embedding.
 
 Contributors: see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow,
-required tests, the PR checklist, and the implicit license-grant policy
-that applies until a license is formally adopted.
+required tests, and the PR checklist.
 
 ---
 
