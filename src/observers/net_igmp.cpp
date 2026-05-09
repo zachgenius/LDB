@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // observer.net.igmp — /proc/net/igmp + /proc/net/igmp6 typed observer
 // (M4 §4.6 closeout).
 //

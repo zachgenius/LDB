@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // describe_schema.h — JSON Schema (draft 2020-12) helpers used by
 // `describe.endpoints` (M5, plan §4.8).
 //

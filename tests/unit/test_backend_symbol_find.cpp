@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::find_symbols.
 //
 // Looks up named functions, globals, and unknown names against the

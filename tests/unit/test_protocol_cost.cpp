@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/protocol/cost — _cost preview metadata helper.
 //
 // Plan §3.2: every successful response carries

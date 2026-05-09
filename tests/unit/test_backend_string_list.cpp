@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::find_strings.
 //
 // The structs fixture contains exactly two strings in __TEXT/__cstring

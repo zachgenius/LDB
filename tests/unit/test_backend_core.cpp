@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for process.save_core + target.load_core.
 //
 // Flow: launch sleeper stop_at_entry → save_core → kill → load_core

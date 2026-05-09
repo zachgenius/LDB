@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend process lifecycle: launch / state /
 // continue / kill against the structs fixture.
 //

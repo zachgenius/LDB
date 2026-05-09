@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "daemon/stdio_loop.h"
 
 #include "protocol/cost.h"

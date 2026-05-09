@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Pure-parser tests for ldb::observers::tcpdump (M4 part 5, §4.6).
 //
 // `tcpdump -nn -tt -l` produces one line per packet, with a leading

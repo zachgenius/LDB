@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for `transport::parse_rr_url` and `transport::find_rr_binary`.
 //
 // Tier 4 §13: rr integration via rr:// URL scheme. The parser is the

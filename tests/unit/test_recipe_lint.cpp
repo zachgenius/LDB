@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for lint_recipe() (recipe_store.h) and the recipe.lint dispatcher
 // endpoint.  Covers the §6 reviewer finding: unknown placeholders like
 // "{patH}" (wrong case) pass through substitute_walk verbatim, silently

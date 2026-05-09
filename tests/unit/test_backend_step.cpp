@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend single-stepping: in / over / out / insn.
 //
 // We launch the structs fixture with stop_at_entry=true so the process

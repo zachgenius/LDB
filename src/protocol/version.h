@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Wire-protocol semantic versioning (Tier 1 §3a, see
 // docs/05-protocol-versioning.md).
 //

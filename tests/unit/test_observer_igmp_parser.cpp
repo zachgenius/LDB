@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Pure-parser tests for ldb::observers IGMP (M4 §4.6 closeout).
 //
 // These tests feed canned text fixtures (captured live on this Pop!_OS

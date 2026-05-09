@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher integration tests for the multi-binary inventory surface
 // (Tier 3 §9): target.list, target.label, session.targets.
 //

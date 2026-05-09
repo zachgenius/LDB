@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::continue_thread (Tier 4 §14, scoped slice).
 //
 // In v0.3 the implementation is a *sync passthrough*: continue_thread

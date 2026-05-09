@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "dap/rpc_channel.h"
 
 #include <fcntl.h>

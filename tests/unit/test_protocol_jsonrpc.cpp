@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/protocol/jsonrpc — request parsing and response serialization.
 //
 // These cover the existing parser/serializer: round-trip of request shapes,

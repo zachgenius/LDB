@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher integration test for artifact.relate / artifact.relations /
 // artifact.unrelate (Tier 3 §7).
 //

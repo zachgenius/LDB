@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher-level tests for probe.create kind="uprobe_bpf" — pure
 // param-validation paths that don't actually attach a BPF program.
 // We rely on bpftrace being absent on this dev box to short-circuit

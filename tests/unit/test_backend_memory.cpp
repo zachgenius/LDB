@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the memory primitives: read_memory / read_cstring /
 // list_regions / search_memory.
 //

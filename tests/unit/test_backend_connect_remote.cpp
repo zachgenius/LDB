@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for target.connect_remote — connect to a remote lldb-server (or
 // gdbserver / debugserver) over its gdb-remote-protocol port.
 //

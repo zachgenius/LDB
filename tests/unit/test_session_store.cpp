@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::store::SessionStore.
 //
 // Contract under test (M3 part 2, plan §3.4 + §8):

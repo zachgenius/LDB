@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::disassemble_range.
 //
 // We disassemble the address range of `point2_distance_sq` from the

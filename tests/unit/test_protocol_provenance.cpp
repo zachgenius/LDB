@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/protocol/provenance — _provenance preview metadata
 // helper plus the integration into serialize_response / response_to_json
 // (the JSON and CBOR serialization paths).

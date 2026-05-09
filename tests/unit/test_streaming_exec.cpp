@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::transport::StreamingExec — long-lived async
 // line-streaming subprocess (M4-4 prep for the bpftrace engine).
 //

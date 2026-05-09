@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for rr:// URL-scheme dispatch inside connect_remote_target.
 //
 // Tier 4 §13. The wire shape is intentional: agents that already speak

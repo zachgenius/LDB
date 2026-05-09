@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Sanity test for the sleeper fixture. Spawns it, reads the
 // PID=...READY=... line from its stdout, and kills it. This test exists
 // to prove the fixture executes correctly before any attach / memory

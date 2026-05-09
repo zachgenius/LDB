@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher-level tests for the observer.exec endpoint (M4 polish,
 // plan §4.6). Covers:
 //

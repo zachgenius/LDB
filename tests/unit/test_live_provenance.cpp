@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the live-provenance snapshot model — slice 1b of v0.3.
 //
 // Audit doc: docs/04-determinism-audit.md §6, §7.

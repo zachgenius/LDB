@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for target.connect_remote_ssh — end-to-end remote debugging
 // over an SSH-tunneled lldb-server (M4 part 2, plan §9).
 //

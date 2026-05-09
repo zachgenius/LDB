@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::xref_address.
 //
 // Against the structs fixture, main contains a `bl point2_distance_sq`

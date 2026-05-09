@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/protocol/transport — wire-format read_message/write_message
 // supporting line-delimited JSON and length-prefixed CBOR (M5 part 3).
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::transport::ssh — SSH transport primitive (M4-1).
 //
 // Surface under test (per docs/02-ldb-mvp-plan.md §9):

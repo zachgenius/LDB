@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the bp_digest component of the live snapshot model —
 // slice 1c of v0.3.
 //

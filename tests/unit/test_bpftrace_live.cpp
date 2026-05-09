@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Live test for the bpftrace engine. Skips cleanly when bpftrace is
 // unavailable — the dev box (Pop!_OS, no apt access) typically lacks
 // it. Even when bpftrace IS present, attaching probes usually requires

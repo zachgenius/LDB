@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend thread + frame enumeration.
 //
 // We launch the structs fixture with stop_at_entry=true so the process

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher-level tests for observer.net.tcpdump (M4 part 5, §4.6).
 //
 // Param-validation paths (no privilege required) AND the

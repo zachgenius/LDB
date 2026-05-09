@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::find_string_xrefs.
 //
 // On ARM64 PIE binaries (our default fixture build), string references

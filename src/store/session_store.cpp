@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "store/session_store.h"
 
 #include "backend/debugger_backend.h"

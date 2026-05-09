@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::store::ArtifactStore.
 //
 // Contract under test (M3 part 1, plan §4.7 + §8):

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "protocol/jsonrpc.h"
 
 #include "protocol/cost.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher integration test for `observer.net.igmp` (M4 §4.6 closeout).
 //
 // Drives Dispatcher::dispatch directly (no subprocess) so we lock down

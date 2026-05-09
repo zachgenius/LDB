@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher ↔ SessionStore integration test (M3 part 2).
 //
 // Pins down the contract that:

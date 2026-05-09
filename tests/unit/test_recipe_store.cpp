@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::store::RecipeStore (Tier 2 §6 — probe recipes).
 //
 // Contract under test:

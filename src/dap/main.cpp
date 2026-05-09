@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ldb-dap — Debug Adapter Protocol shim for LDB.
 //
 // Speaks DAP on its own stdin/stdout (Content-Length-framed JSON) and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for LldbBackend::snapshot_for_target — the cores-only
 // `_provenance.snapshot` source per plan §3.5 (M5 part 6).
 //

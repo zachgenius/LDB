@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Live-local tests for ldb::observers (M4 part 3).
 //
 // Each case invokes the observer entry-point against the current

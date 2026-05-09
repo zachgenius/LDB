@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the C++ breakpoint callback hooks (M3 prep).
 //
 // Validates that:

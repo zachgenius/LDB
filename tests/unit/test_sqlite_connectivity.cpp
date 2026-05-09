@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Minimal sqlite3-as-build-dep smoke test.
 //
 // Per CLAUDE.md "harness expansion" rule: when a new test surface needs

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // View-retrofit regression test.
 //
 // Some endpoints used to return bare `{matches:[...]}` shapes; they

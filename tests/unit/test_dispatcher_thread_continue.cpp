@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the dispatcher routing of:
 //   * thread.continue({target_id, tid})
 //   * process.continue({target_id, tid?})  — tid is the new optional

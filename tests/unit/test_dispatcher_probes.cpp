@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher ↔ ProbeOrchestrator integration test (M3 part 3).
 //
 // Validates the full-stack JSON-RPC surface for the probe.* endpoints:

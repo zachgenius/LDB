@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher integration test for mem.dump_artifact (M3 closeout, plan §4.4).
 //
 // mem.dump_artifact is a pure composition endpoint: it reads memory from

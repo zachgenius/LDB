@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/dap/transport — DAP `Content-Length:`-framed read/write.
 //
 // DAP uses HTTP-style headers to delimit each JSON body. Different from

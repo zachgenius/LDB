@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the multi-binary inventory surface (Tier 3 §9):
 //   • DebuggerBackend::list_targets — enumerate every open target's
 //     id, triple, executable path, optional label, and live-process bit.

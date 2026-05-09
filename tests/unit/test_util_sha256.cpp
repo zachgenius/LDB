@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/util/sha256 — public-domain SHA-256 verified against
 // the NIST short-message vectors and against the (already field-tested)
 // implementation that's lived inside store/artifact_store.cpp since M3.

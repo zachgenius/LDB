@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "transport/local_exec.h"
 
 #include "backend/debugger_backend.h"  // backend::Error

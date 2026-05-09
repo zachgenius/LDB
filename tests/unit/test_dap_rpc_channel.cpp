@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/dap/rpc_channel — the DAP shim's subprocess channel
 // to ldbd. The shim's translation layer is fully tested against the
 // abstract `RpcChannel` interface in test_dap_handlers; this file

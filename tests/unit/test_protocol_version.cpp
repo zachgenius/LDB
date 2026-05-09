@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/protocol/version — semver constants, parser, and the
 // new `kProtocolVersionMismatch` error code (Tier 1 §3a).
 //

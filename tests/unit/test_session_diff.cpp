@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::store::SessionStore::diff_logs (Tier 3 §11).
 //
 // Contract under test:

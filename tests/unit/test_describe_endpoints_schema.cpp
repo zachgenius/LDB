@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // M5 part 2 — describe.endpoints emits JSON Schema (draft 2020-12) for
 // every endpoint, plus per-endpoint `requires_stopped` and `cost_hint`
 // metadata that an agent can read once at session-start to plan its

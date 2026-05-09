@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Pure-logic tests for the operator-configured observer.exec allowlist
 // (M4 polish, plan §4.6). NO subprocess invocation — these exercise
 // only the file parser + glob matcher.

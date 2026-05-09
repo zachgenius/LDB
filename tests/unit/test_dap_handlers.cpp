@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for src/dap/handlers — DAP request → LDB JSON-RPC translation.
 //
 // Each handler is exercised against a stub RpcChannel that records the

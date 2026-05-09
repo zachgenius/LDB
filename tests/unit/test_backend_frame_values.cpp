@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend frame value enumeration:
 // list_locals / list_args / list_registers.
 //

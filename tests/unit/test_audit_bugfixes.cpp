@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the three bug fixes the live-provenance audit surfaced
 // (docs/04-determinism-audit.md §11). These are wire-level bugs worth
 // fixing regardless of the snapshot work that motivated finding them.

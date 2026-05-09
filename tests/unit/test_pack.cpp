@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit tests for ldb::store pack/unpack — `.ldbpack` format helpers
 // (M5 part 5).
 //

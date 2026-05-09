@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for SessionStore::extract_target_ids (Tier 3 §9).
 //
 // extract_target_ids walks a session's rpc_log and buckets every row by

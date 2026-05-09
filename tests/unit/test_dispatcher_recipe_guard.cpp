@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Recursion guard for recipe.run sub-calls (post-§6 reviewer fix).
 //
 // Background: §6 shipped recipes as named, replayable RPC sequences.

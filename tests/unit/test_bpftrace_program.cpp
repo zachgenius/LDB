@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for bpftrace program-text generation from probe.create params.
 // Pure string transformation — given an `UprobeBpfSpec`, the engine
 // emits a single-line bpftrace program.

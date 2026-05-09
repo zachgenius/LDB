@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include "transport/ssh.h"  // SshHost — re-used for remote routing

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Dispatcher integration tests for cross-binary correlation
 // (Tier 3 §10, post-v0.1 scoped slice).
 //

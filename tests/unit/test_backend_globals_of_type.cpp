@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::find_globals_of_type — Tier 3 §12, the
 // first semantic query (type-keyed global lookup). Mirrors what an
 // agent would issue with `static.globals_of_type("point2")` to find

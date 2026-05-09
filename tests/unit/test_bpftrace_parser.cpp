@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for the bpftrace stdout JSON-line parser. Pure string → ProbeEvent
 // transformation; no subprocess.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tests for DebuggerBackend::read_value_path (value.read).
 //
 // `path` is a dotted/bracketed expression evaluated relative to a frame:
