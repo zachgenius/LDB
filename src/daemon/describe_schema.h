@@ -305,7 +305,13 @@ inline json memory_region_def() {
 
 inline json disasm_insn_def() {
   return obj({
-      {"addr",     uint_()},
+      {"addr",     uint_("Instruction address. Alias of `address` "
+                         "(both are always emitted; either may be used "
+                         "in --view fields=...).")},
+      {"address",  uint_("Instruction address. Alias of `addr`, "
+                         "matching the field name used at the "
+                         "disasm.function / disasm.range top level "
+                         "and by mem.read.")},
       {"sz",       uint_()},
       {"bytes",    hex_string()},
       {"mnemonic", str()},

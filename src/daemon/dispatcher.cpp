@@ -193,7 +193,14 @@ json xref_match_to_json(const backend::XrefMatch& x) {
 
 json disasm_insn_to_json(const backend::DisasmInsn& i) {
   json j;
+  // `addr` is the historical short field name; `address` is an alias
+  // emitted for symmetry with the rest of the surface — disasm.function
+  // / disasm.range wrap their results in {address, byte_size, ...} at
+  // the top level, and mem.read / watchpoint use `address`. Emitting
+  // both lets `--view fields=address,...` filters work without forcing
+  // callers to know which level uses which name (papercut #12).
   j["addr"]     = i.address;
+  j["address"]  = i.address;
   j["sz"]       = i.byte_size;
   j["bytes"]    = hex_bytes(i.bytes);
   j["mnemonic"] = i.mnemonic;
