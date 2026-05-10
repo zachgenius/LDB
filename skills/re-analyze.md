@@ -126,11 +126,23 @@ ldb mem.read addr=0x<addr> size=<bytes>
 ldb mem.dump_artifact addr=0x<addr> size=<bytes> name="<label>"   # stores without JSON encoding
 ```
 
-**Threads and stack frames:**
+**Read a global by name (works on a core dump too):**
+```bash
+# value.read is a *typed* read against a stopped thread and frame-relative
+# path (params: path=<frame-relative dotted>, tid, frame_index — and it
+# requires a stopped process). For globals, especially when only a core
+# dump is available, resolve the symbol to an address first, then
+# mem.read at that address.
+ldb symbol.find name="<global_name>"            # note the address from the result
+ldb mem.read   addr=0x<addr_from_above> size=<sizeof_type>
+```
+
+**Threads and stack frames (live or core, requires a stopped thread):**
 ```bash
 ldb process.threads
 ldb process.frame_values thread_id=<tid> frame=0
 ldb process.value_eval thread_id=<tid> frame=0 expr="<expr>"
+ldb value.read         tid=<tid> frame_index=0 path="<frame_relative_dotted>"
 ```
 
 **Step execution:**
