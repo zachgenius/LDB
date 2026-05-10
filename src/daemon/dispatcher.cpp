@@ -907,6 +907,11 @@ with_defs(      obj({{"modules", arr_of(ref("Module"))}}, {"modules"}),
               {"fields",      arr_of(ref("Field"))},
               {"holes_total", uint_()},
           })},
+          {"warnings", arr_of(str(
+              "Optional, non-fatal advisories about the layout — e.g. a "
+              "DWARF inconsistency where a field's end offset exceeds "
+              "byte_size. Absent when the layout is internally "
+              "consistent."))},
       }, {"found"}),
           {{"Field", field_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "medium");
@@ -3226,6 +3231,35 @@ Response Dispatcher::handle_type_layout(const Request& req) {
   json data;
   if (layout.has_value()) {
     data["found"]  = true;
+
+    // DWARF-consistency check (papercut #4): some toolchains emit a
+    // byte_size that is smaller than the end of one or more fields.
+    // Observed on a real cffex_server core dump where g++ -O2 produced
+    // a CSeatInfo whose three trailing std::vector members were
+    // recorded at offsets > byte_size. Don't error — surface a
+    // human-readable warning so the agent can branch on it. Computed
+    // before any view/paging mutates the field array.
+    json warnings = json::array();
+    {
+      const auto& flds = layout->fields;
+      std::uint64_t max_end = 0;
+      const backend::Field* worst = nullptr;
+      for (const auto& f : flds) {
+        std::uint64_t end = f.offset + f.byte_size;
+        if (end > max_end) { max_end = end; worst = &f; }
+      }
+      if (worst != nullptr && max_end > layout->byte_size) {
+        std::string msg = "DWARF inconsistency: field '" + worst->name +
+            "' end (off=" + std::to_string(worst->offset) +
+            "+sz=" + std::to_string(worst->byte_size) +
+            "=" + std::to_string(max_end) +
+            ") exceeds type byte_size=" + std::to_string(layout->byte_size) +
+            "; layout may be unreliable, cross-check against the binary "
+            "(e.g. allocator size in the ctor or member access disasm).";
+        warnings.push_back(std::move(msg));
+      }
+    }
+
     json layout_j = type_layout_to_json(*layout);
     // Apply view (fields, limit, offset, summary) to the layout's
     // fields array. Useful for projecting big structs to just
@@ -3240,6 +3274,9 @@ Response Dispatcher::handle_type_layout(const Request& req) {
     if (paged.contains("summary"))
       layout_j["fields_summary"]     = paged["summary"];
     data["layout"] = std::move(layout_j);
+    if (!warnings.empty()) {
+      data["warnings"] = std::move(warnings);
+    }
   } else {
     data["found"]  = false;
   }
