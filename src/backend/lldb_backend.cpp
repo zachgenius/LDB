@@ -668,6 +668,24 @@ struct SymbolDedupeKey {
   }
 };
 
+// Strip a balanced parenthesized arg list from the end of a qualified
+// C++ name, if present. "Foo::bar(int)" → "Foo::bar"; names without a
+// trailing ')' are returned unchanged. Apple's libLLDB on arm64 doesn't
+// parse `Class::Method(args)` in FindFunctions(eFunctionNameTypeAuto)
+// the way upstream LLDB does, so the find_symbols cascade tries both
+// the literal query and the arg-stripped form to stay portable.
+std::string strip_trailing_arg_list(const std::string& name) {
+  if (name.empty() || name.back() != ')') return name;
+  int depth = 0;
+  for (std::size_t i = name.size(); i-- > 0; ) {
+    if (name[i] == ')') ++depth;
+    else if (name[i] == '(') {
+      if (--depth == 0) return name.substr(0, i);
+    }
+  }
+  return name;
+}
+
 }  // namespace
 
 std::vector<SymbolMatch>
@@ -709,24 +727,35 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
 
   // Pass 2: SBTarget::FindFunctions with eFunctionNameTypeAuto. LLDB's
   // own C++ name parser handles `Class::Method`,
-  // `Class::Method(args)`, and bare `Method`. Functions only — variables
-  // do not show up here, but pass 1 already covers those by name.
+  // `Class::Method(args)`, and bare `Method` — on upstream LLDB.
+  // Apple's libLLDB on arm64 (Homebrew / system LLVM) silently fails
+  // for the parenthesized-args form, so we also try the arg-stripped
+  // name to keep behavior portable. Functions only — variables do not
+  // show up here, but pass 1 already covers those by name.
   // Skipped when the user explicitly asked for variables only.
   if (query.kind != SymbolKind::kVariable) {
-    auto fnlist = target.FindFunctions(
-        query.name.c_str(),
-        static_cast<std::uint32_t>(lldb::eFunctionNameTypeAuto));
-    uint32_t n = fnlist.GetSize();
-    for (uint32_t i = 0; i < n; ++i) {
-      auto ctx = fnlist.GetContextAtIndex(i);
-      auto sym = ctx.GetSymbol();
-      if (!sym.IsValid()) {
-        // FindFunctions sometimes returns an SBFunction without a
-        // backing SBSymbol (inlined / DWARF-only). Skip — we want the
-        // symbol-level match shape.
-        continue;
+    auto run_find_functions = [&](const std::string& nm) {
+      if (nm.empty()) return;
+      auto fnlist = target.FindFunctions(
+          nm.c_str(),
+          static_cast<std::uint32_t>(lldb::eFunctionNameTypeAuto));
+      uint32_t n = fnlist.GetSize();
+      for (uint32_t i = 0; i < n; ++i) {
+        auto ctx = fnlist.GetContextAtIndex(i);
+        auto sym = ctx.GetSymbol();
+        if (!sym.IsValid()) {
+          // FindFunctions sometimes returns an SBFunction without a
+          // backing SBSymbol (inlined / DWARF-only). Skip — we want
+          // the symbol-level match shape.
+          continue;
+        }
+        if (auto m = decorate_symbol(sym, target, query)) push(std::move(*m));
       }
-      if (auto m = decorate_symbol(sym, target, query)) push(std::move(*m));
+    };
+    run_find_functions(query.name);
+    if (auto stripped = strip_trailing_arg_list(query.name);
+        stripped != query.name) {
+      run_find_functions(stripped);
     }
   }
 
@@ -742,7 +771,15 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
   if (out.empty()) {
     constexpr std::size_t kFallbackScanCap = 64;
     const std::string& q = query.name;
+    const std::string q_stripped = strip_trailing_arg_list(q);
     const std::string suffix = "::" + q;
+    const std::string suffix_stripped = "::" + q_stripped;
+    const bool have_stripped_alt = (q_stripped != q);
+
+    auto ends_with = [](std::string_view s, const std::string& suf) {
+      return s.size() > suf.size() &&
+             s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+    };
 
     uint32_t nmod = target.GetNumModules();
     for (uint32_t mi = 0; mi < nmod && out.size() < kFallbackScanCap; ++mi) {
@@ -755,12 +792,21 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
         if (!sym.IsValid()) continue;
         const char* nm = sym.GetName();
         if (!nm) continue;
-        std::string_view sv(nm);
-        bool exact_demangled = (sv == q);
-        bool ends_qualified =
-            sv.size() > suffix.size() &&
-            sv.compare(sv.size() - suffix.size(), suffix.size(), suffix) == 0;
-        if (!exact_demangled && !ends_qualified) continue;
+        const std::string_view sv(nm);
+        bool match = (sv == q) || ends_with(sv, suffix);
+        if (!match && have_stripped_alt) {
+          // Also try the arg-stripped query against both the raw symbol
+          // name and the symbol name's stripped form. Covers the case
+          // where the query has `(args)` but the symbol's GetName()
+          // returns the bare qualified name (Apple libLLDB behavior).
+          const std::string sym_stripped =
+              strip_trailing_arg_list(std::string(sv));
+          const std::string_view svs(sym_stripped);
+          match = (sv == q_stripped) || (svs == q_stripped) ||
+                  ends_with(sv, suffix_stripped) ||
+                  ends_with(svs, suffix_stripped);
+        }
+        if (!match) continue;
         if (auto m = decorate_symbol(sym, target, query)) push(std::move(*m));
       }
     }
