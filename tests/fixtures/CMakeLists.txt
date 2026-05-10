@@ -83,3 +83,19 @@ target_compile_options(ldb_fix_looper PRIVATE
   -fno-omit-frame-pointer
   -fno-eliminate-unused-debug-types
 )
+
+# C++ fixture for symbol.find demangled-name lookup (papercut #3).
+# Itanium ABI mangles `ldb_fix::Widget::poke(long)` to a known mangled
+# symbol; we lean on the demangled name from LLDB SBSymbol::GetName()
+# and so don't pin the mangled spelling here.
+add_executable(ldb_fix_cppsyms cpp/cppsyms.cpp)
+set_target_properties(ldb_fix_cppsyms PROPERTIES
+  OUTPUT_NAME    cppsyms
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+  CXX_STANDARD   17
+)
+target_compile_options(ldb_fix_cppsyms PRIVATE
+  -g -O0
+  -fno-omit-frame-pointer
+  -fno-eliminate-unused-debug-types
+)

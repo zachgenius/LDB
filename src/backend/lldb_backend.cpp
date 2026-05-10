@@ -16,6 +16,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <string_view>
 #include <tuple>
 #include <signal.h>
@@ -610,6 +612,64 @@ std::string module_path_of(lldb::SBSymbol /*sym*/, lldb::SBTarget target,
 
 }  // namespace
 
+namespace {
+
+// Build a SymbolMatch from an SBSymbol, applying the kind filter from
+// the query. Returns std::nullopt if the symbol is invalid or filtered
+// out. Pulled out of find_symbols so the exact-name and demangled
+// fallback paths share one decorator.
+std::optional<SymbolMatch> decorate_symbol(lldb::SBSymbol sym,
+                                           lldb::SBTarget target,
+                                           const SymbolQuery& query) {
+  if (!sym.IsValid()) return std::nullopt;
+  const char* name = sym.GetName();
+  if (!name) return std::nullopt;
+
+  SymbolKind kind = classify_symbol(sym.GetType());
+  if (!kind_matches(query.kind, kind)) return std::nullopt;
+
+  SymbolMatch m;
+  m.name = name;
+  if (const char* mn = sym.GetMangledName()) {
+    if (m.name != mn) m.mangled = mn;
+  }
+  m.kind = kind;
+
+  auto start_addr = sym.GetStartAddress();
+  if (start_addr.IsValid()) {
+    m.address = start_addr.GetFileAddress();
+    lldb::addr_t la = start_addr.GetLoadAddress(target);
+    if (la != LLDB_INVALID_ADDRESS) {
+      m.load_address = static_cast<std::uint64_t>(la);
+    }
+  }
+  auto end_addr = sym.GetEndAddress();
+  if (end_addr.IsValid() && start_addr.IsValid()) {
+    auto e = end_addr.GetFileAddress();
+    auto s = start_addr.GetFileAddress();
+    if (e > s) m.byte_size = e - s;
+  }
+
+  m.module_path = module_path_of(sym, target, start_addr);
+  return m;
+}
+
+// Stable dedupe key for a symbol match. Symbols in different modules
+// can share an address (PLT trampoline + canonical), so we key on
+// (module, file_address, name).
+struct SymbolDedupeKey {
+  std::string module_path;
+  std::uint64_t address;
+  std::string name;
+  bool operator<(const SymbolDedupeKey& o) const {
+    if (module_path != o.module_path) return module_path < o.module_path;
+    if (address     != o.address)     return address     < o.address;
+    return name < o.name;
+  }
+};
+
+}  // namespace
+
 std::vector<SymbolMatch>
 LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
   lldb::SBTarget target;
@@ -622,52 +682,88 @@ LldbBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
     target = it->second;
   }
 
-  // FindSymbols searches all modules — function symbols, data symbols,
-  // weak/exported, etc. We post-filter by SymbolKind.
-  auto sblist = target.FindSymbols(query.name.c_str());
-
   std::vector<SymbolMatch> out;
-  out.reserve(sblist.GetSize());
-
-  uint32_t n = sblist.GetSize();
-  for (uint32_t i = 0; i < n; ++i) {
-    auto ctx = sblist.GetContextAtIndex(i);
-    auto sym = ctx.GetSymbol();
-    if (!sym.IsValid()) continue;
-
-    // Match by display name. SBSymbolContextList.FindSymbols may include
-    // partial / unrelated hits; reject anything where the name differs.
-    const char* name = sym.GetName();
-    if (!name || query.name != name) continue;
-
-    SymbolKind kind = classify_symbol(sym.GetType());
-    if (!kind_matches(query.kind, kind)) continue;
-
-    SymbolMatch m;
-    m.name = name;
-    if (const char* mn = sym.GetMangledName()) {
-      if (m.name != mn) m.mangled = mn;
+  std::set<SymbolDedupeKey> seen;
+  auto push = [&](SymbolMatch m) {
+    SymbolDedupeKey k{m.module_path, m.address, m.name};
+    if (seen.insert(std::move(k)).second) {
+      out.push_back(std::move(m));
     }
-    m.kind = kind;
+  };
 
-    auto start_addr = sym.GetStartAddress();
-    if (start_addr.IsValid()) {
-      m.address = start_addr.GetFileAddress();
-      lldb::addr_t la = start_addr.GetLoadAddress(target);
-      if (la != LLDB_INVALID_ADDRESS) {
-        m.load_address = static_cast<std::uint64_t>(la);
+  // Pass 1: exact-name FindSymbols. Matches when `query.name` is the
+  // mangled symbol or the simple/demangled name LLDB stores on the
+  // symbol. SBTarget::FindSymbols ranges over all loaded modules.
+  {
+    auto sblist = target.FindSymbols(query.name.c_str());
+    uint32_t n = sblist.GetSize();
+    for (uint32_t i = 0; i < n; ++i) {
+      auto ctx = sblist.GetContextAtIndex(i);
+      auto sym = ctx.GetSymbol();
+      if (!sym.IsValid()) continue;
+      const char* name = sym.GetName();
+      if (!name || query.name != name) continue;
+      if (auto m = decorate_symbol(sym, target, query)) push(std::move(*m));
+    }
+  }
+
+  // Pass 2: SBTarget::FindFunctions with eFunctionNameTypeAuto. LLDB's
+  // own C++ name parser handles `Class::Method`,
+  // `Class::Method(args)`, and bare `Method`. Functions only — variables
+  // do not show up here, but pass 1 already covers those by name.
+  // Skipped when the user explicitly asked for variables only.
+  if (query.kind != SymbolKind::kVariable) {
+    auto fnlist = target.FindFunctions(
+        query.name.c_str(),
+        static_cast<std::uint32_t>(lldb::eFunctionNameTypeAuto));
+    uint32_t n = fnlist.GetSize();
+    for (uint32_t i = 0; i < n; ++i) {
+      auto ctx = fnlist.GetContextAtIndex(i);
+      auto sym = ctx.GetSymbol();
+      if (!sym.IsValid()) {
+        // FindFunctions sometimes returns an SBFunction without a
+        // backing SBSymbol (inlined / DWARF-only). Skip — we want the
+        // symbol-level match shape.
+        continue;
+      }
+      if (auto m = decorate_symbol(sym, target, query)) push(std::move(*m));
+    }
+  }
+
+  // Pass 3: demangled-name scan. Only run when the first two passes
+  // produced nothing — this is O(num_symbols) across every loaded
+  // module, so we keep it as a last resort. Matches:
+  //   (a) demangled name == query.name   (covers `Class::Method` when
+  //       LLDB's GetName returns the simple form);
+  //   (b) demangled name endsWith "::" + query.name   (covers bare
+  //       `Method` lookup when only a `Class::Method` symbol exists).
+  // Capped at kFallbackScanCap matches to avoid pathological responses
+  // on huge binaries.
+  if (out.empty()) {
+    constexpr std::size_t kFallbackScanCap = 64;
+    const std::string& q = query.name;
+    const std::string suffix = "::" + q;
+
+    uint32_t nmod = target.GetNumModules();
+    for (uint32_t mi = 0; mi < nmod && out.size() < kFallbackScanCap; ++mi) {
+      auto mod = target.GetModuleAtIndex(mi);
+      if (!mod.IsValid()) continue;
+      std::size_t nsym = mod.GetNumSymbols();
+      for (std::size_t si = 0; si < nsym && out.size() < kFallbackScanCap;
+           ++si) {
+        auto sym = mod.GetSymbolAtIndex(si);
+        if (!sym.IsValid()) continue;
+        const char* nm = sym.GetName();
+        if (!nm) continue;
+        std::string_view sv(nm);
+        bool exact_demangled = (sv == q);
+        bool ends_qualified =
+            sv.size() > suffix.size() &&
+            sv.compare(sv.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (!exact_demangled && !ends_qualified) continue;
+        if (auto m = decorate_symbol(sym, target, query)) push(std::move(*m));
       }
     }
-    auto end_addr = sym.GetEndAddress();
-    if (end_addr.IsValid() && start_addr.IsValid()) {
-      auto e = end_addr.GetFileAddress();
-      auto s = start_addr.GetFileAddress();
-      if (e > s) m.byte_size = e - s;
-    }
-
-    m.module_path = module_path_of(sym, target, start_addr);
-
-    out.push_back(std::move(m));
   }
 
   return out;

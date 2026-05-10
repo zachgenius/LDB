@@ -15,6 +15,7 @@ set(LDB_UNIT_SOURCES
   test_protocol_view.cpp
   test_backend_type_layout.cpp
   test_backend_symbol_find.cpp
+  test_backend_symbol_find_demangle.cpp
   test_backend_globals_of_type.cpp
   test_backend_string_list.cpp
   test_backend_disasm.cpp
@@ -147,10 +148,11 @@ target_link_libraries(ldb_unit_tests PRIVATE
 # Fixture binaries consumed by tests at runtime. Paths are baked into
 # the test binary via compile-time definitions; the $<TARGET_FILE:...>
 # generator expression ensures the build system knows we depend on them.
-add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper ldbd)
+add_dependencies(ldb_unit_tests ldb_fix_structs ldb_fix_sleeper ldb_fix_cppsyms ldbd)
 target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_STRUCTS_PATH="$<TARGET_FILE:ldb_fix_structs>"
   LDB_FIXTURE_SLEEPER_PATH="$<TARGET_FILE:ldb_fix_sleeper>"
+  LDB_FIXTURE_CPPSYMS_PATH="$<TARGET_FILE:ldb_fix_cppsyms>"
   LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
   LDBD_PATH="$<TARGET_FILE:ldbd>"
 )
