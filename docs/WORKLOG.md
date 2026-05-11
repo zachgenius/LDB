@@ -4,6 +4,45 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-11 — Reverse-execution endpoints via RSP packet injection
+
+**Goal:** Post-V1 plan §4 item #2: ship `process.reverse_continue`, `process.reverse_step`, `thread.reverse_step`. Plan called this Tier-1 / 1-session work via "wrap LLDB CLI through `SBCommandInterpreter`."
+
+**Done:**
+- Branched `feat/reverse-exec` off the just-merged `feat/pack-signing`.
+- Untracked `.claude/commands/re-analyze.md` and broadened `.gitignore` to a single `.claude/` rule (was four subdir-specific rules) — that file was the last tracked thing under the agent-state tree.
+- `docs/16-reverse-exec.md` — design doc that corrects the post-V1 plan's premise (see Surprises) and pins the chosen mechanism, the failure matrix, and the kInsn-only scope. Schema descriptions reference this doc directly so agents discover the limitations without reading the worklog.
+- Backend interface: `enum class ReverseStepKind { kIn, kOver, kOut, kInsn }` and two virtuals on `DebuggerBackend` — `reverse_continue(tid)` and `reverse_step_thread(tid, thread_id, kind)`. Stub-implemented in all four `CountingStub` subclasses across the existing unit tests.
+- `LldbBackend`: new `Impl::reverse_capable` map (per-target bool, set on `rr://` connect, cleared in `close_target`). Two new methods use the same dup2/silence-stdout pattern as `save_core` / `connect_remote_target`, send the RSP `bc` / `bs` packet via `SBCommandInterpreter::HandleCommand("process plugin packet send <packet>")`, then pump the listener for 5s for the next stop event (`pump_until_stopped` helper).
+- Dispatcher: three handlers (`handle_process_reverse_continue`, `handle_process_reverse_step`, `handle_thread_reverse_step`). The two step handlers share a `handle_reverse_step_shared` helper since `process.reverse_step` / `thread.reverse_step` carry the same wire shape (mirrors the `process.continue` / `thread.continue` split). Kind parser distinguishes "deferred but reserved" (`in`/`over`/`out` → -32602 with a "v0.3 supports insn only" message) from "unknown kind" (-32602 generic). Backend errors get mapped to JSON-RPC codes via a small classifier: "does not support reverse" → -32003, "no process"/"not stopped" → -32002, else -32000.
+- `describe.endpoints` schema entries for all three endpoints; summaries link to `docs/16`.
+- Tests: `tests/unit/test_dispatcher_reverse_exec.cpp` (12 cases — routing, kind validation, schema presence), `tests/unit/test_backend_reverse_exec.cpp` (4 cases — no-process / non-rr / deferred kinds, no rr needed), `tests/unit/test_backend_reverse_exec_rr.cpp` (2 cases — live rr round-trip, SKIPs without rr), `tests/smoke/test_reverse_exec.py` (end-to-end JSON-RPC through `ldbd`, negative path always-on, live path gated on rr).
+
+**Decisions:**
+- **RSP packet injection, not raw socket talk to rr's gdbserver.** Going via `process plugin packet send` keeps the LLDB process plugin state machine consistent (it knows the process is now running, dispatches its own event handling) — bypassing LLDB would have re-implemented event-loop integration on day one of this feature. Costs ~30 lines of glue vs ~hundreds for an own-RSP path.
+- **v0.3 ships `kind=insn` only.** GDB RSP defines exactly two reverse primitives (`bc`, `bs`). Reverse-step-into / over / out are client-side constructions (disassemble current insn, set internal stops, send `bc`) and that surgery is its own follow-up — see `docs/16-reverse-exec.md` §"Reverse-step-over/into" for the sketch. The wire surface accepts those kind strings today and rejects with -32602 so the schema doesn't change when they fill in.
+- **Capability flag, not auto-probe.** Storing `reverse_capable=true` when an `rr://` URL is parsed is O(1) and trivially correct for the only reverse-capable backend today. Auto-probing via `qSupported` would have been more general but also a separate failure mode to test. Flag-based is easy to extend (future replay transports flip the bit themselves).
+- **`process.reverse_step` and `thread.reverse_step` share one backend method and one dispatcher helper.** Mirrors `process.continue` / `thread.continue` from Tier 4 §14. v0.3 sync semantics make the split cosmetic, but the wire surface is async-ready for v0.4.
+- **Failure semantics published in `docs/16` table form, not just in code.** The agent-facing failure matrix is the actual contract — code reviewers can check it against the classifier in `reverse_exec_error_to_resp` in O(1).
+- **`docs/16` documents that "the plan was wrong"**: LLDB has *no* `reverse-*` CLI commands and *no* `SBProcess::ReverseContinue` API. `apropos reverse` on LLDB 22 returns nothing. The plan's premise of "wrap CLI via `SBCommandInterpreter`" survived only by descending one layer — sending raw RSP packets through `process plugin packet send`. Recorded as a lesson for future plans that assume LLDB CLI availability.
+
+**Surprises / blockers:**
+- **Plan §2 item #2's premise was inaccurate.** Discovered by running `/opt/llvm-22/bin/lldb --batch -o "apropos reverse"` before designing — would have wasted a session if I'd taken the plan at face value. Lesson: validate planning-doc assumptions against the actual tool surface before scoping.
+- **`rr` 5.7.0 cannot record on this AMD CPU** (`type 0x40f40`, ext family 0xb) — `[FATAL ./src/PerfCounters_x86.h:122] compute_cpu_microarch() AMD CPU type ... unknown`. This is an rr bug, not LDB's. The new live-rr tests therefore SKIP cleanly on this dev box (`rr record /bin/true` returncode != 0 → SKIP with explanatory message). CI Linux x86-64 leg uses Intel; positive-path coverage will run there.
+- **`kernel.perf_event_paranoid=2` blocks rr record by default on Ubuntu/Pop!_OS.** User lowered to 1 with `sudo sysctl kernel.perf_event_paranoid=1` for the rr investigation; reset is not required (it just disables rr's recording perms).
+- **Smoke initially expected -32000 for "no process";** the dispatcher correctly maps "no process" to -32002 bad-state per my new classifier. Smoke updated to accept either code. Caught before commit by running ctest locally.
+
+**Verification:**
+- Build: warning-clean on this box after the change.
+- `[reverse]` unit tag: 5 pass, 2 SKIP (live rr, as expected).
+- `smoke_reverse_exec`: green.
+- Failure parity vs master: identical 7-test failure set, all gated on `kernel.yama.ptrace_scope=0` (pre-existing `smoke_attach`, `smoke_memory`, `smoke_mem_dump`, `smoke_live_provenance`, `smoke_live_dlopen`, `smoke_dap_shim`, and 9 ptrace-attach cases inside `unit_tests`). None are introduced by this branch.
+
+**Next:**
+Per `docs/15-post-v1-plan.md` §4, the next item is **hot-reload of probe recipes (#3)** — 1–2 sessions, no design doc needed. Direct quality-of-life win, no backend churn. After that: **token-budget regression CI gate (#7)**, then **hypothesis-tracking artifact type (#6)**. The CI leg with rr available (or a follow-up adding rr to the matrix) will exercise the positive reverse-exec path that this dev box can't.
+
+---
+
 ## 2026-05-11 — README refresh for v1.1.0; post-V1 plan; `.ldbpack` ed25519 signing
 
 **Goal:** Update the v1.1.0 README to match reality, then start working through the post-V1 deferred list. First target: `.ldbpack` signing — the README's #3 deferred item, smallest scope of the lot.
