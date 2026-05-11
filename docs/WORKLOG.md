@@ -371,6 +371,132 @@ v1.4 #10 done. Remaining v1.4 items per `docs/17-version-plan.md`: #8 GdbMiBacke
 
 ---
 
+## 2026-05-11 — v1.4 #12 phase-1: ldb-probe-agent (libbpf, freestanding)
+
+**Goal:** Land post-V1 plan item #12 (`docs/17-version-plan.md`) — a
+standalone `ldb-probe-agent` binary speaking length-prefixed JSON over
+stdio, using libbpf + CO-RE for portable BPF. Phase-1 scope: wire
+protocol module, agent binary with libbpf runtime, build-system gating
+on libbpf + bpftool. Daemon-side `AgentEngine` integration deferred to
+phase-2.
+
+**Done (commits on branch `worktree-agent-a178dc30351325d97`):**
+- `8656fb2 feat(probe-agent): wire-protocol module + design note` —
+  `docs/21-probe-agent.md` (188 lines), `src/probe_agent/protocol.{h,cpp}`
+  (~403 lines), `tests/unit/test_bpf_agent_protocol.cpp` (16 cases,
+  319 assertions). Framing (4-byte big-endian length + JSON,
+  `kMaxFrameBytes` cap), command builders (hello / attach_uprobe /
+  attach_kprobe / attach_tracepoint / poll_events / detach /
+  shutdown), response parsers, RFC 4648 base64 round-trip for opaque
+  event payloads.
+- `cf88607 feat(probe-agent): ldb-probe-agent binary + libbpf runtime` —
+  `src/probe_agent/main.cpp` (196 lines protocol loop),
+  `src/probe_agent/bpf_runtime.{h,cpp}` (RAII over skeleton + per-attach
+  bpf_link*, LastError carries protocol error codes),
+  `src/probe_agent/bpf/hello.bpf.c` (44 lines, per-CPU syscall counter
+  on `raw_syscalls/sys_enter`). `LDB_ENABLE_BPF_AGENT` CMake option
+  (AUTO/ON/OFF; default AUTO so stripped hosts still build); two-layer
+  gate `LDB_BPF_AGENT_BUILD` (binary) + `LDB_BPF_HAVE_TOOLCHAIN`
+  (embedded program) so a host with libbpf but no clang+bpftool still
+  builds the protocol-conformance binary.
+- `<this commit> fix(probe-agent): CMake redirect + base64 padding +
+  stdout-closed bail-out + worklog` — review fixes (see Decisions).
+
+**Decisions:**
+- **Why a separate binary, not a daemon thread.** Privilege separation:
+  `ldb-probe-agent` needs CAP_BPF (or root) for `BPF()` syscalls; the
+  daemon stays unprivileged. The agent talks JSON over its stdio to
+  whoever spawned it (typically the daemon, but the surface is
+  transport-agnostic — ssh-launched remote agents are free for the
+  asking once the daemon-side `AgentEngine` lands). The CPython /
+  liblldb / liblldbd dependencies stay out of the privileged process.
+  Verified via `ldd`: ldb-probe-agent links only `libbpf.so.1 +
+  libelf.so.1 + libz.so.1 + libzstd.so.1 + libc.so.6 + libstdc++.so.6`.
+- **Wire format = length-prefixed JSON, not protobuf or msgpack.** Same
+  ergonomic as the daemon's `--stdio` channel; reuses nlohmann::json
+  on both ends; binary event payloads piggyback as base64-encoded
+  strings (RFC 4648). A future high-throughput mode can graduate to
+  a binary frame variant; the phase-1 conformance binary is JSON-only.
+- **`LDB_ENABLE_BPF_AGENT=AUTO`** silently skips when libbpf is absent
+  (green build on stripped hosts), `ON` hard-fails for CI enforcement.
+  Tested both paths on this box (libbpf present → AUTO==ON behavior;
+  manually unset libbpf-dev → AUTO skips).
+- **Two-layer gate for the BPF program.** Even with `LDB_ENABLE_BPF_AGENT
+  =ON`, the embedded `.bpf.c` only compiles if clang AND bpftool are
+  present. Otherwise the binary builds but every command answers
+  `not_supported` — useful as a wire-protocol conformance vehicle
+  before the BPF toolchain is set up. On this dev box: clang + bpftool
+  absent → `LDB_BPF_HAS_SKELETON=0` → binary built, skeleton path
+  #ifdef'd out.
+- **CMake redirect needs `sh -c`.** `add_custom_command COMMAND` does
+  NOT invoke a shell, so the original `> file` redirect was passed
+  literally to bpftool. Silently broken on the dev box (no toolchain →
+  path never exercised); would have broken on every CI box with the
+  full toolchain. Fixed by wrapping in `sh -c`; flagged in code review.
+- **base64 `AB=C` is invalid.** RFC 4648 §3.3: once you see a pad
+  character in a 4-group, every remaining position in that group must
+  also be a pad. The original decoder accepted `AB=C` and emitted two
+  garbage bytes; corrected with an explicit `v[2] < 0 && v[3] >= 0`
+  reject. Test coverage added in a follow-up case in the same file.
+- **`send_frame` ignored return value.** Every callsite in main.cpp's
+  dispatch loop discarded the bool. If the daemon dies (stdout closes,
+  pipe broken), the agent would spin forever reading frames and
+  dropping responses until stdin also closed. Fixed by gating at the
+  top of each loop iteration on `std::cout` state — once a write_frame
+  hits a broken pipe, the next iteration bails out cleanly.
+
+**Surprises / blockers:**
+- **The session was killed by a stream watchdog** after no progress for
+  600s. Last visible output was "Clean build. Let me check warnings:"
+  — the agent was near completion of the daemon-side `AgentEngine`
+  wiring when it stalled. The two committed commits are clean and
+  standalone; the uncommitted changes (`src/probes/agent_engine.{h,cpp}`,
+  modifications to `dispatcher.cpp` + `probe_orchestrator.{h,cpp}`,
+  `tests/smoke/test_probe_agent.py`) were discarded. Phase-2 will
+  start from the now-stable agent binary surface and add the daemon
+  routing.
+- **Branched from `f0df68e` (v1.3 merge), not `feat/v1.4-backend` tip.**
+  The worktree was set up before #11 landed; the agent didn't rebase.
+  Merge to `feat/v1.4-backend` is conflict-free because all new files
+  are under `src/probe_agent/` and the CMakeLists touchpoints are
+  additive — but flagged here for the worklog.
+- **No clang + bpftool on this dev box.** The hello.bpf.c → skeleton
+  path is not exercised locally. CI matrix needs a Linux runner with
+  the full BPF toolchain installed; today `docs/06-ci.md` does not
+  include one. Tracked as a follow-up.
+
+**Verification:**
+- `cmake -B build -G Ninja` configure clean; `cmake --build build`
+  warning-clean on this box.
+- `build/bin/ldb_unit_tests "[bpf-agent]"` → 16 cases, 319 assertions
+  per the original commit; passing.
+- `build/bin/ldb-probe-agent --version` →
+  `"ldb-probe-agent libbpf 1.3 btf=yes embedded=0"`.
+- Manual hello round-trip: `printf '\x00\x00\x00\x10{"type":"hello"}'
+  | build/bin/ldb-probe-agent | xxd` produces a well-formed length-
+  prefixed JSON response with `agent_id`, `version`, `btf_present`,
+  `embedded_programs`.
+- ctest baseline unchanged (this branch never wired the agent into the
+  daemon, so no smokes affected).
+
+**Next:**
+Phase-2:
+- `src/probes/agent_engine.{h,cpp}` — daemon-side wrapper that spawns
+  `ldb-probe-agent`, owns the protocol session, exposes `start /
+  poll / stop` on the orchestrator-side recipe surface.
+- `ProbeOrchestrator` routes recipes with `engine: "agent"` to the
+  new engine, leaves `engine: "bpftrace"` and unset to existing code.
+- `tests/smoke/test_probe_agent.py` (already drafted on the worktree
+  uncommitted; needs the AgentEngine wiring to compile).
+- CI Linux runner with clang + bpftool + CAP_BPF for the live path.
+
+Phase-3 (post-v1.4):
+- Detach + ringbuf-streamed events for high-fan-out probes.
+- BPF program selection from the recipe body (today: hardcoded
+  `syscall_count`); requires a recipe-format extension.
+
+---
+
 ## 2026-05-11 — v1.3 "Agent UX polish" push (all 6 items)
 
 **Goal:** Ship all of v1.3 in one branch per `docs/17-version-plan.md` — six Tier-1 polish items: #7 token-budget CI gate, #3 recipe.reload, #6 hypothesis artifact type, #5 diff-mode view descriptors, the kind=in/over/out reverse-step carve-out, and #4 measured cost preview.
