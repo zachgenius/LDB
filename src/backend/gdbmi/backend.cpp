@@ -341,23 +341,250 @@ bool GdbMiBackend::save_core(TargetId, const std::string&) {
   todo("save_core");
 }
 
-// ── Static analysis (stubbed) ─────────────────────────────────────────
+// ── Static analysis ───────────────────────────────────────────────────
 
-std::vector<Module> GdbMiBackend::list_modules(TargetId)         { todo("list_modules"); }
-std::optional<TypeLayout> GdbMiBackend::find_type_layout(
-    TargetId, const std::string&) { todo("find_type_layout"); }
-std::vector<SymbolMatch> GdbMiBackend::find_symbols(
-    TargetId, const SymbolQuery&) { todo("find_symbols"); }
+namespace {
+
+// Parse "0x<hex>" or "0x<hex>." or "0x<hex> in <name>" → uint64.
+// Returns 0 on parse failure (matches gdb's own "not found" semantic).
+std::uint64_t parse_hex_addr(std::string_view s) {
+  // Skip leading whitespace / quotes.
+  while (!s.empty() && (s.front() == ' ' || s.front() == '"')) s.remove_prefix(1);
+  if (s.size() < 3 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) return 0;
+  s.remove_prefix(2);
+  std::uint64_t v = 0;
+  while (!s.empty()) {
+    char c = s.front();
+    int d;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'f') d = 10 + (c - 'a');
+    else if (c >= 'A' && c <= 'F') d = 10 + (c - 'A');
+    else break;
+    v = (v << 4) | static_cast<std::uint64_t>(d);
+    s.remove_prefix(1);
+  }
+  return v;
+}
+
+// Run `info address NAME` (CLI fall-through) and pull the address
+// from the resulting console-stream record. Returns 0 if gdb
+// couldn't resolve the symbol — typical for forward-declared or
+// extern-without-definition cases.
+std::uint64_t resolve_symbol_address(GdbMiSession& s,
+                                     const std::string& name) {
+  // Drain stale async records so we read fresh output for this call.
+  s.drain_async();
+  auto r = s.send_command("info address " + name);
+  if (!r.has_value() || r->klass != "done") return 0;
+  // Address arrives on the console-stream that preceded this ^done.
+  // drain_async picks up everything queued between commands.
+  auto pending = s.drain_async();
+  // Scan for "at address 0xADDR." in the most recent console-stream.
+  std::string text;
+  for (const auto& rec : pending) {
+    if (rec.kind == MiRecordKind::kConsoleStream) {
+      text += rec.stream_text;
+    }
+  }
+  const std::string needle = "at address ";
+  auto pos = text.find(needle);
+  if (pos == std::string::npos) return 0;
+  return parse_hex_addr(std::string_view(text).substr(pos + needle.size()));
+}
+
+}  // namespace
+
+std::vector<Module> GdbMiBackend::list_modules(TargetId tid) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<Module> out;
+
+  // v1.4 scope: main exec only. -file-list-shared-libraries returns
+  // empty for static targets (no process); shared-lib enumeration
+  // needs a live inferior. Documented in docs/18 as a known v1.4
+  // gap; revisit when we add launch/attach support.
+  if (st.exe_path.has_value()) {
+    Module m;
+    m.path = *st.exe_path;
+    // Load address unknown without a live process; use 0 as the
+    // sentinel that matches LldbBackend's behavior on unloaded
+    // modules.
+    m.load_address = 0;
+    // uuid (build-id) and triple deferred — both require an extra
+    // CLI parse round-trip per module. Worth doing in a follow-up
+    // pass but not blocking the abstraction-validation goal.
+    out.push_back(std::move(m));
+  }
+  return out;
+}
+
+std::optional<TypeLayout>
+GdbMiBackend::find_type_layout(TargetId, const std::string&) {
+  todo("find_type_layout");
+}
+
+std::vector<SymbolMatch>
+GdbMiBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<SymbolMatch> out;
+
+  // Build the MI command. -symbol-info-functions accepts --name
+  // PATTERN (regex). Empty pattern → all functions; we mirror
+  // LldbBackend's behavior which treats empty queries as "match
+  // anything" (rare, mostly debug use).
+  auto run_kind = [&](const char* mi_verb, SymbolKind kind_enum) {
+    std::string cmd = std::string(mi_verb);
+    if (!query.name.empty()) {
+      // gdb's --name is a regex; escape metacharacters to keep it a
+      // literal substring match (LldbBackend's default).
+      std::string pat;
+      pat.reserve(query.name.size() * 2);
+      for (char c : query.name) {
+        if (std::strchr(".^$*+?()[]{}|\\", c)) pat.push_back('\\');
+        pat.push_back(c);
+      }
+      cmd += " --name " + pat;
+    }
+    auto rec = st.session->send_command(cmd);
+    if (!rec.has_value() || rec->klass == "error") return;
+    if (!rec->payload.is_tuple()) return;
+    const auto& root = rec->payload.as_tuple();
+    auto sit = root.find("symbols");
+    if (sit == root.end() || !sit->second.is_tuple()) return;
+    const auto& syms = sit->second.as_tuple();
+    auto dit = syms.find("debug");
+    if (dit == syms.end() || !dit->second.is_list()) return;
+    for (const auto& file_entry : dit->second.as_list()) {
+      if (!file_entry.is_tuple()) continue;
+      const auto& fe = file_entry.as_tuple();
+      auto inner = fe.find("symbols");
+      if (inner == fe.end() || !inner->second.is_list()) continue;
+      for (const auto& sym_v : inner->second.as_list()) {
+        if (!sym_v.is_tuple()) continue;
+        const auto& sym = sym_v.as_tuple();
+        SymbolMatch m;
+        m.kind = kind_enum;
+        if (auto it = sym.find("name");
+            it != sym.end() && it->second.is_string()) {
+          m.name = it->second.as_string();
+        }
+        m.address = 0;
+        if (st.exe_path.has_value()) m.module_path = *st.exe_path;
+        // byte_size, mangled, load_address left at defaults — gdb's
+        // -symbol-info-functions doesn't surface them. Filling in
+        // each via a separate `info symbol` round-trip would
+        // dominate runtime on large result sets; agents who need
+        // byte_size can follow up per-result.
+        out.push_back(std::move(m));
+      }
+    }
+  };
+
+  if (query.kind == SymbolKind::kAny ||
+      query.kind == SymbolKind::kFunction) {
+    run_kind("-symbol-info-functions", SymbolKind::kFunction);
+  }
+  if (query.kind == SymbolKind::kAny ||
+      query.kind == SymbolKind::kVariable) {
+    run_kind("-symbol-info-variables", SymbolKind::kVariable);
+  }
+
+  // Resolve addresses via `info address` per symbol. Slow (one CLI
+  // fall-through per result) but accurate and matches LldbBackend's
+  // SymbolMatch contract. For pathological result sets (>500 hits)
+  // this can take seconds — agent callers should narrow with --name.
+  for (auto& m : out) {
+    if (m.address == 0 && !m.name.empty()) {
+      m.address = resolve_symbol_address(*st.session, m.name);
+    }
+  }
+  return out;
+}
+
 std::vector<GlobalVarMatch> GdbMiBackend::find_globals_of_type(
-    TargetId, std::string_view, bool&) { todo("find_globals_of_type"); }
-std::vector<StringMatch> GdbMiBackend::find_strings(
-    TargetId, const StringQuery&) { todo("find_strings"); }
-std::vector<DisasmInsn> GdbMiBackend::disassemble_range(
-    TargetId, std::uint64_t, std::uint64_t) { todo("disassemble_range"); }
-std::vector<XrefMatch> GdbMiBackend::xref_address(
-    TargetId, std::uint64_t) { todo("xref_address"); }
-std::vector<StringXrefResult> GdbMiBackend::find_string_xrefs(
-    TargetId, const std::string&) { todo("find_string_xrefs"); }
+    TargetId, std::string_view, bool&) {
+  todo("find_globals_of_type");
+}
+
+std::vector<StringMatch>
+GdbMiBackend::find_strings(TargetId, const StringQuery&) {
+  todo("find_strings");
+}
+
+std::vector<DisasmInsn>
+GdbMiBackend::disassemble_range(TargetId tid, std::uint64_t lo,
+                                  std::uint64_t hi) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<DisasmInsn> out;
+
+  // -data-disassemble mode 0 = bare insn only; mode 1 = with src lines.
+  // We use mode 0 for parity with LldbBackend's default (no line info
+  // by default; agents that want source-line correlation can xref
+  // via separate calls).
+  char buf[160];
+  std::snprintf(buf, sizeof(buf),
+                "-data-disassemble -s 0x%llx -e 0x%llx -- 0",
+                static_cast<unsigned long long>(lo),
+                static_cast<unsigned long long>(hi));
+  auto rec = st.session->send_command(buf);
+  if (!rec.has_value() || rec->klass == "error") {
+    if (rec.has_value()) throw_gdb_error(error_msg_of(*rec));
+    throw Error("gdbmi: disassemble_range: session died");
+  }
+  if (!rec->payload.is_tuple()) return out;
+  auto it = rec->payload.as_tuple().find("asm_insns");
+  if (it == rec->payload.as_tuple().end() || !it->second.is_list()) {
+    return out;
+  }
+  for (const auto& insn_v : it->second.as_list()) {
+    if (!insn_v.is_tuple()) continue;
+    const auto& t = insn_v.as_tuple();
+    DisasmInsn ins;
+    if (auto ait = t.find("address");
+        ait != t.end() && ait->second.is_string()) {
+      ins.address = parse_hex_addr(ait->second.as_string());
+    }
+    if (auto iit = t.find("inst");
+        iit != t.end() && iit->second.is_string()) {
+      // gdb emits the full insn as one string like "mov    %rsp,%rbp".
+      // Split on the first whitespace block — mnemonic up front,
+      // operands after. This matches the LldbBackend convention.
+      const std::string& full = iit->second.as_string();
+      auto space = full.find_first_of(" \t");
+      if (space == std::string::npos) {
+        ins.mnemonic = full;
+      } else {
+        ins.mnemonic = full.substr(0, space);
+        auto op_start = full.find_first_not_of(" \t", space);
+        if (op_start != std::string::npos) {
+          ins.operands = full.substr(op_start);
+        }
+      }
+    }
+    // func-name + offset go in the optional comment; LldbBackend
+    // populates similar context there.
+    if (auto fit = t.find("func-name");
+        fit != t.end() && fit->second.is_string() &&
+        !fit->second.as_string().empty()) {
+      ins.comment = fit->second.as_string();
+      if (auto oit = t.find("offset");
+          oit != t.end() && oit->second.is_string()) {
+        ins.comment += "+" + oit->second.as_string();
+      }
+    }
+    out.push_back(std::move(ins));
+  }
+  return out;
+}
+
+std::vector<XrefMatch>
+GdbMiBackend::xref_address(TargetId, std::uint64_t) {
+  todo("xref_address");
+}
+
+std::vector<StringXrefResult>
+GdbMiBackend::find_string_xrefs(TargetId, const std::string&) {
+  todo("find_string_xrefs");
+}
 
 // ── Threads / frames / values (stubbed) ───────────────────────────────
 

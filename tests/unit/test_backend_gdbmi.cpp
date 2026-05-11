@@ -102,3 +102,67 @@ TEST_CASE("GdbMiBackend: snapshot differs across targets",
   be->close_target(a.target_id);
   be->close_target(b.target_id);
 }
+
+// ── Static analysis ───────────────────────────────────────────────────
+
+TEST_CASE("GdbMiBackend: list_modules returns the main exec",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  auto mods = be->list_modules(open.target_id);
+  REQUIRE(mods.size() == 1);
+  CHECK(mods[0].path == kFixturePath);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: disassemble_range covers a known function",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+
+  // Resolve point2_distance_sq via find_symbols so we know its
+  // address; then disassemble the first 64 bytes.
+  ldb::backend::SymbolQuery q;
+  q.name = "point2_distance_sq";
+  q.kind = ldb::backend::SymbolKind::kFunction;
+  auto syms = be->find_symbols(open.target_id, q);
+  REQUIRE_FALSE(syms.empty());
+  auto base = syms[0].address;
+  REQUIRE(base != 0);
+
+  auto insns = be->disassemble_range(open.target_id, base, base + 64);
+  CHECK(insns.size() >= 4);
+  // The first instruction must start at the requested base.
+  CHECK(insns[0].address == base);
+  // Mnemonics from gdb's x86 disassembler are lowercased — confirm
+  // we got a real opcode string in mnemonic, not the whole insn.
+  CHECK_FALSE(insns[0].mnemonic.empty());
+  CHECK(insns[0].mnemonic.find(' ') == std::string::npos);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: find_symbols by exact name resolves address",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+
+  ldb::backend::SymbolQuery q;
+  q.name = "main";
+  q.kind = ldb::backend::SymbolKind::kFunction;
+  auto syms = be->find_symbols(open.target_id, q);
+  REQUIRE_FALSE(syms.empty());
+  bool found_main = false;
+  for (const auto& s : syms) {
+    if (s.name == "main") {
+      found_main = true;
+      CHECK(s.address != 0);
+      CHECK(s.kind == ldb::backend::SymbolKind::kFunction);
+      CHECK(s.module_path == kFixturePath);
+    }
+  }
+  CHECK(found_main);
+  be->close_target(open.target_id);
+}
