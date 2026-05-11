@@ -21,11 +21,21 @@ graph that survives across sessions.
 ## Status
 
 **V1 released.** `v1.0.0` closed all release gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md); `v1.1.0` is the current
-tag and folds in dogfood fixes from a real reverse-engineering pass
-(qualified C++ symbol lookup, DWARF `byte_size` warnings on `type.layout`,
-`address` alias on disassembled instructions). No breaking wire changes
-since v1.0.0.
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.2.0` is the
+current tag and adds:
+
+- `.ldbpack` ed25519 signing (`session.export` / `artifact.export`
+  accept `sign_key`; import-side `trust_root` + `require_signed` —
+  see [docs/14-pack-signing.md](docs/14-pack-signing.md)),
+- Reverse-execution endpoints over rr-backed targets
+  (`process.reverse_continue`, `process.reverse_step`,
+  `thread.reverse_step`, `kind=insn` only —
+  see [docs/16-reverse-exec.md](docs/16-reverse-exec.md)),
+- Dogfood fixes from `v1.1.0` (qualified C++ symbol lookup, DWARF
+  `byte_size` warnings on `type.layout`, `address` alias on
+  disassembled instructions).
+
+No breaking wire changes since v1.0.0; everything since is additive.
 
 | | |
 |---|---|
