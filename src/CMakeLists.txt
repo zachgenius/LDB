@@ -13,6 +13,8 @@ set(LDBD_SOURCES
   backend/lldb_backend.cpp
   probes/probe_orchestrator.cpp
   probes/bpftrace_engine.cpp
+  perf/perf_parser.cpp
+  perf/perf_runner.cpp
   backend/gdbmi/backend.cpp
   backend/gdbmi/parser.cpp
   backend/gdbmi/session.cpp

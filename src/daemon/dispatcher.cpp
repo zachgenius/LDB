@@ -10,6 +10,8 @@
 #include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
+#include "perf/perf_parser.h"
+#include "perf/perf_runner.h"
 #include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
@@ -21,7 +23,10 @@
 #include "transport/ssh.h"
 #include "util/log.h"
 
+#include <unistd.h>
+
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -697,6 +702,10 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "probe.disable")      return handle_probe_disable(req);
     if (req.method == "probe.enable")       return handle_probe_enable(req);
     if (req.method == "probe.delete")       return handle_probe_delete(req);
+
+    if (req.method == "perf.record")        return handle_perf_record(req);
+    if (req.method == "perf.report")        return handle_perf_report(req);
+    if (req.method == "perf.cancel")        return handle_perf_cancel(req);
 
     if (req.method == "observer.proc.fds")    return handle_observer_proc_fds(req);
     if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
@@ -2336,6 +2345,88 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"probe_id", str()},
           {"deleted",  bool_()},
       }, {"probe_id", "deleted"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== perf.* (post-V1 plan #13) ==============
+  //
+  // Sibling to probe.*; shells out to the system `perf` binary. Samples
+  // are shaped to align with the BPF agent event schema #12 is landing
+  // (ts_ns, tid, pid, cpu, stack: [{addr, sym, mod}]). See
+  // docs/22-perf-integration.md.
+
+  add("perf.record",
+      "Spawn `perf record` against a pid or a fresh command and "
+      "synchronously return the resulting perf.data artifact id plus "
+      "parsed samples. Synchronous in phase 1 — duration_ms is capped "
+      "at 300000 (5 min). Errors: perf missing, kernel.perf_event_paranoid "
+      "too strict, target pid vanished, ArtifactStore not configured.",
+      obj({
+          {"pid",          int_("OS pid to sample; mutually exclusive "
+                                "with `command`.")},
+          {"command",      arr_of(str(), "argv to spawn + sample; "
+                                          "mutually exclusive with `pid`.")},
+          {"duration_ms",  uint_("Wall-clock duration. Required for pid "
+                                  "mode; capped at 300000.")},
+          {"frequency_hz", uint_("perf -F; default 99.")},
+          {"events",       arr_of(str(), "perf -e; default [\"cycles\"].")},
+          {"call_graph",   enum_str({"fp", "dwarf", "lbr"},
+                                     "perf --call-graph; default \"fp\".")},
+          {"build_id",     str("ArtifactStore key prefix for the perf.data "
+                                "blob. Default \"_perf\".")},
+      }),
+      obj({
+          {"artifact_id",   int_()},
+          {"artifact_name", str()},
+          {"sample_count",  uint_()},
+          {"duration_ms",   uint_()},
+          {"perf_argv",     arr_of(str())},
+          {"stderr_tail",   str()},
+          {"parse_errors",  arr_of(str(), "Non-fatal parse errors from "
+                                           "the perf script ingestion. "
+                                           "Empty on a clean trace.")},
+      }, {"artifact_id", "artifact_name", "sample_count"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+  add("perf.report",
+      "Re-parse an existing perf.data artifact and return its samples. "
+      "Lets the agent ask for a different stack depth or sample cap "
+      "without re-recording.",
+      obj({
+          {"artifact_id",    int_()},
+          {"max_samples",    uint_("Default 0 = no cap.")},
+          {"max_stack_depth",uint_("Default 0 = no cap.")},
+      }, {"artifact_id"}),
+      obj({
+          {"samples", arr_of(obj({
+              {"ts_ns", int_()},
+              {"tid",   uint_()},
+              {"pid",   uint_()},
+              {"cpu",   int_()},
+              {"comm",  str()},
+              {"event", str()},
+              {"stack", arr_of(obj({
+                  {"addr", str("Hex IP, e.g. \"0x412af0\".")},
+                  {"sym",  str()},
+                  {"mod",  str()},
+              }))},
+          }))},
+          {"total",          uint_()},
+          {"truncated",      bool_()},
+          {"perf_data_size", uint_()},
+          {"parse_errors",   arr_of(str())},
+      }, {"samples", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+  add("perf.cancel",
+      "Send SIGTERM to an in-flight perf.record subprocess. Phase 1: "
+      "perf.record is synchronous so there is never an in-flight call; "
+      "this endpoint exists for catalog completeness and returns "
+      "-32002 kBadState until the async variant lands.",
+      obj({{"record_id", str()}}, {"record_id"}),
+      obj({
+          {"record_id", str()},
+          {"cancelled", bool_()},
+      }, {"record_id", "cancelled"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== observer.* ==============
@@ -6416,6 +6507,309 @@ Response Dispatcher::handle_probe_delete(const Request& req) {
   data["probe_id"] = *probe_id;
   data["deleted"]  = true;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+// ---- perf.* handlers (post-V1 plan #13) --------------------------------
+//
+// See docs/22-perf-integration.md. The runner is synchronous in phase 1
+// (perf.record blocks for `duration_ms`); perf.cancel is wired in
+// `describe.endpoints` for catalog completeness and returns
+// kBadState until the async variant lands.
+
+namespace {
+
+json perf_sample_to_view_json(const ldb::perf::Sample& s) {
+  return ldb::perf::PerfParser::sample_to_json(s);
+}
+
+}  // namespace
+
+Response Dispatcher::handle_perf_record(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+
+  ldb::perf::RecordSpec spec;
+
+  // pid xor command
+  bool have_pid = false;
+  std::int64_t pid_v = 0;
+  if (auto it = req.params.find("pid");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_number_integer() && !it->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "pid must be integer");
+    }
+    pid_v = it->get<std::int64_t>();
+    if (pid_v <= 0) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "pid must be positive");
+    }
+    have_pid = true;
+  }
+  bool have_cmd = false;
+  if (auto it = req.params.find("command");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_array()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "command must be array of string");
+    }
+    for (const auto& a : *it) {
+      if (!a.is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "command entries must be strings");
+      }
+      spec.command.push_back(a.get<std::string>());
+    }
+    have_cmd = !spec.command.empty();
+  }
+  if (have_pid == have_cmd) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "exactly one of pid|command must be set");
+  }
+  if (have_pid) spec.pid = pid_v;
+
+  // perf record -- <cmd> execs <cmd> directly after the trace interval;
+  // a JSON-RPC client supplying `command` is requesting arbitrary process
+  // spawn. Route it through the same operator-policy allowlist as
+  // observer.exec instead of trusting the wire. pid mode is fine —
+  // observer-side decision about which pids the agent can sample is
+  // outside this surface (it's kernel + perf_event_paranoid territory).
+  if (have_cmd) {
+    if (!exec_allowlist_) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "perf.record command mode disabled — no allowlist configured. "
+          "Set --observer-exec-allowlist or LDB_OBSERVER_EXEC_ALLOWLIST, "
+          "or use pid mode against an already-running process.");
+    }
+    if (!exec_allowlist_->allows(spec.command)) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden,
+          "perf.record: command not allowed by operator policy");
+    }
+  }
+
+  // duration_ms (uint). Required for pid mode; optional for command mode
+  // (the command's lifetime is the trace duration), but if supplied we
+  // still cap-check.
+  std::uint64_t duration_ms = 0;
+  if (auto it = req.params.find("duration_ms");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "duration_ms", &duration_ms)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "duration_ms must be non-negative integer");
+    }
+    spec.duration = std::chrono::milliseconds(static_cast<long long>(duration_ms));
+  } else if (have_pid) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "duration_ms required when pid is set");
+  }
+
+  // 10 kHz upper bound. Above this, sampling pressure starts producing
+  // multi-GB perf.data files in a 5-minute trace and the kernel itself
+  // typically throttles unprivileged perf at 1 kHz anyway. Daemon-side
+  // cap is the cheap guard before disk/RAM exhaustion (see also the
+  // perf.data size cap below).
+  constexpr std::uint64_t kMaxFrequencyHz = 10000;
+  std::uint64_t freq = 0;
+  if (auto it = req.params.find("frequency_hz");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "frequency_hz", &freq) || freq == 0) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "frequency_hz must be positive integer");
+    }
+    if (freq > kMaxFrequencyHz) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "frequency_hz exceeds " + std::to_string(kMaxFrequencyHz)
+            + " Hz daemon cap");
+    }
+    spec.frequency_hz = static_cast<std::uint32_t>(freq);
+  }
+
+  if (auto it = req.params.find("events");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_array()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "events must be array of string");
+    }
+    for (const auto& a : *it) {
+      if (!a.is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "events entries must be strings");
+      }
+      std::string ev = a.get<std::string>();
+      if (ev.empty()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "events entries must be non-empty strings");
+      }
+      spec.events.push_back(std::move(ev));
+    }
+  }
+
+  if (const auto* cg = require_string(req.params, "call_graph")) {
+    if (!cg->empty() && *cg != "fp" && *cg != "dwarf" && *cg != "lbr") {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "call_graph must be one of {fp, dwarf, lbr}");
+    }
+    spec.call_graph = *cg;
+  }
+
+  std::string build_id = "_perf";
+  if (const auto* bi = require_string(req.params, "build_id"); bi && !bi->empty()) {
+    build_id = *bi;
+  }
+
+  // Execute. perf::PerfRunner throws backend::Error on subprocess
+  // failure; the dispatcher's outer catch maps that to -32000.
+  ldb::perf::RecordResult result = ldb::perf::PerfRunner::record(spec);
+
+  // Slurp the perf.data file into the ArtifactStore. The cap exists
+  // because perf record at high frequency with --call-graph dwarf can
+  // emit multi-GB traces; blindly resize()-ing into RAM and copying to
+  // the artifact store would put 2x that on disk plus 1x in memory.
+  // 256 MiB is comfortable for typical 5-minute traces at 99 Hz fp
+  // call-graph; agents who genuinely need more can chunk by time.
+  constexpr std::streamsize kMaxPerfDataBytes =
+      static_cast<std::streamsize>(256) * 1024 * 1024;
+  std::vector<std::uint8_t> blob;
+  {
+    std::ifstream f(result.perf_data_path, std::ios::binary);
+    if (!f) {
+      ::unlink(result.perf_data_path.c_str());
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+                                "perf record succeeded but the perf.data "
+                                "temp file is unreadable");
+    }
+    f.seekg(0, std::ios::end);
+    std::streamsize sz = f.tellg();
+    if (sz < 0) sz = 0;
+    if (sz > kMaxPerfDataBytes) {
+      ::unlink(result.perf_data_path.c_str());
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+          "perf.data exceeds daemon cap (" + std::to_string(sz)
+            + " > " + std::to_string(kMaxPerfDataBytes)
+            + " bytes); shorten duration_ms, lower frequency_hz, or "
+              "drop --call-graph dwarf");
+    }
+    f.seekg(0, std::ios::beg);
+    blob.resize(static_cast<std::size_t>(sz));
+    if (sz > 0) f.read(reinterpret_cast<char*>(blob.data()), sz);
+  }
+  ::unlink(result.perf_data_path.c_str());
+
+  // Name with a UTC timestamp suffix so multiple records on the same
+  // build_id don't collide.
+  std::string artifact_name;
+  {
+    auto t = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    struct tm tm_buf{};
+    gmtime_r(&t, &tm_buf);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "perf-%Y%m%dT%H%M%SZ.data", &tm_buf);
+    artifact_name = buf;
+  }
+
+  json meta = json::object();
+  meta["perf_argv"]      = result.perf_argv;
+  meta["sample_count"]   = result.parsed.samples.size();
+  meta["parse_errors"]   = result.parsed.parse_errors;
+  if (!result.parsed.hostname.empty())   meta["hostname"]   = result.parsed.hostname;
+  if (!result.parsed.os_release.empty()) meta["os_release"] = result.parsed.os_release;
+  if (!result.parsed.arch.empty())       meta["arch"]       = result.parsed.arch;
+
+  ldb::store::ArtifactRow row;
+  try {
+    row = artifacts_->put(build_id, artifact_name, blob,
+                          std::string("perf.data"), meta);
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              std::string("artifact store put failed: ")
+                                  + e.what());
+  }
+
+  json data;
+  data["artifact_id"]   = row.id;
+  data["artifact_name"] = row.name;
+  data["sample_count"]  = result.parsed.samples.size();
+  data["duration_ms"]   = result.wall_duration.count();
+  data["perf_argv"]     = result.perf_argv;
+  data["stderr_tail"]   = result.stderr_tail;
+  data["parse_errors"]  = result.parsed.parse_errors;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_perf_report(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t artifact_id = 0;
+  if (!require_uint(req.params, "artifact_id", &artifact_id) || artifact_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "artifact_id must be positive integer");
+  }
+  std::uint64_t max_samples = 0;
+  if (auto it = req.params.find("max_samples");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "max_samples", &max_samples)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "max_samples must be non-negative integer");
+    }
+  }
+  std::uint64_t max_stack = 0;
+  if (auto it = req.params.find("max_stack_depth");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "max_stack_depth", &max_stack)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "max_stack_depth must be non-negative integer");
+    }
+  }
+
+  auto row_opt = artifacts_->get_by_id(static_cast<std::int64_t>(artifact_id));
+  if (!row_opt) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "artifact_id not found");
+  }
+
+  ldb::perf::ReportSpec rs;
+  rs.perf_data_path  = row_opt->stored_path;
+  rs.max_samples     = static_cast<std::int64_t>(max_samples);
+  rs.max_stack_depth = static_cast<std::int64_t>(max_stack);
+
+  ldb::perf::ReportResult result = ldb::perf::PerfRunner::report(rs);
+
+  json arr = json::array();
+  for (const auto& s : result.parsed.samples) {
+    arr.push_back(perf_sample_to_view_json(s));
+  }
+  json data;
+  data["samples"]        = std::move(arr);
+  // `total` is the pre-truncation count so an agent capping with
+  // max_samples can tell whether to widen the cap. Mirrors what
+  // view::apply_to_array does for paginated read-path endpoints.
+  data["total"]          = result.total_samples;
+  data["truncated"]      = result.truncated;
+  data["perf_data_size"] = row_opt->byte_size;
+  data["parse_errors"]   = result.parsed.parse_errors;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_perf_cancel(const Request& req) {
+  // Phase 1: perf.record is synchronous, so there's never anything to
+  // cancel. We return -32002 kBadState with a deterministic message so
+  // an agent can detect "this build does not support async record".
+  // Even param-malformed cases get this error preferentially — the
+  // surface is intentionally trivial.
+  if (!req.params.is_object() || !req.params.contains("record_id")) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "record_id required");
+  }
+  return protocol::make_err(req.id, ErrorCode::kBadState,
+                            "perf.record is synchronous in this build; "
+                            "no in-flight record to cancel");
 }
 
 // ---- observer.* handlers ------------------------------------------------

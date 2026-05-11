@@ -201,6 +201,11 @@ class Dispatcher {
   protocol::Response handle_probe_enable(const protocol::Request& req);
   protocol::Response handle_probe_delete(const protocol::Request& req);
 
+  // Post-V1 plan #13: perf record/report (docs/22-perf-integration.md).
+  protocol::Response handle_perf_record(const protocol::Request& req);
+  protocol::Response handle_perf_report(const protocol::Request& req);
+  protocol::Response handle_perf_cancel(const protocol::Request& req);
+
   protocol::Response handle_observer_proc_fds(const protocol::Request& req);
   protocol::Response handle_observer_proc_maps(const protocol::Request& req);
   protocol::Response handle_observer_proc_status(const protocol::Request& req);
