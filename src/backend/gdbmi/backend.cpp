@@ -5,8 +5,10 @@
 #include "util/sha256.h"
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -778,6 +780,89 @@ std::uint64_t parse_kernel_tid(std::string_view target_id) {
   return v;
 }
 
+// Translate a kernel tid (LDB's ThreadId) to gdb's internal numeric
+// thread id. Walks `-thread-info` once per call. Returns 0 if no
+// thread matches — the caller turns that into a typed error.
+std::uint32_t gdb_id_for_kernel_tid(GdbMiSession& s, ThreadId thread_id) {
+  auto thr_rec = send_or_throw(s, "-thread-info");
+  if (!thr_rec.payload.is_tuple()) return 0;
+  auto it = thr_rec.payload.as_tuple().find("threads");
+  if (it == thr_rec.payload.as_tuple().end() || !it->second.is_list()) {
+    return 0;
+  }
+  // Two-precedence match: prefer an exact LWP hit; fall back to a
+  // gdb-id match only when the thread has no LWP marker (core
+  // targets, Wine). Mixing the two predicates in a single pass is
+  // unsafe — a thread with kt==0 and gid==thread_id would shadow a
+  // later thread whose LWP actually matches.
+  std::uint32_t gid_fallback = 0;
+  for (const auto& thr_v : it->second.as_list()) {
+    if (!thr_v.is_tuple()) continue;
+    const auto& t = thr_v.as_tuple();
+    std::uint64_t kt = 0;
+    if (auto tgt = t.find("target-id");
+        tgt != t.end() && tgt->second.is_string()) {
+      kt = parse_kernel_tid(tgt->second.as_string());
+    }
+    std::uint32_t gid = 0;
+    if (auto idit = t.find("id");
+        idit != t.end() && idit->second.is_string()) {
+      try { gid = static_cast<std::uint32_t>(
+          std::stoul(idit->second.as_string()));
+      } catch (...) {}
+    }
+    if (kt == thread_id) return gid;     // exact LWP match — done
+    if (kt == 0 && gid == thread_id && gid_fallback == 0) {
+      gid_fallback = gid;                // remember; don't return yet
+    }
+  }
+  return gid_fallback;
+}
+
+// Select (thread, frame) on gdb. Throws backend::Error if either
+// step fails — matches LldbBackend's resolve_frame_locked contract.
+void select_thread_frame(GdbMiSession& s, ThreadId thread_id,
+                          std::uint32_t frame_index) {
+  std::uint32_t gid = gdb_id_for_kernel_tid(s, thread_id);
+  if (gid == 0) throw Error("unknown thread id");
+  send_or_throw(s, "-thread-select " + std::to_string(gid));
+  send_or_throw(s, "-stack-select-frame " + std::to_string(frame_index));
+}
+
+// Pull (name, type, value) out of a MI tuple shaped like
+// `{name="x",type="int",value="42"}` (no-value entries also occur
+// — gdb omits the value field when --simple-values rejects the
+// type as too complex). Bytes/address/summary populated as far as
+// MI gives us:
+//   • address: parsed if value looks like a hex literal (registers,
+//     pointer locals). Otherwise unset.
+//   • bytes:   we leave empty — MI doesn't surface raw bytes for an
+//     SBValue equivalent. Agents needing bytes follow up with
+//     mem.read against `address`.
+//   • summary: gdb's value string verbatim (e.g. "42", "0x7ff...",
+//     `"hello"`). This is the closest analogue to LldbBackend's
+//     SBValue::GetSummary || GetValue.
+ValueInfo mi_tuple_to_value_info(const MiTuple& t, const char* kind) {
+  ValueInfo out;
+  if (auto it = t.find("name"); it != t.end() && it->second.is_string()) {
+    out.name = it->second.as_string();
+  }
+  if (auto it = t.find("type"); it != t.end() && it->second.is_string()) {
+    out.type = it->second.as_string();
+  } else {
+    out.type = "<unknown>";
+  }
+  if (auto it = t.find("value"); it != t.end() && it->second.is_string()) {
+    const std::string& v = it->second.as_string();
+    out.summary = v;
+    if (v.size() >= 3 && v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) {
+      out.address = parse_hex_addr(v);
+    }
+  }
+  if (kind) out.kind = kind;
+  return out;
+}
+
 }  // namespace
 
 std::vector<ThreadInfo> GdbMiBackend::list_threads(TargetId tid) {
@@ -833,36 +918,9 @@ std::vector<FrameInfo> GdbMiBackend::list_frames(TargetId tid,
   auto& st = must_get_target(*impl_, tid);
   std::vector<FrameInfo> out;
   if (st.last_status.state == ProcessState::kNone) return out;
-  // The caller's ThreadId is a kernel tid; gdb's -thread-select
-  // wants gdb's internal numeric id. Resolve by walking -thread-info
-  // until we find a target-id whose embedded LWP matches.
-  std::uint32_t gdb_id = 0;
-  {
-    auto thr_rec = send_or_throw(*st.session, "-thread-info");
-    if (thr_rec.payload.is_tuple()) {
-      auto it = thr_rec.payload.as_tuple().find("threads");
-      if (it != thr_rec.payload.as_tuple().end() && it->second.is_list()) {
-        for (const auto& thr_v : it->second.as_list()) {
-          if (!thr_v.is_tuple()) continue;
-          const auto& t = thr_v.as_tuple();
-          std::uint64_t kt = 0;
-          if (auto tgt = t.find("target-id");
-              tgt != t.end() && tgt->second.is_string()) {
-            kt = parse_kernel_tid(tgt->second.as_string());
-          }
-          if (kt == thread_id) {
-            if (auto idit = t.find("id");
-                idit != t.end() && idit->second.is_string()) {
-              try { gdb_id = static_cast<std::uint32_t>(
-                  std::stoul(idit->second.as_string()));
-              } catch (...) {}
-            }
-            break;
-          }
-        }
-      }
-    }
-  }
+  // The caller's ThreadId is a kernel tid; gdb's -thread-select wants
+  // gdb's internal numeric id. Resolve once, then select the thread.
+  std::uint32_t gdb_id = gdb_id_for_kernel_tid(*st.session, thread_id);
   if (gdb_id == 0) throw Error("unknown thread id");
   send_or_throw(*st.session,
                 "-thread-select " + std::to_string(gdb_id));
@@ -962,33 +1020,291 @@ ProcessStatus GdbMiBackend::reverse_step_thread(TargetId tid,
   st.last_status = wait_for_stop(*st.session, std::chrono::seconds(30));
   return st.last_status;
 }
-std::vector<ValueInfo> GdbMiBackend::list_locals(TargetId, ThreadId,
-                                                    std::uint32_t) {
-  todo("list_locals");
+std::vector<ValueInfo> GdbMiBackend::list_locals(TargetId tid,
+                                                    ThreadId thread_id,
+                                                    std::uint32_t frame_index) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<ValueInfo> out;
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot list locals");
+  }
+  select_thread_frame(*st.session, thread_id, frame_index);
+
+  // --simple-values: emit `value` for scalar/pointer types, skip it
+  // for aggregates. This keeps the response cheap and matches the
+  // LLDB SBValue model where summaries are best-effort.
+  auto rec = send_or_throw(*st.session,
+                            "-stack-list-locals --simple-values");
+  if (!rec.payload.is_tuple()) return out;
+  auto it = rec.payload.as_tuple().find("locals");
+  if (it == rec.payload.as_tuple().end() || !it->second.is_list()) return out;
+  for (const auto& v : it->second.as_list()) {
+    if (!v.is_tuple()) continue;
+    out.push_back(mi_tuple_to_value_info(v.as_tuple(), "local"));
+  }
+  return out;
 }
-std::vector<ValueInfo> GdbMiBackend::list_args(TargetId, ThreadId,
-                                                  std::uint32_t) {
-  todo("list_args");
+
+std::vector<ValueInfo> GdbMiBackend::list_args(TargetId tid,
+                                                  ThreadId thread_id,
+                                                  std::uint32_t frame_index) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<ValueInfo> out;
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot list args");
+  }
+  select_thread_frame(*st.session, thread_id, frame_index);
+
+  // `1` ≡ --simple-values; LOW HIGH bounds the frame range we want.
+  // For a single frame we set both ends to frame_index.
+  std::string cmd = "-stack-list-arguments 1 " +
+                    std::to_string(frame_index) + " " +
+                    std::to_string(frame_index);
+  auto rec = send_or_throw(*st.session, cmd);
+  if (!rec.payload.is_tuple()) return out;
+  auto it = rec.payload.as_tuple().find("stack-args");
+  if (it == rec.payload.as_tuple().end() || !it->second.is_list()) return out;
+  // stack-args is a list of {level=..., args=[{name,type,value},...]}.
+  for (const auto& level_v : it->second.as_list()) {
+    if (!level_v.is_tuple()) continue;
+    auto ait = level_v.as_tuple().find("args");
+    if (ait == level_v.as_tuple().end() || !ait->second.is_list()) continue;
+    for (const auto& arg_v : ait->second.as_list()) {
+      if (!arg_v.is_tuple()) continue;
+      out.push_back(mi_tuple_to_value_info(arg_v.as_tuple(), "arg"));
+    }
+  }
+  return out;
 }
-std::vector<ValueInfo> GdbMiBackend::list_registers(TargetId, ThreadId,
-                                                       std::uint32_t) {
-  todo("list_registers");
+
+std::vector<ValueInfo> GdbMiBackend::list_registers(TargetId tid,
+                                                       ThreadId thread_id,
+                                                       std::uint32_t frame_index) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<ValueInfo> out;
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot list registers");
+  }
+  select_thread_frame(*st.session, thread_id, frame_index);
+
+  // Two-call dance: names first (positional index → name), then
+  // values keyed by the same indexes. We zip them into ValueInfo.
+  std::vector<std::string> names;
+  {
+    auto rec = send_or_throw(*st.session, "-data-list-register-names");
+    if (rec.payload.is_tuple()) {
+      auto it = rec.payload.as_tuple().find("register-names");
+      if (it != rec.payload.as_tuple().end() && it->second.is_list()) {
+        names.reserve(it->second.as_list().size());
+        for (const auto& n : it->second.as_list()) {
+          if (n.is_string()) names.push_back(n.as_string());
+          else names.emplace_back();
+        }
+      }
+    }
+  }
+
+  // Format `x` = hex; the register-values entries are
+  // {number="N",value="0x..."} pairs.
+  auto rec = send_or_throw(*st.session, "-data-list-register-values x");
+  if (!rec.payload.is_tuple()) return out;
+  auto it = rec.payload.as_tuple().find("register-values");
+  if (it == rec.payload.as_tuple().end() || !it->second.is_list()) return out;
+  for (const auto& rv_v : it->second.as_list()) {
+    if (!rv_v.is_tuple()) continue;
+    const auto& t = rv_v.as_tuple();
+    std::uint32_t num = 0;
+    if (auto nit = t.find("number");
+        nit != t.end() && nit->second.is_string()) {
+      try { num = static_cast<std::uint32_t>(
+          std::stoul(nit->second.as_string()));
+      } catch (...) { continue; }
+    }
+    ValueInfo vi;
+    vi.kind = "register";
+    if (num < names.size() && !names[num].empty()) vi.name = names[num];
+    // gdb doesn't expose per-register DWARF type info via MI; leave
+    // type at "<unknown>" to match LldbBackend's fallback semantics.
+    vi.type = "<unknown>";
+    if (auto val = t.find("value");
+        val != t.end() && val->second.is_string()) {
+      const std::string& s = val->second.as_string();
+      vi.summary = s;
+      if (s.size() >= 3 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        // The value of a register IS its value; keep `address` unset
+        // (matches LldbBackend, which doesn't populate load_address
+        // for registers — they don't have one).
+      }
+    }
+    out.push_back(std::move(vi));
+  }
+  return out;
 }
-EvalResult GdbMiBackend::evaluate_expression(TargetId, ThreadId,
-                                                std::uint32_t,
-                                                const std::string&,
-                                                const EvalOptions&) {
-  todo("evaluate_expression");
+
+EvalResult GdbMiBackend::evaluate_expression(TargetId tid,
+                                                ThreadId thread_id,
+                                                std::uint32_t frame_index,
+                                                const std::string& expr,
+                                                const EvalOptions& opts) {
+  // EvalOptions has no MI analogue (no SetIgnoreBreakpoints / TryAllThreads
+  // equivalents) — gdb's -data-evaluate-expression is unconditional. We
+  // accept the option but ignore it; documented in docs/18.
+  (void)opts;
+
+  auto& st = must_get_target(*impl_, tid);
+  EvalResult out;
+
+  // Pure-numeric expressions (e.g. "1+2") evaluate without an
+  // inferior; only do the thread/frame selection when one exists.
+  if (st.last_status.state != ProcessState::kNone) {
+    // Bad tid/frame_index surfaces a typed Error from
+    // select_thread_frame — let it propagate per contract.
+    select_thread_frame(*st.session, thread_id, frame_index);
+  }
+
+  // Build the MI command — single-line. The expression may contain
+  // any C-like syntax; we wrap in quotes and escape per mi_quote
+  // rules so embedded quotes/backslashes survive.
+  auto rec = st.session->send_command("-data-evaluate-expression " +
+                                       mi_quote(expr));
+  if (!rec.has_value()) {
+    throw Error("gdbmi: subprocess died during evaluate");
+  }
+  if (rec->klass == "error") {
+    // Eval failure is *data*, not an exception — same as LldbBackend.
+    out.ok    = false;
+    out.error = error_msg_of(*rec);
+    return out;
+  }
+  if (!rec->payload.is_tuple()) {
+    out.ok    = false;
+    out.error = "evaluate: malformed response";
+    return out;
+  }
+  auto it = rec->payload.as_tuple().find("value");
+  if (it == rec->payload.as_tuple().end() || !it->second.is_string()) {
+    out.ok    = false;
+    out.error = "evaluate: no value in response";
+    return out;
+  }
+  out.ok            = true;
+  out.value.name    = expr;          // gdb doesn't echo the expr; use the input
+  out.value.kind    = "eval";
+  out.value.summary = it->second.as_string();
+  // Hex-shaped values mark pointers/addresses; lift them into
+  // `address` so agents don't need to re-parse the summary string.
+  const std::string& v = it->second.as_string();
+  if (v.size() >= 3 && v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) {
+    out.value.address = parse_hex_addr(v);
+  }
+
+  // Best-effort: follow up with `ptype EXPR` for the type. gdb's
+  // ptype prints `type = TYPENAME` on the console stream. Parse the
+  // first such line; leave type empty on miss. This is one extra
+  // round-trip per eval — acceptable for an interactive surface.
+  //
+  // SAFETY: `ptype` is a CLI fall-through (no MI quoting); we'd be
+  // pasting `expr` directly into the shell-like CLI parser. Restrict
+  // to plain identifiers / qualified names so an attacker-controlled
+  // expression can't smuggle newlines, quotes, or shell metas into
+  // the gdb session. Arbitrary expressions still evaluate via the
+  // MI -data-evaluate-expression above; only the optional type
+  // lookup is gated.
+  auto is_simple_ident = [](const std::string& e) -> bool {
+    if (e.empty()) return false;
+    for (unsigned char c : e) {
+      if (!std::isalnum(c) && c != '_' && c != ':') return false;
+    }
+    return true;
+  };
+  if (is_simple_ident(expr)) {
+    st.session->drain_async();
+    auto pt = st.session->send_command("ptype " + expr);
+    if (pt.has_value() && pt->klass == "done") {
+      std::string text;
+      for (const auto& r : st.session->drain_async()) {
+        if (r.kind == MiRecordKind::kConsoleStream) text += r.stream_text;
+      }
+      const std::string needle = "type = ";
+      auto pos = text.find(needle);
+      if (pos != std::string::npos) {
+        auto start = pos + needle.size();
+        auto end = text.find('\n', start);
+        std::string ty = (end == std::string::npos)
+                           ? text.substr(start) : text.substr(start, end - start);
+        // Strip trailing whitespace/\r.
+        while (!ty.empty() && (ty.back() == ' ' || ty.back() == '\t' ||
+                                ty.back() == '\r')) {
+          ty.pop_back();
+        }
+        if (!ty.empty()) out.value.type = std::move(ty);
+      }
+    }
+  }
+  if (out.value.type.empty()) out.value.type = "<unknown>";
+  return out;
 }
-ReadResult GdbMiBackend::read_value_path(TargetId, ThreadId,
-                                            std::uint32_t,
-                                            const std::string&) {
-  todo("read_value_path");
+
+ReadResult GdbMiBackend::read_value_path(TargetId tid, ThreadId thread_id,
+                                            std::uint32_t frame_index,
+                                            const std::string& path) {
+  // value.read accepts a frame-relative dotted/indexed path. In gdb-MI
+  // there's no separate path-walker primitive — but a path like
+  // "this->next" or "g_arr[2].x" is already a valid C expression that
+  // gdb's evaluator understands. So delegate to evaluate_expression
+  // and re-wrap the result.
+  EvalOptions opts;  // defaults; eval doesn't honor options on this backend
+  auto ev = evaluate_expression(tid, thread_id, frame_index, path, opts);
+
+  ReadResult out;
+  out.ok    = ev.ok;
+  out.error = std::move(ev.error);
+  out.value = std::move(ev.value);
+  // children: gdb's MI exposes immediate children via `-var-create` /
+  // `-var-list-children` (variable objects), but those carry their own
+  // lifecycle (per-object IDs, manual delete on the agent's behalf).
+  // Skipping in v1.4 — agents who want children re-issue value.read
+  // against a deeper path. Documented in docs/18 as an MI gap.
+  return out;
 }
-std::uint64_t GdbMiBackend::read_register(TargetId, ThreadId,
-                                             std::uint32_t,
-                                             const std::string&) {
-  todo("read_register");
+
+std::uint64_t GdbMiBackend::read_register(TargetId tid, ThreadId thread_id,
+                                             std::uint32_t frame_index,
+                                             const std::string& name) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) return 0;
+  // Same swallow-error semantic as LldbBackend: unknown / unreadable
+  // register returns 0. Bad tid/frame_index surfaces a thrown error
+  // via select_thread_frame; we let it propagate.
+  select_thread_frame(*st.session, thread_id, frame_index);
+
+  // gdb's $REG syntax inside -data-evaluate-expression returns the
+  // register's value as a string (hex on most regs, decimal for
+  // small ones like CPU flag fields). mi_quote escapes anything in
+  // `name` that could otherwise close the quoted argument early —
+  // the register name is operator-controlled so we treat it as
+  // untrusted by default.
+  auto rec = st.session->send_command(
+      "-data-evaluate-expression " + mi_quote("$" + name));
+  if (!rec.has_value() || rec->klass == "error") return 0;
+  if (!rec->payload.is_tuple()) return 0;
+  auto it = rec->payload.as_tuple().find("value");
+  if (it == rec->payload.as_tuple().end() || !it->second.is_string()) return 0;
+  std::string_view v = it->second.as_string();
+  while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) {
+    v.remove_prefix(1);
+  }
+  if (v.size() >= 2 && v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) {
+    return parse_hex_addr(v);
+  }
+  // Decimal fallback. strtoull tolerates trailing junk; leftover
+  // text after the digits (e.g. "12345 <symbol+0x10>") is harmless.
+  std::string s(v);
+  errno = 0;
+  char* endp = nullptr;
+  unsigned long long u = std::strtoull(s.c_str(), &endp, 10);
+  if (errno != 0 || endp == s.c_str()) return 0;
+  return static_cast<std::uint64_t>(u);
 }
 
 // ── Memory ────────────────────────────────────────────────────────────
