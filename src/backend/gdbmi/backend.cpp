@@ -392,6 +392,49 @@ std::uint64_t resolve_symbol_address(GdbMiSession& s,
   return parse_hex_addr(std::string_view(text).substr(pos + needle.size()));
 }
 
+// Estimate a function's byte size via `disassemble FUNCNAME` (CLI
+// fall-through). The output lines carry `0xADDR <+OFFSET>: insn` per
+// instruction; we take the highest offset + 16 (max x86 instruction
+// length) as a safe upper bound. ARM64's max-insn-length is 4 so
+// this over-estimates on arm64 by ~12 bytes, harmless for the
+// dispatcher's disasm.function which truncates trailing junk on
+// the gdb side via the asm_insns array.
+//
+// Returns 0 if gdb can't disassemble the symbol — same "not found"
+// semantic as resolve_symbol_address.
+std::uint64_t resolve_function_byte_size(GdbMiSession& s,
+                                          const std::string& name) {
+  s.drain_async();
+  auto r = s.send_command("disassemble " + name);
+  if (!r.has_value() || r->klass != "done") return 0;
+  auto pending = s.drain_async();
+  std::string text;
+  for (const auto& rec : pending) {
+    if (rec.kind == MiRecordKind::kConsoleStream) {
+      text += rec.stream_text;
+    }
+  }
+  // Find the highest `<+N>` offset across all instruction lines.
+  std::uint64_t max_offset = 0;
+  std::size_t i = 0;
+  while (i < text.size()) {
+    auto open = text.find("<+", i);
+    if (open == std::string::npos) break;
+    auto close = text.find(">", open);
+    if (close == std::string::npos) break;
+    std::uint64_t off = 0;
+    for (std::size_t j = open + 2; j < close; ++j) {
+      char c = text[j];
+      if (c < '0' || c > '9') { off = 0; break; }
+      off = off * 10 + static_cast<unsigned>(c - '0');
+    }
+    if (off > max_offset) max_offset = off;
+    i = close + 1;
+  }
+  if (max_offset == 0) return 0;
+  return max_offset + 16;
+}
+
 }  // namespace
 
 std::vector<Module> GdbMiBackend::list_modules(TargetId tid) {
@@ -492,9 +535,17 @@ GdbMiBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
   // fall-through per result) but accurate and matches LldbBackend's
   // SymbolMatch contract. For pathological result sets (>500 hits)
   // this can take seconds — agent callers should narrow with --name.
+  //
+  // For functions we ALSO resolve byte_size via `disassemble NAME`
+  // so disasm.function (which keys on byte_size != 0) works
+  // end-to-end against this backend.
   for (auto& m : out) {
     if (m.address == 0 && !m.name.empty()) {
       m.address = resolve_symbol_address(*st.session, m.name);
+    }
+    if (m.kind == SymbolKind::kFunction && m.byte_size == 0 &&
+        !m.name.empty() && m.address != 0) {
+      m.byte_size = resolve_function_byte_size(*st.session, m.name);
     }
   }
   return out;

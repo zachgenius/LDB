@@ -417,12 +417,14 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
                        std::shared_ptr<store::ArtifactStore> artifacts,
                        std::shared_ptr<store::SessionStore> sessions,
                        std::shared_ptr<probes::ProbeOrchestrator> probes,
-                       std::shared_ptr<observers::ExecAllowlist> exec_allowlist)
+                       std::shared_ptr<observers::ExecAllowlist> exec_allowlist,
+                       std::string backend_name)
     : backend_(std::move(backend)),
       artifacts_(std::move(artifacts)),
       sessions_(std::move(sessions)),
       probes_(std::move(probes)),
-      exec_allowlist_(std::move(exec_allowlist)) {}
+      exec_allowlist_(std::move(exec_allowlist)),
+      backend_name_(std::move(backend_name)) {}
 
 Dispatcher::~Dispatcher() = default;
 
@@ -763,6 +765,9 @@ Response Dispatcher::handle_hello(const Request& req) {
 #else
       {"disasm_backend", "lldb"},
 #endif
+      // v1.4 #8: echo the active DebuggerBackend so agents can
+      // branch behavior. "lldb" (default) or "gdb" (GdbMiBackend).
+      {"backend", backend_name_.empty() ? "lldb" : backend_name_},
   };
   data["formats"] = json::array({"json", "cbor"});
   return protocol::make_ok(req.id, std::move(data));

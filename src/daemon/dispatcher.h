@@ -39,7 +39,8 @@ class Dispatcher {
                       std::shared_ptr<store::SessionStore> sessions = {},
                       std::shared_ptr<probes::ProbeOrchestrator> probes = {},
                       std::shared_ptr<observers::ExecAllowlist>
-                          exec_allowlist = {});
+                          exec_allowlist = {},
+                      std::string backend_name = "lldb");
   ~Dispatcher();
 
   protocol::Response dispatch(const protocol::Request& req);
@@ -50,6 +51,9 @@ class Dispatcher {
   std::shared_ptr<store::SessionStore>         sessions_;
   std::shared_ptr<probes::ProbeOrchestrator>   probes_;
   std::shared_ptr<observers::ExecAllowlist>    exec_allowlist_;
+  // Active backend label echoed via hello.data.capabilities.backend.
+  // Set by the constructor from main.cpp's --backend resolution.
+  std::string                                  backend_name_;
   // Set by session.attach, cleared by session.detach. While set, every
   // dispatch result is appended to the session's rpc_log.
   std::unique_ptr<store::SessionStore::Writer> active_session_writer_;

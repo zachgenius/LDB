@@ -530,6 +530,18 @@ set_tests_properties(smoke_cli_repl PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #8: cross-backend smoke under ldbd --backend=gdb.
+# SKIPs cleanly when gdb is not on PATH.
+add_test(
+  NAME smoke_gdbmi_backend
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_gdbmi_backend.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_gdbmi_backend PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"
