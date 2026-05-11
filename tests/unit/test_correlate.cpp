@@ -431,6 +431,11 @@ class StubBackend : public ldb::backend::DebuggerBackend {
       list_frames(TID, ThreadID, std::uint32_t) override { return {}; }
   ldb::backend::ProcessStatus
       step_thread(TID, ThreadID, ldb::backend::StepKind) override { return {}; }
+  ldb::backend::ProcessStatus reverse_continue(TID) override { return {}; }
+  ldb::backend::ProcessStatus
+      reverse_step_thread(TID, ThreadID, ldb::backend::ReverseStepKind) override {
+    return {};
+  }
   std::vector<ldb::backend::ValueInfo>
       list_locals(TID, ThreadID, std::uint32_t) override { return {}; }
   std::vector<ldb::backend::ValueInfo>

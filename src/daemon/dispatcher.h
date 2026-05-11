@@ -85,10 +85,13 @@ class Dispatcher {
   protocol::Response handle_process_detach(const protocol::Request& req);
   protocol::Response handle_process_save_core(const protocol::Request& req);
   protocol::Response handle_process_step(const protocol::Request& req);
+  protocol::Response handle_process_reverse_continue(const protocol::Request& req);
+  protocol::Response handle_process_reverse_step(const protocol::Request& req);
 
   protocol::Response handle_thread_list(const protocol::Request& req);
   protocol::Response handle_thread_frames(const protocol::Request& req);
   protocol::Response handle_thread_continue(const protocol::Request& req);
+  protocol::Response handle_thread_reverse_step(const protocol::Request& req);
 
   protocol::Response handle_frame_locals(const protocol::Request& req);
   protocol::Response handle_frame_args(const protocol::Request& req);

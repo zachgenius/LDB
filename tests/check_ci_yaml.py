@@ -73,13 +73,18 @@ def main():
         fail("missing `on:` triggers block")
     if not isinstance(on_block, dict):
         fail("`on:` is not a mapping")
-    if set(on_block.keys()) != {"push", "workflow_dispatch"}:
+    allowed_triggers = {"push", "workflow_dispatch", "pull_request"}
+    if not set(on_block.keys()) <= allowed_triggers:
         fail(
-            "`on:` must only contain push and workflow_dispatch triggers; "
-            f"got {sorted(on_block.keys())!r}"
+            "`on:` may only contain push / workflow_dispatch / pull_request "
+            f"triggers; got {sorted(on_block.keys())!r}"
         )
+    if "push" not in on_block:
+        fail("`on:` must include a push trigger (post-merge gate)")
 
-    # Push trigger must be restricted to the master branch.
+    # Push trigger must be restricted to the master branch (post-merge
+    # gate). pull_request, if present, must also target master (pre-merge
+    # gate from any branch).
     push_block = on_block["push"]
     if not isinstance(push_block, dict):
         fail("`on.push` must be a mapping with branches")
@@ -88,6 +93,16 @@ def main():
         fail(f"`on.push.branches` must be exactly ['master']; got {branches!r}")
     if "tags" in push_block:
         fail("`on.push` must not include tags")
+    if "pull_request" in on_block:
+        pr_block = on_block["pull_request"]
+        if not isinstance(pr_block, dict):
+            fail("`on.pull_request` must be a mapping with branches")
+        pr_branches = pr_block.get("branches")
+        if pr_branches != ["master"]:
+            fail(
+                "`on.pull_request.branches` must be exactly ['master']; "
+                f"got {pr_branches!r}"
+            )
 
     jobs = doc["jobs"]
     if not isinstance(jobs, dict) or not jobs:
@@ -100,8 +115,20 @@ def main():
     for jname, jdef in jobs.items():
         if not isinstance(jdef, dict):
             fail(f"job `{jname}` is not a mapping")
-        if jdef.get("if") != "github.ref == 'refs/heads/master'":
-            fail(f"job `{jname}` must be guarded to run only on master")
+        # Jobs must be guarded so they run only on the three supported
+        # triggers (push to master, PR to master, manual dispatch). The
+        # earlier 'github.ref == master' form is rejected — it would
+        # silently skip pull_request and workflow_dispatch runs.
+        expected_guard = (
+            "github.event_name == 'push' || "
+            "github.event_name == 'pull_request' || "
+            "github.event_name == 'workflow_dispatch'"
+        )
+        if jdef.get("if") != expected_guard:
+            fail(
+                f"job `{jname}` must be guarded with the event-name "
+                f"triplet; got {jdef.get('if')!r}"
+            )
         runs_on = jdef.get("runs-on", "")
         steps = jdef.get("steps", []) or []
         step_text = " ".join(

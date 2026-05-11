@@ -541,10 +541,16 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "process.detach")     return handle_process_detach(req);
     if (req.method == "process.save_core")  return handle_process_save_core(req);
     if (req.method == "process.step")       return handle_process_step(req);
+    if (req.method == "process.reverse_continue")
+      return handle_process_reverse_continue(req);
+    if (req.method == "process.reverse_step")
+      return handle_process_reverse_step(req);
 
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
     if (req.method == "thread.continue")    return handle_thread_continue(req);
+    if (req.method == "thread.reverse_step")
+      return handle_thread_reverse_step(req);
 
     if (req.method == "frame.locals")       return handle_frame_locals(req);
     if (req.method == "frame.args")         return handle_frame_args(req);
@@ -1221,6 +1227,35 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
       }, {"state", "pid"}),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
+  add("process.reverse_continue",
+      "Reverse-continue: run backward until the next stop. Requires a "
+      "record/replay backend (rr, reached via target.connect_remote "
+      "rr://). Implemented by sending the GDB RSP 'bc' packet through "
+      "LLDB's gdb-remote plugin. Non-rr targets get -32003 forbidden. "
+      "See docs/16-reverse-exec.md.",
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      process_state_def(),
+      /*requires_target=*/true, /*requires_stopped=*/true, "high");
+
+  add("process.reverse_step",
+      "Reverse-step the given thread. v0.3 supports kind=insn only "
+      "(RSP 'bs' packet, one machine instruction). kind=in/over/out "
+      "are reserved-but-rejected (-32602) — their reverse semantics "
+      "need client-side step-over emulation that lands later. See "
+      "docs/16-reverse-exec.md.",
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       tid_param()},
+          {"kind",      enum_str({"in", "over", "out", "insn"})},
+      }, {"target_id", "tid", "kind"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"pc",          uint_()},
+          {"stop_reason", str()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "high");
+
   // ============== thread.* / frame.* / value.* ==============
 
   add("thread.list",
@@ -1255,6 +1290,24 @@ with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
       }, {"target_id", "tid"}),
       process_state_def(),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
+
+  add("thread.reverse_step",
+      "Reverse-step the given thread. Same shape as process.reverse_step; "
+      "the split mirrors thread.continue / process.continue so async-aware "
+      "clients can drive either entry point. v0.3 sync: kind=insn only. "
+      "See docs/16-reverse-exec.md.",
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       tid_param()},
+          {"kind",      enum_str({"in", "over", "out", "insn"})},
+      }, {"target_id", "tid", "kind"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"pc",          uint_()},
+          {"stop_reason", str()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/true, "high");
 
   add("frame.locals",
       "Local variables in scope at a frame. Bytes capped at 64; agents "
@@ -3043,6 +3096,134 @@ Response Dispatcher::handle_process_step(const Request& req) {
     }
   }
   return protocol::make_ok(req.id, std::move(data));
+}
+
+namespace {
+
+// Reverse-step kind parser. The wire accepts the same four strings as
+// forward step for symmetry, but v0.3 implements only `insn`. The other
+// three are accepted-and-rejected with -32602 to keep the schema stable
+// when client-side reverse-step-over/out lands. `*out` is only written
+// for `insn`.
+bool parse_reverse_step_kind(const std::string& s,
+                             backend::ReverseStepKind* out,
+                             bool* deferred_known_kind) {
+  *deferred_known_kind = false;
+  if (s == "insn") { *out = backend::ReverseStepKind::kInsn; return true; }
+  if (s == "in" || s == "over" || s == "out") {
+    *deferred_known_kind = true;
+    return false;
+  }
+  return false;
+}
+
+// Map a backend::Error from a reverse-exec call to a JSON-RPC error
+// code. Inspects the message text since backend::Error doesn't carry a
+// kind enum.
+Response reverse_exec_error_to_resp(const std::optional<json>& id,
+                                    const ldb::backend::Error& e) {
+  const std::string what = e.what();
+  if (what.find("does not support reverse execution") != std::string::npos) {
+    return protocol::make_err(id, ErrorCode::kForbidden, what);
+  }
+  if (what.find("not stopped") != std::string::npos ||
+      what.find("no process") != std::string::npos) {
+    return protocol::make_err(id, ErrorCode::kBadState, what);
+  }
+  if (what.find("kind not supported") != std::string::npos) {
+    return protocol::make_err(id, ErrorCode::kInvalidParams, what);
+  }
+  return protocol::make_err(id, ErrorCode::kBackendError, what);
+}
+
+}  // namespace
+
+Response Dispatcher::handle_process_reverse_continue(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  try {
+    auto status = backend_->reverse_continue(
+        static_cast<backend::TargetId>(target_id));
+    return protocol::make_ok(req.id, process_status_to_json(status));
+  } catch (const ldb::backend::Error& e) {
+    return reverse_exec_error_to_resp(req.id, e);
+  }
+}
+
+// Shared body for process.reverse_step and thread.reverse_step. The two
+// endpoints differ only in their wire name; both take {target_id, tid,
+// kind} and route to backend::reverse_step_thread. The split mirrors
+// the existing process.continue / thread.continue pair (Tier 4 §14).
+namespace {
+Response handle_reverse_step_shared(
+    std::shared_ptr<backend::DebuggerBackend> backend,
+    const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "tid", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'tid'");
+  }
+  const auto* kind_str = require_string(req.params, "kind");
+  if (!kind_str) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'kind'");
+  }
+  backend::ReverseStepKind kind;
+  bool deferred = false;
+  if (!parse_reverse_step_kind(*kind_str, &kind, &deferred)) {
+    if (deferred) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'kind' " + *kind_str + " is reserved but not yet implemented; "
+          "v0.3 supports kind=insn only (see docs/16-reverse-exec.md)");
+    }
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "'kind' must be one of: in, over, out, insn");
+  }
+  try {
+    auto status = backend->reverse_step_thread(
+        static_cast<backend::TargetId>(target_id),
+        static_cast<backend::ThreadId>(tid),
+        kind);
+    json data = process_status_to_json(status);
+    if (status.state == backend::ProcessState::kStopped) {
+      auto threads = backend->list_threads(
+          static_cast<backend::TargetId>(target_id));
+      for (const auto& t : threads) {
+        if (t.tid == tid) {
+          data["pc"] = t.pc;
+          break;
+        }
+      }
+    }
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const ldb::backend::Error& e) {
+    return reverse_exec_error_to_resp(req.id, e);
+  }
+}
+}  // namespace
+
+Response Dispatcher::handle_process_reverse_step(const Request& req) {
+  return handle_reverse_step_shared(backend_, req);
+}
+
+Response Dispatcher::handle_thread_reverse_step(const Request& req) {
+  return handle_reverse_step_shared(backend_, req);
 }
 
 Response Dispatcher::handle_string_xref(const Request& req) {

@@ -64,6 +64,10 @@ class LldbBackend final : public DebuggerBackend {
   ProcessStatus step_thread(TargetId tid, ThreadId thread_id,
                             StepKind kind) override;
 
+  ProcessStatus reverse_continue(TargetId tid) override;
+  ProcessStatus reverse_step_thread(TargetId tid, ThreadId thread_id,
+                                    ReverseStepKind kind) override;
+
   std::vector<ValueInfo>
       list_locals(TargetId tid, ThreadId thread_id,
                   std::uint32_t frame_index) override;

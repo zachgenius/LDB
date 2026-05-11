@@ -21,16 +21,26 @@ graph that survives across sessions.
 ## Status
 
 **V1 released.** `v1.0.0` closed all release gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md); `v1.1.0` is the current
-tag and folds in dogfood fixes from a real reverse-engineering pass
-(qualified C++ symbol lookup, DWARF `byte_size` warnings on `type.layout`,
-`address` alias on disassembled instructions). No breaking wire changes
-since v1.0.0.
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.2.0` is the
+current tag and adds:
+
+- `.ldbpack` ed25519 signing (`session.export` / `artifact.export`
+  accept `sign_key`; import-side `trust_root` + `require_signed` —
+  see [docs/14-pack-signing.md](docs/14-pack-signing.md)),
+- Reverse-execution endpoints over rr-backed targets
+  (`process.reverse_continue`, `process.reverse_step`,
+  `thread.reverse_step`, `kind=insn` only —
+  see [docs/16-reverse-exec.md](docs/16-reverse-exec.md)),
+- Dogfood fixes from `v1.1.0` (qualified C++ symbol lookup, DWARF
+  `byte_size` warnings on `type.layout`, `address` alias on
+  disassembled instructions).
+
+No breaking wire changes since v1.0.0; everything since is additive.
 
 | | |
 |---|---|
-| **Validation** | Default `ctest` suite (52 tests) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
-| **Endpoints** | 82 across target / process / thread / frame / value / memory / probe / observer / session / artifact / recipe / correlate |
+| **Validation** | Default `ctest` suite (53 tests) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
+| **Endpoints** | 85 across target / process / thread / frame / value / memory / probe / observer / session / artifact / recipe / correlate |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
 | **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
@@ -75,8 +85,8 @@ plus `lldb-server platform` — no LDB-specific code on the target.
 |---|---|---|
 | **Static analysis** | `target.open`, `target.close`, `target.list`, `target.label`, `module.list`, `type.layout`, `symbol.find`, `string.list`, `string.xref`, `disasm.range`, `disasm.function`, `xref.addr`, `static.globals_of_type` | `pahole`, `nm`, `readelf`, `strings`, `objdump` |
 | **Cross-target correlation** | `correlate.types`, `correlate.symbols`, `correlate.strings` | hand-rolled diffing between two binaries / cores |
-| **Process control** | `target.attach`, `target.connect_remote`, `target.connect_remote_ssh`, `target.load_core`, `target.create_empty`, `process.launch`, `process.state`, `process.continue`, `process.kill`, `process.detach`, `process.save_core`, `process.step` | `gdb`, `lldb` |
-| **Thread / frame / value** | `thread.list`, `thread.frames`, `thread.continue`, `frame.locals`, `frame.args`, `frame.registers`, `value.eval`, `value.read` | `gdb` `bt`/`info`/`print`, `lldb` `frame` family |
+| **Process control** | `target.attach`, `target.connect_remote`, `target.connect_remote_ssh`, `target.load_core`, `target.create_empty`, `process.launch`, `process.state`, `process.continue`, `process.kill`, `process.detach`, `process.save_core`, `process.step`, `process.reverse_continue`, `process.reverse_step` | `gdb`, `lldb`, `rr` |
+| **Thread / frame / value** | `thread.list`, `thread.frames`, `thread.continue`, `thread.reverse_step`, `frame.locals`, `frame.args`, `frame.registers`, `value.eval`, `value.read` | `gdb` `bt`/`info`/`print`, `lldb` `frame` family |
 | **Memory** | `mem.read`, `mem.read_cstr`, `mem.regions`, `mem.search`, `mem.dump_artifact` | `gdb` `x`/`find`, `/proc/<pid>/mem` scraping |
 | **Probes** | `probe.create` (kind: `lldb_breakpoint` or `uprobe_bpf`), `probe.events`, `probe.list`, `probe.enable`, `probe.disable`, `probe.delete` | `strace`, `bpftrace`, hand-rolled tracepoints |
 | **Typed observers** | `observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets`, `observer.net.tcpdump`, `observer.net.igmp`, `observer.exec` (allowlisted) | `lsof`, `ss`, `tcpdump`, `cat /proc/...`, `run_host_command` |
@@ -99,11 +109,13 @@ items?, tokens_est}` and `_provenance: {snapshot, deterministic}`.
 | LLDB / liblldb | 18 or newer | 22.1.x verified; older versions likely work via SBAPI stability |
 | SQLite | 3.40+ | Sessions and artifact index |
 | zlib | system | `.ldbpack` gzip compression |
+| libsodium | 1.0.18+ | `.ldbpack` ed25519 signing (hard dep) |
 | Python | 3.11+ | Smoke tests and `tools/ldb/ldb` client |
 | Ninja | 1.10+ | Optional; default build generator |
 | `bpftrace` | 0.18+ | Optional; required for `kind: "uprobe_bpf"` probes |
 | `lldb-server` | from LLDB | Optional; required for `target.connect_remote*` live tests |
 | `tcpdump` | system | Optional; required for `observer.net.tcpdump` (needs CAP_NET_RAW) |
+| `rr` | 5.6+ | Optional; required for reverse-execution endpoints. Linux only; needs `kernel.perf_event_paranoid <= 1` to record |
 
 LLDB's prebuilt LLVM tarballs link against `libpython3.11` for embedded
 scripting; ensure that runtime is available even if you don't use embedded
@@ -123,16 +135,17 @@ sudo apt-get update
 sudo apt-get install -y \
   ninja-build cmake build-essential \
   liblldb-dev lldb \
-  libsqlite3-dev zlib1g-dev \
+  libsqlite3-dev zlib1g-dev libsodium-dev \
   python3 \
   bpftrace tcpdump \
-  openssh-server openssh-client
+  openssh-server openssh-client \
+  rr
 ```
 
 macOS (Apple Silicon / Homebrew):
 
 ```bash
-brew install llvm ninja cmake sqlite
+brew install llvm ninja cmake sqlite libsodium
 ```
 
 Optional Capstone backend:
@@ -141,9 +154,11 @@ Optional Capstone backend:
 brew install capstone pkgconf
 ```
 
-`bpftrace`, `tcpdump`, `lldb-server`, and `openssh-server` are only needed for
-their respective live probe / observer / remote-connection paths; the static
-analysis and core-backed paths build without them.
+`bpftrace`, `tcpdump`, `lldb-server`, `openssh-server`, and `rr` are only
+needed for their respective live probe / observer / remote-connection /
+reverse-execution paths; the static analysis and core-backed paths build
+without them. `libsodium` is a hard build dep (used by `.ldbpack` ed25519
+signing). `rr` is Linux x86-64 / arm64 only — macOS has no equivalent.
 
 ---
 
@@ -291,7 +306,7 @@ These are acceptable in the planned V1 cut and are part of the public contract:
 - Capstone is opt-in and affects only `disasm.range` and `disasm.function`.
 - `xref.addr` and `string.xref` intentionally keep LLDB disassembly/comment semantics.
 - True async/non-stop runtime is deferred; the per-thread protocol surface is present but sync-backed.
-- rr support is exposed through `target.connect_remote` URLs; reverse execution endpoints remain deferred.
+- Reverse execution is supported only against rr-backed targets (reached via `target.connect_remote rr://`); `process.reverse_step` / `thread.reverse_step` accept `kind=insn` only in v0.3, with `in`/`over`/`out` reserved-but-rejected pending client-side step-over emulation (see [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md)).
 - Linux-only observers and BPF/tcpdump paths SKIP on macOS or unprivileged runners.
 - macOS local-process tests depend on Apple's signed `debugserver`.
 
@@ -339,8 +354,9 @@ docs/                Design docs and engineering worklog
 | [`docs/06-ci.md`](docs/06-ci.md) | What CI runs, what SKIPs on the runner, how to reproduce locally |
 | [`docs/07-dap-shim.md`](docs/07-dap-shim.md) | `ldb-dap` Debug Adapter Protocol shim — supported requests, capabilities, VS Code launch.json example |
 | [`docs/13-v1-readiness.md`](docs/13-v1-readiness.md) | V1 release gates, supported matrix, validation commands, and known limitations |
-| [`docs/14-pack-signing.md`](docs/14-pack-signing.md) | `.ldbpack` ed25519 signing design (in-flight on `feat/pack-signing`) |
+| [`docs/14-pack-signing.md`](docs/14-pack-signing.md) | `.ldbpack` ed25519 signing — design, key format, failure matrix |
 | [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) | Tiered breakdown of post-V1 deferred work with dependency graph and execution order |
+| [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md) | Reverse-execution endpoints over rr via RSP packet injection — design, scope, kind=insn-only contract |
 | [`docs/WORKLOG.md`](docs/WORKLOG.md) | Engineering journal — newest entries on top |
 | [`CLAUDE.md`](CLAUDE.md) | Workflow rules for AI-assisted development on this repo |
 
@@ -367,7 +383,8 @@ Build is warning-clean under
 `-Wnull-dereference -Wdouble-promotion -Wformat=2 -Wmisleading-indentation`.
 
 Every session ends with an entry in [`docs/WORKLOG.md`](docs/WORKLOG.md);
-commit messages reference the milestone (M0–M5) and endpoint or component.
+commit messages reference the endpoint or component being changed and
+the design doc that governs it.
 
 See [`CLAUDE.md`](CLAUDE.md) for the full workflow rules.
 
@@ -384,13 +401,18 @@ Other deferrals:
   model + per-endpoint determinism audit. Unblocks `session.fork` and
   `session.replay` against live targets.
 - **`session.fork` / `session.replay`** — depend on live provenance.
-- **`.ldbpack` signing** — operator-trust feature; meaningful once packs
-  travel to untrusted hands.
+- **Reverse-step `kind=in`/`over`/`out`** — `process.reverse_step` /
+  `thread.reverse_step` ship today with `kind=insn` only (RSP `bs`
+  packet). The source-line variants need client-side step-over
+  emulation; sketch in [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md).
 - **GDB/MI second backend** — proves the `DebuggerBackend` abstraction
   doesn't quietly leak LLDB-isms.
 - **Embedded Python for user-authored probe callbacks** — current probes
   are C++-only.
 - **CLI: interactive REPL, ssh-remote daemon mode.**
+
+See [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) for the full
+tiered breakdown of post-V1 work with dependencies and execution order.
 
 ---
 

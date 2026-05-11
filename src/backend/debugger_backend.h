@@ -226,6 +226,20 @@ enum class StepKind {
   kInsn,
 };
 
+// Reverse-execution step kinds. The wire surface accepts the same
+// "in" / "over" / "out" / "insn" strings as forward step for symmetry,
+// but v0.3 implements only kInsn (RSP `bs` packet). kIn / kOver / kOut
+// are reserved — their reverse semantics require client-side step-over
+// emulation (decode the current instruction, set internal stops, send
+// reverse-continue, watch for the stop) and the dispatcher rejects them
+// with -32602 today. See docs/16-reverse-exec.md.
+enum class ReverseStepKind {
+  kIn,
+  kOver,
+  kOut,
+  kInsn,
+};
+
 using ThreadId = std::uint64_t;   // SBThread::GetThreadID() — kernel tid
 
 struct ThreadInfo {
@@ -576,6 +590,30 @@ class DebuggerBackend {
   // for invalid target_id, unknown thread id, or no live process.
   virtual ProcessStatus
       step_thread(TargetId tid, ThreadId thread_id, StepKind kind) = 0;
+
+  // Reverse-continue: run the process backward until the next stop
+  // (typically a breakpoint or the beginning of the trace). Requires
+  // a record/replay backend that advertises reverse-exec support —
+  // currently rr, reached via `target.connect_remote rr://`. Implemented
+  // by sending the GDB RSP `bc` packet through the gdb-remote plugin
+  // (LLDB has no public SBProcess::ReverseContinue API), then pumping
+  // the listener until the next stop event arrives.
+  //
+  // Throws backend::Error with a clearly worded message when:
+  //   * the target_id is unknown,
+  //   * no live process is attached,
+  //   * the target is not reverse-capable (dispatcher maps to -32003).
+  virtual ProcessStatus reverse_continue(TargetId tid) = 0;
+
+  // Reverse-step a single thread by one machine instruction.
+  // v0.3 contract: only ReverseStepKind::kInsn is implemented; kIn /
+  // kOver / kOut throw a "kind not supported" backend::Error. The
+  // wire surface accepts those strings so the schema doesn't change
+  // when the client-side step-over emulator lands later — see
+  // docs/16-reverse-exec.md.
+  virtual ProcessStatus
+      reverse_step_thread(TargetId tid, ThreadId thread_id,
+                          ReverseStepKind kind) = 0;
 
   // --- Frame values ----------------------------------------------------
   //

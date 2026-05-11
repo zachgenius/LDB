@@ -1,7 +1,9 @@
 # LDB CI — Linux x86-64 + Linux arm64 + macOS arm64
 #
-# Builds and tests `ldbd` only on pushes to `master` or manual runs
-# from `master`.
+# Builds and tests `ldbd` on:
+#   * pushes to `master` (post-merge gate),
+#   * pull requests targeting `master` (pre-merge gate),
+#   * manual `workflow_dispatch` runs against any branch.
 # Documented in `docs/06-ci.md`.
 
 name: CI
@@ -11,16 +13,21 @@ on:
   push:
     branches:
       - master
+  pull_request:
+    branches:
+      - master
 
-# Don't pile up redundant runs on a fast-pushing branch.
+# Don't pile up redundant runs on a fast-pushing branch. PR-vs-push on
+# the same ref share a group; cancel-in-progress=true keeps PR pushes
+# from queueing behind their own older runs.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   linux:
     name: Linux x86-64 (Ubuntu 24.04, gcc-13, apt LLDB 18)
-    if: github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -36,12 +43,21 @@ jobs:
             libsqlite3-dev zlib1g-dev libsodium-dev \
             python3 \
             bpftrace tcpdump \
-            openssh-server openssh-client
+            openssh-server openssh-client \
+            rr
 
       - name: Disable Yama ptrace_scope (live attach tests)
         run: |
           sudo sysctl -w kernel.yama.ptrace_scope=0
           cat /proc/sys/kernel/yama/ptrace_scope
+
+      - name: Lower kernel.perf_event_paranoid (rr record gate)
+        run: |
+          # rr needs perf_event_paranoid <= 1 to record. CI runners
+          # default to 2. Without this the rr-backed reverse-exec smoke
+          # SKIPs cleanly but never exercises the positive path.
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          cat /proc/sys/kernel/perf_event_paranoid
 
       - name: Configure local sshd + key auth (target.connect_remote_ssh)
         run: |
@@ -99,7 +115,7 @@ jobs:
 
   linux-arm64:
     name: Linux arm64 (Ubuntu 24.04, apt LLDB 18)
-    if: github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -173,7 +189,7 @@ jobs:
 
   linux-capstone:
     name: Linux x86-64 Capstone disasm (Ubuntu 24.04, gcc-13, apt LLDB 18)
-    if: github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -247,7 +263,7 @@ jobs:
 
   macos:
     name: macOS arm64 (macos-14, Homebrew LLVM)
-    if: github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     timeout-minutes: 90
     steps:
