@@ -4,8 +4,14 @@
 #include "protocol/jsonrpc.h"
 #include "store/session_store.h"
 
+#include <nlohmann/json.hpp>
+
+#include <cstddef>
+#include <list>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace ldb::backend { class DebuggerBackend; }
 namespace ldb::store   { class ArtifactStore; }
@@ -48,6 +54,33 @@ class Dispatcher {
   // dispatch result is appended to the session's rpc_log.
   std::unique_ptr<store::SessionStore::Writer> active_session_writer_;
   std::string active_session_id_;  // for info / debug
+
+  // Diff-cache for post-V1 plan #5 (view.diff_against). Stores the
+  // most recent N array responses keyed by (method, params-canonical,
+  // snapshot). Endpoints that opt in record their array under the
+  // current snapshot before slicing/projection; when a subsequent
+  // call carries view.diff_against=<prior_snapshot>, the dispatcher
+  // looks up the prior items and emits the set-symmetric-difference
+  // instead of the full array. LRU-bounded so long-running sessions
+  // don't grow without limit; cache misses surface as a
+  // diff_baseline_missing flag in the response.
+  struct DiffCacheEntry {
+    std::string    cache_key;
+    nlohmann::json items;
+  };
+  static constexpr std::size_t kDiffCacheCapacity = 64;
+  std::list<DiffCacheEntry> diff_cache_;     // MRU at front
+  std::unordered_map<std::string, std::list<DiffCacheEntry>::iterator>
+      diff_cache_index_;
+  void                diff_cache_put(std::string key, nlohmann::json items);
+  std::optional<nlohmann::json>
+                       diff_cache_get(const std::string& key);
+  // Build a canonical key for the (method, params, snapshot) tuple.
+  // The "view" sub-object is excluded from params hashing so that
+  // changing pagination doesn't invalidate the cached baseline.
+  static std::string  diff_cache_key(const std::string& method,
+                                     const nlohmann::json& params,
+                                     const std::string& snapshot);
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);

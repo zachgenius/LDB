@@ -1,9 +1,9 @@
 {
   "version": 1,
   "drift_tolerance": 0.1,
-  "total_tokens": 8104,
+  "total_tokens": 8209,
   "per_method": {
-    "describe.endpoints": 5349,
+    "describe.endpoints": 5454,
     "disasm.function": 634,
     "hello": 43,
     "module.list": 999,

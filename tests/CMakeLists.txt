@@ -495,6 +495,17 @@ set_tests_properties(smoke_hypothesis PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #5: view.diff_against on module.list / thread.list.
+add_test(
+  NAME smoke_view_diff
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_diff.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_view_diff PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"

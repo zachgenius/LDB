@@ -423,6 +423,45 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
 
 Dispatcher::~Dispatcher() = default;
 
+// ── DiffCache (post-V1 plan #5) ────────────────────────────────────────
+
+std::string Dispatcher::diff_cache_key(const std::string& method,
+                                       const json& params,
+                                       const std::string& snapshot) {
+  // Canonicalize params: drop "view" so pagination changes don't
+  // fragment the cache. nlohmann::json's default serialization sorts
+  // object keys, so the dump is stable regardless of insertion order.
+  json key_params = params.is_object() ? params : json::object();
+  if (key_params.contains("view")) key_params.erase("view");
+  return method + "|" + key_params.dump() + "|" + snapshot;
+}
+
+void Dispatcher::diff_cache_put(std::string key, json items) {
+  auto it = diff_cache_index_.find(key);
+  if (it != diff_cache_index_.end()) {
+    // Replace existing entry; move to MRU.
+    diff_cache_.erase(it->second);
+    diff_cache_index_.erase(it);
+  }
+  diff_cache_.push_front({std::move(key), std::move(items)});
+  diff_cache_index_[diff_cache_.front().cache_key] = diff_cache_.begin();
+
+  // Bound the cache. Evict from the back (least-recently-used).
+  while (diff_cache_.size() > kDiffCacheCapacity) {
+    diff_cache_index_.erase(diff_cache_.back().cache_key);
+    diff_cache_.pop_back();
+  }
+}
+
+std::optional<json>
+Dispatcher::diff_cache_get(const std::string& key) {
+  auto it = diff_cache_index_.find(key);
+  if (it == diff_cache_index_.end()) return std::nullopt;
+  // Touch: move to MRU.
+  diff_cache_.splice(diff_cache_.begin(), diff_cache_, it->second);
+  return diff_cache_.front().items;
+}
+
 namespace {
 
 // Extract target_id from request params, when present and integer-typed.
@@ -906,7 +945,12 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
 
   // ============== static analysis ==============
 
-  add("module.list", "Enumerate modules of a target.",
+  add("module.list",
+      "Enumerate modules of a target. Supports view.diff_against — pass "
+      "a prior response's _provenance.snapshot to receive only the "
+      "module entries added/removed since that snapshot (set-symmetric-"
+      "difference; each item annotated with diff_op). Cache miss "
+      "surfaces as diff_baseline_missing=true and the full array.",
       obj({{"target_id", target_id_param()}}, {"target_id"}),
 with_defs(      obj({{"modules", arr_of(ref("Module"))}}, {"modules"}),
           {{"Module", module_def()}}),
@@ -1263,7 +1307,10 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
   // ============== thread.* / frame.* / value.* ==============
 
   add("thread.list",
-      "Enumerate threads of the target's process.",
+      "Enumerate threads of the target's process. Supports "
+      "view.diff_against in the same way as module.list — pass a "
+      "prior _provenance.snapshot to receive only added/removed "
+      "thread entries.",
       obj({{"target_id", target_id_param()}}, {"target_id"}),
 with_defs(      obj({{"threads", arr_of(ref("Thread"))}}, {"threads"}),
           {{"Thread", thread_info_def()}}),
@@ -2660,8 +2707,32 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
 
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "modules"));
+  // Post-V1 plan #5 — diff against a prior snapshot's cached array.
+  std::string snapshot = backend_->snapshot_for_target(
+      static_cast<backend::TargetId>(tid));
+  bool diff_applied = false;
+  bool baseline_missing = false;
+  if (!snapshot.empty()) {
+    diff_cache_put(diff_cache_key("module.list", req.params, snapshot), arr);
+  }
+  if (view_spec.diff_against.has_value()) {
+    diff_applied = true;
+    auto baseline = diff_cache_get(diff_cache_key("module.list", req.params,
+                                                  *view_spec.diff_against));
+    if (baseline.has_value()) {
+      arr = protocol::view::compute_diff(*baseline, arr);
+    } else {
+      baseline_missing = true;
+    }
+  }
+
+  json data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                             "modules");
+  if (diff_applied) {
+    data["diff_against"] = *view_spec.diff_against;
+    data["diff_baseline_missing"] = baseline_missing;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_thread_list(const Request& req) {
@@ -2674,8 +2745,32 @@ Response Dispatcher::handle_thread_list(const Request& req) {
   auto threads = backend_->list_threads(static_cast<backend::TargetId>(tid));
   json arr = json::array();
   for (const auto& t : threads) arr.push_back(thread_info_to_json(t));
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "threads"));
+
+  std::string snapshot = backend_->snapshot_for_target(
+      static_cast<backend::TargetId>(tid));
+  bool diff_applied = false;
+  bool baseline_missing = false;
+  if (!snapshot.empty()) {
+    diff_cache_put(diff_cache_key("thread.list", req.params, snapshot), arr);
+  }
+  if (view_spec.diff_against.has_value()) {
+    diff_applied = true;
+    auto baseline = diff_cache_get(diff_cache_key("thread.list", req.params,
+                                                  *view_spec.diff_against));
+    if (baseline.has_value()) {
+      arr = protocol::view::compute_diff(*baseline, arr);
+    } else {
+      baseline_missing = true;
+    }
+  }
+
+  json data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                             "threads");
+  if (diff_applied) {
+    data["diff_against"] = *view_spec.diff_against;
+    data["diff_baseline_missing"] = baseline_missing;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_thread_frames(const Request& req) {

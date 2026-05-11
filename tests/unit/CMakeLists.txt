@@ -13,6 +13,7 @@ set(LDB_UNIT_SOURCES
   test_protocol_cost.cpp
   test_protocol_cbor.cpp
   test_protocol_view.cpp
+  test_view_diff.cpp
   test_backend_type_layout.cpp
   test_backend_symbol_find.cpp
   test_backend_symbol_find_demangle.cpp
