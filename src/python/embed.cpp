@@ -168,7 +168,19 @@ PyRef json_to_py(const nlohmann::json& v, int depth) {
     if (v.get<bool>()) { Py_INCREF(Py_True); return PyRef(Py_True); }
     Py_INCREF(Py_False); return PyRef(Py_False);
   }
-  if (v.is_number_integer() || v.is_number_unsigned()) {
+  if (v.is_number_unsigned()) {
+    // Branch separately: nlohmann::json's get<int64_t> raises type_error
+    // for unsigned values > INT64_MAX, and that exception is not a
+    // backend::Error — it would escape invoke() uncaught.
+    auto u = v.get<std::uint64_t>();
+    if (u > static_cast<std::uint64_t>(
+                std::numeric_limits<long long>::max())) {
+      throw backend::Error(
+          "python: unsigned integer out of int64 range");
+    }
+    return PyRef(PyLong_FromLongLong(static_cast<long long>(u)));
+  }
+  if (v.is_number_integer()) {
     return PyRef(PyLong_FromLongLong(
         static_cast<long long>(v.get<std::int64_t>())));
   }
@@ -448,12 +460,27 @@ Callable::Callable(std::string_view module_source, std::string_view origin)
   if (!module_dict) throw backend::Error("python: PyDict_New failed");
   // PyEval_EvalCode needs __builtins__ in the globals dict, otherwise
   // every name lookup fails. Borrow the main builtins.
+  // PyEval_GetBuiltins() was deprecated in 3.13 in favour of
+  // PyEval_GetFrameBuiltins(); guard so a 3.13 strict-warnings build
+  // doesn't fail. Both return a borrowed reference to the same dict
+  // when called from the main frame.
+#if PY_VERSION_HEX >= 0x030d0000
+  PyObject* builtins = PyEval_GetFrameBuiltins();
+#else
   PyObject* builtins = PyEval_GetBuiltins();
+#endif
   if (builtins) {
     PyDict_SetItemString(module_dict.get(), "__builtins__", builtins);
   }
-  PyDict_SetItemString(module_dict.get(), "__name__",
-                       PyUnicode_FromString("<recipe>"));
+  // PyDict_SetItemString does NOT steal the value reference. The newly
+  // created unicode would leak otherwise — every Callable constructed
+  // would accumulate one PyObject. Wrap so the destructor cleans up
+  // after the dict has taken its own reference.
+  {
+    PyRef name(PyUnicode_FromString("<recipe>"));
+    if (!name) throw backend::Error("python: PyUnicode_FromString failed");
+    PyDict_SetItemString(module_dict.get(), "__name__", name.get());
+  }
 
   PyRef result(PyEval_EvalCode(code.get(), module_dict.get(),
                                 module_dict.get()));

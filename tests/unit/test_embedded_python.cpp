@@ -203,4 +203,23 @@ TEST_CASE("embedded_python: bytes return is an explicit error",
   }
 }
 
+TEST_CASE("embedded_python: unsigned int > INT64_MAX raises backend::Error",
+          "[python][embed][types]") {
+  // nlohmann::json stores unsigned values whose magnitude exceeds
+  // INT64_MAX in its uint slot. Routing those through get<int64_t>()
+  // raises json::type_error — which is NOT a backend::Error subclass
+  // and would escape invoke() uncaught. The fix branches on
+  // is_number_unsigned() and rejects out-of-range with a typed error.
+  Callable c(kEchoBody, "<test>");
+  json big;
+  big["v"] = std::uint64_t{0xffffffffffffffffULL};  // 2^64 - 1
+  try {
+    (void)c.invoke(big);
+    FAIL("expected backend::Error for u64 > INT64_MAX");
+  } catch (const ldb::backend::Error& e) {
+    std::string what = e.what();
+    REQUIRE(what.find("int64 range") != std::string::npos);
+  }
+}
+
 #endif  // LDB_ENABLE_PYTHON

@@ -202,8 +202,16 @@ JSON-RPC response (mapped through dispatcher to the `data` field of the
 }
 ```
 
-`SyntaxError` from `recipe.lint` (compile step) carries the line/column
-fields the standard module already exposes:
+`SyntaxError` from `recipe.lint` (compile step) currently surfaces the
+same shape as runtime exceptions — the wrapper captures `exception_type`
+("SyntaxError"), the message, and a synthesised one-line traceback.
+Structured `lineno` / `offset` / `text` fields are **deferred**: they
+require extracting `SyntaxError.lineno` / `.offset` / `.text` attributes
+from the value object before normalisation, which is a small additive
+change but adds shape that no caller consumes yet. Phase-2 will land it
+together with the first `recipe.lint` smoke that exercises malformed
+Python. Until then `data` carries the same three fields as any other
+Python exception:
 
 ```jsonc
 {
@@ -211,10 +219,8 @@ fields the standard module already exposes:
   "message": "python: SyntaxError: invalid syntax",
   "data": {
     "exception_type": "SyntaxError",
-    "lineno": 3,
-    "offset": 7,
-    "text": "  retrn ctx\n",
-    "traceback": "..."
+    "message": "invalid syntax",
+    "traceback": "SyntaxError: invalid syntax"
   }
 }
 ```
