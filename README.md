@@ -20,14 +20,17 @@ graph that survives across sessions.
 
 ## Status
 
-**Pre-V1 hardening.** The tagged `v0.1.0` cut is the MVP baseline; current
-`master` is closing the operational V1 gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md).
+**V1 released.** `v1.0.0` closed all release gates tracked in
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md); `v1.1.0` is the current
+tag and folds in dogfood fixes from a real reverse-engineering pass
+(qualified C++ symbol lookup, DWARF `byte_size` warnings on `type.layout`,
+`address` alias on disassembled instructions). No breaking wire changes
+since v1.0.0.
 
 | | |
 |---|---|
-| **Validation** | Default `ctest` suite plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
-| **Endpoints** | 65 across target / process / thread / frame / value / memory / probe / observer / session / artifact |
+| **Validation** | Default `ctest` suite (52 tests) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
+| **Endpoints** | 82 across target / process / thread / frame / value / memory / probe / observer / session / artifact / recipe / correlate |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
 | **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
@@ -70,14 +73,16 @@ plus `lldb-server platform` — no LDB-specific code on the target.
 
 | Surface | Endpoints | Replaces |
 |---|---|---|
-| **Static analysis** | `target.open`, `module.list`, `type.layout`, `type.find`, `symbol.find`, `string.list`, `string.xref`, `disasm.range`, `disasm.function`, `xref.addr` | `pahole`, `nm`, `readelf`, `strings`, `objdump` |
+| **Static analysis** | `target.open`, `target.close`, `target.list`, `target.label`, `module.list`, `type.layout`, `symbol.find`, `string.list`, `string.xref`, `disasm.range`, `disasm.function`, `xref.addr`, `static.globals_of_type` | `pahole`, `nm`, `readelf`, `strings`, `objdump` |
+| **Cross-target correlation** | `correlate.types`, `correlate.symbols`, `correlate.strings` | hand-rolled diffing between two binaries / cores |
 | **Process control** | `target.attach`, `target.connect_remote`, `target.connect_remote_ssh`, `target.load_core`, `target.create_empty`, `process.launch`, `process.state`, `process.continue`, `process.kill`, `process.detach`, `process.save_core`, `process.step` | `gdb`, `lldb` |
-| **Thread / frame / value** | `thread.list`, `thread.frames`, `frame.locals`, `frame.args`, `frame.registers`, `value.eval`, `value.read` | `gdb` `bt`/`info`/`print`, `lldb` `frame` family |
+| **Thread / frame / value** | `thread.list`, `thread.frames`, `thread.continue`, `frame.locals`, `frame.args`, `frame.registers`, `value.eval`, `value.read` | `gdb` `bt`/`info`/`print`, `lldb` `frame` family |
 | **Memory** | `mem.read`, `mem.read_cstr`, `mem.regions`, `mem.search`, `mem.dump_artifact` | `gdb` `x`/`find`, `/proc/<pid>/mem` scraping |
 | **Probes** | `probe.create` (kind: `lldb_breakpoint` or `uprobe_bpf`), `probe.events`, `probe.list`, `probe.enable`, `probe.disable`, `probe.delete` | `strace`, `bpftrace`, hand-rolled tracepoints |
 | **Typed observers** | `observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets`, `observer.net.tcpdump`, `observer.net.igmp`, `observer.exec` (allowlisted) | `lsof`, `ss`, `tcpdump`, `cat /proc/...`, `run_host_command` |
-| **Sessions** | `session.create`, `session.attach`, `session.detach`, `session.list`, `session.info`, `session.export`, `session.import` | sqlite-backed RPC log; `.ldbpack` portable bundles |
-| **Artifacts** | `artifact.put`, `artifact.get`, `artifact.list`, `artifact.tag`, `artifact.export`, `artifact.import` | build-ID-keyed store, queryable across sessions |
+| **Sessions** | `session.create`, `session.attach`, `session.detach`, `session.list`, `session.info`, `session.diff`, `session.targets`, `session.export`, `session.import` | sqlite-backed RPC log; `.ldbpack` portable bundles |
+| **Artifacts** | `artifact.put`, `artifact.get`, `artifact.list`, `artifact.tag`, `artifact.delete`, `artifact.relate`, `artifact.relations`, `artifact.unrelate`, `artifact.export`, `artifact.import` | build-ID-keyed store with typed relations, queryable across sessions |
+| **Recipes** | `recipe.create`, `recipe.from_session`, `recipe.list`, `recipe.get`, `recipe.run`, `recipe.delete`, `recipe.lint` | parametric replayable RPC scripts captured from sessions |
 
 Every endpoint accepts a `view` descriptor (`fields`/`limit`/`offset`/`summary`)
 for token-budget control. Every successful response carries `_cost: {bytes,
@@ -264,7 +269,7 @@ Responses:
 ```
 
 Errors carry a typed `error.code` from a fixed enum so an agent can match on
-code rather than prose. Codes used in the MVP:
+code rather than prose. Codes in the V1 surface:
 
 | Code | Meaning |
 |---|---|
@@ -329,8 +334,8 @@ docs/                Design docs and engineering worklog
 |---|---|
 | [`docs/00-README.md`](docs/00-README.md) | Architecture overview, design decisions, reading order |
 | [`docs/01-gdb-core-methodology.md`](docs/01-gdb-core-methodology.md) | Analysis of GDB 17.1's architecture — foundational reading |
-| [`docs/02-ldb-mvp-plan.md`](docs/02-ldb-mvp-plan.md) | MVP plan: protocol spec, RPC surface, milestones, reference workflow |
-| [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md) | Post-MVP trajectory: progressive replacement of LLDB components |
+| [`docs/02-ldb-mvp-plan.md`](docs/02-ldb-mvp-plan.md) | V1 plan: protocol spec, RPC surface, milestones, reference workflow |
+| [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md) | Post-V1 trajectory: progressive replacement of LLDB components |
 | [`docs/06-ci.md`](docs/06-ci.md) | What CI runs, what SKIPs on the runner, how to reproduce locally |
 | [`docs/07-dap-shim.md`](docs/07-dap-shim.md) | `ldb-dap` Debug Adapter Protocol shim — supported requests, capabilities, VS Code launch.json example |
 | [`docs/13-v1-readiness.md`](docs/13-v1-readiness.md) | V1 release gates, supported matrix, validation commands, and known limitations |
@@ -366,10 +371,10 @@ See [`CLAUDE.md`](CLAUDE.md) for the full workflow rules.
 
 ---
 
-## Out of scope (post-v0.1)
+## Out of scope (post-v1.x)
 
 The cores-only provenance scope was a deliberate decision; live-process
-provenance is the largest deferred item and is tracked as a major post-MVP
+provenance is the largest deferred item and is tracked as a major post-V1
 milestone in [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md).
 Other deferrals:
 
@@ -383,7 +388,7 @@ Other deferrals:
   doesn't quietly leak LLDB-isms.
 - **Embedded Python for user-authored probe callbacks** — current probes
   are C++-only.
-- **CLI: interactive REPL, ssh-remote daemon mode, session diff.**
+- **CLI: interactive REPL, ssh-remote daemon mode.**
 
 ---
 
