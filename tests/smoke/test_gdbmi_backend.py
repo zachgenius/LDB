@@ -141,7 +141,8 @@ def main():
         # representatives that are still stubbed (per docs/18):
         for method, params in [
             ("type.layout", {"target_id": target_id, "name": "point2"}),
-            ("mem.regions", {"target_id": target_id}),
+            ("frame.locals",
+             {"target_id": target_id, "tid": 1, "frame": 0}),
         ]:
             r_unimpl = call(method, params)
             expect(not r_unimpl["ok"],

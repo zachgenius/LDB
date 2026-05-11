@@ -945,24 +945,175 @@ std::uint64_t GdbMiBackend::read_register(TargetId, ThreadId,
   todo("read_register");
 }
 
-// ── Memory (stubbed) ──────────────────────────────────────────────────
+// ── Memory ────────────────────────────────────────────────────────────
+
+namespace {
+
+// Decode a hex byte string (e.g. "f30f1efa") into bytes. Stops at
+// odd-length / non-hex-char gracefully.
+std::vector<std::uint8_t> hex_decode(std::string_view s) {
+  std::vector<std::uint8_t> out;
+  out.reserve(s.size() / 2);
+  auto val = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+  };
+  for (std::size_t i = 0; i + 1 < s.size(); i += 2) {
+    int hi = val(s[i]);
+    int lo = val(s[i + 1]);
+    if (hi < 0 || lo < 0) break;
+    out.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
+  }
+  return out;
+}
+
+}  // namespace
 
 std::vector<std::uint8_t>
-GdbMiBackend::read_memory(TargetId, std::uint64_t, std::uint64_t) {
-  todo("read_memory");
+GdbMiBackend::read_memory(TargetId tid, std::uint64_t addr,
+                            std::uint64_t size) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<std::uint8_t> out;
+  if (size == 0) return out;
+  char buf[96];
+  std::snprintf(buf, sizeof(buf),
+                "-data-read-memory-bytes 0x%llx %llu",
+                static_cast<unsigned long long>(addr),
+                static_cast<unsigned long long>(size));
+  auto rec = send_or_throw(*st.session, buf);
+  if (!rec.payload.is_tuple()) return out;
+  auto it = rec.payload.as_tuple().find("memory");
+  if (it == rec.payload.as_tuple().end() || !it->second.is_list()) return out;
+  for (const auto& chunk_v : it->second.as_list()) {
+    if (!chunk_v.is_tuple()) continue;
+    auto cit = chunk_v.as_tuple().find("contents");
+    if (cit == chunk_v.as_tuple().end() || !cit->second.is_string()) continue;
+    auto decoded = hex_decode(cit->second.as_string());
+    out.insert(out.end(), decoded.begin(), decoded.end());
+  }
+  return out;
 }
-std::string
-GdbMiBackend::read_cstring(TargetId, std::uint64_t, std::uint32_t) {
-  todo("read_cstring");
+
+std::string GdbMiBackend::read_cstring(TargetId tid, std::uint64_t addr,
+                                          std::uint32_t max_len) {
+  if (max_len == 0) max_len = 4096;
+  auto bytes = read_memory(tid, addr, max_len);
+  std::string out;
+  out.reserve(bytes.size());
+  for (auto b : bytes) {
+    if (b == 0) break;
+    out.push_back(static_cast<char>(b));
+  }
+  return out;
 }
-std::vector<MemoryRegion> GdbMiBackend::list_regions(TargetId) {
-  todo("list_regions");
+
+std::vector<MemoryRegion> GdbMiBackend::list_regions(TargetId tid) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<MemoryRegion> out;
+  if (st.last_status.state == ProcessState::kNone) return out;
+  // No MI verb for mappings — `info proc mappings` CLI fall-through.
+  // Output is space-padded human text; parser extracts start/end/
+  // perms/objfile per line. Linux-only in v1.4 (gdb-on-macOS produces
+  // different output).
+  st.session->drain_async();
+  auto r = st.session->send_command("info proc mappings");
+  if (!r.has_value() || r->klass != "done") return out;
+  std::string text;
+  for (const auto& rec : st.session->drain_async()) {
+    if (rec.kind == MiRecordKind::kConsoleStream) text += rec.stream_text;
+  }
+  // Each row: "  0xSTART  0xEND  size  offset  perms  objfile"
+  // We split on whitespace and accept rows with >= 5 columns.
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    auto nl = text.find('\n', pos);
+    std::string line = (nl == std::string::npos)
+                         ? text.substr(pos) : text.substr(pos, nl - pos);
+    if (nl == std::string::npos) pos = text.size();
+    else pos = nl + 1;
+
+    // Tokenize on whitespace.
+    std::vector<std::string> cols;
+    std::size_t i = 0;
+    while (i < line.size()) {
+      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+      if (i >= line.size()) break;
+      std::size_t j = i;
+      while (j < line.size() && line[j] != ' ' && line[j] != '\t') ++j;
+      cols.push_back(line.substr(i, j - i));
+      i = j;
+    }
+    if (cols.size() < 5) continue;
+    if (cols[0].size() < 2 || cols[0][0] != '0' || cols[0][1] != 'x') continue;
+    MemoryRegion r2;
+    r2.base    = parse_hex_addr(cols[0]);
+    auto end   = parse_hex_addr(cols[1]);
+    r2.size    = (end > r2.base) ? (end - r2.base) : 0;
+    // cols[4] is the perms string ("rwxp" or similar).
+    const std::string& p = cols[4];
+    r2.readable   = p.find('r') != std::string::npos;
+    r2.writable   = p.find('w') != std::string::npos;
+    r2.executable = p.find('x') != std::string::npos;
+    if (cols.size() > 5) {
+      std::string nm = cols[5];
+      for (std::size_t k = 6; k < cols.size(); ++k) {
+        nm += " " + cols[k];
+      }
+      r2.name = std::move(nm);
+    }
+    out.push_back(std::move(r2));
+  }
+  return out;
 }
+
 std::vector<MemorySearchHit>
-GdbMiBackend::search_memory(TargetId, std::uint64_t, std::uint64_t,
-                              const std::vector<std::uint8_t>&,
-                              std::uint32_t) {
-  todo("search_memory");
+GdbMiBackend::search_memory(TargetId tid, std::uint64_t lo,
+                              std::uint64_t hi,
+                              const std::vector<std::uint8_t>& needle,
+                              std::uint32_t max_hits) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<MemorySearchHit> out;
+  if (needle.empty()) return out;
+  // gdb's `find /b ADDR_LO, +SIZE, b0, b1, ...` byte-mode search.
+  // We do it as CLI fall-through since MI has no equivalent.
+  std::string cmd = "find /b ";
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "0x%llx, 0x%llx",
+                static_cast<unsigned long long>(lo),
+                static_cast<unsigned long long>(hi));
+  cmd += buf;
+  for (auto b : needle) {
+    std::snprintf(buf, sizeof(buf), ", 0x%02x", b);
+    cmd += buf;
+  }
+  st.session->drain_async();
+  auto rec = st.session->send_command(cmd);
+  if (!rec.has_value() || rec->klass != "done") return out;
+  std::string text;
+  for (const auto& r : st.session->drain_async()) {
+    if (r.kind == MiRecordKind::kConsoleStream) text += r.stream_text;
+  }
+  // Each hit line is "0xADDR".
+  std::size_t pos = 0;
+  while (pos < text.size() && out.size() < max_hits) {
+    auto open = text.find("0x", pos);
+    if (open == std::string::npos) break;
+    std::uint64_t a = parse_hex_addr(std::string_view(text).substr(open));
+    if (a >= lo && a < hi) {
+      MemorySearchHit h;
+      h.address = a;
+      out.push_back(std::move(h));
+    }
+    pos = open + 2;
+    // Skip the hex digits we just parsed.
+    while (pos < text.size() &&
+           ((text[pos] >= '0' && text[pos] <= '9') ||
+            (text[pos] >= 'a' && text[pos] <= 'f') ||
+            (text[pos] >= 'A' && text[pos] <= 'F'))) ++pos;
+  }
+  return out;
 }
 
 // ── Breakpoints (stubbed) ─────────────────────────────────────────────
