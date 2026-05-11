@@ -131,3 +131,57 @@ TEST_CASE("reverse_step_thread(kInsn): live rr round-trip succeeds",
   std::filesystem::remove_all(trace_root, ec);
   ::unsetenv("_RR_TRACE_DIR");
 }
+
+TEST_CASE("reverse_step_thread(kIn / kOver / kOut): live rr round-trip succeeds",
+          "[backend][reverse][rr][live][requires_rr]") {
+  // v1.3 carve-out from docs/16-reverse-exec.md §"Reverse-step-
+  // over/into". The kinds are implemented via a bounded `bs` loop
+  // with source-line + frame-depth termination. /bin/true is too
+  // short to verify deep semantic correctness, but we can still
+  // confirm: the backend accepts each kind, drives the rr packet
+  // path without throwing, and returns a non-invalid post-state.
+  auto rr_bin = find_rr_for_test();
+  if (rr_bin.empty()) {
+    SKIP("rr not installed — live reverse-step kinds test cannot run");
+  }
+
+  int kind_idx = 0;
+  for (auto kind : {ReverseStepKind::kIn, ReverseStepKind::kOver,
+                    ReverseStepKind::kOut}) {
+    ++kind_idx;
+    std::string trace_root =
+        std::filesystem::temp_directory_path().string() +
+        "/ldb-rr-revs-k-" + std::to_string(::getpid()) + "-" +
+        std::to_string(kind_idx);
+    std::string trace_dir = trace_root + "/true-0";
+    if (!record_minimal_trace(rr_bin, trace_root, trace_dir)) {
+      SKIP("rr record /bin/true failed — cannot exercise reverse-step");
+    }
+
+    auto be = std::make_unique<LldbBackend>();
+    auto open = be->create_empty_target();
+    REQUIRE(open.target_id != 0);
+
+    std::string url = "rr://" + trace_dir;
+    auto status = be->connect_remote_target(open.target_id, url, "");
+    REQUIRE(status.state == ProcessState::kStopped);
+
+    auto threads = be->list_threads(open.target_id);
+    REQUIRE_FALSE(threads.empty());
+    auto tid = threads[0].tid;
+
+    ldb::backend::ProcessStatus after;
+    try {
+      after = be->reverse_step_thread(open.target_id, tid, kind);
+    } catch (const ldb::backend::Error& e) {
+      FAIL("reverse_step_thread(kind=" << kind_idx << ") threw: "
+           << e.what());
+    }
+    CHECK(after.state != ProcessState::kInvalid);
+
+    be->close_target(open.target_id);
+    std::error_code ec;
+    std::filesystem::remove_all(trace_root, ec);
+  }
+  ::unsetenv("_RR_TRACE_DIR");
+}

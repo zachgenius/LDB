@@ -21,26 +21,40 @@ graph that survives across sessions.
 ## Status
 
 **V1 released.** `v1.0.0` closed all release gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.2.0` is the
-current tag and adds:
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.3.0` is the
+current tag — an agent-UX polish release on top of v1.2.0's signing
++ reverse-exec foundations:
 
-- `.ldbpack` ed25519 signing (`session.export` / `artifact.export`
-  accept `sign_key`; import-side `trust_root` + `require_signed` —
-  see [docs/14-pack-signing.md](docs/14-pack-signing.md)),
-- Reverse-execution endpoints over rr-backed targets
-  (`process.reverse_continue`, `process.reverse_step`,
-  `thread.reverse_step`, `kind=insn` only —
-  see [docs/16-reverse-exec.md](docs/16-reverse-exec.md)),
-- Dogfood fixes from `v1.1.0` (qualified C++ symbol lookup, DWARF
-  `byte_size` warnings on `type.layout`, `address` alias on
-  disassembled instructions).
+- `recipe.reload` + `LDB_RECIPE_DIR` startup scan for hot-reloading
+  file-backed probe recipes;
+- `artifact.put format="hypothesis-v1"` + `artifact.hypothesis_template`
+  for structured belief tracking;
+- `view.diff_against=<snapshot>` on `module.list` / `thread.list`
+  (set-symmetric-difference against a cached baseline snapshot);
+- `process.reverse_step` / `thread.reverse_step` now accept
+  `kind=in/over/out` via client-side `bs`-loop emulation
+  (see [docs/16-reverse-exec.md](docs/16-reverse-exec.md));
+- `describe.endpoints` with `view.include_cost_stats=true` returns
+  measured `cost_p50_tokens` alongside the static `cost_hint`;
+- Token-budget regression CI gate (`tests/baselines/agent_workflow_tokens.json`)
+  locks `_cost.tokens_est` totals across a canonical RPC sequence,
+  fails on ±10% drift.
+
+Earlier additive features remain: `.ldbpack` ed25519 signing
+([docs/14](docs/14-pack-signing.md)), reverse-execution endpoints
+([docs/16](docs/16-reverse-exec.md)), and the dogfood fixes from
+v1.1.0 (qualified C++ symbol lookup, DWARF `byte_size` warnings,
+`address` alias on disassembled instructions).
 
 No breaking wire changes since v1.0.0; everything since is additive.
+See [docs/17-version-plan.md](docs/17-version-plan.md) for the full
+v1.3 / v1.4 / v1.5 bundling and [docs/15-post-v1-plan.md](docs/15-post-v1-plan.md)
+for the item-level catalog.
 
 | | |
 |---|---|
-| **Validation** | Default `ctest` suite (53 tests) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
-| **Endpoints** | 85 across target / process / thread / frame / value / memory / probe / observer / session / artifact / recipe / correlate |
+| **Validation** | Default `ctest` suite (58 tests) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
+| **Endpoints** | 87 across target / process / thread / frame / value / memory / probe / observer / session / artifact / recipe / correlate |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
 | **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
@@ -306,7 +320,7 @@ These are acceptable in the planned V1 cut and are part of the public contract:
 - Capstone is opt-in and affects only `disasm.range` and `disasm.function`.
 - `xref.addr` and `string.xref` intentionally keep LLDB disassembly/comment semantics.
 - True async/non-stop runtime is deferred; the per-thread protocol surface is present but sync-backed.
-- Reverse execution is supported only against rr-backed targets (reached via `target.connect_remote rr://`); `process.reverse_step` / `thread.reverse_step` accept `kind=insn` only in v0.3, with `in`/`over`/`out` reserved-but-rejected pending client-side step-over emulation (see [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md)).
+- Reverse execution is supported only against rr-backed targets (reached via `target.connect_remote rr://`); `process.reverse_step` / `thread.reverse_step` accept all four kinds (`in`/`over`/`out`/`insn`) — `in`/`over`/`out` use a bounded `bs`-loop emulation with source-line + frame-depth termination ([`docs/16-reverse-exec.md`](docs/16-reverse-exec.md) §"Reverse-step-over/into").
 - Linux-only observers and BPF/tcpdump paths SKIP on macOS or unprivileged runners.
 - macOS local-process tests depend on Apple's signed `debugserver`.
 
@@ -399,17 +413,13 @@ Other deferrals:
 
 - **Live-process provenance** — resume-counter + register-hash snapshot
   model + per-endpoint determinism audit. Unblocks `session.fork` and
-  `session.replay` against live targets.
+  `session.replay` against live targets. Scheduled for v1.5.
 - **`session.fork` / `session.replay`** — depend on live provenance.
-- **Reverse-step `kind=in`/`over`/`out`** — `process.reverse_step` /
-  `thread.reverse_step` ship today with `kind=insn` only (RSP `bs`
-  packet). The source-line variants need client-side step-over
-  emulation; sketch in [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md).
 - **GDB/MI second backend** — proves the `DebuggerBackend` abstraction
-  doesn't quietly leak LLDB-isms.
+  doesn't quietly leak LLDB-isms. Scheduled for v1.4.
 - **Embedded Python for user-authored probe callbacks** — current probes
-  are C++-only.
-- **CLI: interactive REPL, ssh-remote daemon mode.**
+  are C++-only. Scheduled for v1.4.
+- **CLI: interactive REPL, ssh-remote daemon mode.** Scheduled for v1.4.
 
 See [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) for the full
 tiered breakdown of post-V1 work with dependencies and execution order.

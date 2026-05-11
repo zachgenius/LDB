@@ -4,8 +4,14 @@
 #include "protocol/jsonrpc.h"
 #include "store/session_store.h"
 
+#include <nlohmann/json.hpp>
+
+#include <cstddef>
+#include <list>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace ldb::backend { class DebuggerBackend; }
 namespace ldb::store   { class ArtifactStore; }
@@ -48,6 +54,52 @@ class Dispatcher {
   // dispatch result is appended to the session's rpc_log.
   std::unique_ptr<store::SessionStore::Writer> active_session_writer_;
   std::string active_session_id_;  // for info / debug
+
+  // Diff-cache for post-V1 plan #5 (view.diff_against). Stores the
+  // most recent N array responses keyed by (method, params-canonical,
+  // snapshot). Endpoints that opt in record their array under the
+  // current snapshot before slicing/projection; when a subsequent
+  // call carries view.diff_against=<prior_snapshot>, the dispatcher
+  // looks up the prior items and emits the set-symmetric-difference
+  // instead of the full array. LRU-bounded so long-running sessions
+  // don't grow without limit; cache misses surface as a
+  // diff_baseline_missing flag in the response.
+  struct DiffCacheEntry {
+    std::string    cache_key;
+    nlohmann::json items;
+  };
+  static constexpr std::size_t kDiffCacheCapacity = 64;
+  std::list<DiffCacheEntry> diff_cache_;     // MRU at front
+  std::unordered_map<std::string, std::list<DiffCacheEntry>::iterator>
+      diff_cache_index_;
+  void                diff_cache_put(std::string key, nlohmann::json items);
+  std::optional<nlohmann::json>
+                       diff_cache_get(const std::string& key);
+  // Build a canonical key for the (method, params, snapshot) tuple.
+  // The "view" sub-object is excluded from params hashing so that
+  // changing pagination doesn't invalidate the cached baseline.
+  static std::string  diff_cache_key(const std::string& method,
+                                     const nlohmann::json& params,
+                                     const std::string& snapshot);
+
+  // Cost samples for post-V1 plan #4 (measured cost preview). Per
+  // endpoint we accumulate a bounded ring of the most recent N
+  // _cost.tokens_est observations plus a running total count.
+  // describe.endpoints reads p50 from the ring and emits it alongside
+  // the static cost_hint, so agents can budget against measured
+  // numbers from the actual session rather than the original guess.
+  static constexpr std::size_t kCostRingCapacity = 100;
+  struct CostSampleRing {
+    std::vector<std::uint64_t> recent;   // ≤ kCostRingCapacity entries
+    std::size_t                next = 0; // write cursor (when full)
+    std::uint64_t              total = 0; // lifetime count, not just ring size
+  };
+  std::unordered_map<std::string, CostSampleRing> cost_samples_;
+  void                record_cost_sample(const std::string& method,
+                                          std::uint64_t tokens);
+  std::optional<std::uint64_t>
+                       cost_p50(const std::string& method) const;
+  std::uint64_t        cost_total(const std::string& method) const;
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
@@ -107,6 +159,8 @@ class Dispatcher {
   protocol::Response handle_mem_dump_artifact(const protocol::Request& req);
 
   protocol::Response handle_artifact_put(const protocol::Request& req);
+  protocol::Response handle_artifact_hypothesis_template(
+      const protocol::Request& req);
   protocol::Response handle_artifact_get(const protocol::Request& req);
   protocol::Response handle_artifact_list(const protocol::Request& req);
   protocol::Response handle_artifact_tag(const protocol::Request& req);
@@ -134,6 +188,7 @@ class Dispatcher {
   protocol::Response handle_recipe_run(const protocol::Request& req);
   protocol::Response handle_recipe_delete(const protocol::Request& req);
   protocol::Response handle_recipe_lint(const protocol::Request& req);
+  protocol::Response handle_recipe_reload(const protocol::Request& req);
 
   protocol::Response handle_probe_create(const protocol::Request& req);
   protocol::Response handle_probe_events(const protocol::Request& req);

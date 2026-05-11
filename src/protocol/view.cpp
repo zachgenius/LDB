@@ -68,6 +68,14 @@ Spec parse_from_params(const json& params) {
     out.summary = sit->get<bool>();
   }
 
+  if (auto dit = vit->find("diff_against");
+      dit != vit->end() && !dit->is_null()) {
+    if (!dit->is_string()) {
+      throw std::invalid_argument("'view.diff_against' must be a string");
+    }
+    out.diff_against = dit->get<std::string>();
+  }
+
   return out;
 }
 
@@ -132,6 +140,50 @@ json apply_to_array(json items, const Spec& spec, std::string_view items_key) {
   }
 
   out[std::string(items_key)] = std::move(sliced);
+  return out;
+}
+
+json compute_diff(const json& baseline, const json& current) {
+  json out = json::array();
+  if (!baseline.is_array() || !current.is_array()) {
+    // Defensively pass the full current set through as "added" when
+    // either side is malformed. The caller is responsible for guarding
+    // against this in practice — apply_to_array's contract already
+    // assumes array inputs.
+    if (current.is_array()) {
+      for (const auto& item : current) {
+        json ann = item;
+        ann["diff_op"] = "added";
+        out.push_back(std::move(ann));
+      }
+    }
+    return out;
+  }
+
+  // Whole-item JSON-bytes equality. nlohmann::json serializes
+  // deterministically (sorted keys) so two functionally-equal objects
+  // compare equal even when constructed in different orders.
+  auto contains = [](const json& arr, const json& probe) {
+    for (const auto& el : arr) {
+      if (el == probe) return true;
+    }
+    return false;
+  };
+
+  for (const auto& el : current) {
+    if (!contains(baseline, el)) {
+      json ann = el;
+      ann["diff_op"] = "added";
+      out.push_back(std::move(ann));
+    }
+  }
+  for (const auto& el : baseline) {
+    if (!contains(current, el)) {
+      json ann = el;
+      ann["diff_op"] = "removed";
+      out.push_back(std::move(ann));
+    }
+  }
   return out;
 }
 

@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "drift_tolerance": 0.1,
+  "note": "Per-platform baselines. Regenerate with LDB_UPDATE_BASELINE=1 on the target platform after an intentional wire-shape change. Linux ELF and macOS Mach-O expose different section detail through SBAPI, so module.list / target.open token counts diverge by ~20x between platforms — hence the split.",
+  "platforms": {
+    "Darwin-arm64": {
+      "total_tokens": 50137,
+      "per_method": {
+        "describe.endpoints": 5501,
+        "disasm.function": 700,
+        "hello": 43,
+        "module.list": 21903,
+        "string.list": 73,
+        "target.close": 4,
+        "target.open": 21913
+      }
+    },
+    "Linux-x86_64": {
+      "total_tokens": 8256,
+      "per_method": {
+        "describe.endpoints": 5501,
+        "disasm.function": 634,
+        "hello": 43,
+        "module.list": 999,
+        "string.list": 69,
+        "target.close": 4,
+        "target.open": 1006
+      }
+    }
+  }
+}

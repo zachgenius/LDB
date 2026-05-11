@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemon/dispatcher.h"
 
+#include <algorithm>
+
 #include "backend/debugger_backend.h"
 #include "daemon/describe_schema.h"
 #include "ldb/version.h"
+#include "protocol/cost.h"
 #include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
 #include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
+#include "store/hypothesis.h"
 #include "store/pack.h"
 #include "store/pack_signing.h"
 #include "store/recipe_store.h"
@@ -422,6 +426,79 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
 
 Dispatcher::~Dispatcher() = default;
 
+// ── DiffCache (post-V1 plan #5) ────────────────────────────────────────
+
+std::string Dispatcher::diff_cache_key(const std::string& method,
+                                       const json& params,
+                                       const std::string& snapshot) {
+  // Canonicalize params: drop "view" so pagination changes don't
+  // fragment the cache. nlohmann::json's default serialization sorts
+  // object keys, so the dump is stable regardless of insertion order.
+  json key_params = params.is_object() ? params : json::object();
+  if (key_params.contains("view")) key_params.erase("view");
+  return method + "|" + key_params.dump() + "|" + snapshot;
+}
+
+void Dispatcher::diff_cache_put(std::string key, json items) {
+  auto it = diff_cache_index_.find(key);
+  if (it != diff_cache_index_.end()) {
+    // Replace existing entry; move to MRU.
+    diff_cache_.erase(it->second);
+    diff_cache_index_.erase(it);
+  }
+  diff_cache_.push_front({std::move(key), std::move(items)});
+  diff_cache_index_[diff_cache_.front().cache_key] = diff_cache_.begin();
+
+  // Bound the cache. Evict from the back (least-recently-used).
+  while (diff_cache_.size() > kDiffCacheCapacity) {
+    diff_cache_index_.erase(diff_cache_.back().cache_key);
+    diff_cache_.pop_back();
+  }
+}
+
+std::optional<json>
+Dispatcher::diff_cache_get(const std::string& key) {
+  auto it = diff_cache_index_.find(key);
+  if (it == diff_cache_index_.end()) return std::nullopt;
+  // Touch: move to MRU.
+  diff_cache_.splice(diff_cache_.begin(), diff_cache_, it->second);
+  return diff_cache_.front().items;
+}
+
+// ── Cost-sample recorder (post-V1 plan #4) ─────────────────────────────
+
+void Dispatcher::record_cost_sample(const std::string& method,
+                                     std::uint64_t tokens) {
+  auto& ring = cost_samples_[method];
+  ++ring.total;
+  if (ring.recent.size() < kCostRingCapacity) {
+    ring.recent.push_back(tokens);
+  } else {
+    ring.recent[ring.next] = tokens;
+    ring.next = (ring.next + 1) % kCostRingCapacity;
+  }
+}
+
+std::optional<std::uint64_t>
+Dispatcher::cost_p50(const std::string& method) const {
+  auto it = cost_samples_.find(method);
+  if (it == cost_samples_.end() || it->second.recent.empty()) {
+    return std::nullopt;
+  }
+  // p50 = the lower of the two middle elements in a sorted copy. For
+  // odd-sized rings this is the median exactly; for even-sized rings
+  // we round down, which is the conservative direction for an agent's
+  // budget check (always slightly under-promise).
+  std::vector<std::uint64_t> sorted = it->second.recent;
+  std::sort(sorted.begin(), sorted.end());
+  return sorted[(sorted.size() - 1) / 2];
+}
+
+std::uint64_t Dispatcher::cost_total(const std::string& method) const {
+  auto it = cost_samples_.find(method);
+  return it == cost_samples_.end() ? 0u : it->second.total;
+}
+
 namespace {
 
 // Extract target_id from request params, when present and integer-typed.
@@ -465,6 +542,21 @@ Response Dispatcher::dispatch(const Request& req) {
   auto t0 = clock::now();
   Response resp = dispatch_inner(req);
   decorate_provenance(resp, backend_.get(), req);
+
+  // Post-V1 plan #4: record measured cost. We compute tokens_est
+  // here (the same formula serialize_response uses) so the recorder
+  // doesn't depend on the JSON-RPC serialization path. Errors don't
+  // carry _cost on the wire and aren't useful as budget signals;
+  // record only successful responses.
+  if (resp.ok && !req.method.empty()) {
+    json cost = protocol::cost::compute_cost(resp.data);
+    if (cost.contains("tokens_est") &&
+        (cost["tokens_est"].is_number_unsigned() ||
+         cost["tokens_est"].is_number_integer())) {
+      record_cost_sample(req.method,
+                         cost["tokens_est"].get<std::uint64_t>());
+    }
+  }
   if (active_session_writer_) {
     auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
                      clock::now() - t0).count();
@@ -566,6 +658,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "mem.dump_artifact")  return handle_mem_dump_artifact(req);
 
     if (req.method == "artifact.put")       return handle_artifact_put(req);
+    if (req.method == "artifact.hypothesis_template")
+      return handle_artifact_hypothesis_template(req);
     if (req.method == "artifact.get")       return handle_artifact_get(req);
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
@@ -593,6 +687,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "recipe.run")          return handle_recipe_run(req);
     if (req.method == "recipe.delete")       return handle_recipe_delete(req);
     if (req.method == "recipe.lint")         return handle_recipe_lint(req);
+    if (req.method == "recipe.reload")       return handle_recipe_reload(req);
 
     if (req.method == "probe.create")       return handle_probe_create(req);
     if (req.method == "probe.events")       return handle_probe_events(req);
@@ -686,6 +781,22 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   // shape can derive it locally from `properties` + `required`.
   using namespace ldb::daemon::schema;
 
+  // Post-V1 plan #4: measured cost is opt-in via view.include_cost_stats.
+  // The default response stays byte-deterministic (so session.diff /
+  // _provenance hashes stay clean across calls); agents who want the
+  // measured numbers ask for them explicitly. Token-budget baselines
+  // and the rest of the v1.0 schema are unaffected.
+  bool include_cost_stats = false;
+  if (req.params.is_object()) {
+    if (auto vit = req.params.find("view");
+        vit != req.params.end() && vit->is_object()) {
+      if (auto iit = vit->find("include_cost_stats");
+          iit != vit->end() && iit->is_boolean()) {
+        include_cost_stats = iit->get<bool>();
+      }
+    }
+  }
+
   json eps = json::array();
   auto add = [&](std::string name, const char* summary,
                  json params_schema, json returns_schema,
@@ -703,6 +814,16 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
     e["requires_target"]  = requires_target;
     e["requires_stopped"] = requires_stopped;
     e["cost_hint"]        = std::move(cost_hint);
+    if (include_cost_stats) {
+      // cost_n_samples is always present (zero when uncalled);
+      // cost_p50_tokens is absent when there are no samples so agents
+      // can distinguish "this endpoint is cheap" from "we have no
+      // data yet."
+      e["cost_n_samples"] = static_cast<std::int64_t>(cost_total(name));
+      if (auto p50 = cost_p50(name); p50.has_value()) {
+        e["cost_p50_tokens"] = *p50;
+      }
+    }
     eps.push_back(std::move(e));
   };
 
@@ -746,7 +867,10 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
 
   add("describe.endpoints",
       "List supported methods with their JSON Schema params/returns, "
-      "requires_target, requires_stopped, and cost_hint.",
+      "requires_target, requires_stopped, and cost_hint. Pass "
+      "view.include_cost_stats=true to also receive cost_n_samples + "
+      "cost_p50_tokens per entry (measured in-process; opt-in so the "
+      "default response stays byte-deterministic for session.diff).",
       obj({}),
       obj({{"endpoints", arr_of(obj_open(
           "Per-method record. See plan §4.8."))}}, {"endpoints"}),
@@ -902,7 +1026,12 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
 
   // ============== static analysis ==============
 
-  add("module.list", "Enumerate modules of a target.",
+  add("module.list",
+      "Enumerate modules of a target. Supports view.diff_against — pass "
+      "a prior response's _provenance.snapshot to receive only the "
+      "module entries added/removed since that snapshot (set-symmetric-"
+      "difference; each item annotated with diff_op). Cache miss "
+      "surfaces as diff_baseline_missing=true and the full array.",
       obj({{"target_id", target_id_param()}}, {"target_id"}),
 with_defs(      obj({{"modules", arr_of(ref("Module"))}}, {"modules"}),
           {{"Module", module_def()}}),
@@ -1259,7 +1388,10 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
   // ============== thread.* / frame.* / value.* ==============
 
   add("thread.list",
-      "Enumerate threads of the target's process.",
+      "Enumerate threads of the target's process. Supports "
+      "view.diff_against in the same way as module.list — pass a "
+      "prior _provenance.snapshot to receive only added/removed "
+      "thread entries.",
       obj({{"target_id", target_id_param()}}, {"target_id"}),
 with_defs(      obj({{"threads", arr_of(ref("Thread"))}}, {"threads"}),
           {{"Thread", thread_info_def()}}),
@@ -1457,7 +1589,12 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
 
   add("artifact.put",
       "Store a binary blob in the artifact store, keyed by "
-      "(build_id, name). bytes_b64 is base64-encoded.",
+      "(build_id, name). bytes_b64 is base64-encoded. format is a "
+      "caller-supplied content tag; a few formats trigger typed "
+      "validation: format=\"hypothesis-v1\" requires the bytes to "
+      "parse as a JSON envelope with a numeric `confidence` in [0..1] "
+      "and an `evidence_refs` array of artifact_id integers. Fetch "
+      "artifact.hypothesis_template() for a starter envelope.",
       obj({
           {"build_id",  str()},
           {"name",      str()},
@@ -1472,6 +1609,18 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"stored_path", str()},
       }, {"id", "sha256", "byte_size", "stored_path"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+  add("artifact.hypothesis_template",
+      "Return a JSON skeleton suitable as the body of a "
+      "hypothesis-v1 artifact. The template already validates; "
+      "agents fill in optional fields (statement, rationale, author) "
+      "and base64-encode it as artifact.put's bytes_b64. See "
+      "docs/18-hypothesis.md for the schema rationale.",
+      obj({}, {}),
+      obj({
+          {"template", obj_open("JSON envelope ready for artifact.put.")},
+      }, {"template"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("artifact.get",
       "Fetch an artifact by (build_id, name) or by id. Cap with "
@@ -2040,6 +2189,32 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
                 {"step_index", int_()},
                 {"message",    str()},
             }, {}))},
+        }, {"recipe_id", "warning_count", "warnings"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+    add("recipe.reload",
+        "Re-read a recipe from its source file on disk and replace the "
+        "store entry. Only valid for file-backed recipes — those imported "
+        "via create_from_file or via the LDB_RECIPE_DIR startup scan. "
+        "Recipes created in-band via recipe.create / recipe.from_session "
+        "have no source_path and reject reload with -32003 forbidden. "
+        "On a successful reload the artifact id changes (ArtifactStore's "
+        "(build_id, name) collision rule replaces with a fresh id); the "
+        "response surfaces both the new recipe_id and previous_recipe_id "
+        "so agents can refresh their handle. Lint warnings are returned "
+        "in the same shape as recipe.lint.",
+        obj({{"recipe_id", int_()}}, {"recipe_id"}),
+        obj({
+            {"recipe_id",          int_()},
+            {"previous_recipe_id", int_()},
+            {"name",               str()},
+            {"call_count",         int_()},
+            {"warning_count",      int_()},
+            {"warnings",           arr_of(obj({
+                {"step_index", int_()},
+                {"message",    str()},
+            }, {}))},
+            {"source_path",        str()},
         }, {"recipe_id", "warning_count", "warnings"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "low");
   }
@@ -2613,8 +2788,32 @@ Response Dispatcher::handle_module_list(const Request& req) {
   json arr = json::array();
   for (const auto& m : mods) arr.push_back(module_to_json(m));
 
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "modules"));
+  // Post-V1 plan #5 — diff against a prior snapshot's cached array.
+  std::string snapshot = backend_->snapshot_for_target(
+      static_cast<backend::TargetId>(tid));
+  bool diff_applied = false;
+  bool baseline_missing = false;
+  if (!snapshot.empty()) {
+    diff_cache_put(diff_cache_key("module.list", req.params, snapshot), arr);
+  }
+  if (view_spec.diff_against.has_value()) {
+    diff_applied = true;
+    auto baseline = diff_cache_get(diff_cache_key("module.list", req.params,
+                                                  *view_spec.diff_against));
+    if (baseline.has_value()) {
+      arr = protocol::view::compute_diff(*baseline, arr);
+    } else {
+      baseline_missing = true;
+    }
+  }
+
+  json data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                             "modules");
+  if (diff_applied) {
+    data["diff_against"] = *view_spec.diff_against;
+    data["diff_baseline_missing"] = baseline_missing;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_thread_list(const Request& req) {
@@ -2627,8 +2826,32 @@ Response Dispatcher::handle_thread_list(const Request& req) {
   auto threads = backend_->list_threads(static_cast<backend::TargetId>(tid));
   json arr = json::array();
   for (const auto& t : threads) arr.push_back(thread_info_to_json(t));
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "threads"));
+
+  std::string snapshot = backend_->snapshot_for_target(
+      static_cast<backend::TargetId>(tid));
+  bool diff_applied = false;
+  bool baseline_missing = false;
+  if (!snapshot.empty()) {
+    diff_cache_put(diff_cache_key("thread.list", req.params, snapshot), arr);
+  }
+  if (view_spec.diff_against.has_value()) {
+    diff_applied = true;
+    auto baseline = diff_cache_get(diff_cache_key("thread.list", req.params,
+                                                  *view_spec.diff_against));
+    if (baseline.has_value()) {
+      arr = protocol::view::compute_diff(*baseline, arr);
+    } else {
+      baseline_missing = true;
+    }
+  }
+
+  json data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                             "threads");
+  if (diff_applied) {
+    data["diff_against"] = *view_spec.diff_against;
+    data["diff_baseline_missing"] = baseline_missing;
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_thread_frames(const Request& req) {
@@ -3100,20 +3323,16 @@ Response Dispatcher::handle_process_step(const Request& req) {
 
 namespace {
 
-// Reverse-step kind parser. The wire accepts the same four strings as
-// forward step for symmetry, but v0.3 implements only `insn`. The other
-// three are accepted-and-rejected with -32602 to keep the schema stable
-// when client-side reverse-step-over/out lands. `*out` is only written
-// for `insn`.
+// Reverse-step kind parser. All four kinds are accepted by the
+// backend; "insn" is the RSP `bs` packet verbatim, "in"/"over"/"out"
+// use a bounded `bs` loop with source-line + frame-depth checks
+// (see LldbBackend::reverse_step_thread).
 bool parse_reverse_step_kind(const std::string& s,
-                             backend::ReverseStepKind* out,
-                             bool* deferred_known_kind) {
-  *deferred_known_kind = false;
+                             backend::ReverseStepKind* out) {
+  if (s == "in")   { *out = backend::ReverseStepKind::kIn;   return true; }
+  if (s == "over") { *out = backend::ReverseStepKind::kOver; return true; }
+  if (s == "out")  { *out = backend::ReverseStepKind::kOut;  return true; }
   if (s == "insn") { *out = backend::ReverseStepKind::kInsn; return true; }
-  if (s == "in" || s == "over" || s == "out") {
-    *deferred_known_kind = true;
-    return false;
-  }
   return false;
 }
 
@@ -3185,13 +3404,7 @@ Response handle_reverse_step_shared(
                               "missing string param 'kind'");
   }
   backend::ReverseStepKind kind;
-  bool deferred = false;
-  if (!parse_reverse_step_kind(*kind_str, &kind, &deferred)) {
-    if (deferred) {
-      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
-          "'kind' " + *kind_str + " is reserved but not yet implemented; "
-          "v0.3 supports kind=insn only (see docs/16-reverse-exec.md)");
-    }
+  if (!parse_reverse_step_kind(*kind_str, &kind)) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
         "'kind' must be one of: in, over, out, insn");
   }
@@ -3900,6 +4113,26 @@ Response Dispatcher::handle_artifact_put(const Request& req) {
     meta = *it;
   }
 
+  // Post-V1 plan #6: when the caller declares the hypothesis-v1 format,
+  // parse the bytes as JSON and validate the envelope. The artifact
+  // store accepts arbitrary blobs; the dispatcher is the layer that
+  // enforces typed formats so the store stays format-agnostic.
+  if (format.has_value() && *format == ldb::store::kHypothesisFormat) {
+    json env;
+    try {
+      env = json::parse(bytes->begin(), bytes->end());
+    } catch (const std::exception& e) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("hypothesis-v1 bytes must be valid JSON: ") +
+          e.what());
+    }
+    auto v = ldb::store::validate_hypothesis_envelope(env);
+    if (!v.ok) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("hypothesis-v1: ") + v.error);
+    }
+  }
+
   auto row = artifacts_->put(*build_id, *name, *bytes, std::move(format),
                               meta);
   json data;
@@ -3907,6 +4140,13 @@ Response Dispatcher::handle_artifact_put(const Request& req) {
   data["sha256"]      = row.sha256;
   data["byte_size"]   = row.byte_size;
   data["stored_path"] = row.stored_path;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_hypothesis_template(const Request& req) {
+  // Pure helper; no artifact store required, no params.
+  json data;
+  data["template"] = ldb::store::default_hypothesis_template();
   return protocol::make_ok(req.id, std::move(data));
 }
 
@@ -5087,6 +5327,10 @@ json recipe_to_summary_json(const ldb::store::Recipe& r) {
   if (r.description.has_value()) j["description"] = *r.description;
   j["call_count"] = static_cast<std::int64_t>(r.calls.size());
   j["created_at"] = r.created_at;
+  // source_path appears only on file-backed recipes; absence signals
+  // the recipe was created in-band (recipe.create / recipe.from_session)
+  // and cannot be reloaded.
+  if (r.source_path.has_value()) j["source_path"] = *r.source_path;
   return j;
 }
 
@@ -5422,6 +5666,75 @@ Response Dispatcher::handle_recipe_lint(const Request& req) {
   data["recipe_id"]    = id;
   data["warning_count"] = static_cast<int>(warnings.size());
   data["warnings"]     = std::move(warn_arr);
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_reload(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("recipe_id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'recipe_id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'recipe_id'");
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  ldb::store::Recipe reloaded;
+  try {
+    reloaded = rs.reload(id);
+  } catch (const ldb::backend::Error& e) {
+    const std::string what = e.what();
+    if (what.find("no source_path") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden, what);
+    }
+    if (what.find("not found") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+    }
+    if (what.find("no such file") != std::string::npos ||
+        what.find("cannot open") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kBadState, what);
+    }
+    if (what.find("malformed") != std::string::npos ||
+        what.find("missing top-level") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, what);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+  }
+
+  auto warnings = ldb::store::lint_recipe(reloaded);
+  json warn_arr = json::array();
+  for (const auto& w : warnings) {
+    warn_arr.push_back(json{{"step_index", w.step_index},
+                            {"message",    w.message}});
+  }
+  json data;
+  data["recipe_id"]     = reloaded.id;
+  data["name"]          = reloaded.name;
+  data["call_count"]    = static_cast<int>(reloaded.calls.size());
+  data["warning_count"] = static_cast<int>(warnings.size());
+  data["warnings"]      = std::move(warn_arr);
+  if (reloaded.source_path.has_value()) {
+    data["source_path"] = *reloaded.source_path;
+  }
+  // recipe.reload replaces by name → fresh artifact id. Surface the
+  // previous id explicitly so an agent holding `id` knows its handle
+  // is now stale.
+  if (reloaded.id != id) {
+    data["previous_recipe_id"] = id;
+  }
   return protocol::make_ok(req.id, std::move(data));
 }
 

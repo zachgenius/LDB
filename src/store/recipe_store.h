@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -78,6 +79,11 @@ struct Recipe {
   std::vector<RecipeParameter> parameters;
   std::vector<RecipeCall>      calls;
   std::int64_t                 created_at = 0;
+  // Absolute path to the JSON file backing this recipe, set on recipes
+  // imported via create_from_file() / load_from_directory(). Recipes
+  // created in-band via create() / from_session leave this nullopt.
+  // recipe.reload (post-V1 plan #3) requires source_path to be set.
+  std::optional<std::string>   source_path;
 };
 
 // Methods an extract-from-session pass strips — these are protocol
@@ -146,7 +152,47 @@ class RecipeStore {
                                              std::int64_t   created_at,
                                              const nlohmann::json& env);
 
+  // ── Post-V1 plan #3 — file-backed recipes ────────────────────────────
+  //
+  // create_from_file: parse a JSON file as a recipe envelope (same
+  // shape as envelope_from_recipe + a top-level "name" string) and
+  // insert via create(). Stores the absolute file path in artifact
+  // meta so reload() can find it. Throws backend::Error on a missing
+  // file, parse error, or "name" field absent.
+  Recipe create_from_file(const std::filesystem::path& path);
+
+  // reload: look up `id`, read source_path out of artifact meta,
+  // re-read the file, replace the store entry. Returns the new Recipe
+  // (with a fresh id per ArtifactStore::put collision semantics).
+  //
+  // Throws backend::Error with:
+  //   * "source_path"-mentioning message when the recipe wasn't
+  //     created_from_file (dispatcher maps to -32003).
+  //   * a filesystem error mentioning "no such file" / similar when
+  //     the source has vanished.
+  Recipe reload(std::int64_t id);
+
+  // load_from_directory: scan dir for *.json files (one level, no
+  // recursion), call create_from_file on each, accumulate results
+  // including per-file error messages. Malformed files do not block
+  // the scan — the caller decides whether to log or exit.
+  struct ScanResult {
+    std::filesystem::path             path;
+    std::optional<std::int64_t>       recipe_id;
+    std::string                       error;   // empty on success
+  };
+  std::vector<ScanResult>
+      load_from_directory(const std::filesystem::path& dir);
+
  private:
+  // Insertion variant used by create() / create_from_file(). Encodes
+  // the source_path into artifact meta when present.
+  Recipe create_with_source(std::string                  name,
+                            std::optional<std::string>   description,
+                            std::vector<RecipeParameter> parameters,
+                            std::vector<RecipeCall>      calls,
+                            std::optional<std::string>   source_path);
+
   ArtifactStore* store_;
 };
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ldb
-  VERSION 1.2.0
+  VERSION 1.3.0
   DESCRIPTION "LLM/Agent-first universal debugger"
   LANGUAGES CXX C
 )

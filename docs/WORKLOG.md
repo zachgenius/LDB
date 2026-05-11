@@ -4,6 +4,43 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-11 — v1.3 "Agent UX polish" push (all 6 items)
+
+**Goal:** Ship all of v1.3 in one branch per `docs/17-version-plan.md` — six Tier-1 polish items: #7 token-budget CI gate, #3 recipe.reload, #6 hypothesis artifact type, #5 diff-mode view descriptors, the kind=in/over/out reverse-step carve-out, and #4 measured cost preview.
+
+**Done (one commit per feature, all green on each):**
+- `babe79f` feat(token-budget): smoke_token_budget — deterministic RPC sequence (hello / target.open / module.list / string.list / disasm.function / describe.endpoints / target.close) whose summed `_cost.tokens_est` is pinned in `tests/baselines/agent_workflow_tokens.json`. ±10% gate; `LDB_UPDATE_BASELINE=1` regenerates. Locks the cost north-star before subsequent items move it.
+- `ce92ef8` feat(recipe.reload): new `recipe.reload({recipe_id})` endpoint + `LDB_RECIPE_DIR` startup scan. File-backed recipes get an absolute `source_path` recorded in artifact meta; reload re-reads the file, re-runs `recipe.lint`, replaces the entry. Store-only recipes (in-band `recipe.create`/`from_session`) reject reload with -32003. `RecipeStore::create_from_file` / `reload` / `load_from_directory` are the new surface; `Recipe.source_path` round-trips through meta.
+- `f0e5ea3` feat(artifact.hypothesis): `format="hypothesis-v1"` triggers JSON-envelope validation on `artifact.put` — required `confidence: [0..1]` + `evidence_refs: [artifact_id]`; free-form `statement` / `rationale` / `author`. New helper endpoint `artifact.hypothesis_template` returns a starter envelope that itself validates. Validator in `src/store/hypothesis.{h,cpp}` so ArtifactStore stays format-agnostic.
+- `fb1af81` feat(view.diff_against): `protocol::view::compute_diff(baseline, current)` (set-symmetric-difference, items annotated `diff_op="added|removed"`) + `Dispatcher::diff_cache_` (bounded LRU, capacity 64) keyed by `(method | canonical-params | snapshot)`. Wired on `module.list` and `thread.list` initially — other read-path endpoints silently ignore the field until they opt in. Cache miss surfaces `diff_baseline_missing: true` + full array.
+- `290e46d` feat(reverse-exec): `kind=in/over/out` shipped via bounded `bs`-loop emulation per `docs/16-reverse-exec.md` §"Reverse-step-over/into". kIn = bs until source-line change; kOver = bs until line change AND depth ≤ start; kOut = bs until depth < start. 256-iteration cap. Documented approximation pitfalls (inlined code, stripped binaries, tail calls). Dispatcher dropped the `deferred_known_kind` reject path.
+- `790719c` feat(describe.cost): per-method bounded ring (N=100) of `_cost.tokens_est` observations in `Dispatcher`, lifetime total tracked separately. `describe.endpoints` with `view.include_cost_stats=true` emits `cost_n_samples` (always) + `cost_p50_tokens` (absent when uncalled). **Opt-in** so default-shape responses stay byte-deterministic for `session.diff` and provenance audits — the first cut included the fields unconditionally and broke `test_dispatcher_session_diff`'s `diverged == 0` invariant.
+
+**Decisions:**
+- **Token-budget gate first.** Locks the cost metric before subsequent additive items have a chance to silently move it. Each later feature commit either holds the baseline or bumps it intentionally with a documented reason in the commit message. Cumulative drift across v1.3: 7786 → 8256 tokens (+6.0%), all from additive endpoint catalog entries.
+- **File-backed recipes use a startup scan, not file-watching.** Plan said "file-watching path under `LDB_RECIPE_DIR`" but `inotify`-style watching is a separate failure-mode burden (descriptor leaks, atomic-replace handling, recursive directories). Explicit `recipe.reload` is the minimum viable. Watching is a v1.4+ enhancement if real user pull surfaces.
+- **Hypothesis validation in dispatcher, not store.** ArtifactStore accepts arbitrary blobs by design; promoting it to a schema enforcer would block third-party formats. The dispatcher knows about typed formats (hypothesis-v1 today; more later), the store does not.
+- **`view.diff_against` opt-in per endpoint, not blanket on every read-path.** Plan said "every read-path endpoint" but the diff plumbing is non-trivial per-endpoint (snapshot lookup, cache key computation, response annotation). v1.3 wires `module.list` + `thread.list` as proof; `describe.endpoints` documents which endpoints support it; the rest follow incrementally. Endpoints that don't implement diff silently ignore the field — discoverable via describe.endpoints, not a silent error.
+- **kIn/kOver/kOut emulation uses the existing `bs`-loop, not internal breakpoints.** The doc previously sketched a step-over-via-temp-breakpoint approach — the simpler bounded loop with depth + line-change termination covers the common case without the temp-breakpoint placement complexity. Approximate where source lines are missing (stripped binaries) or stack walking is off (inlined code) — documented in `docs/16` §"Where this approximation falls short".
+- **Cost stats opt-in via `view.include_cost_stats`.** Determinism matters: `cost_n_samples` is call-count-dependent and made every `describe.endpoints` response non-deterministic, breaking `test_dispatcher_session_diff`. Opt-in keeps the default shape byte-stable for replay and diff.
+- **256-iter cap on the reverse-step loop is intentional.** Bounds worst-case wall-time to ~5s of RSP round-trips. Hitting the cap is not an error — daemon snapshots whatever state the loop ended on; agent can decide to retry, escalate, or fall through to kInsn.
+
+**Surprises / blockers:**
+- **`view.include_cost_stats` initially shipped non-opt-in** and broke `test_dispatcher_session_diff`'s `diverged == 0` invariant because the call-count fields made describe.endpoints responses session-dependent. Caught by running full `ctest` before commit — fix was the opt-in flag rather than removing the feature.
+- **Smoke baseline started at 7786, drifted to 8256 across the six items** (+6.0% cumulative). Each commit individually under 3%; the ±10% gate held all the way through. Worth flagging that a fictional v1.4 feature batch could plausibly hit the cliff — recommend regenerating baseline after each landed v1.4 feature rather than at branch close.
+- **rr's CPU-microarch bug still bites on this dev box** (AMD Zen 4/5 → `rr record` fatal). Live-rr SKIPs continue to fire for both #5 reverse-step kinds tests and the reverse-exec smoke. CI Linux x86-64 has rr installed (added in v1.2 branch) and should exercise the positive path there; this dev box can only verify schema + dispatcher routing.
+
+**Verification:**
+- Build: warning-clean on this box after every commit.
+- All `[recipe][reload]` (5 cases), `[hypothesis]` (13 cases), `[diff]` (8 cases), `[reverse]` (5 pass, 3 SKIP without rr), `[cost][p50]` (4 cases) unit tags green.
+- All new smokes green: `smoke_token_budget`, `smoke_recipe_reload`, `smoke_hypothesis`, `smoke_view_diff`, `smoke_reverse_exec`, `smoke_cost_p50`.
+- Full ctest failure parity vs master: identical 7-test failure set (`smoke_attach`, `smoke_memory`, `smoke_mem_dump`, `smoke_live_provenance`, `smoke_live_dlopen`, `smoke_dap_shim`, and 9 ptrace-attach cases inside `unit_tests`) — all gated on `kernel.yama.ptrace_scope=0`. Zero new regressions.
+
+**Next:**
+After v1.3 lands on master and tags as `v1.3.0`, the next bucket is v1.4 — "Backend abstraction + observability". First item: `#8 GDB/MI second backend` per `docs/17-version-plan.md`. Land that first within v1.4 since it validates the `DebuggerBackend` abstraction before any Tier-3 backend rewrites (own DWARF reader / own RSP client / own ptrace driver).
+
+---
+
 ## 2026-05-11 — Reverse-execution endpoints via RSP packet injection
 
 **Goal:** Post-V1 plan §4 item #2: ship `process.reverse_continue`, `process.reverse_step`, `thread.reverse_step`. Plan called this Tier-1 / 1-session work via "wrap LLDB CLI through `SBCommandInterpreter`."

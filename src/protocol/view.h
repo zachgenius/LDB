@@ -29,6 +29,13 @@ struct Spec {
   std::optional<std::uint64_t> limit;  // unset = no cap
   std::uint64_t offset = 0;
   bool summary = false;
+  // Snapshot to diff the current response array against. When set,
+  // diff-aware endpoints (currently module.list / thread.list) emit
+  // a set-symmetric-difference of items annotated with diff_op,
+  // instead of the full array. Endpoints that haven't opted in
+  // silently ignore this field; describe.endpoints documents
+  // per-endpoint support. See compute_diff for the math.
+  std::optional<std::string> diff_against;
 };
 
 // Default sample size used when summary=true.
@@ -55,5 +62,18 @@ Spec parse_from_params(const nlohmann::json& params);
 // std::move when ownership transfer is desired.
 nlohmann::json apply_to_array(nlohmann::json items, const Spec& spec,
                               std::string_view items_key);
+
+// Compute the set-symmetric-difference between two arrays of objects
+// (post-V1 plan #5). Items in `current` but not in `baseline` get
+// diff_op="added"; items in `baseline` but not in `current` get
+// diff_op="removed". Equality is whole-item JSON-bytes equality
+// (order-independent). Returns a JSON array.
+//
+// A modified item — same identity but different fields — surfaces as
+// one "removed" entry (the old shape) plus one "added" entry (the new
+// shape). Identity-keyed change detection ("name=X changed from
+// addr=A to addr=B") is a v1.4+ enhancement.
+nlohmann::json compute_diff(const nlohmann::json& baseline,
+                            const nlohmann::json& current);
 
 }  // namespace ldb::protocol::view

@@ -459,6 +459,63 @@ set_tests_properties(smoke_agent_workflow PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #7: token-budget regression CI gate. Pins _cost.tokens_est
+# totals for a canonical agent-workflow RPC sequence. Update the baseline
+# (tests/baselines/agent_workflow_tokens.json) by re-running with
+# LDB_UPDATE_BASELINE=1 after an intentional wire-shape change.
+add_test(
+  NAME smoke_token_budget
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_token_budget.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+          "${CMAKE_SOURCE_DIR}/tests/baselines/agent_workflow_tokens.json"
+)
+set_tests_properties(smoke_token_budget PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #3: recipe.reload + LDB_RECIPE_DIR startup scan.
+add_test(
+  NAME smoke_recipe_reload
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe_reload.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_recipe_reload PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #6: hypothesis-v1 artifact type validation +
+# artifact.hypothesis_template helper.
+add_test(
+  NAME smoke_hypothesis
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_hypothesis.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_hypothesis PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #5: view.diff_against on module.list / thread.list.
+add_test(
+  NAME smoke_view_diff
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_diff.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_view_diff PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #4: measured cost preview in describe.endpoints.
+add_test(
+  NAME smoke_cost_p50
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_cost_p50.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_cost_p50 PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"
