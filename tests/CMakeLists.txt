@@ -337,6 +337,20 @@ set_tests_properties(smoke_recipe_python PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #12 phase-2: agent.hello round-trip through ldbd.
+# SKIPs when ldb-probe-agent wasn't built (no libbpf on the host).
+if(LDB_BPF_AGENT_BUILD)
+  add_test(
+    NAME smoke_probe_agent
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe_agent.py"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb-probe-agent>"
+  )
+  set_tests_properties(smoke_probe_agent PROPERTIES
+    TIMEOUT 30
+  )
+endif()
+
 add_test(
   NAME smoke_probe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe.py"

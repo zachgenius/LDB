@@ -12,6 +12,7 @@
 #include "observers/observers.h"
 #include "perf/perf_parser.h"
 #include "perf/perf_runner.h"
+#include "probes/agent_engine.h"
 #include "probes/probe_orchestrator.h"
 #include "python/embed.h"
 #include "protocol/view.h"
@@ -707,6 +708,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "perf.record")        return handle_perf_record(req);
     if (req.method == "perf.report")        return handle_perf_report(req);
     if (req.method == "perf.cancel")        return handle_perf_cancel(req);
+
+    if (req.method == "agent.hello")        return handle_agent_hello(req);
 
     if (req.method == "observer.proc.fds")    return handle_observer_proc_fds(req);
     if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
@@ -2436,6 +2439,33 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"cancelled", bool_()},
       }, {"record_id", "cancelled"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== agent.* (post-V1 #12 phase-2) ==============
+  // The `ldb-probe-agent` binary is the privileged half of the probe
+  // stack: it links libbpf and (optionally) carries embedded CO-RE
+  // skeletons. The daemon spawns it on demand and speaks length-
+  // prefixed JSON over the agent's stdio. agent.hello is phase-2's
+  // ground-truth wire test — full attach_* / poll_events routing is
+  // wired through the ProbeOrchestrator in a follow-up commit.
+  add("agent.hello",
+      "Spawn ldb-probe-agent, perform a hello round-trip, return the "
+      "agent's version + libbpf version + BTF availability + embedded "
+      "program list. The agent exits after the round-trip (the daemon "
+      "sends shutdown). Errors:\n"
+      "  • -32002 kBadState: agent binary not found (set "
+      "$LDB_PROBE_AGENT, install on $PATH, or build alongside ldbd).\n"
+      "  • -32000 kBackendError: spawn / pipe / protocol failure.\n"
+      "See docs/21-probe-agent.md for the wire protocol.",
+      obj({}),
+      obj({
+          {"agent_path",        str()},
+          {"agent_version",     str()},
+          {"libbpf_version",    str()},
+          {"btf_present",       bool_()},
+          {"embedded_programs", arr_of(str())},
+      }, {"agent_path", "agent_version", "libbpf_version",
+          "btf_present", "embedded_programs"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   // ============== observer.* ==============
 
@@ -6921,6 +6951,29 @@ Response Dispatcher::handle_perf_report(const Request& req) {
   data["perf_data_size"] = row_opt->byte_size;
   data["parse_errors"]   = result.parsed.parse_errors;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_agent_hello(const Request& req) {
+  std::string path = ldb::probes::AgentEngine::discover_agent();
+  if (path.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "ldb-probe-agent not found — set $LDB_PROBE_AGENT, install on "
+        "$PATH, or build ldb-probe-agent alongside ldbd (requires "
+        "libbpf via pkg-config at cmake time)");
+  }
+  try {
+    ldb::probes::AgentEngine eng(path);
+    auto ok = eng.hello();
+    json data;
+    data["agent_path"]        = path;
+    data["agent_version"]     = ok.version;
+    data["libbpf_version"]    = ok.libbpf_version;
+    data["btf_present"]       = ok.btf_present;
+    data["embedded_programs"] = ok.embedded_programs;
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  }
 }
 
 Response Dispatcher::handle_perf_cancel(const Request& req) {

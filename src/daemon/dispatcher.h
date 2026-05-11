@@ -206,6 +206,11 @@ class Dispatcher {
   protocol::Response handle_perf_report(const protocol::Request& req);
   protocol::Response handle_perf_cancel(const protocol::Request& req);
 
+  // Post-V1 plan #12 phase-2: ldb-probe-agent wire shim
+  // (docs/21-probe-agent.md). Phase-2 ships hello; attach_* + poll
+  // come with the orchestrator wiring in a follow-up commit.
+  protocol::Response handle_agent_hello(const protocol::Request& req);
+
   protocol::Response handle_observer_proc_fds(const protocol::Request& req);
   protocol::Response handle_observer_proc_maps(const protocol::Request& req);
   protocol::Response handle_observer_proc_status(const protocol::Request& req);
