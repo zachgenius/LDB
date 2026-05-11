@@ -90,3 +90,9 @@ target_compile_definitions(ldb-dap PRIVATE
   LDB_VERSION_PATCH=${PROJECT_VERSION_PATCH}
   LDB_VERSION_STRING="${PROJECT_VERSION}"
 )
+
+# ----- ldb-probe-agent (post-V1 #12) --------------------------------------
+#
+# Built only when libbpf was found at top-level configure time. The
+# subdirectory's CMakeLists short-circuits otherwise.
+add_subdirectory(probe_agent)

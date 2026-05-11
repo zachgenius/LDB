@@ -10,6 +10,10 @@ project(ldb
 option(LDB_BUILD_TESTS "Build LDB tests" ON)
 option(LDB_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(LDB_ENABLE_CAPSTONE "Enable the opt-in Capstone disassembly backend" OFF)
+# AUTO when unset: turn ON when libbpf is found, OFF otherwise. Keeps the
+# build green on stripped boxes while making local dev "just work."
+set(LDB_ENABLE_BPF_AGENT "AUTO" CACHE STRING
+  "Build ldb-probe-agent (post-V1 #12). ON/OFF/AUTO.")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -240,6 +244,70 @@ if(LDB_ENABLE_CAPSTONE)
   endif()
 else()
   message(STATUS "ldb: capstone disabled (set -DLDB_ENABLE_CAPSTONE=ON to enable)")
+endif()
+
+# ----- libbpf (post-V1 #12) ----------------------------------------------
+#
+# Optional. The probe agent binary links libbpf; the daemon never does
+# (it talks to the agent over stdio). When libbpf is absent, the agent
+# is skipped and recipes with engine="agent" return -32000 from the
+# daemon at probe.create time. The bpftrace engine remains the default
+# and unaffected.
+
+set(LDB_BPF_AGENT_BUILD OFF)
+add_library(ldb_libbpf INTERFACE)
+if(NOT LDB_ENABLE_BPF_AGENT STREQUAL "OFF")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LDB_LIBBPF QUIET libbpf)
+  endif()
+  if(LDB_LIBBPF_FOUND)
+    set(LDB_LIBBPF_SYSTEM_INCLUDE_DIRS "")
+    foreach(_inc IN LISTS LDB_LIBBPF_INCLUDE_DIRS)
+      list(APPEND LDB_LIBBPF_SYSTEM_INCLUDE_DIRS "${_inc}")
+    endforeach()
+    list(REMOVE_DUPLICATES LDB_LIBBPF_SYSTEM_INCLUDE_DIRS)
+    target_include_directories(ldb_libbpf SYSTEM INTERFACE
+      ${LDB_LIBBPF_SYSTEM_INCLUDE_DIRS}
+    )
+    target_link_directories(ldb_libbpf INTERFACE
+      ${LDB_LIBBPF_LIBRARY_DIRS}
+    )
+    target_link_libraries(ldb_libbpf INTERFACE
+      ${LDB_LIBBPF_LIBRARIES}
+    )
+    set(LDB_BPF_AGENT_BUILD ON)
+    message(STATUS "ldb: libbpf via pkg-config (${LDB_LIBBPF_VERSION}) "
+                   "→ ldb-probe-agent enabled")
+  else()
+    if(LDB_ENABLE_BPF_AGENT STREQUAL "ON")
+      message(FATAL_ERROR
+        "LDB_ENABLE_BPF_AGENT=ON but libbpf was not found via pkg-config. "
+        "Install libbpf-dev (Debian/Ubuntu) or set PKG_CONFIG_PATH to a "
+        "prefix containing libbpf.pc.")
+    endif()
+    message(STATUS "ldb: libbpf not found → ldb-probe-agent disabled "
+                   "(set LDB_ENABLE_BPF_AGENT=ON to require it)")
+  endif()
+endif()
+
+# Optional BPF source compilation. If clang AND bpftool are present, the
+# agent embeds a CO-RE skeleton compiled from src/probe_agent/bpf/. If
+# either is missing, the agent still builds but reports
+# embedded_programs:[] and returns not_supported on attach_*.
+set(LDB_BPF_HAVE_TOOLCHAIN OFF)
+if(LDB_BPF_AGENT_BUILD)
+  find_program(LDB_BPF_CLANG clang)
+  find_program(LDB_BPF_BPFTOOL bpftool)
+  if(LDB_BPF_CLANG AND LDB_BPF_BPFTOOL)
+    set(LDB_BPF_HAVE_TOOLCHAIN ON)
+    message(STATUS "ldb: BPF toolchain — clang=${LDB_BPF_CLANG} "
+                   "bpftool=${LDB_BPF_BPFTOOL} (skeleton will be generated)")
+  else()
+    message(STATUS "ldb: BPF toolchain incomplete "
+                   "(clang=${LDB_BPF_CLANG} bpftool=${LDB_BPF_BPFTOOL}) — "
+                   "ldb-probe-agent will be built without an embedded program")
+  endif()
 endif()
 
 # ----- Vendored deps ------------------------------------------------------
