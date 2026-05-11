@@ -233,16 +233,10 @@ def main():
             proc2.wait(timeout=10)
 
         # ---- signing flow (docs/14-pack-signing.md tests 11 + 12) ----
-        # Currently expected-to-skip: the dispatcher does not yet honor
-        # `sign_key` / `trust_root` / `require_signed`. Once the
-        # implementation lands, remove the `signing_xfail` early-return
-        # and the rest of this block runs as full positive + negative
-        # coverage.
-        signing_xfail = True
-        if signing_xfail:
-            print("ldbpack signing smoke: SKIP (dispatcher integration "
-                  "pending — docs/14 §Test Plan items 11 + 12)")
-        else:
+        # Positive (daemon A signs with alice, daemon B trusts alice) +
+        # negative (B trusts only bob). Both must pass against the
+        # implemented dispatcher.
+        if True:
             key_priv = os.path.join(
                 os.path.dirname(__file__), "..",
                 "fixtures", "keys", "alice_ed25519")

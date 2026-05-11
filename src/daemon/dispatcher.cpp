@@ -11,12 +11,15 @@
 #include "protocol/view.h"
 #include "store/artifact_store.h"
 #include "store/pack.h"
+#include "store/pack_signing.h"
 #include "store/recipe_store.h"
 #include "store/session_store.h"
 #include "transport/ssh.h"
 #include "util/log.h"
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <set>
@@ -1724,20 +1727,43 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
         {"reason", str()},
     }, {"kind", "key"});
 
+    auto export_signature_schema = obj({
+        {"key_id",    str()},
+        {"algorithm", str()},
+    }, {"key_id", "algorithm"});
+
+    auto import_signature_schema = obj({
+        {"key_id",   str()},
+        {"verified", bool_()},
+        {"signer",   str()},
+    }, {"key_id", "verified"});
+
     add("session.export",
         "Bundle one session and every artifact in the store into a "
         "gzip+tar `.ldbpack` archive (plan §8). Path defaults to "
         "${LDB_STORE_ROOT}/packs/<id>.ldbpack. Produces a manifest the "
-        "agent can introspect before extracting on the import side.",
+        "agent can introspect before extracting on the import side. "
+        "Optional `sign_key` (path to an unencrypted OpenSSH ed25519 "
+        "private key) emits an `ldbpack/1+sig` pack with embedded "
+        "signature.json / signature.sig sidecar entries — see "
+        "docs/14-pack-signing.md.",
         obj({
-            {"id",   str()},
-            {"path", str("Optional output path; defaults under store root.")},
+            {"id",       str()},
+            {"path",     str("Optional output path; defaults under store root.")},
+            {"sign_key", str("Optional path to an OpenSSH ed25519 private "
+                             "key; when set the pack is emitted as "
+                             "ldbpack/1+sig and includes signature.json + "
+                             "signature.sig sidecar entries.")},
+            {"signer",   str("Optional free-form signer label baked into "
+                             "signature.json; defaults to the key's "
+                             "comment field.")},
         }, {"id"}),
         obj({
             {"path",      str()},
             {"byte_size", uint_()},
             {"sha256",    str()},
             {"manifest",  pack_manifest_schema},
+            {"signature", export_signature_schema},
         }, {"path", "byte_size", "sha256", "manifest"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
@@ -1745,15 +1771,27 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
         "Import a `.ldbpack` archive: walk its manifest, insert every "
         "session and artifact into the local stores. conflict_policy "
         "controls duplicate handling (default 'error' aborts the whole "
-        "import; 'skip' preserves local entries; 'overwrite' replaces).",
+        "import; 'skip' preserves local entries; 'overwrite' replaces). "
+        "Optional `trust_root` (directory of `*.pub` or `authorized_keys` "
+        "file) authenticates a signed pack; `require_signed=true` "
+        "rejects any unsigned pack with kBadState.",
         obj({
             {"path",            str()},
             {"conflict_policy", enum_str({"error", "skip", "overwrite"})},
+            {"trust_root",      str("Optional path to a directory of "
+                                     "`*.pub` files or a single "
+                                     "`authorized_keys`-format file. "
+                                     "When set, the pack's signer key_id "
+                                     "must appear in the trust root or "
+                                     "the import is refused.")},
+            {"require_signed",  bool_("If true, refuse unsigned packs "
+                                       "with kBadState (-32002).")},
         }, {"path"}),
         obj({
-            {"imported", arr_of(import_entry_schema)},
-            {"skipped",  arr_of(import_entry_schema)},
-            {"policy",   str()},
+            {"imported",  arr_of(import_entry_schema)},
+            {"skipped",   arr_of(import_entry_schema)},
+            {"policy",    str()},
+            {"signature", import_signature_schema},
         }, {"imported", "skipped", "policy"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
@@ -1761,32 +1799,40 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
         "Bundle artifacts (no session) into a `.ldbpack`. With "
         "build_id set, only that build's artifacts; with names set, "
         "only those names; both empty exports every artifact in the "
-        "store.",
+        "store. Optional `sign_key` emits a signed pack — see "
+        "docs/14-pack-signing.md.",
         obj({
             {"build_id", str()},
             {"names",    arr_of(str())},
             {"path",     str()},
+            {"sign_key", str("Optional path to an OpenSSH ed25519 "
+                             "private key.")},
+            {"signer",   str("Optional signer label.")},
         }),
         obj({
             {"path",      str()},
             {"byte_size", uint_()},
             {"sha256",    str()},
             {"manifest",  pack_manifest_schema},
+            {"signature", export_signature_schema},
         }, {"path", "byte_size", "sha256", "manifest"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "high");
 
     add("artifact.import",
         "Alias of session.import — both endpoints accept the same "
         "`.ldbpack` shape and import every entry inside. Conflict "
-        "policy semantics identical.",
+        "policy and trust-root semantics identical.",
         obj({
             {"path",            str()},
             {"conflict_policy", enum_str({"error", "skip", "overwrite"})},
+            {"trust_root",      str()},
+            {"require_signed",  bool_()},
         }, {"path"}),
         obj({
-            {"imported", arr_of(import_entry_schema)},
-            {"skipped",  arr_of(import_entry_schema)},
-            {"policy",   str()},
+            {"imported",  arr_of(import_entry_schema)},
+            {"skipped",   arr_of(import_entry_schema)},
+            {"policy",    str()},
+            {"signature", import_signature_schema},
         }, {"imported", "skipped", "policy"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "high");
   }
@@ -4401,12 +4447,15 @@ bool valid_pack_path(const std::string& s, std::string* err) {
   return true;
 }
 
-// Pull a {path, conflict_policy?} request body; returns the canonical
-// path and policy (default kError). On bad input, returns an Err
-// response wrapping the request id.
+// Pull a {path, conflict_policy?, trust_root?, require_signed?} request
+// body; returns the canonical path, policy (default kError), and signing
+// options (docs/14-pack-signing.md §"API Surface"). On bad input,
+// returns an Err response wrapping the request id.
 struct ImportArgs {
-  std::filesystem::path        path;
-  ldb::store::ConflictPolicy   policy = ldb::store::ConflictPolicy::kError;
+  std::filesystem::path                path;
+  ldb::store::ConflictPolicy           policy = ldb::store::ConflictPolicy::kError;
+  std::optional<std::filesystem::path> trust_root;
+  bool                                 require_signed = false;
 };
 
 std::optional<Response>
@@ -4436,6 +4485,96 @@ parse_import_args(const Request& req, ImportArgs* out) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams,
           "'conflict_policy' must be one of: error, skip, overwrite");
     }
+  }
+  if (auto it = req.params.find("trust_root");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'trust_root' must be a string");
+    }
+    auto s = it->get<std::string>();
+    if (s.empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'trust_root' must be a non-empty string");
+    }
+    out->trust_root = std::filesystem::path(s);
+  }
+  if (auto it = req.params.find("require_signed");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_boolean()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'require_signed' must be a boolean");
+    }
+    out->require_signed = it->get<bool>();
+  }
+  return std::nullopt;
+}
+
+// Parse the export-side signing options ({sign_key, signer}) shared by
+// session.export and artifact.export. `signed_key` is left empty when
+// `sign_key` is not in [params]; the caller picks unsigned vs signed
+// pack producer based on `signed_key.has_value()`.
+//
+// Per docs/14 §"Error mapping":
+//   * `sign_key` path missing on export → kInvalidParams
+//   * encrypted OpenSSH key             → kInvalidParams
+//   * malformed key                     → kInvalidParams
+struct ExportSignOpts {
+  std::optional<ldb::store::Ed25519KeyPair> signed_key;
+  std::optional<std::string>                signer_label;
+  std::string                               key_id;  // for the response
+};
+
+std::optional<Response>
+parse_export_sign_opts(const Request& req, ExportSignOpts* out) {
+  if (!req.params.is_object()) return std::nullopt;
+  auto sk_it = req.params.find("sign_key");
+  if (sk_it == req.params.end() || sk_it->is_null()) {
+    // Plain unsigned export — leave opts empty.
+    return std::nullopt;
+  }
+  if (!sk_it->is_string()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'sign_key' must be a string");
+  }
+  auto sk_path = sk_it->get<std::string>();
+  if (sk_path.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'sign_key' must be a non-empty string");
+  }
+  std::ifstream in(sk_path, std::ios::binary);
+  if (!in) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "sign_key file not found or unreadable: " +
+                              sk_path);
+  }
+  in.seekg(0, std::ios::end);
+  auto sz = in.tellg();
+  if (sz < 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "sign_key: tellg failed: " + sk_path);
+  }
+  in.seekg(0, std::ios::beg);
+  std::vector<std::uint8_t> pem(static_cast<std::size_t>(sz));
+  if (sz > 0) {
+    in.read(reinterpret_cast<char*>(pem.data()),
+            static_cast<std::streamsize>(pem.size()));
+  }
+  try {
+    auto kp = ldb::store::parse_openssh_secret_key(pem);
+    out->signed_key = kp;
+    out->key_id     = ldb::store::compute_key_id(kp.public_key);
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              std::string("sign_key: ") + e.what());
+  }
+  if (auto it = req.params.find("signer");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'signer' must be a string");
+    }
+    out->signer_label = it->get<std::string>();
   }
   return std::nullopt;
 }
@@ -4483,15 +4622,33 @@ Response Dispatcher::handle_session_export(const Request& req) {
     out_path = dir / (*id + ".ldbpack");
   }
 
-  // pack_session throws backend::Error on a missing session id or any
-  // io / sqlite failure; the dispatch() catch maps that to -32000.
-  auto result = ldb::store::pack_session(*sessions_, *artifacts_, *id,
-                                          out_path);
+  ExportSignOpts sopts;
+  if (auto e = parse_export_sign_opts(req, &sopts)) return *e;
+
+  // Unsigned path: keep using `pack_session` directly so the on-disk
+  // bytes stay bit-identical to today when `sign_key` isn't given —
+  // smoke_agent_workflow asserts on that round-trip.
   json data;
-  data["path"]      = result.path.string();
-  data["byte_size"] = result.byte_size;
-  data["sha256"]    = result.sha256;
-  data["manifest"]  = result.manifest;
+  if (!sopts.signed_key.has_value()) {
+    auto result = ldb::store::pack_session(*sessions_, *artifacts_, *id,
+                                            out_path);
+    data["path"]      = result.path.string();
+    data["byte_size"] = result.byte_size;
+    data["sha256"]    = result.sha256;
+    data["manifest"]  = result.manifest;
+  } else {
+    auto sr = ldb::store::pack_session_signed(
+        *sessions_, *artifacts_, *id, out_path,
+        sopts.signed_key, sopts.signer_label);
+    data["path"]      = sr.result.path.string();
+    data["byte_size"] = sr.result.byte_size;
+    data["sha256"]    = sr.result.sha256;
+    data["manifest"]  = sr.result.manifest;
+    json sig;
+    sig["key_id"]    = sopts.key_id;
+    sig["algorithm"] = "ed25519";
+    data["signature"] = std::move(sig);
+  }
   return protocol::make_ok(req.id, std::move(data));
 }
 
@@ -4554,13 +4711,30 @@ Response Dispatcher::handle_artifact_export(const Request& req) {
     out_path = dir / fn;
   }
 
-  auto result = ldb::store::pack_artifacts(*artifacts_, build_id,
-                                            std::move(names), out_path);
+  ExportSignOpts sopts;
+  if (auto e = parse_export_sign_opts(req, &sopts)) return *e;
+
   json data;
-  data["path"]      = result.path.string();
-  data["byte_size"] = result.byte_size;
-  data["sha256"]    = result.sha256;
-  data["manifest"]  = result.manifest;
+  if (!sopts.signed_key.has_value()) {
+    auto result = ldb::store::pack_artifacts(*artifacts_, build_id,
+                                              std::move(names), out_path);
+    data["path"]      = result.path.string();
+    data["byte_size"] = result.byte_size;
+    data["sha256"]    = result.sha256;
+    data["manifest"]  = result.manifest;
+  } else {
+    auto sr = ldb::store::pack_artifacts_signed(
+        *artifacts_, build_id, std::move(names), out_path,
+        sopts.signed_key, sopts.signer_label);
+    data["path"]      = sr.result.path.string();
+    data["byte_size"] = sr.result.byte_size;
+    data["sha256"]    = sr.result.sha256;
+    data["manifest"]  = sr.result.manifest;
+    json sig;
+    sig["key_id"]    = sopts.key_id;
+    sig["algorithm"] = "ed25519";
+    data["signature"] = std::move(sig);
+  }
   return protocol::make_ok(req.id, std::move(data));
 }
 
@@ -4576,6 +4750,53 @@ Response Dispatcher::handle_session_import(const Request& req) {
                               "session.import: no such pack file: " +
                               args.path.string());
   }
+
+  // Verify-then-unpack pipeline. `verify_pack` is run for every import
+  // (signed or not) — for unsigned packs it gives an internal-consistency
+  // check at the cost of one extra parse pass; for signed packs it
+  // gates the apply step on the signature outcome. Error mapping is in
+  // docs/14-pack-signing.md §"Error mapping".
+  ldb::store::PackVerifyReport vrep;
+  try {
+    vrep = ldb::store::verify_pack(args.path, args.trust_root);
+  } catch (const backend::Error& e) {
+    // Trust-root I/O errors and malformed signature blobs come through
+    // here. Per the docs, trust-root missing/unreadable is a kBadState
+    // when `require_signed=true` (the operator asked for it but the
+    // environment can't fulfill it); otherwise the import is refused
+    // with kForbidden (the pack carries a signature we couldn't check).
+    std::string m = e.what();
+    auto is_trust_io = m.find("trust_root") != std::string::npos;
+    auto code = (is_trust_io && args.require_signed)
+                    ? ErrorCode::kBadState
+                    : ErrorCode::kBackendError;
+    return protocol::make_err(req.id, code, m);
+  }
+
+  if (args.require_signed && !vrep.is_signed) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "session.import: pack is unsigned but require_signed=true");
+  }
+  if (args.require_signed && !args.trust_root.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "session.import: require_signed=true but no trust_root provided");
+  }
+  if (vrep.is_signed && !vrep.verified && args.trust_root.has_value()) {
+    // Three failure modes funnel here:
+    //   (a) ed25519 verify failed
+    //   (b) signer key_id not in trust_root
+    //   (c) per-entry sha256 mismatch / entries-set mismatch
+    // All three are kForbidden per docs/14 (well-formed request,
+    // operation refused). The message names which check tripped.
+    json edata;
+    if (!vrep.key_id.empty()) edata["key_id"] = vrep.key_id;
+    return protocol::make_err(req.id, ErrorCode::kForbidden,
+                              vrep.error_message.empty()
+                                  ? "session.import: signature verification failed"
+                                  : vrep.error_message,
+                              std::move(edata));
+  }
+
   auto report = ldb::store::unpack(*sessions_, *artifacts_, args.path,
                                     args.policy);
   json imported = json::array();
@@ -4586,6 +4807,14 @@ Response Dispatcher::handle_session_import(const Request& req) {
   data["imported"] = std::move(imported);
   data["skipped"]  = std::move(skipped);
   data["policy"]   = ldb::store::conflict_policy_str(args.policy);
+
+  if (vrep.is_signed) {
+    json sig;
+    sig["key_id"]   = vrep.key_id;
+    sig["verified"] = vrep.verified;
+    if (!vrep.signer.empty()) sig["signer"] = vrep.signer;
+    data["signature"] = std::move(sig);
+  }
   return protocol::make_ok(req.id, std::move(data));
 }
 
