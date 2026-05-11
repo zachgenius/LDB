@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "backend/debugger_backend.h"  // backend::TargetId
 #include "protocol/jsonrpc.h"
 #include "store/session_store.h"
 
@@ -17,6 +18,7 @@ namespace ldb::backend { class DebuggerBackend; }
 namespace ldb::store   { class ArtifactStore; }
 namespace ldb::probes  { class ProbeOrchestrator; }
 namespace ldb::observers { class ExecAllowlist; }
+namespace ldb::python  { class Callable; }
 
 namespace ldb::daemon {
 
@@ -104,6 +106,14 @@ class Dispatcher {
   std::optional<std::uint64_t>
                        cost_p50(const std::string& method) const;
   std::uint64_t        cost_total(const std::string& method) const;
+
+  // Post-V1 plan #14 phase-1: registered Python frame unwinders. Keyed
+  // by target_id; calling process.set_python_unwinder twice on the
+  // same target replaces. We hold by unique_ptr so the Callable's
+  // GIL-acquire-on-destruct happens in this dispatcher's thread when
+  // the entry is overwritten or the map empties at shutdown.
+  std::unordered_map<backend::TargetId,
+                     std::unique_ptr<python::Callable>> python_unwinders_;
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
@@ -210,6 +220,15 @@ class Dispatcher {
   // (docs/21-probe-agent.md). Phase-2 ships hello; attach_* + poll
   // come with the orchestrator wiring in a follow-up commit.
   protocol::Response handle_agent_hello(const protocol::Request& req);
+
+  // Post-V1 plan #14 phase-1: Python frame unwinders. Phase-1 stores
+  // the Callable per target_id and exposes process.unwind_one as a
+  // test-and-observability endpoint that invokes the registered
+  // unwinder synchronously against caller-supplied {ip,sp,fp}. Real
+  // SBUnwinder hookup so LLDB's stack-walker calls the Callable
+  // during ordinary process.list_frames is phase-2.
+  protocol::Response handle_process_set_python_unwinder(const protocol::Request& req);
+  protocol::Response handle_process_unwind_one(const protocol::Request& req);
 
   protocol::Response handle_observer_proc_fds(const protocol::Request& req);
   protocol::Response handle_observer_proc_maps(const protocol::Request& req);

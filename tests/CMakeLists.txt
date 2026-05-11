@@ -351,6 +351,18 @@ if(LDB_BPF_AGENT_BUILD)
   )
 endif()
 
+# Post-V1 plan #14 phase-1: Python frame unwinders.
+# SKIPs cleanly when ldbd was built without LDB_ENABLE_PYTHON
+# (test self-detects via describe.endpoints).
+add_test(
+  NAME smoke_python_unwinder
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_python_unwinder.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_python_unwinder PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_probe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe.py"

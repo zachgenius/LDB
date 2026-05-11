@@ -711,6 +711,10 @@ Response Dispatcher::dispatch_inner(const Request& req) {
 
     if (req.method == "agent.hello")        return handle_agent_hello(req);
 
+    if (req.method == "process.set_python_unwinder")
+                                              return handle_process_set_python_unwinder(req);
+    if (req.method == "process.unwind_one") return handle_process_unwind_one(req);
+
     if (req.method == "observer.proc.fds")    return handle_observer_proc_fds(req);
     if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
     if (req.method == "observer.proc.status") return handle_observer_proc_status(req);
@@ -2465,6 +2469,45 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"embedded_programs", arr_of(str())},
       }, {"agent_path", "agent_version", "libbpf_version",
           "btf_present", "embedded_programs"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  // ============== process.set_python_unwinder / unwind_one (post-V1 #14) ==
+  add("process.set_python_unwinder",
+      "Register a Python frame-unwinder callable against a target. The "
+      "module must define `def run(ctx): ...`; ctx carries "
+      "{ip, sp, fp, registers?} and the callable returns either null "
+      "(fall through to LLDB's default unwind) or a dict with "
+      "{next_ip, next_sp, next_fp}. Compile errors at registration are "
+      "surfaced as -32602 kInvalidParams. Phase-1 stores the callable; "
+      "real SBUnwinder hookup so LLDB's stack walker calls into it "
+      "during ordinary frame enumeration is phase-2.",
+      obj({
+          {"target_id", int_()},
+          {"body",      str()},
+      }, {"target_id", "body"}),
+      obj({
+          {"target_id",  int_()},
+          {"registered", bool_()},
+      }, {"target_id", "registered"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("process.unwind_one",
+      "Invoke the registered Python unwinder against a synthetic frame "
+      "{ip, sp, fp} and return the result verbatim. This is a phase-1 "
+      "observability endpoint — it lets agents and tests exercise the "
+      "unwinder without a real stopped process. Returns -32002 "
+      "kBadState when no unwinder is registered for the target.",
+      obj({
+          {"target_id", int_()},
+          {"ip",        int_()},
+          {"sp",        int_()},
+          {"fp",        int_()},
+          {"registers", obj({})},
+      }, {"target_id", "ip", "sp", "fp"}),
+      obj({
+          {"target_id", int_()},
+          {"result",    obj({})},
+      }, {"target_id", "result"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   // ============== observer.* ==============
@@ -6951,6 +6994,90 @@ Response Dispatcher::handle_perf_report(const Request& req) {
   data["perf_data_size"] = row_opt->byte_size;
   data["parse_errors"]   = result.parsed.parse_errors;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_process_set_python_unwinder(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) || target_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "target_id must be positive integer");
+  }
+  auto bit = req.params.find("body");
+  if (bit == req.params.end() || !bit->is_string()
+      || bit->get<std::string>().empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "missing non-empty string param 'body'");
+  }
+  if (!ldb::python::Interpreter::available()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "process.set_python_unwinder requires ldbd built with "
+        "LDB_ENABLE_PYTHON");
+  }
+  try {
+    auto callable = std::make_unique<ldb::python::Callable>(
+        bit->get<std::string>(),
+        "<unwinder:target=" + std::to_string(target_id) + ">");
+    python_unwinders_[target_id] = std::move(callable);
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
+  }
+  json data;
+  data["target_id"] = target_id;
+  data["registered"] = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_process_unwind_one(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) || target_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "target_id must be positive integer");
+  }
+  auto it = python_unwinders_.find(target_id);
+  if (it == python_unwinders_.end()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "no python unwinder registered for target_id=" +
+        std::to_string(target_id));
+  }
+  // ctx is the frame state the unwinder operates on. The four required
+  // keys mirror the canonical "stack walker" interface; the unwinder
+  // returns either null (fall through to LLDB's default) or a dict with
+  // the next frame's {next_ip, next_sp, next_fp}.
+  json ctx = json::object();
+  for (const char* key : {"ip", "sp", "fp"}) {
+    auto pit = req.params.find(key);
+    if (pit == req.params.end() || pit->is_null()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("missing integer param '") + key + "'");
+    }
+    if (!pit->is_number_integer() && !pit->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("'") + key + "' must be an integer");
+    }
+    ctx[key] = *pit;
+  }
+  if (auto reg = req.params.find("registers");
+      reg != req.params.end() && reg->is_object()) {
+    ctx["registers"] = *reg;
+  }
+  try {
+    json result = it->second->invoke(ctx);
+    json data;
+    data["target_id"] = target_id;
+    data["result"]    = std::move(result);
+    data["stdout"]    = it->second->last_stdout();
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  }
 }
 
 Response Dispatcher::handle_agent_hello(const Request& req) {

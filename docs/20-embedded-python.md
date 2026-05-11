@@ -230,6 +230,41 @@ runtime exceptions. This matches the existing distinction between
 malformed-input and runtime-failure that the dispatcher uses for
 recipe-v1 path validation vs. recipe.run failures.
 
+## 7a. Frame unwinders (post-V1 plan #14 phase-1)
+
+The same `Callable` surface backs Python frame unwinders:
+
+```
+process.set_python_unwinder({target_id, body})  →  registers
+process.unwind_one({target_id, ip, sp, fp})     →  invokes synchronously
+```
+
+The module must define `def run(ctx): ...`. `ctx` is a dict with
+`{ip, sp, fp, registers?}`; the callable returns either `null` (fall
+through to LLDB's default unwind) or a dict with `{next_ip, next_sp,
+next_fp}`.
+
+**Phase-1 stores the callable per target_id and exposes `unwind_one`
+as a synchronous test endpoint** — agents and tests exercise the
+unwinder without needing a real stopped process. The phase-2 hookup
+into LLDB's SBUnwinder so the stack walker calls into the callable
+during ordinary `process.list_frames` is intentionally deferred:
+
+- It needs `SBUnwindPlan` interception via `SBLanguageRuntime` or a
+  custom command-interpreter hook; the SBAPI surface is in flux.
+- Once the wire contract (set / unwind_one) is pinned, the SBUnwinder
+  side can land independently without breaking any client.
+
+Failure mapping:
+- Compile error at registration → `-32602 kInvalidParams`.
+- Unset target / unwinder not registered → `-32002 kBadState`.
+- Runtime Python exception during invoke → `-32000 kBackendError`,
+  same shape as `recipe.run`.
+
+Lifetime: re-registration replaces. Map is cleared at dispatcher
+shutdown (the Callable destructor acquires the GIL to `Py_XDECREF`
+its module references).
+
 ## 8. Stdout discipline
 
 CPython by default writes to fd 1, which is also the JSON-RPC channel.
