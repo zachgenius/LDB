@@ -97,7 +97,7 @@ which the dispatcher maps to `-32003` forbidden.
 |--------------------------------------------|----------|-----------------------------------------------------------------|
 | Missing `target_id`                        | `-32602` | Dispatcher pre-check.                                           |
 | Missing `tid` / `kind` (reverse_step)      | `-32602` | Dispatcher pre-check.                                           |
-| `kind=in` / `over` / `out`                 | `-32602` | Reserved; v0.3 supports `insn` only.                            |
+| `kind=in` / `over` / `out`                 | accepted | v1.3+ implements client-side step-over emulation (see §"Reverse-step-over/into"). |
 | `kind` not one of in/over/out/insn         | `-32602` | Unknown kind string.                                            |
 | Unknown `target_id`                        | `-32000` | Backend lookup miss.                                            |
 | No live process                            | `-32002` | Backend state check.                                            |
@@ -112,25 +112,41 @@ surface a `stale: true` field via the view layer.
 
 ## Reverse-step-over / reverse-step-into
 
-These were considered for v0.3 and deferred. The mechanical issue: GDB
-RSP defines exactly two reverse primitives (`bc`, `bs`). Everything
-else is a client-side construction:
+**Shipped in v1.3** via a bounded `bs` loop with source-line +
+frame-depth termination. The simpler-than-LLDB-ThreadPlan approach:
 
-- **reverse-step-into** (`kIn`) ≈ `bs` repeatedly until a source-line
-  boundary is crossed. Cheap, but requires DWARF line-table walking
-  per step — sequence-of-`bs` is doable but the stop-reason path needs
-  more work.
-- **reverse-step-over** (`kOver`) ≈ disassemble the current
-  instruction, decide whether it's a call, set an internal breakpoint
-  at the next instruction in the *current* frame, then `bc`. The
-  breakpoint placement is the tricky bit (must survive the reverse
-  direction, must not fire on the original `bc` cursor).
-- **reverse-step-out** (`kOut`) ≈ unwind one frame, set an internal
-  breakpoint at the return address site, `bc`. Same internal-bp
-  difficulties.
+- **`kIn`** (reverse-step-into): repeat `bs` until the source line
+  changes. Any line change is acceptable — descending into a callee
+  on the way back is exactly the "step into reversed" semantic.
+- **`kOver`** (reverse-step-over): repeat `bs` until the source line
+  changes AND the call stack depth is equal to or shallower than at
+  the start. If `bs` lands us in a deeper frame (we stepped backward
+  into a callee from a call site), we keep stepping until we escape
+  back to the caller.
+- **`kOut`** (reverse-step-out): repeat `bs` until the call stack
+  depth is strictly less than the starting depth — i.e. we've left
+  the starting frame entirely.
 
-Track these in `docs/15-post-v1-plan.md` Tier 2 (likely a small follow-up
-session each) once the `bs` foundation is field-tested.
+The loop is bounded at 256 iterations to avoid pathological runtime
+on long single-line basic blocks; if the cap fires the daemon
+snapshots whatever state the loop ended on (the agent observes the
+unchanged PC and can decide to retry or escalate).
+
+Where this approximation falls short:
+- **Inlined code** can confuse depth-based termination (`kOver` /
+  `kOut` may overshoot or under-shoot when the apparent stack
+  matches the optimised one rather than the source one).
+- **Stripped binaries** (no line entries) reduce all kinds to
+  insn-by-insn stepping — the first `bs` returns immediately. That
+  matches the v1.2 `kInsn`-only behaviour the agent had before.
+- **Tail-called functions** appear as a depth decrease in the source
+  semantics but not always in LLDB's frame walk; `kOut` may stop
+  one frame later than expected.
+
+The implementation lives in `LldbBackend::reverse_step_thread`
+(`src/backend/lldb_backend.cpp`). Identity-keyed change detection
+(`"line 47 in foo() came back as line 46"` vs `"line 47 disappeared,
+line 46 appeared"`) is a v1.4+ enhancement.
 
 ## Test coverage
 

@@ -2601,13 +2601,86 @@ ProcessStatus LldbBackend::reverse_continue(TargetId tid) {
   return snapshot(proc);
 }
 
+namespace {
+
+// Capture the "starting position" we'll compare against in the
+// reverse-step loop: source file+line and depth of the call stack.
+// Stripped or JIT-only code yields empty file/line; the loop falls
+// back to insn-level termination in that case.
+struct StepStart {
+  std::string  file;
+  std::uint32_t line  = 0;
+  std::uint32_t depth = 0;
+};
+
+StepStart capture_step_start(lldb::SBThread& thr) {
+  StepStart s;
+  s.depth = thr.GetNumFrames();
+  auto frame = thr.GetFrameAtIndex(0);
+  if (frame.IsValid()) {
+    auto le = frame.GetLineEntry();
+    if (le.IsValid()) {
+      s.line = le.GetLine();
+      auto fs = le.GetFileSpec();
+      const char* fn = fs.GetFilename();
+      if (fn) s.file = fn;
+    }
+  }
+  return s;
+}
+
+// Termination predicate per kind. Returns true iff the current
+// (thread, frame) state satisfies the reverse-step goal.
+//   kIn   : any source-line change is fine (we may have descended
+//           into a callee — that's exactly what "step into reversed"
+//           means).
+//   kOver : line changed AND we're at the same depth or shallower
+//           (we don't accept landing deeper, since that would mean
+//           we entered a callee).
+//   kOut  : we're at a shallower depth than start (we've escaped the
+//           starting frame).
+//   kInsn : the caller already returned after one `bs`; not used in
+//           the loop.
+bool step_terminates(lldb::SBThread& thr, const StepStart& start,
+                     ldb::backend::ReverseStepKind kind) {
+  std::uint32_t depth = thr.GetNumFrames();
+  auto frame = thr.GetFrameAtIndex(0);
+  std::string file;
+  std::uint32_t line = 0;
+  if (frame.IsValid()) {
+    auto le = frame.GetLineEntry();
+    if (le.IsValid()) {
+      line = le.GetLine();
+      auto fs = le.GetFileSpec();
+      const char* fn = fs.GetFilename();
+      if (fn) file = fn;
+    }
+  }
+  bool line_changed = (line != start.line) || (file != start.file);
+  switch (kind) {
+    case ldb::backend::ReverseStepKind::kIn:
+      return line_changed;
+    case ldb::backend::ReverseStepKind::kOver:
+      return line_changed && depth <= start.depth;
+    case ldb::backend::ReverseStepKind::kOut:
+      return depth < start.depth;
+    case ldb::backend::ReverseStepKind::kInsn:
+      return true;
+  }
+  return true;
+}
+
+// How many `bs` packets we'll send for a single kind=in/over/out call
+// before giving up. 256 is enough to cross any source line we've ever
+// observed (longest single-line block in real code is rarely > 50
+// instructions) while bounding the worst case to ~5s of round-trips.
+constexpr int kReverseStepMaxIters = 256;
+
+}  // namespace
+
 ProcessStatus LldbBackend::reverse_step_thread(TargetId tid,
                                                 ThreadId thread_id,
                                                 ReverseStepKind kind) {
-  if (kind != ReverseStepKind::kInsn) {
-    throw Error("reverse step kind not supported in v0.3; "
-                "only 'insn' is implemented (see docs/16-reverse-exec.md)");
-  }
   lldb::SBTarget target;
   bool capable = false;
   {
@@ -2636,14 +2709,39 @@ ProcessStatus LldbBackend::reverse_step_thread(TargetId tid,
   // tracks selection per-process.
   proc.SetSelectedThreadByID(thread_id);
 
-  auto ro = run_packet_send(impl_->debugger, target, "bs");
-  if (!ro.Succeeded()) {
-    const char* err = ro.GetError();
-    throw Error(std::string("reverse-step packet failed: ") +
-                (err ? err : "unknown error"));
-  }
+  if (kind == ReverseStepKind::kInsn) {
+    auto ro = run_packet_send(impl_->debugger, target, "bs");
+    if (!ro.Succeeded()) {
+      const char* err = ro.GetError();
+      throw Error(std::string("reverse-step packet failed: ") +
+                  (err ? err : "unknown error"));
+    }
+    pump_until_stopped(impl_->debugger, proc, std::chrono::seconds(5));
+  } else {
+    // Source-line-granularity emulation per docs/16-reverse-exec.md
+    // §"Reverse-step-over/into": send `bs` in a bounded loop, checking
+    // a kind-specific termination predicate after each step. Less
+    // accurate than LLDB's forward ThreadPlan stack but adequate for
+    // the most common case (single-frame reverse stepping in
+    // unoptimised code).
+    StepStart start = capture_step_start(thr);
+    for (int i = 0; i < kReverseStepMaxIters; ++i) {
+      auto ro = run_packet_send(impl_->debugger, target, "bs");
+      if (!ro.Succeeded()) {
+        const char* err = ro.GetError();
+        throw Error(std::string("reverse-step packet failed: ") +
+                    (err ? err : "unknown error"));
+      }
+      pump_until_stopped(impl_->debugger, proc, std::chrono::seconds(5));
 
-  pump_until_stopped(impl_->debugger, proc, std::chrono::seconds(5));
+      auto cur_thr = proc.GetThreadByID(thread_id);
+      if (!cur_thr.IsValid()) break;  // exited / vanished
+      if (step_terminates(cur_thr, start, kind)) break;
+    }
+    // If we hit the iteration cap, fall through: snapshot whatever
+    // state we ended on. The agent can observe the still-unchanged PC
+    // / line and decide to retry or escalate.
+  }
 
   {
     std::lock_guard<std::mutex> lk(impl_->mu);

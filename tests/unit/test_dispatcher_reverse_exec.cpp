@@ -219,36 +219,46 @@ TEST_CASE("process.reverse_step kind=insn routes to backend.reverse_step_thread"
   CHECK(be->last_rev_step_kind   == ReverseStepKind::kInsn);
 }
 
-TEST_CASE("process.reverse_step kind=in/over rejected with -32602 (deferred)",
-          "[dispatcher][process][reverse_step][error]") {
-  auto be = std::make_shared<CountingStub>();
-  Dispatcher d(be);
-
-  auto r_in = d.dispatch(make_req("process.reverse_step",
-      json{{"target_id", 1}, {"tid", 7}, {"kind", "in"}}));
-  REQUIRE_FALSE(r_in.ok);
-  CHECK(r_in.error_code == ErrorCode::kInvalidParams);
-
-  auto r_over = d.dispatch(make_req("process.reverse_step",
-      json{{"target_id", 1}, {"tid", 7}, {"kind", "over"}}));
-  REQUIRE_FALSE(r_over.ok);
-  CHECK(r_over.error_code == ErrorCode::kInvalidParams);
-
-  // The stub backend method must not have been called.
-  CHECK(be->reverse_step_thread_calls == 0);
+TEST_CASE("process.reverse_step accepts kind=in/over/out (v1.3 carve-out)",
+          "[dispatcher][process][reverse_step]") {
+  // v1.3 implemented client-side step-over emulation for the deferred
+  // kinds. The dispatcher now forwards them to the backend instead of
+  // rejecting with -32602. See docs/16-reverse-exec.md.
+  for (const char* kind_str : {"in", "over", "out"}) {
+    auto be = std::make_shared<CountingStub>();
+    Dispatcher d(be);
+    auto resp = d.dispatch(make_req("process.reverse_step",
+        json{{"target_id", 1}, {"tid", 7}, {"kind", kind_str}}));
+    REQUIRE(resp.ok);
+    CHECK(be->reverse_step_thread_calls == 1);
+  }
 }
 
-TEST_CASE("process.reverse_step kind=out rejected with -32602",
+TEST_CASE("process.reverse_step routes the parsed kind verbatim",
+          "[dispatcher][process][reverse_step]") {
+  struct Case { const char* str; ReverseStepKind expected; };
+  for (const Case& c : {Case{"in",   ReverseStepKind::kIn},
+                        Case{"over", ReverseStepKind::kOver},
+                        Case{"out",  ReverseStepKind::kOut},
+                        Case{"insn", ReverseStepKind::kInsn}}) {
+    auto be = std::make_shared<CountingStub>();
+    Dispatcher d(be);
+    auto resp = d.dispatch(make_req("process.reverse_step",
+        json{{"target_id", 1}, {"tid", 7}, {"kind", c.str}}));
+    REQUIRE(resp.ok);
+    CHECK(be->last_rev_step_kind == c.expected);
+  }
+}
+
+TEST_CASE("process.reverse_step rejects unknown kind with -32602",
           "[dispatcher][process][reverse_step][error]") {
-  // Reverse step-out is semantically ambiguous (the inverse of "run to
-  // parent return" is "rewind to call instruction at depth-1"). Not a
-  // priority; reject so the kind-space stays disciplined.
   auto be = std::make_shared<CountingStub>();
   Dispatcher d(be);
   auto resp = d.dispatch(make_req("process.reverse_step",
-      json{{"target_id", 1}, {"tid", 7}, {"kind", "out"}}));
+      json{{"target_id", 1}, {"tid", 7}, {"kind", "sideways"}}));
   REQUIRE_FALSE(resp.ok);
   CHECK(resp.error_code == ErrorCode::kInvalidParams);
+  CHECK(be->reverse_step_thread_calls == 0);
 }
 
 TEST_CASE("process.reverse_step missing tid → -32602",

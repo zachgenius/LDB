@@ -3242,20 +3242,16 @@ Response Dispatcher::handle_process_step(const Request& req) {
 
 namespace {
 
-// Reverse-step kind parser. The wire accepts the same four strings as
-// forward step for symmetry, but v0.3 implements only `insn`. The other
-// three are accepted-and-rejected with -32602 to keep the schema stable
-// when client-side reverse-step-over/out lands. `*out` is only written
-// for `insn`.
+// Reverse-step kind parser. All four kinds are accepted by the
+// backend; "insn" is the RSP `bs` packet verbatim, "in"/"over"/"out"
+// use a bounded `bs` loop with source-line + frame-depth checks
+// (see LldbBackend::reverse_step_thread).
 bool parse_reverse_step_kind(const std::string& s,
-                             backend::ReverseStepKind* out,
-                             bool* deferred_known_kind) {
-  *deferred_known_kind = false;
+                             backend::ReverseStepKind* out) {
+  if (s == "in")   { *out = backend::ReverseStepKind::kIn;   return true; }
+  if (s == "over") { *out = backend::ReverseStepKind::kOver; return true; }
+  if (s == "out")  { *out = backend::ReverseStepKind::kOut;  return true; }
   if (s == "insn") { *out = backend::ReverseStepKind::kInsn; return true; }
-  if (s == "in" || s == "over" || s == "out") {
-    *deferred_known_kind = true;
-    return false;
-  }
   return false;
 }
 
@@ -3327,13 +3323,7 @@ Response handle_reverse_step_shared(
                               "missing string param 'kind'");
   }
   backend::ReverseStepKind kind;
-  bool deferred = false;
-  if (!parse_reverse_step_kind(*kind_str, &kind, &deferred)) {
-    if (deferred) {
-      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
-          "'kind' " + *kind_str + " is reserved but not yet implemented; "
-          "v0.3 supports kind=insn only (see docs/16-reverse-exec.md)");
-    }
+  if (!parse_reverse_step_kind(*kind_str, &kind)) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
         "'kind' must be one of: in, over, out, insn");
   }

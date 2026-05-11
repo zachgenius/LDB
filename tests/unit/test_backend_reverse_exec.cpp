@@ -72,23 +72,27 @@ TEST_CASE("reverse_continue: non-rr live target is forbidden",
   be->kill_process(open.target_id);
 }
 
-TEST_CASE("reverse_step_thread: kIn / kOver rejected (deferred kinds)",
-          "[backend][reverse][error]") {
-  // The dispatcher pre-filters at the wire layer (-32602), but the
-  // backend method must also reject these defensively — any future
-  // caller bypassing the dispatcher (Catch2-driven test, embedded use)
-  // must hit the same wall.
+TEST_CASE("reverse_step_thread: kIn / kOver / kOut accepted at the backend",
+          "[backend][reverse]") {
+  // v1.3: the kind=in/over/out path is implemented via a bounded `bs`
+  // loop with source-line + frame-depth termination. On a target with
+  // no live process the backend still rejects (no process to step) —
+  // we just want to confirm it's the no-process check that fires, not
+  // a "kind not supported" guard.
   auto be = std::make_unique<LldbBackend>();
   auto open = be->create_empty_target();
   REQUIRE(open.target_id != 0);
 
-  // No live process either, so both throws are valid; the message
-  // doesn't have to be "unsupported kind" to pass — we just want this
-  // not to silently succeed.
-  CHECK_THROWS_AS(
-      be->reverse_step_thread(open.target_id, 1, ReverseStepKind::kIn),
-      ldb::backend::Error);
-  CHECK_THROWS_AS(
-      be->reverse_step_thread(open.target_id, 1, ReverseStepKind::kOver),
-      ldb::backend::Error);
+  for (auto k : {ReverseStepKind::kIn, ReverseStepKind::kOver,
+                 ReverseStepKind::kOut}) {
+    try {
+      be->reverse_step_thread(open.target_id, 1, k);
+      FAIL("reverse_step_thread on empty target should have thrown");
+    } catch (const ldb::backend::Error& e) {
+      const std::string what = e.what();
+      // The empty-target path should hit "no process", not the old
+      // "kind not supported" message we removed in v1.3.
+      CHECK(what.find("kind not supported") == std::string::npos);
+    }
+  }
 }

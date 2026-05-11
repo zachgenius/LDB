@@ -94,16 +94,25 @@ def main():
         expect(not r3["ok"] and r3.get("error", {}).get("code") == -32602,
                f"missing target_id expected -32602, got {r3}")
 
-        # Negative: deferred kinds (in / over / out) → -32602.
-        for k in ("in", "over", "out"):
+        # v1.3 carve-out: kind=in/over/out are now accepted at the wire
+        # layer. On an empty target the backend rejects with a "no
+        # process" / "not stopped" error (-32002 or -32000), NOT the
+        # old kind-deferred -32602.
+        for k in ("in", "over", "out", "insn"):
             r = call("process.reverse_step",
                      {"target_id": tid, "tid": 1, "kind": k})
-            expect(not r["ok"] and r.get("error", {}).get("code") == -32602,
-                   f"reverse_step kind={k} expected -32602, got {r}")
-            r = call("thread.reverse_step",
-                     {"target_id": tid, "tid": 1, "kind": k})
-            expect(not r["ok"] and r.get("error", {}).get("code") == -32602,
-                   f"thread.reverse_step kind={k} expected -32602, got {r}")
+            expect(not r["ok"],
+                   f"reverse_step kind={k} on empty target should fail: {r}")
+            code = r.get("error", {}).get("code")
+            expect(code in (-32000, -32002, -32003),
+                   f"reverse_step kind={k} expected backend error, got {r}")
+
+        # Unknown kind still -32602.
+        r_bad = call("process.reverse_step",
+                     {"target_id": tid, "tid": 1, "kind": "sideways"})
+        expect(not r_bad["ok"] and
+               r_bad.get("error", {}).get("code") == -32602,
+               f"unknown kind expected -32602, got {r_bad}")
 
         # Live positive: gated on rr availability.
         rr_bin = find_rr()
