@@ -506,6 +506,16 @@ set_tests_properties(smoke_view_diff PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #4: measured cost preview in describe.endpoints.
+add_test(
+  NAME smoke_cost_p50
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_cost_p50.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_cost_p50 PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"

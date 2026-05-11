@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemon/dispatcher.h"
 
+#include <algorithm>
+
 #include "backend/debugger_backend.h"
 #include "daemon/describe_schema.h"
 #include "ldb/version.h"
+#include "protocol/cost.h"
 #include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
@@ -462,6 +465,40 @@ Dispatcher::diff_cache_get(const std::string& key) {
   return diff_cache_.front().items;
 }
 
+// ── Cost-sample recorder (post-V1 plan #4) ─────────────────────────────
+
+void Dispatcher::record_cost_sample(const std::string& method,
+                                     std::uint64_t tokens) {
+  auto& ring = cost_samples_[method];
+  ++ring.total;
+  if (ring.recent.size() < kCostRingCapacity) {
+    ring.recent.push_back(tokens);
+  } else {
+    ring.recent[ring.next] = tokens;
+    ring.next = (ring.next + 1) % kCostRingCapacity;
+  }
+}
+
+std::optional<std::uint64_t>
+Dispatcher::cost_p50(const std::string& method) const {
+  auto it = cost_samples_.find(method);
+  if (it == cost_samples_.end() || it->second.recent.empty()) {
+    return std::nullopt;
+  }
+  // p50 = the lower of the two middle elements in a sorted copy. For
+  // odd-sized rings this is the median exactly; for even-sized rings
+  // we round down, which is the conservative direction for an agent's
+  // budget check (always slightly under-promise).
+  std::vector<std::uint64_t> sorted = it->second.recent;
+  std::sort(sorted.begin(), sorted.end());
+  return sorted[(sorted.size() - 1) / 2];
+}
+
+std::uint64_t Dispatcher::cost_total(const std::string& method) const {
+  auto it = cost_samples_.find(method);
+  return it == cost_samples_.end() ? 0u : it->second.total;
+}
+
 namespace {
 
 // Extract target_id from request params, when present and integer-typed.
@@ -505,6 +542,21 @@ Response Dispatcher::dispatch(const Request& req) {
   auto t0 = clock::now();
   Response resp = dispatch_inner(req);
   decorate_provenance(resp, backend_.get(), req);
+
+  // Post-V1 plan #4: record measured cost. We compute tokens_est
+  // here (the same formula serialize_response uses) so the recorder
+  // doesn't depend on the JSON-RPC serialization path. Errors don't
+  // carry _cost on the wire and aren't useful as budget signals;
+  // record only successful responses.
+  if (resp.ok && !req.method.empty()) {
+    json cost = protocol::cost::compute_cost(resp.data);
+    if (cost.contains("tokens_est") &&
+        (cost["tokens_est"].is_number_unsigned() ||
+         cost["tokens_est"].is_number_integer())) {
+      record_cost_sample(req.method,
+                         cost["tokens_est"].get<std::uint64_t>());
+    }
+  }
   if (active_session_writer_) {
     auto dt_us = std::chrono::duration_cast<std::chrono::microseconds>(
                      clock::now() - t0).count();
@@ -729,6 +781,22 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   // shape can derive it locally from `properties` + `required`.
   using namespace ldb::daemon::schema;
 
+  // Post-V1 plan #4: measured cost is opt-in via view.include_cost_stats.
+  // The default response stays byte-deterministic (so session.diff /
+  // _provenance hashes stay clean across calls); agents who want the
+  // measured numbers ask for them explicitly. Token-budget baselines
+  // and the rest of the v1.0 schema are unaffected.
+  bool include_cost_stats = false;
+  if (req.params.is_object()) {
+    if (auto vit = req.params.find("view");
+        vit != req.params.end() && vit->is_object()) {
+      if (auto iit = vit->find("include_cost_stats");
+          iit != vit->end() && iit->is_boolean()) {
+        include_cost_stats = iit->get<bool>();
+      }
+    }
+  }
+
   json eps = json::array();
   auto add = [&](std::string name, const char* summary,
                  json params_schema, json returns_schema,
@@ -746,6 +814,16 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
     e["requires_target"]  = requires_target;
     e["requires_stopped"] = requires_stopped;
     e["cost_hint"]        = std::move(cost_hint);
+    if (include_cost_stats) {
+      // cost_n_samples is always present (zero when uncalled);
+      // cost_p50_tokens is absent when there are no samples so agents
+      // can distinguish "this endpoint is cheap" from "we have no
+      // data yet."
+      e["cost_n_samples"] = static_cast<std::int64_t>(cost_total(name));
+      if (auto p50 = cost_p50(name); p50.has_value()) {
+        e["cost_p50_tokens"] = *p50;
+      }
+    }
     eps.push_back(std::move(e));
   };
 
@@ -789,7 +867,10 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
 
   add("describe.endpoints",
       "List supported methods with their JSON Schema params/returns, "
-      "requires_target, requires_stopped, and cost_hint.",
+      "requires_target, requires_stopped, and cost_hint. Pass "
+      "view.include_cost_stats=true to also receive cost_n_samples + "
+      "cost_p50_tokens per entry (measured in-process; opt-in so the "
+      "default response stays byte-deterministic for session.diff).",
       obj({}),
       obj({{"endpoints", arr_of(obj_open(
           "Per-method record. See plan §4.8."))}}, {"endpoints"}),

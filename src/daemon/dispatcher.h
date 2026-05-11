@@ -82,6 +82,25 @@ class Dispatcher {
                                      const nlohmann::json& params,
                                      const std::string& snapshot);
 
+  // Cost samples for post-V1 plan #4 (measured cost preview). Per
+  // endpoint we accumulate a bounded ring of the most recent N
+  // _cost.tokens_est observations plus a running total count.
+  // describe.endpoints reads p50 from the ring and emits it alongside
+  // the static cost_hint, so agents can budget against measured
+  // numbers from the actual session rather than the original guess.
+  static constexpr std::size_t kCostRingCapacity = 100;
+  struct CostSampleRing {
+    std::vector<std::uint64_t> recent;   // ≤ kCostRingCapacity entries
+    std::size_t                next = 0; // write cursor (when full)
+    std::uint64_t              total = 0; // lifetime count, not just ring size
+  };
+  std::unordered_map<std::string, CostSampleRing> cost_samples_;
+  void                record_cost_sample(const std::string& method,
+                                          std::uint64_t tokens);
+  std::optional<std::uint64_t>
+                       cost_p50(const std::string& method) const;
+  std::uint64_t        cost_total(const std::string& method) const;
+
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
   protocol::Response handle_describe_endpoints(const protocol::Request& req);
