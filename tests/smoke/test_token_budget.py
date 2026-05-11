@@ -14,6 +14,16 @@ commit.
 size, so identical RPCs across runs produce identical token counts
 provided the fixture and daemon code are unchanged.
 
+Per-platform baselines: macOS Mach-O modules expose a far richer
+section table than Linux ELF (per-segment sections like
+`__TEXT/__text`, `__TEXT/__auth_stubs`, `__DATA_CONST`, ..., each with
+file/load addresses, permissions, sizes, types), so `module.list` and
+`target.open` responses are an order of magnitude larger on Darwin.
+The baseline file therefore stores per-platform entries keyed by
+`uname -s + "-" + uname -m` (e.g. `Linux-x86_64`, `Darwin-arm64`); the
+smoke SKIPs cleanly on platforms with no baseline rather than failing
+loudly.
+
 Baseline file: tests/baselines/agent_workflow_tokens.json
 
 To regenerate the baseline locally (e.g. after an intentional schema
@@ -27,6 +37,7 @@ diverge.
 """
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -146,20 +157,44 @@ def run_sequence(ldbd, fixture, store_root):
     return per_method
 
 
+def platform_key():
+    """E.g. `Linux-x86_64`, `Linux-aarch64`, `Darwin-arm64`."""
+    return f"{platform.system()}-{platform.machine()}"
+
+
 def load_baseline(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def write_baseline(path, observed_total, observed_per_method):
+    """Update the current platform's entry in the baseline file,
+    preserving entries for other platforms."""
+    existing = {}
+    if os.path.isfile(path):
+        try:
+            existing = load_baseline(path)
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+
     payload = {
-        "version": 1,
+        "version": 2,
         "drift_tolerance": DRIFT_TOLERANCE,
+        "note": "Per-platform baselines. Regenerate with "
+                "LDB_UPDATE_BASELINE=1 on the target platform after an "
+                "intentional wire-shape change. Linux ELF and macOS "
+                "Mach-O expose different section detail through SBAPI, "
+                "so module.list / target.open token counts diverge by "
+                "~20x between platforms — hence the split.",
+        "platforms": dict(existing.get("platforms", {})),
+    }
+    payload["platforms"][platform_key()] = {
         "total_tokens": observed_total,
         "per_method": dict(sorted(observed_per_method.items())),
-        "note": "Regenerate with LDB_UPDATE_BASELINE=1 after an "
-                "intentional wire-shape change.",
     }
+    # Sort platforms alphabetically for diff stability.
+    payload["platforms"] = dict(sorted(payload["platforms"].items()))
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -183,11 +218,14 @@ def main():
         per_method = run_sequence(ldbd, fixture, store_root)
         total = sum(per_method.values())
 
+        plat = platform_key()
+
         if os.environ.get("LDB_UPDATE_BASELINE") == "1":
             write_baseline(baseline_path, total, per_method)
             print(
-                f"token_budget: baseline written to {baseline_path} "
-                f"(total={total}, methods={len(per_method)})"
+                f"token_budget: baseline for {plat} written to "
+                f"{baseline_path} (total={total}, "
+                f"methods={len(per_method)})"
             )
             return
 
@@ -199,7 +237,27 @@ def main():
             sys.exit(1)
 
         baseline = load_baseline(baseline_path)
-        baseline_total = int(baseline["total_tokens"])
+
+        # v1: top-level total_tokens/per_method. v2: per-platform under
+        # "platforms". Support both so old baselines don't break the
+        # gate during the migration window.
+        platforms = baseline.get("platforms")
+        if platforms is not None:
+            entry = platforms.get(plat)
+            if entry is None:
+                print(
+                    f"token_budget: no baseline for platform '{plat}'; "
+                    f"SKIPPING (other platforms present: "
+                    f"{sorted(platforms.keys())}). Generate one with "
+                    f"LDB_UPDATE_BASELINE=1 on this host."
+                )
+                return
+            baseline_total = int(entry["total_tokens"])
+            base_pm = entry.get("per_method", {})
+        else:
+            baseline_total = int(baseline["total_tokens"])
+            base_pm = baseline.get("per_method", {})
+
         tolerance = float(baseline.get("drift_tolerance", DRIFT_TOLERANCE))
 
         if baseline_total == 0:
@@ -213,13 +271,12 @@ def main():
         if drift > tolerance:
             sys.stderr.write(
                 f"token_budget: TOTAL DRIFT {drift * 100:.1f}% exceeds "
-                f"tolerance {tolerance * 100:.0f}%\n"
+                f"tolerance {tolerance * 100:.0f}% on platform {plat}\n"
                 f"  baseline total: {baseline_total}\n"
                 f"  observed total: {total}\n"
                 f"  diff:           {total - baseline_total:+d}\n"
                 "  per-method observed vs baseline:\n"
             )
-            base_pm = baseline.get("per_method", {})
             all_methods = sorted(set(per_method) | set(base_pm))
             for m in all_methods:
                 obs = per_method.get(m, 0)
@@ -237,9 +294,9 @@ def main():
             sys.exit(1)
 
         print(
-            f"token_budget: total={total} (baseline={baseline_total}, "
-            f"drift={drift * 100:.2f}%, tolerance="
-            f"{tolerance * 100:.0f}%) — within budget"
+            f"token_budget: {plat} total={total} "
+            f"(baseline={baseline_total}, drift={drift * 100:.2f}%, "
+            f"tolerance={tolerance * 100:.0f}%) — within budget"
         )
     finally:
         import shutil

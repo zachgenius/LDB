@@ -86,7 +86,15 @@ def main():
                f"static snapshot missing: {r1.get('_provenance')}")
         static_module_count = len(r1["data"]["modules"])
 
-        # Step 2: launch stopped-at-entry → dyld/libc/libpthread load.
+        # Step 2: launch stopped-at-entry. On Linux this typically
+        # ADDS modules (ld.so + libc + libpthread map into the address
+        # space). On macOS the launch step often REDUCES the
+        # module.list output to just dyld + the binary, because LLDB
+        # discards the pre-resolved LC_LOAD_DYLIB entries it had
+        # enumerated at target.open and re-derives the actually-loaded
+        # set from the live process. The diff machinery doesn't care
+        # which direction the set moved; it only needs the snapshots
+        # to differ and the diff to contain *some* annotated entries.
         launched = call("process.launch", {
             "target_id": target_id,
             "stop_at_entry": True,
@@ -100,15 +108,17 @@ def main():
                f"snapshots should differ: static={static_snapshot} "
                f"live={live_snapshot}")
         live_module_count = len(r2["data"]["modules"])
-        # Launching almost always adds at least the dynamic linker
-        # and libc; the count should grow. (We don't assert a specific
-        # delta because the loader set varies across platforms.)
-        expect(live_module_count >= static_module_count,
-               f"module count should not shrink: {static_module_count} "
-               f"-> {live_module_count}")
+        expect(live_module_count != static_module_count,
+               f"module set should change across launch on every "
+               f"supported platform: {static_module_count} -> "
+               f"{live_module_count}")
 
-        # Step 3: diff against the static snapshot. Should contain
-        # only entries with diff_op set.
+        # Step 3: diff against the static snapshot. Direction-agnostic:
+        # we only require that the diff contains SOME annotated entries
+        # and that each carries a valid diff_op. macOS may produce only
+        # "removed" entries (dyld discarded the pre-resolved list);
+        # Linux typically produces only "added" entries (loader filled
+        # in the dependency closure).
         r3 = call("module.list", {
             "target_id": target_id,
             "view": {"diff_against": static_snapshot},
@@ -120,18 +130,13 @@ def main():
         expect(data3.get("diff_baseline_missing") is False,
                f"baseline should be cached: {data3}")
         diff_items = data3["modules"]
-        # Every item must carry diff_op in {added, removed}.
         for it in diff_items:
             op = it.get("diff_op")
             expect(op in ("added", "removed"),
                    f"unexpected diff_op: {it}")
-        # Static→live is monotone; expect no "removed" entries.
-        removed = [it for it in diff_items if it.get("diff_op") == "removed"]
-        expect(len(removed) == 0,
-               f"unexpected removed modules: {removed}")
-        added = [it for it in diff_items if it.get("diff_op") == "added"]
-        expect(len(added) >= 1,
-               f"expected at least one added module after launch: "
+        expect(len(diff_items) >= 1,
+               f"expected at least one annotated entry in the diff "
+               f"(snapshots differed, so the diff must be non-empty): "
                f"{diff_items}")
 
         # Step 4: bogus diff_against → baseline missing flag.
