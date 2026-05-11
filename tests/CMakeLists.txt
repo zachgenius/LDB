@@ -516,6 +516,20 @@ set_tests_properties(smoke_cost_p50 PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #10: interactive REPL with persistent daemon, meta-
+# commands (:explain / :cost / :replay / :quit), tab completion via
+# prompt_toolkit-or-readline fallback.
+add_test(
+  NAME smoke_cli_repl
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_cli_repl.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_cli_repl PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"

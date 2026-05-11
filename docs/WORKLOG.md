@@ -4,6 +4,40 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-11 — v1.4 #10: interactive REPL for `tools/ldb/ldb`
+
+**Goal:** Land post-V1 plan item #10 (`docs/17-version-plan.md`) — an interactive REPL for the Python CLI. The headline win is daemon persistence: one `ldbd --stdio` survives across many commands, so `target_id` from `target.open` is usable in later `module.list` / `disasm.*` calls without re-opening the binary.
+
+**Done:**
+- `tools/ldb/ldb`: new `--repl` flag drops into an interactive loop. Spawns ONE daemon, fetches `describe.endpoints` once for the in-memory catalog, then reads commands from stdin (line-editable via prompt_toolkit when importable, else readline; plain stdin.readline when piped — covers tty / piped-script / smoke-driver cases). Reuses the existing schema-driven `parse_kv_pairs` / `build_params` / coercion path, so new endpoints work in the REPL without code changes.
+- Meta-commands (prefix `:`): `:help`, `:explain METHOD`, `:cost` (calls `describe.endpoints` with `view.include_cost_stats=true` and renders endpoints that have measured samples), `:replay` (re-runs the last non-meta call with the same params dict), `:quit`/`:q`/`:exit`, plus EOF/Ctrl-D.
+- Tab completion: first token completes against endpoint method names + meta-commands; subsequent tokens complete on `key=` from the current method's `params_schema.properties`. Same logic backs both the prompt_toolkit Completer and the readline completer; the readline path adjusts `set_completer_delims` so `target.open` and `target_id=1` complete as single words.
+- Smoke: `tests/smoke/test_cli_repl.py` drives the REPL by piping a command script into `ldb --repl`. Covers (a) persistent-daemon round-trip — `target.open` yields a `target_id` that's usable in a subsequent `module.list`, (b) `:explain hello` prints schema/summary fields, (c) `:cost` produces non-empty stats after a call has run, (d) `:replay` yields two `hello` responses each with `name: ldbd`, (e) `:quit` and EOF both exit rc=0. Registered as `smoke_cli_repl` in `tests/CMakeLists.txt`.
+
+**Decisions:**
+- **REPL prints full envelope (equivalent to `--raw`).** The one-shot CLI's default of `data`-only is for shell pipelines; agents/humans in the REPL want to see `_cost`, `_provenance`, and errors inline. Removes a mode switch — `--raw` becomes a no-op inside the REPL.
+- **prompt_toolkit is opportunistic, not required.** A hard dependency would break the "stdlib-only" footprint the CLI has held since M5. readline is always present on Linux/macOS; prompt_toolkit upgrades the experience (history file, fish-style autosuggest down the road) when installed. Piped stdin (smoke driver) uses `sys.stdin.readline()` and never touches either library.
+- **`:cost` calls `describe.endpoints` opt-in.** The stats are gated behind `view.include_cost_stats=true` since v1.3 (see commit `790719c` — the field was non-opt-in initially and broke session.diff determinism). The REPL just toggles the view flag; no special endpoint.
+- **No history file on disk yet.** prompt_toolkit's InMemoryHistory keeps in-session history; a persistent `~/.ldb_history` is a follow-up if the feature gets traction. Avoiding for now to keep the surface area minimal and dodge "where does this file go on $XDG_STATE_HOME vs $HOME" platform decisions.
+- **`:replay` keeps `last_method` unchanged.** Repeated `:replay :replay :replay` all re-run the original call, not each prior replay. Matches gdb's `<RET>` semantics — repeating doesn't drift target.
+- **REPL doesn't accept top-level `--ldbd`/`--format`/`--verbose` inline.** Those are session-level decisions taken at startup; the REPL is one daemon, one format, for its whole lifetime. Changing them would mean tearing down the daemon and re-fetching the catalog, which defeats the point.
+
+**Surprises / blockers:**
+- **The `tests/unit/CMakeLists.txt` + `src/backend/gdbmi/` tree is the user's in-progress v1.4 #8 work** (GdbMiBackend). Those files were uncommitted on the working tree when I started; touching them is out of scope for #10. The unit-test build currently fails because the gdbmi parser/session files aren't wired into `ldb_lib` (only into `ldbd` directly). My commit is `tools/ldb/ldb`, `tests/CMakeLists.txt`, `tests/smoke/test_cli_repl.py` only; the gdbmi tree is untouched.
+- **One flaky ctest batch on the very first serial run** that I couldn't reproduce on re-run — likely cold-cache contention with a parallel build. Subsequent serial + parallel runs both pass 51/51.
+
+**Verification:**
+- `ldbd` build clean (`cmake --build build --target ldbd`).
+- `python3 tests/smoke/test_cli_repl.py … → OK: ldb --repl smoke` (covers the 6 acceptance cases above).
+- `python3 tests/smoke/test_agent_workflow.py … → agent workflow smoke test PASSED` (one-shot mode unaffected).
+- `python3 tests/smoke/test_ldb_cli.py … → OK: ldb CLI smoke` (existing one-shot CLI smoke unaffected).
+- Full `ctest -R smoke_` (51 tests, skipping ptrace-blocked ones per the v1.3 baseline): 100% pass.
+
+**Next:**
+v1.4 #10 done. Remaining v1.4 items per `docs/17-version-plan.md`: #8 GdbMiBackend (already underway on this branch — uncommitted; not mine), #9 embedded Python probe callbacks, #14 custom Python frame unwinders, #11 ssh-remote daemon mode, #12 libbpf agent, #13 perf integration.
+
+---
+
 ## 2026-05-11 — v1.3 "Agent UX polish" push (all 6 items)
 
 **Goal:** Ship all of v1.3 in one branch per `docs/17-version-plan.md` — six Tier-1 polish items: #7 token-budget CI gate, #3 recipe.reload, #6 hypothesis artifact type, #5 diff-mode view descriptors, the kind=in/over/out reverse-step carve-out, and #4 measured cost preview.
