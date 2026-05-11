@@ -305,30 +305,148 @@ void GdbMiBackend::close_target(TargetId tid) {
 // batches: static-analysis, process control, threads/frames/values,
 // memory, breakpoints, reverse exec).
 
-ProcessStatus GdbMiBackend::launch_process(TargetId, const LaunchOptions&) {
-  todo("launch_process");
+namespace {
+
+// Drain async records after an exec-style command. gdb sends
+// *stopped / *running on the async channel; we look for the most
+// recent terminal-state record and translate to ProcessStatus.
+// Polls the session up to `deadline` for the expected record.
+ProcessStatus wait_for_stop(GdbMiSession& s,
+                            std::chrono::milliseconds budget) {
+  using clock = std::chrono::steady_clock;
+  const auto deadline = clock::now() + budget;
+  ProcessStatus out;
+  out.state = ProcessState::kRunning;
+
+  while (clock::now() < deadline) {
+    auto async = s.drain_async();
+    for (const auto& rec : async) {
+      if (rec.kind != MiRecordKind::kExecAsync) continue;
+      if (rec.klass == "stopped") {
+        out.state = ProcessState::kStopped;
+        if (rec.payload.is_tuple()) {
+          const auto& t = rec.payload.as_tuple();
+          if (auto it = t.find("reason");
+              it != t.end() && it->second.is_string()) {
+            const std::string& reason = it->second.as_string();
+            out.stop_reason = reason;
+            if (reason == "exited" || reason == "exited-normally" ||
+                reason == "exited-signalled") {
+              out.state = ProcessState::kExited;
+            } else if (reason == "signal-received") {
+              // Could be crashed or signalled; keep kStopped for now.
+              out.state = ProcessState::kStopped;
+            }
+          }
+        }
+        return out;
+      }
+      if (rec.klass == "running") {
+        out.state = ProcessState::kRunning;
+        // Don't return yet — exec-async may emit *running then
+        // *stopped in quick succession.
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return out;
 }
+
+}  // namespace
+
+ProcessStatus GdbMiBackend::launch_process(TargetId tid,
+                                              const LaunchOptions& opts) {
+  auto& st = must_get_target(*impl_, tid);
+
+  // stop_at_entry: set a temporary breakpoint at main BEFORE exec-run
+  // (gdb's --start flag would also work, but tbreak gives us a
+  // matching breakpoint-hit stop reason that downstream observers
+  // can pattern-match on).
+  if (opts.stop_at_entry) {
+    send_or_throw(*st.session, "-break-insert -t main");
+  }
+
+  // -exec-run --start triggers a transient break at main and runs;
+  // without stop_at_entry, plain -exec-run runs to completion or to
+  // the first inferior signal. We use -exec-run unconditionally and
+  // let the tbreak above handle the stop_at_entry case.
+  auto r = send_or_throw(*st.session, "-exec-run");
+  // gdb returns ^running for -exec-run; the actual stop arrives
+  // asynchronously.
+  (void)r;
+  st.last_status = wait_for_stop(*st.session,
+                                  std::chrono::seconds(10));
+  return st.last_status;
+}
+
 ProcessStatus GdbMiBackend::get_process_state(TargetId tid) {
-  // Trivial enough to land in this commit — the cached state is
-  // exactly what callers expect when no MI call has been issued
-  // since the last status change.
   auto& st = must_get_target(*impl_, tid);
   return st.last_status;
 }
-ProcessStatus GdbMiBackend::continue_process(TargetId)       { todo("continue_process"); }
-ProcessStatus GdbMiBackend::continue_thread(TargetId, ThreadId) {
-  todo("continue_thread");
+
+ProcessStatus GdbMiBackend::continue_process(TargetId tid) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot continue");
+  }
+  send_or_throw(*st.session, "-exec-continue");
+  st.last_status = wait_for_stop(*st.session, std::chrono::seconds(30));
+  return st.last_status;
 }
+
+ProcessStatus GdbMiBackend::continue_thread(TargetId target_id,
+                                              ThreadId thread_id) {
+  // v0.3 sync passthrough — mirrors LldbBackend's docstring: per-
+  // thread continue is async-prep wire shape; until v1.5 async
+  // runtime lands, this is process-wide continue with the thread
+  // selected first.
+  auto& st = must_get_target(*impl_, target_id);
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot continue");
+  }
+  // The thread_id param is a kernel tid; we ignore the per-thread
+  // selection in v0.3 (matches LldbBackend's sync passthrough) and
+  // just do a process-wide continue. When v1.5 async lands, this
+  // will translate kernel tid → gdb id and use --thread.
+  (void)thread_id;
+  send_or_throw(*st.session, "-exec-continue");
+  st.last_status = wait_for_stop(*st.session, std::chrono::seconds(30));
+  return st.last_status;
+}
+
 ProcessStatus GdbMiBackend::kill_process(TargetId tid) {
-  // Idempotent: a target with no process should return kNone.
   auto& st = must_get_target(*impl_, tid);
   if (st.last_status.state == ProcessState::kNone) return st.last_status;
-  send_or_throw(*st.session, "-exec-abort");
+  // -exec-abort is the documented MI form; some gdb builds map it
+  // to `kill` for compatibility. The CLI fall-through `kill` is a
+  // safe alternative when the MI verb isn't recognised.
+  auto r = st.session->send_command("-exec-abort");
+  if (!r.has_value() || r->klass == "error") {
+    // Fall back to the CLI form.
+    auto cli = st.session->send_command("kill");
+    (void)cli;
+  }
   st.last_status.state = ProcessState::kNone;
   return st.last_status;
 }
-ProcessStatus GdbMiBackend::attach(TargetId, std::int32_t) { todo("attach"); }
-ProcessStatus GdbMiBackend::detach_process(TargetId)       { todo("detach_process"); }
+
+ProcessStatus GdbMiBackend::attach(TargetId tid, std::int32_t pid) {
+  auto& st = must_get_target(*impl_, tid);
+  send_or_throw(*st.session,
+                "-target-attach " + std::to_string(pid));
+  // gdb stops the process on successful attach.
+  st.last_status.state = ProcessState::kStopped;
+  st.last_status.pid   = pid;
+  return st.last_status;
+}
+
+ProcessStatus GdbMiBackend::detach_process(TargetId tid) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) return st.last_status;
+  send_or_throw(*st.session, "-target-detach");
+  st.last_status.state = ProcessState::kDetached;
+  return st.last_status;
+}
 ProcessStatus GdbMiBackend::connect_remote_target(TargetId,
     const std::string&, const std::string&) {
   todo("connect_remote_target");
@@ -637,11 +755,157 @@ GdbMiBackend::find_string_xrefs(TargetId, const std::string&) {
   todo("find_string_xrefs");
 }
 
-// ── Threads / frames / values (stubbed) ───────────────────────────────
+// ── Threads / frames / values ─────────────────────────────────────────
 
-std::vector<ThreadInfo> GdbMiBackend::list_threads(TargetId)     { todo("list_threads"); }
-std::vector<FrameInfo>  GdbMiBackend::list_frames(TargetId,
-    ThreadId, std::uint32_t) { todo("list_frames"); }
+namespace {
+
+// Parse the "Thread 0x7f... (LWP 12345)" target-id form gdb returns
+// in -thread-info, extracting the kernel tid. The Linux pattern is
+// `Thread 0xHEX (LWP TID) "name"`; on macOS gdb (rare) the format
+// differs. Return 0 on parse failure — the caller falls back to
+// gdb's internal numeric thread id.
+std::uint64_t parse_kernel_tid(std::string_view target_id) {
+  const std::string marker = "LWP ";
+  auto pos = target_id.find(marker);
+  if (pos == std::string::npos) return 0;
+  auto start = pos + marker.size();
+  std::uint64_t v = 0;
+  for (auto i = start; i < target_id.size(); ++i) {
+    char c = target_id[i];
+    if (c < '0' || c > '9') break;
+    v = v * 10 + static_cast<unsigned>(c - '0');
+  }
+  return v;
+}
+
+}  // namespace
+
+std::vector<ThreadInfo> GdbMiBackend::list_threads(TargetId tid) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<ThreadInfo> out;
+  if (st.last_status.state == ProcessState::kNone) return out;
+  auto rec = send_or_throw(*st.session, "-thread-info");
+  if (!rec.payload.is_tuple()) return out;
+  auto it = rec.payload.as_tuple().find("threads");
+  if (it == rec.payload.as_tuple().end() || !it->second.is_list()) return out;
+  for (const auto& thr_v : it->second.as_list()) {
+    if (!thr_v.is_tuple()) continue;
+    const auto& t = thr_v.as_tuple();
+    ThreadInfo ti;
+    if (auto idit = t.find("id");
+        idit != t.end() && idit->second.is_string()) {
+      try { ti.index = static_cast<std::uint32_t>(
+          std::stoul(idit->second.as_string()));
+      } catch (...) {}
+    }
+    if (auto tgt = t.find("target-id");
+        tgt != t.end() && tgt->second.is_string()) {
+      ti.tid = parse_kernel_tid(tgt->second.as_string());
+    }
+    if (ti.tid == 0) ti.tid = ti.index;   // fallback: gdb id
+    if (auto nm = t.find("name");
+        nm != t.end() && nm->second.is_string()) {
+      ti.name = nm->second.as_string();
+    }
+    if (auto frame = t.find("frame");
+        frame != t.end() && frame->second.is_tuple()) {
+      auto fit = frame->second.as_tuple().find("addr");
+      if (fit != frame->second.as_tuple().end() &&
+          fit->second.is_string()) {
+        ti.pc = parse_hex_addr(fit->second.as_string());
+      }
+    }
+    if (auto sit = t.find("state");
+        sit != t.end() && sit->second.is_string()) {
+      ti.stop_reason = sit->second.as_string();
+      ti.state = sit->second.as_string() == "running"
+                   ? ProcessState::kRunning
+                   : ProcessState::kStopped;
+    }
+    out.push_back(std::move(ti));
+  }
+  return out;
+}
+
+std::vector<FrameInfo> GdbMiBackend::list_frames(TargetId tid,
+                                                    ThreadId thread_id,
+                                                    std::uint32_t max_depth) {
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<FrameInfo> out;
+  if (st.last_status.state == ProcessState::kNone) return out;
+  // The caller's ThreadId is a kernel tid; gdb's -thread-select
+  // wants gdb's internal numeric id. Resolve by walking -thread-info
+  // until we find a target-id whose embedded LWP matches.
+  std::uint32_t gdb_id = 0;
+  {
+    auto thr_rec = send_or_throw(*st.session, "-thread-info");
+    if (thr_rec.payload.is_tuple()) {
+      auto it = thr_rec.payload.as_tuple().find("threads");
+      if (it != thr_rec.payload.as_tuple().end() && it->second.is_list()) {
+        for (const auto& thr_v : it->second.as_list()) {
+          if (!thr_v.is_tuple()) continue;
+          const auto& t = thr_v.as_tuple();
+          std::uint64_t kt = 0;
+          if (auto tgt = t.find("target-id");
+              tgt != t.end() && tgt->second.is_string()) {
+            kt = parse_kernel_tid(tgt->second.as_string());
+          }
+          if (kt == thread_id) {
+            if (auto idit = t.find("id");
+                idit != t.end() && idit->second.is_string()) {
+              try { gdb_id = static_cast<std::uint32_t>(
+                  std::stoul(idit->second.as_string()));
+              } catch (...) {}
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+  if (gdb_id == 0) throw Error("unknown thread id");
+  send_or_throw(*st.session,
+                "-thread-select " + std::to_string(gdb_id));
+  std::string cmd = "-stack-list-frames";
+  if (max_depth > 0) {
+    cmd += " 0 " + std::to_string(max_depth - 1);
+  }
+  auto rec = send_or_throw(*st.session, cmd);
+  if (!rec.payload.is_tuple()) return out;
+  auto it = rec.payload.as_tuple().find("stack");
+  if (it == rec.payload.as_tuple().end() || !it->second.is_list()) return out;
+  for (const auto& frame_v : it->second.as_list()) {
+    if (!frame_v.is_tuple()) continue;
+    const auto& f = frame_v.as_tuple();
+    FrameInfo fi;
+    if (auto lvit = f.find("level");
+        lvit != f.end() && lvit->second.is_string()) {
+      try { fi.index = static_cast<std::uint32_t>(
+          std::stoul(lvit->second.as_string()));
+      } catch (...) {}
+    }
+    if (auto ait = f.find("addr");
+        ait != f.end() && ait->second.is_string()) {
+      fi.pc = parse_hex_addr(ait->second.as_string());
+    }
+    if (auto fnit = f.find("func");
+        fnit != f.end() && fnit->second.is_string()) {
+      fi.function = fnit->second.as_string();
+    }
+    if (auto filit = f.find("file");
+        filit != f.end() && filit->second.is_string()) {
+      fi.file = filit->second.as_string();
+    }
+    if (auto liit = f.find("line");
+        liit != f.end() && liit->second.is_string()) {
+      try { fi.line = static_cast<std::uint32_t>(
+          std::stoul(liit->second.as_string()));
+      } catch (...) {}
+    }
+    out.push_back(std::move(fi));
+  }
+  return out;
+}
 ProcessStatus GdbMiBackend::step_thread(TargetId, ThreadId, StepKind) {
   todo("step_thread");
 }

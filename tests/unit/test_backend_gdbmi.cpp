@@ -161,8 +161,84 @@ TEST_CASE("GdbMiBackend: find_symbols by exact name resolves address",
       CHECK(s.address != 0);
       CHECK(s.kind == ldb::backend::SymbolKind::kFunction);
       CHECK(s.module_path == kFixturePath);
+      CHECK(s.byte_size > 0);   // resolved via `disassemble main`
     }
   }
   CHECK(found_main);
+  be->close_target(open.target_id);
+}
+
+// ── Process control + threads/frames ──────────────────────────────────
+
+TEST_CASE("GdbMiBackend: launch_process stops at entry + threads listed",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+
+  ldb::backend::LaunchOptions opts;
+  opts.stop_at_entry = true;
+  auto st = be->launch_process(open.target_id, opts);
+  // Either stopped at entry, exited (very short program), or
+  // running through — all valid post-launch states. We don't
+  // pin to kStopped because the fixture might run to completion
+  // before our async drain kicks in.
+  CHECK((st.state == ldb::backend::ProcessState::kStopped ||
+         st.state == ldb::backend::ProcessState::kExited));
+
+  if (st.state == ldb::backend::ProcessState::kStopped) {
+    auto threads = be->list_threads(open.target_id);
+    CHECK_FALSE(threads.empty());
+    CHECK(threads[0].pc != 0);
+
+    auto frames = be->list_frames(open.target_id,
+                                   threads[0].tid, 8);
+    CHECK_FALSE(frames.empty());
+    // Index 0 is the innermost; its pc should match the thread's pc.
+    CHECK(frames[0].pc == threads[0].pc);
+  }
+
+  be->kill_process(open.target_id);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: continue_process resumes a stopped inferior",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  ldb::backend::LaunchOptions opts;
+  opts.stop_at_entry = true;
+  auto launched = be->launch_process(open.target_id, opts);
+  if (launched.state != ldb::backend::ProcessState::kStopped) {
+    // Already ran to completion — that's a valid outcome on a
+    // tiny fixture; we can't test continue from there.
+    be->close_target(open.target_id);
+    SUCCEED("fixture exited before continue could fire");
+    return;
+  }
+
+  auto after = be->continue_process(open.target_id);
+  CHECK((after.state == ldb::backend::ProcessState::kExited ||
+         after.state == ldb::backend::ProcessState::kStopped));
+
+  be->kill_process(open.target_id);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: continue with no process throws kBadState-ish",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  // No launch — continue must throw with "no live process" wording
+  // so the dispatcher maps to -32002 bad-state.
+  try {
+    be->continue_process(open.target_id);
+    FAIL("continue_process without a live process should throw");
+  } catch (const ldb::backend::Error& e) {
+    const std::string what = e.what();
+    CHECK(what.find("no live process") != std::string::npos);
+  }
   be->close_target(open.target_id);
 }

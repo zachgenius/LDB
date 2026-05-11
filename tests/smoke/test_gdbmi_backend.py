@@ -137,11 +137,11 @@ def main():
                    f"too few insns: {len(insns)}")
 
         # Methods not yet ported to GdbMiBackend surface a clean
-        # -32000 with "not implemented yet" rather than crashing.
-        # Confirming a few representatives:
+        # typed error rather than crashing. Confirming a few
+        # representatives that are still stubbed (per docs/18):
         for method, params in [
             ("type.layout", {"target_id": target_id, "name": "point2"}),
-            ("process.launch", {"target_id": target_id}),
+            ("mem.regions", {"target_id": target_id}),
         ]:
             r_unimpl = call(method, params)
             expect(not r_unimpl["ok"],
