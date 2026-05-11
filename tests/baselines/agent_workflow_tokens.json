@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "drift_tolerance": 0.1,
+  "total_tokens": 7786,
+  "per_method": {
+    "describe.endpoints": 5031,
+    "disasm.function": 634,
+    "hello": 43,
+    "module.list": 999,
+    "string.list": 69,
+    "target.close": 4,
+    "target.open": 1006
+  },
+  "note": "Regenerate with LDB_UPDATE_BASELINE=1 after an intentional wire-shape change."
+}

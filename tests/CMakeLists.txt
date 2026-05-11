@@ -459,6 +459,21 @@ set_tests_properties(smoke_agent_workflow PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #7: token-budget regression CI gate. Pins _cost.tokens_est
+# totals for a canonical agent-workflow RPC sequence. Update the baseline
+# (tests/baselines/agent_workflow_tokens.json) by re-running with
+# LDB_UPDATE_BASELINE=1 after an intentional wire-shape change.
+add_test(
+  NAME smoke_token_budget
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_token_budget.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+          "${CMAKE_SOURCE_DIR}/tests/baselines/agent_workflow_tokens.json"
+)
+set_tests_properties(smoke_token_budget PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"
