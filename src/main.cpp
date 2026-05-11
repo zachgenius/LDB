@@ -7,6 +7,7 @@
 #include "probes/probe_orchestrator.h"
 #include "protocol/transport.h"
 #include "store/artifact_store.h"
+#include "store/recipe_store.h"
 #include "store/session_store.h"
 #include "util/log.h"
 
@@ -170,6 +171,36 @@ int main(int argc, char** argv) {
     // Same reasoning as artifact store: don't fail startup. session.*
     // returns -32002 when sessions is null.
     ldb::log::warn(std::string("session store unavailable: ") + e.what());
+  }
+
+  // Post-V1 plan #3: file-backed recipes. If LDB_RECIPE_DIR is set on
+  // startup, scan it for *.json files and load each as a recipe. The
+  // scan never fails the daemon — malformed files are logged to stderr
+  // and skipped, since the dispatcher's recipe.* endpoints remain
+  // perfectly usable without any file-backed recipes.
+  if (artifacts) {
+    if (const char* dir_env = std::getenv("LDB_RECIPE_DIR");
+        dir_env && *dir_env != '\0') {
+      try {
+        ldb::store::RecipeStore rs(*artifacts);
+        auto results = rs.load_from_directory(std::filesystem::path(dir_env));
+        std::size_t ok = 0, err = 0;
+        for (const auto& sr : results) {
+          if (sr.error.empty()) {
+            ++ok;
+          } else {
+            ++err;
+            ldb::log::warn(std::string("recipe scan: ") +
+                           sr.path.string() + " — " + sr.error);
+          }
+        }
+        ldb::log::info(std::string("recipe scan: ") + dir_env + " — " +
+                       std::to_string(ok) + " loaded, " +
+                       std::to_string(err) + " errored");
+      } catch (const std::exception& e) {
+        ldb::log::warn(std::string("recipe scan failed: ") + e.what());
+      }
+    }
   }
 
   // Probe orchestrator. The orchestrator owns the table of active

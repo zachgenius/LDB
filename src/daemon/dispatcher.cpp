@@ -593,6 +593,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "recipe.run")          return handle_recipe_run(req);
     if (req.method == "recipe.delete")       return handle_recipe_delete(req);
     if (req.method == "recipe.lint")         return handle_recipe_lint(req);
+    if (req.method == "recipe.reload")       return handle_recipe_reload(req);
 
     if (req.method == "probe.create")       return handle_probe_create(req);
     if (req.method == "probe.events")       return handle_probe_events(req);
@@ -2040,6 +2041,32 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
                 {"step_index", int_()},
                 {"message",    str()},
             }, {}))},
+        }, {"recipe_id", "warning_count", "warnings"}),
+        /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+    add("recipe.reload",
+        "Re-read a recipe from its source file on disk and replace the "
+        "store entry. Only valid for file-backed recipes — those imported "
+        "via create_from_file or via the LDB_RECIPE_DIR startup scan. "
+        "Recipes created in-band via recipe.create / recipe.from_session "
+        "have no source_path and reject reload with -32003 forbidden. "
+        "On a successful reload the artifact id changes (ArtifactStore's "
+        "(build_id, name) collision rule replaces with a fresh id); the "
+        "response surfaces both the new recipe_id and previous_recipe_id "
+        "so agents can refresh their handle. Lint warnings are returned "
+        "in the same shape as recipe.lint.",
+        obj({{"recipe_id", int_()}}, {"recipe_id"}),
+        obj({
+            {"recipe_id",          int_()},
+            {"previous_recipe_id", int_()},
+            {"name",               str()},
+            {"call_count",         int_()},
+            {"warning_count",      int_()},
+            {"warnings",           arr_of(obj({
+                {"step_index", int_()},
+                {"message",    str()},
+            }, {}))},
+            {"source_path",        str()},
         }, {"recipe_id", "warning_count", "warnings"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "low");
   }
@@ -5087,6 +5114,10 @@ json recipe_to_summary_json(const ldb::store::Recipe& r) {
   if (r.description.has_value()) j["description"] = *r.description;
   j["call_count"] = static_cast<std::int64_t>(r.calls.size());
   j["created_at"] = r.created_at;
+  // source_path appears only on file-backed recipes; absence signals
+  // the recipe was created in-band (recipe.create / recipe.from_session)
+  // and cannot be reloaded.
+  if (r.source_path.has_value()) j["source_path"] = *r.source_path;
   return j;
 }
 
@@ -5422,6 +5453,75 @@ Response Dispatcher::handle_recipe_lint(const Request& req) {
   data["recipe_id"]    = id;
   data["warning_count"] = static_cast<int>(warnings.size());
   data["warnings"]     = std::move(warn_arr);
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_recipe_reload(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::int64_t id = 0;
+  if (auto it = req.params.find("recipe_id");
+      it != req.params.end() && !it->is_null()) {
+    if (it->is_number_integer()) {
+      id = it->get<std::int64_t>();
+    } else if (it->is_number_unsigned()) {
+      id = static_cast<std::int64_t>(it->get<std::uint64_t>());
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'recipe_id' must be an integer");
+    }
+  } else {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing integer param 'recipe_id'");
+  }
+
+  ldb::store::RecipeStore rs(*artifacts_);
+  ldb::store::Recipe reloaded;
+  try {
+    reloaded = rs.reload(id);
+  } catch (const ldb::backend::Error& e) {
+    const std::string what = e.what();
+    if (what.find("no source_path") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden, what);
+    }
+    if (what.find("not found") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+    }
+    if (what.find("no such file") != std::string::npos ||
+        what.find("cannot open") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kBadState, what);
+    }
+    if (what.find("malformed") != std::string::npos ||
+        what.find("missing top-level") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, what);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+  }
+
+  auto warnings = ldb::store::lint_recipe(reloaded);
+  json warn_arr = json::array();
+  for (const auto& w : warnings) {
+    warn_arr.push_back(json{{"step_index", w.step_index},
+                            {"message",    w.message}});
+  }
+  json data;
+  data["recipe_id"]     = reloaded.id;
+  data["name"]          = reloaded.name;
+  data["call_count"]    = static_cast<int>(reloaded.calls.size());
+  data["warning_count"] = static_cast<int>(warnings.size());
+  data["warnings"]      = std::move(warn_arr);
+  if (reloaded.source_path.has_value()) {
+    data["source_path"] = *reloaded.source_path;
+  }
+  // recipe.reload replaces by name → fresh artifact id. Surface the
+  // previous id explicitly so an agent holding `id` knows its handle
+  // is now stale.
+  if (reloaded.id != id) {
+    data["previous_recipe_id"] = id;
+  }
   return protocol::make_ok(req.id, std::move(data));
 }
 

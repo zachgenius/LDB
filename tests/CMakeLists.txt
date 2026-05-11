@@ -474,6 +474,16 @@ set_tests_properties(smoke_token_budget PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #3: recipe.reload + LDB_RECIPE_DIR startup scan.
+add_test(
+  NAME smoke_recipe_reload
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe_reload.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_recipe_reload PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"

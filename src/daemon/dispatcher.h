@@ -134,6 +134,7 @@ class Dispatcher {
   protocol::Response handle_recipe_run(const protocol::Request& req);
   protocol::Response handle_recipe_delete(const protocol::Request& req);
   protocol::Response handle_recipe_lint(const protocol::Request& req);
+  protocol::Response handle_recipe_reload(const protocol::Request& req);
 
   protocol::Response handle_probe_create(const protocol::Request& req);
   protocol::Response handle_probe_events(const protocol::Request& req);

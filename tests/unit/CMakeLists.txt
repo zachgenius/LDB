@@ -41,6 +41,7 @@ set(LDB_UNIT_SOURCES
   test_artifact_relations.cpp
   test_dispatcher_artifact_relate.cpp
   test_recipe_store.cpp
+  test_recipe_reload.cpp
   test_dispatcher_recipe_guard.cpp
   test_recipe_lint.cpp
   test_session_store.cpp

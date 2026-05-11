@@ -4,9 +4,13 @@
 #include "backend/debugger_backend.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ldb::store {
 
@@ -189,6 +193,17 @@ Recipe RecipeStore::create(std::string                  name,
                            std::optional<std::string>   description,
                            std::vector<RecipeParameter> parameters,
                            std::vector<RecipeCall>      calls) {
+  return create_with_source(std::move(name), std::move(description),
+                            std::move(parameters), std::move(calls),
+                            /*source_path=*/std::nullopt);
+}
+
+Recipe RecipeStore::create_with_source(
+    std::string                  name,
+    std::optional<std::string>   description,
+    std::vector<RecipeParameter> parameters,
+    std::vector<RecipeCall>      calls,
+    std::optional<std::string>   source_path) {
   if (name.empty()) throw_recipe_error("recipe name must be non-empty");
 
   // Reject duplicate parameter slot names — they'd race in
@@ -210,19 +225,23 @@ Recipe RecipeStore::create(std::string                  name,
   r.description = std::move(description);
   r.parameters = std::move(parameters);
   r.calls = std::move(calls);
+  r.source_path = source_path;
 
   auto env = envelope_from_recipe(r);
   std::string body = env.dump();
   std::vector<std::uint8_t> bytes(body.begin(), body.end());
 
   // The artifact's meta carries the high-level fields so list() doesn't
-  // have to read+parse every blob just for "show me a directory."
+  // have to read+parse every blob just for "show me a directory." When
+  // source_path is set (post-V1 plan #3 file-backed recipes) it lives
+  // in meta so reload() can recover it without a separate index.
   nlohmann::json meta = nlohmann::json::object();
   meta["recipe_name"] = r.name;
   if (r.description.has_value()) meta["description"] = *r.description;
   meta["call_count"] = static_cast<std::int64_t>(r.calls.size());
   meta["parameter_count"] =
       static_cast<std::int64_t>(r.parameters.size());
+  if (r.source_path.has_value()) meta["source_path"] = *r.source_path;
 
   auto row = store_->put(kRecipeBuildId,
                          std::string(kRecipeNamePrefix) + r.name,
@@ -258,8 +277,14 @@ std::optional<Recipe> RecipeStore::get(std::int64_t id) {
   if (display_name.rfind(prefix, 0) == 0) {
     display_name.erase(0, prefix.size());
   }
-  return recipe_from_envelope(row->id, std::move(display_name),
-                              row->created_at, env);
+  Recipe r = recipe_from_envelope(row->id, std::move(display_name),
+                                  row->created_at, env);
+  // Recover the source_path written by create_with_source (plan #3).
+  if (row->meta.is_object() && row->meta.contains("source_path") &&
+      row->meta["source_path"].is_string()) {
+    r.source_path = row->meta["source_path"].get<std::string>();
+  }
+  return r;
 }
 
 std::vector<Recipe> RecipeStore::list() {
@@ -283,6 +308,124 @@ bool RecipeStore::remove(std::int64_t id) {
     return false;
   }
   return store_->remove(id);
+}
+
+// ── File-backed recipes (post-V1 plan #3) ──────────────────────────────
+
+namespace {
+
+// Parse a file as a recipe envelope plus top-level "name". Returns the
+// parsed pieces ready to feed into create_with_source. Throws
+// backend::Error with a filesystem-recognisable message on any
+// read/parse failure — the dispatcher relies on the wording to route
+// to the right JSON-RPC error code.
+struct ParsedRecipeFile {
+  std::string                  name;
+  std::optional<std::string>   description;
+  std::vector<RecipeParameter> parameters;
+  std::vector<RecipeCall>      calls;
+};
+
+ParsedRecipeFile parse_recipe_file(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) || ec) {
+    throw_recipe_error("no such file: " + path.string());
+  }
+  std::ifstream in(path);
+  if (!in) {
+    throw_recipe_error("cannot open recipe file: " + path.string());
+  }
+  std::ostringstream buf;
+  buf << in.rdbuf();
+  nlohmann::json env;
+  try {
+    env = nlohmann::json::parse(buf.str());
+  } catch (const std::exception& e) {
+    throw_recipe_error("malformed recipe file " + path.string() + ": "
+                       + e.what());
+  }
+  if (!env.is_object()) {
+    throw_recipe_error("recipe file " + path.string() +
+                       " top-level must be a JSON object");
+  }
+  if (!env.contains("name") || !env["name"].is_string()) {
+    throw_recipe_error("recipe file " + path.string() +
+                       " missing top-level string 'name'");
+  }
+
+  ParsedRecipeFile out;
+  out.name = env["name"].get<std::string>();
+
+  // recipe_from_envelope expects the envelope shape without "name"
+  // (the artifact name carries it). Hand it a flat copy.
+  auto stub = RecipeStore::recipe_from_envelope(/*id=*/0, out.name,
+                                                /*created_at=*/0, env);
+  out.description = stub.description;
+  out.parameters = std::move(stub.parameters);
+  out.calls = std::move(stub.calls);
+  return out;
+}
+
+}  // namespace
+
+Recipe RecipeStore::create_from_file(const std::filesystem::path& path) {
+  auto parsed = parse_recipe_file(path);
+  // Canonicalize so reload() doesn't lose the recipe when the operator
+  // changes their cwd. weakly_canonical is fine — the existence check
+  // already happened in parse_recipe_file.
+  std::error_code ec;
+  auto abs = std::filesystem::weakly_canonical(path, ec);
+  if (ec) abs = std::filesystem::absolute(path);
+  return create_with_source(std::move(parsed.name),
+                            std::move(parsed.description),
+                            std::move(parsed.parameters),
+                            std::move(parsed.calls),
+                            abs.string());
+}
+
+Recipe RecipeStore::reload(std::int64_t id) {
+  auto existing = get(id);
+  if (!existing.has_value()) {
+    throw_recipe_error("recipe not found: " + std::to_string(id));
+  }
+  if (!existing->source_path.has_value()) {
+    throw_recipe_error(
+        "recipe " + std::to_string(id) +
+        " has no source_path; only file-backed recipes (loaded via "
+        "create_from_file or load_from_directory) can be reloaded");
+  }
+  return create_from_file(*existing->source_path);
+}
+
+std::vector<RecipeStore::ScanResult>
+RecipeStore::load_from_directory(const std::filesystem::path& dir) {
+  std::vector<ScanResult> out;
+  std::error_code ec;
+  if (!std::filesystem::is_directory(dir, ec) || ec) {
+    return out;
+  }
+  // Stable order so reloads + smokes are deterministic.
+  std::vector<std::filesystem::path> entries;
+  for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+    if (de.is_regular_file() && de.path().extension() == ".json") {
+      entries.push_back(de.path());
+    }
+  }
+  std::sort(entries.begin(), entries.end());
+  for (const auto& p : entries) {
+    ScanResult sr;
+    sr.path = p;
+    try {
+      auto r = create_from_file(p);
+      sr.recipe_id = r.id;
+    } catch (const ldb::backend::Error& e) {
+      sr.error = e.what();
+    } catch (const std::exception& e) {
+      sr.error = e.what();
+    }
+    out.push_back(std::move(sr));
+  }
+  return out;
 }
 
 // ── lint_recipe ────────────────────────────────────────────────────────────
