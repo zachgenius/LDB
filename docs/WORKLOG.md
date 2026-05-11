@@ -4,6 +4,176 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.4 phase-2: #9/#12/#14 integration layers + libsodium fix
+
+**Goal:** User installed libsodium-dev (removing the
+`/tmp/sodium-prefix` workaround) and asked to continue the v1.4 work.
+Three deferred phase-2 / phase-1 items from the previous session
+needed wiring:
+
+- #9 phase-2: hook the CPython embed surface into `RecipeStore` /
+  `recipe.create` / `recipe.lint` / `recipe.run` for `format =
+  "python-v1"`.
+- #12 phase-2: daemon-side `AgentEngine` that spawns
+  `ldb-probe-agent`, performs a hello round-trip, returns version /
+  libbpf / BTF / embedded-programs info.
+- #14 phase-1: Python frame unwinders — registration + a synchronous
+  test-and-observability invocation endpoint. SBUnwinder hookup
+  deferred to phase-2.
+
+**Done (commits on `feat/v1.4-backend`, in order):**
+
+- **`704fafe` feat(python): wire python-v1 recipes into RecipeStore +
+  lint + run (#9 phase-2)** — extends `Recipe` with an optional
+  `python_body` field; `envelope_from_recipe` / `recipe_from_envelope`
+  round-trip the body in the existing `recipe-v1` artifact format
+  (backward-compatible: envelopes without `python_body` parse as
+  old-style call-sequence recipes). New `RecipeStore::create_python_recipe`
+  + internal workhorse `create_internal`. Dispatcher:
+  `handle_recipe_create` accepts a `format` enum and routes to the
+  right path; `handle_recipe_lint` compiles via `Callable`
+  construction and surfaces SyntaxError as a single `LintWarning` at
+  step_index=0; `handle_recipe_run` invokes the Callable with
+  caller-supplied `args` as the Python `ctx`, returns
+  `{result, stdout, stderr}`. Runtime exceptions → -32000 with
+  structured `exception_type` + `message` in `error.data`. New
+  `describe.endpoints` schema announces the `format` enum + `body`
+  param. Smoke `tests/smoke/test_recipe_python.py` covers create /
+  lint(valid+SyntaxError) / run / runtime-exception / missing-body
+  cases. TDD red-state confirmed on the envelope unit test (compile
+  failed with `no member python_body` before the field was added).
+
+- **`<this branch>` feat(probe-agent): AgentEngine + agent.hello
+  endpoint (#12 phase-2)** — `src/probes/agent_engine.{h,cpp}` is an
+  own-the-subprocess RAII class using `posix_spawnp` with two pipes
+  (stdin/stdout), wrapping each in `__gnu_cxx::stdio_filebuf` so the
+  existing `probe_agent::{read,write}_frame` helpers compose cleanly.
+  `discover_agent()`: `$LDB_PROBE_AGENT` → `$PATH` → sibling-of-self
+  fallback (via `/proc/self/exe`). Destructor sends `shutdown`,
+  500ms-then-SIGKILL the child. New `agent.hello` dispatcher endpoint
+  returns the agent's version, libbpf version, BTF availability, and
+  embedded programs. Smoke `tests/smoke/test_probe_agent.py` end-to-
+  end through ldbd; gated in `tests/CMakeLists.txt` on
+  `LDB_BPF_AGENT_BUILD` so stripped hosts don't see spurious
+  failures.
+
+- **`bd81c8f` feat(unwinder): python frame unwinders +
+  process.unwind_one test endpoint (#14 phase-1)** — reuses #9's
+  `Callable`. `Dispatcher::python_unwinders_` is
+  `unordered_map<TargetId, unique_ptr<Callable>>`. New
+  `process.set_python_unwinder({target_id, body})` registers (compile
+  errors → -32602). New `process.unwind_one({target_id, ip, sp, fp,
+  registers?})` builds the `ctx` dict from the caller's frame state,
+  invokes the Callable, returns `{result, stdout}`. Runtime
+  exception → -32000. Unset target → -32002. SBUnwinder hookup
+  deferred to phase-2 (SBAPI surface for unwinder interception is in
+  flux; decoupling the wire contract from the LLDB integration is
+  the right cut). `docs/20-embedded-python.md` §7a documents the
+  contract + phase-1/2 split. Smoke `tests/smoke/test_python_unwinder.py`
+  covers register + invoke + stdout capture + SyntaxError + missing-
+  unwinder + replacement semantics.
+
+**Decisions:**
+
+- **Reuse `recipe-v1` artifact format for python-v1 recipes** instead
+  of a new format. `python_body` is an optional envelope field; old
+  recipes parse unchanged. Saves duplicating `list()` / `get()` /
+  `remove()` filters across two formats. The discriminator at runtime
+  is `Recipe::python_body.has_value()`, not a string compare —
+  faster and less error-prone.
+- **`recipe.run` uses `args` for python-v1, `parameters` for
+  recipe-v1.** python-v1 has no placeholder substitution — the dict
+  IS the literal `ctx`. Keeping the names distinct prevents an agent
+  from accidentally getting `substitute_params` semantics on a
+  Python recipe.
+- **`AgentEngine` is one-shot per call.** Every `agent.hello` spawns
+  a fresh `ldb-probe-agent`. This is honest about phase-2 scope: the
+  persistent session needed for `attach_* / poll_events` is phase-3.
+  Spawn cost is ~ms on a local fork; agents calling `hello`
+  diagnostically once-per-session is fine.
+- **`AgentEngine::discover_agent` order is env → PATH → sibling.**
+  Same precedence as the other ldb tools (LDB_LLDB_SERVER,
+  LDB_PERF). The sibling lookup via `/proc/self/exe` means a
+  developer running `build/bin/ldbd` gets `build/bin/ldb-probe-agent`
+  automatically without needing the install-prefix on $PATH.
+- **`process.unwind_one` is a test-and-observability endpoint, not
+  the integration point.** The whole purpose is "give CI and agents
+  a way to exercise the callable end-to-end without a real stopped
+  process." Calling it documents the contract (`ctx` keys + return
+  shape) which is what phase-2's SBUnwinder hookup will marshal to.
+- **`python_unwinders_` on the dispatcher, not the backend.** The
+  callable's lifetime is tied to the dispatcher (single-threaded
+  today; per-session in the future). Putting it on the backend would
+  thread Python state through `DebuggerBackend::*` interfaces that
+  have nothing to do with Python. Forward-decl `class Callable;` +
+  include in the .cpp keeps the header light.
+
+**Surprises / blockers:**
+
+- **`libbpf-dev` not installed alongside `libsodium-dev`** on this
+  dev box. Worked around the same way as before: extracted the
+  `libbpf-dev_1.3.0` .deb to `/tmp/libbpf-extracted/usr` and rewrote
+  the .pc file's `prefix=` so pkg-config resolves it correctly.
+  `cmake -B build` picks it up via
+  `PKG_CONFIG_PATH=/tmp/libbpf-extracted/usr/lib/x86_64-linux-gnu/pkgconfig`.
+  Documented for the next session; `sudo apt-get install libbpf-dev`
+  removes the workaround.
+- **`Recipe` struct change is technically a wire shape change for
+  `recipe.get`.** Old clients reading the JSON envelope still see
+  every field they used to. New `python_body` only appears when set.
+  Backward-compat preserved by inspection of `envelope_from_recipe`.
+- **Dispatcher `python_unwinders_` is shared across all sessions in
+  the daemon process.** Today there's only one session per ldbd
+  invocation in the common case, but the multi-session model (M3+)
+  will need per-session keying. Flagged for phase-2; the obvious
+  fix is `unordered_map<(session_id, target_id), Callable>` or a
+  per-session dispatcher state object.
+
+**Verification:**
+
+- `cmake --build build` clean modulo pre-existing nlohmann
+  `-Wnull-dereference` false positives (22 instances on master).
+- `ldb_unit_tests "[envelope]"` → 2/2, 23 assertions including the
+  new python-v1 round-trip case.
+- `python3 tests/smoke/test_recipe_python.py build/bin/ldbd` →
+  OK: recipe python-v1 smoke (5 acceptance cases).
+- `python3 tests/smoke/test_probe_agent.py …` → OK: agent.hello
+  smoke (4 acceptance cases).
+- `python3 tests/smoke/test_python_unwinder.py …` → OK:
+  process.set_python_unwinder smoke (6 acceptance cases).
+- Full `ctest --test-dir build -j4` → 58/65 pass, 7 fail — *identical*
+  set to the documented baseline (ptrace_scope=1 group). +3 smokes,
+  no regressions.
+
+**Next:**
+
+v1.4 is now functionally complete to its design-doc commitments
+(phase-1 + phase-2 for #9, phase-2 for #12, phase-1 for #14). What
+remains for v1.4 closure on master:
+
+1. **#12 phase-3:** persistent `AgentEngine` session,
+   `ProbeOrchestrator` routing of `engine: "agent"` probes,
+   attach_uprobe / attach_kprobe / poll_events wiring. The
+   AgentEngine class is structured to grow into this without a
+   rewrite — add a `start_session()` that doesn't shutdown, plus
+   `attach_* / poll`.
+2. **#14 phase-2:** SBUnwinder hookup so `process.list_frames`
+   actually calls the registered Callable during ordinary stack
+   walking. Likely via `SBLanguageRuntime` subclass or a
+   command-interpreter hook.
+3. **CI:** a Linux runner with libbpf-dev + clang + bpftool +
+   CAP_BPF to exercise the BPF skeleton path of `ldb-probe-agent`
+   that this box couldn't cover. Same runner can pick up the
+   `perf` live-path (#13) when `linux-tools-generic` is installed.
+4. **libbpf-dev:** install via `sudo apt-get install libbpf-dev`
+   to remove the `/tmp/libbpf-extracted` workaround.
+
+The branch is ready for review + merge to master. All design-doc
+commitments are met; remaining phase-N work is documented and
+landing-independent (each one a clean follow-up commit).
+
+---
+
 ## 2026-05-11 — v1.4 close-out: #11/#13/#9/#12 landed (overnight session)
 
 **Goal:** User asleep; given a mandate to manage remaining v1.4 work
