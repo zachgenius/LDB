@@ -78,6 +78,7 @@ set(LDB_UNIT_SOURCES
   test_bpftrace_live.cpp
   test_dispatcher_uprobe_bpf.cpp
   test_perf_parser.cpp
+  test_dispatcher_perf.cpp
   test_observer_tcpdump_parser.cpp
   test_observer_tcpdump_live.cpp
   test_dispatcher_tcpdump.cpp

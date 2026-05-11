@@ -71,6 +71,11 @@ struct ReportSpec {
 struct ReportResult {
   PerfParser::Result parsed;
   bool               truncated = false; // sample count > max_samples
+  // Pre-truncation sample count. `parsed.samples.size()` reflects the
+  // capped/sliced view; `total_samples` is what the trace actually held.
+  // An agent calling `perf.report` with `max_samples=10` against a trace
+  // of 2000 samples needs to see 2000 to know whether to widen the cap.
+  std::size_t        total_samples = 0;
 };
 
 class PerfRunner {

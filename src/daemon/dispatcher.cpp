@@ -6571,6 +6571,25 @@ Response Dispatcher::handle_perf_record(const Request& req) {
   }
   if (have_pid) spec.pid = pid_v;
 
+  // perf record -- <cmd> execs <cmd> directly after the trace interval;
+  // a JSON-RPC client supplying `command` is requesting arbitrary process
+  // spawn. Route it through the same operator-policy allowlist as
+  // observer.exec instead of trusting the wire. pid mode is fine —
+  // observer-side decision about which pids the agent can sample is
+  // outside this surface (it's kernel + perf_event_paranoid territory).
+  if (have_cmd) {
+    if (!exec_allowlist_) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "perf.record command mode disabled — no allowlist configured. "
+          "Set --observer-exec-allowlist or LDB_OBSERVER_EXEC_ALLOWLIST, "
+          "or use pid mode against an already-running process.");
+    }
+    if (!exec_allowlist_->allows(spec.command)) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden,
+          "perf.record: command not allowed by operator policy");
+    }
+  }
+
   // duration_ms (uint). Required for pid mode; optional for command mode
   // (the command's lifetime is the trace duration), but if supplied we
   // still cap-check.
@@ -6587,6 +6606,12 @@ Response Dispatcher::handle_perf_record(const Request& req) {
                               "duration_ms required when pid is set");
   }
 
+  // 10 kHz upper bound. Above this, sampling pressure starts producing
+  // multi-GB perf.data files in a 5-minute trace and the kernel itself
+  // typically throttles unprivileged perf at 1 kHz anyway. Daemon-side
+  // cap is the cheap guard before disk/RAM exhaustion (see also the
+  // perf.data size cap below).
+  constexpr std::uint64_t kMaxFrequencyHz = 10000;
   std::uint64_t freq = 0;
   if (auto it = req.params.find("frequency_hz");
       it != req.params.end() && !it->is_null()) {
@@ -6594,9 +6619,12 @@ Response Dispatcher::handle_perf_record(const Request& req) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                                 "frequency_hz must be positive integer");
     }
-    spec.frequency_hz = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(freq,
-                                 std::numeric_limits<std::uint32_t>::max()));
+    if (freq > kMaxFrequencyHz) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "frequency_hz exceeds " + std::to_string(kMaxFrequencyHz)
+            + " Hz daemon cap");
+    }
+    spec.frequency_hz = static_cast<std::uint32_t>(freq);
   }
 
   if (auto it = req.params.find("events");
@@ -6610,7 +6638,12 @@ Response Dispatcher::handle_perf_record(const Request& req) {
         return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                                   "events entries must be strings");
       }
-      spec.events.push_back(a.get<std::string>());
+      std::string ev = a.get<std::string>();
+      if (ev.empty()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "events entries must be non-empty strings");
+      }
+      spec.events.push_back(std::move(ev));
     }
   }
 
@@ -6631,8 +6664,14 @@ Response Dispatcher::handle_perf_record(const Request& req) {
   // failure; the dispatcher's outer catch maps that to -32000.
   ldb::perf::RecordResult result = ldb::perf::PerfRunner::record(spec);
 
-  // Slurp the perf.data file into the ArtifactStore. Best effort to
-  // unlink the temp file afterwards so /tmp doesn't accumulate.
+  // Slurp the perf.data file into the ArtifactStore. The cap exists
+  // because perf record at high frequency with --call-graph dwarf can
+  // emit multi-GB traces; blindly resize()-ing into RAM and copying to
+  // the artifact store would put 2x that on disk plus 1x in memory.
+  // 256 MiB is comfortable for typical 5-minute traces at 99 Hz fp
+  // call-graph; agents who genuinely need more can chunk by time.
+  constexpr std::streamsize kMaxPerfDataBytes =
+      static_cast<std::streamsize>(256) * 1024 * 1024;
   std::vector<std::uint8_t> blob;
   {
     std::ifstream f(result.perf_data_path, std::ios::binary);
@@ -6645,6 +6684,14 @@ Response Dispatcher::handle_perf_record(const Request& req) {
     f.seekg(0, std::ios::end);
     std::streamsize sz = f.tellg();
     if (sz < 0) sz = 0;
+    if (sz > kMaxPerfDataBytes) {
+      ::unlink(result.perf_data_path.c_str());
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+          "perf.data exceeds daemon cap (" + std::to_string(sz)
+            + " > " + std::to_string(kMaxPerfDataBytes)
+            + " bytes); shorten duration_ms, lower frequency_hz, or "
+              "drop --call-graph dwarf");
+    }
     f.seekg(0, std::ios::beg);
     blob.resize(static_cast<std::size_t>(sz));
     if (sz > 0) f.read(reinterpret_cast<char*>(blob.data()), sz);
@@ -6740,7 +6787,10 @@ Response Dispatcher::handle_perf_report(const Request& req) {
   }
   json data;
   data["samples"]        = std::move(arr);
-  data["total"]          = result.parsed.samples.size();
+  // `total` is the pre-truncation count so an agent capping with
+  // max_samples can tell whether to widen the cap. Mirrors what
+  // view::apply_to_array does for paginated read-path endpoints.
+  data["total"]          = result.total_samples;
   data["truncated"]      = result.truncated;
   data["perf_data_size"] = row_opt->byte_size;
   data["parse_errors"]   = result.parsed.parse_errors;

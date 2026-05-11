@@ -18,6 +18,7 @@ Phase-1 contract per docs/22-perf-integration.md.
 """
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -104,8 +105,25 @@ def main():
                    "params": params or {}}
             daemon.stdin.write(json.dumps(req) + "\n")
             daemon.stdin.flush()
-            # Read with a small timeout via select since the perf call
-            # itself may take 500ms + spawn overhead.
+            # Bound the per-call wait so a daemon hang (perf segfaults
+            # mid-record, waitpid blocks indefinitely) surfaces as a real
+            # test failure rather than ctest's outer TIMEOUT verdict —
+            # the two are diagnostically different.
+            ready, _, _ = select.select([daemon.stdout], [], [], timeout)
+            if not ready:
+                try:
+                    daemon.kill()
+                except Exception:
+                    pass
+                stderr = ""
+                try:
+                    stderr = daemon.stderr.read() or ""
+                except Exception:
+                    pass
+                sys.stderr.write(
+                    f"daemon did not respond to {method} within "
+                    f"{timeout}s (stderr tail: {stderr[-2000:]})\n")
+                sys.exit(1)
             line = daemon.stdout.readline()
             if not line:
                 stderr = daemon.stderr.read()

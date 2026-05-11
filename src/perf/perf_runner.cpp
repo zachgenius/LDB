@@ -252,6 +252,7 @@ ReportResult PerfRunner::report(const ReportSpec& spec) {
 
   ReportResult r;
   r.parsed = PerfParser::parse(er.stdout_data);
+  r.total_samples = r.parsed.samples.size();
   if (spec.max_samples > 0
       && static_cast<std::int64_t>(r.parsed.samples.size())
              > spec.max_samples) {
