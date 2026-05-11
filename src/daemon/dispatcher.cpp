@@ -2584,9 +2584,20 @@ Response Dispatcher::handle_target_connect_remote(const Request& req) {
     plugin = it->get<std::string>();
   }
 
-  auto status = backend_->connect_remote_target(
-      static_cast<backend::TargetId>(tid), *url, plugin);
-  return protocol::make_ok(req.id, process_status_to_json(status));
+  try {
+    auto status = backend_->connect_remote_target(
+        static_cast<backend::TargetId>(tid), *url, plugin);
+    return protocol::make_ok(req.id, process_status_to_json(status));
+  } catch (const backend::Error& e) {
+    // "does not support" → -32003 forbidden so agents can branch
+    // backends cleanly (e.g. fall back to --backend=lldb on rr://
+    // URLs the gdb backend rejects).
+    const std::string what = e.what();
+    if (what.find("does not support") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden, what);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+  }
 }
 
 Response Dispatcher::handle_target_connect_remote_ssh(const Request& req) {
@@ -2652,12 +2663,20 @@ Response Dispatcher::handle_target_connect_remote_ssh(const Request& req) {
     opts.setup_timeout = std::chrono::milliseconds(timeout_ms);
   }
 
-  auto result = backend_->connect_remote_target_ssh(
-      static_cast<backend::TargetId>(tid), opts);
-  json data = process_status_to_json(result.status);
-  data["target_id"]         = tid;
-  data["local_tunnel_port"] = result.local_tunnel_port;
-  return protocol::make_ok(req.id, std::move(data));
+  try {
+    auto result = backend_->connect_remote_target_ssh(
+        static_cast<backend::TargetId>(tid), opts);
+    json data = process_status_to_json(result.status);
+    data["target_id"]         = tid;
+    data["local_tunnel_port"] = result.local_tunnel_port;
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const backend::Error& e) {
+    const std::string what = e.what();
+    if (what.find("does not support") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden, what);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+  }
 }
 
 Response Dispatcher::handle_process_detach(const Request& req) {

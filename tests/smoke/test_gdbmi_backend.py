@@ -136,23 +136,33 @@ def main():
             expect(len(insns) >= 4,
                    f"too few insns: {len(insns)}")
 
-        # Methods not yet ported to GdbMiBackend surface a clean
-        # typed error rather than crashing. Confirming a few
-        # representatives that are still stubbed (per docs/18):
-        for method, params in [
-            ("type.layout", {"target_id": target_id, "name": "point2"}),
-            ("frame.locals",
-             {"target_id": target_id, "tid": 1, "frame": 0}),
-        ]:
-            r_unimpl = call(method, params)
-            expect(not r_unimpl["ok"],
-                   f"{method} should still fail in v1.4 gdb backend: "
-                   f"{r_unimpl}")
-            err = r_unimpl.get("error", {})
-            msg = err.get("message", "")
-            expect("not implemented yet" in msg or
-                   err.get("code") in (-32000, -32002, -32003),
-                   f"{method} should return typed error: {r_unimpl}")
+        # type.layout now lands on the gdb backend (v1.4 final batch).
+        # ptype /o parsing populates the struct's fields with offsets
+        # and byte sizes; alignment stays 0 (gdb doesn't surface
+        # alignof via MI). Use "struct point2" — gdb's C tag-name
+        # lookup requires the prefix, and the backend transparently
+        # retries plain "point2" → "struct point2" so either works.
+        rlayout = call("type.layout",
+                       {"target_id": target_id, "name": "point2"})
+        expect(rlayout["ok"], f"type.layout: {rlayout}")
+        if rlayout["ok"]:
+            layout = rlayout["data"]["layout"]
+            expect(layout.get("byte_size") == 8,
+                   f"point2 byte_size: {layout}")
+            expect(len(layout.get("fields", [])) == 2,
+                   f"point2 field count: {layout}")
+
+        # Methods that require a live process surface a typed error
+        # (mapped to -32002 by the dispatcher) when called against a
+        # static target. frame.locals is the canonical example.
+        r_no_proc = call("frame.locals",
+                         {"target_id": target_id, "tid": 1, "frame": 0})
+        expect(not r_no_proc["ok"],
+               f"frame.locals against static target should fail: "
+               f"{r_no_proc}")
+        err = r_no_proc.get("error", {})
+        expect(err.get("code") in (-32000, -32002, -32003),
+               f"frame.locals should return typed error: {r_no_proc}")
 
         # Clean target close.
         rcls = call("target.close", {"target_id": target_id})

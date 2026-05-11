@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <system_error>
+#include <unistd.h>
 
 using ldb::backend::gdbmi::GdbMiBackend;
 using ldb::backend::ProcessState;
@@ -426,5 +428,281 @@ TEST_CASE("GdbMiBackend: evaluate_expression handles pure arithmetic",
   CHECK(res.ok);
   REQUIRE(res.value.summary.has_value());
   CHECK(res.value.summary->find('3') != std::string::npos);
+  be->close_target(open.target_id);
+}
+
+// ── Breakpoints (v1.4 final batch) ────────────────────────────────────
+
+TEST_CASE("GdbMiBackend: create_breakpoint at main returns bp_id and addr",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+
+  ldb::backend::BreakpointSpec spec;
+  spec.function = "main";
+  auto h = be->create_breakpoint(open.target_id, spec);
+  CHECK(h.bp_id != 0);
+  // locations: 1 when gdb resolved an address (non-pending bp).
+  CHECK(h.locations == 1);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: create_breakpoint without spec fields throws",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  ldb::backend::BreakpointSpec spec;  // all defaults
+  CHECK_THROWS_AS(be->create_breakpoint(open.target_id, spec),
+                  ldb::backend::Error);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: disable/enable/delete_breakpoint round-trip",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+
+  ldb::backend::BreakpointSpec spec;
+  spec.function = "point2_distance_sq";
+  auto h = be->create_breakpoint(open.target_id, spec);
+  REQUIRE(h.bp_id != 0);
+
+  // All three should succeed silently on a real bp.
+  CHECK_NOTHROW(be->disable_breakpoint(open.target_id, h.bp_id));
+  CHECK_NOTHROW(be->enable_breakpoint(open.target_id, h.bp_id));
+  CHECK_NOTHROW(be->delete_breakpoint(open.target_id, h.bp_id));
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: disable_breakpoint unknown id throws",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  CHECK_THROWS_AS(be->disable_breakpoint(open.target_id, 9999),
+                  ldb::backend::Error);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: set_breakpoint_callback accepts and stores",
+          "[gdbmi][live][requires_gdb]") {
+  // The callback won't actually fire on the v1.4 gdb backend (best-
+  // effort; no event thread). The test pins the contract that the
+  // registration path is non-throwing on a valid bp_id, which is
+  // what the orchestrator depends on.
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  ldb::backend::BreakpointSpec spec;
+  spec.function = "main";
+  auto h = be->create_breakpoint(open.target_id, spec);
+  REQUIRE(h.bp_id != 0);
+
+  ldb::backend::BreakpointCallback cb =
+      [](void*, const ldb::backend::BreakpointCallbackArgs&) { return false; };
+  CHECK_NOTHROW(
+      be->set_breakpoint_callback(open.target_id, h.bp_id,
+                                  std::move(cb), /*baton=*/nullptr));
+  be->close_target(open.target_id);
+}
+
+// ── Static analysis (v1.4 final batch) ────────────────────────────────
+
+TEST_CASE("GdbMiBackend: find_type_layout(point2) returns x,y at 0,4",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  // The fixture's `struct point2` has two int fields, no padding.
+  // The backend accepts plain "point2" and retries "struct point2"
+  // internally — both forms succeed.
+  auto layout = be->find_type_layout(open.target_id, "point2");
+  REQUIRE(layout.has_value());
+  CHECK(layout->byte_size == 8);
+  REQUIRE(layout->fields.size() == 2);
+  CHECK(layout->fields[0].name == "x");
+  CHECK(layout->fields[0].offset == 0);
+  CHECK(layout->fields[0].byte_size == 4);
+  CHECK(layout->fields[1].name == "y");
+  CHECK(layout->fields[1].offset == 4);
+  CHECK(layout->fields[1].byte_size == 4);
+  // alignment is best-effort; gdb's ptype /o doesn't surface it.
+  CHECK(layout->alignment == 0);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: find_type_layout(dxp_login_frame) detects hole",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  auto layout = be->find_type_layout(open.target_id, "dxp_login_frame");
+  REQUIRE(layout.has_value());
+  CHECK(layout->byte_size == 16);
+  REQUIRE(layout->fields.size() == 2);
+  // magic at 0..3, sid at 8..15 → 4-byte hole_after on magic.
+  CHECK(layout->fields[0].offset == 0);
+  CHECK(layout->fields[0].byte_size == 4);
+  CHECK(layout->fields[0].holes_after == 4);
+  CHECK(layout->fields[1].offset == 8);
+  CHECK(layout->fields[1].byte_size == 8);
+  CHECK(layout->holes_total == 4);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: find_type_layout on unknown returns nullopt",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  auto layout = be->find_type_layout(open.target_id, "no_such_type_xyz");
+  CHECK_FALSE(layout.has_value());
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: find_globals_of_type finds g_login_template",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  bool truncated = true;  // sentinel to confirm backend clears it
+  auto matches = be->find_globals_of_type(open.target_id,
+                                           "dxp_login_frame", truncated);
+  CHECK_FALSE(truncated);
+  bool found = false;
+  for (const auto& g : matches) {
+    if (g.name == "g_login_template") {
+      found = true;
+      CHECK(g.type.find("dxp_login_frame") != std::string::npos);
+      CHECK(g.file_address != 0);
+    }
+  }
+  CHECK(found);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: find_globals_of_type empty name throws",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  bool truncated = false;
+  CHECK_THROWS_AS(be->find_globals_of_type(open.target_id, "", truncated),
+                  ldb::backend::Error);
+  be->close_target(open.target_id);
+}
+
+// ── Punted endpoints — return empty, don't crash ──────────────────────
+
+TEST_CASE("GdbMiBackend: find_strings is a punted no-op (returns empty)",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  ldb::backend::StringQuery q;
+  auto out = be->find_strings(open.target_id, q);
+  CHECK(out.empty());
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: xref_address is a punted no-op (returns empty)",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  auto out = be->xref_address(open.target_id, 0x1000);
+  CHECK(out.empty());
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: find_string_xrefs is a punted no-op (returns empty)",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  auto out = be->find_string_xrefs(open.target_id, "DXP/1.0");
+  CHECK(out.empty());
+  be->close_target(open.target_id);
+}
+
+// ── Connect / save / load ─────────────────────────────────────────────
+
+TEST_CASE("GdbMiBackend: connect_remote_target rr:// is rejected with reason",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->create_empty_target();
+  try {
+    be->connect_remote_target(open.target_id, "rr:///tmp/some-trace", "");
+    FAIL("rr:// URL should have thrown");
+  } catch (const ldb::backend::Error& e) {
+    const std::string what = e.what();
+    CHECK(what.find("rr://") != std::string::npos);
+  }
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: connect_remote_target_ssh punts cleanly",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->create_empty_target();
+  ldb::backend::ConnectRemoteSshOptions opts;
+  opts.host = "localhost";
+  opts.inferior_path = "/bin/true";
+  try {
+    be->connect_remote_target_ssh(open.target_id, opts);
+    FAIL("ssh transport should have thrown");
+  } catch (const ldb::backend::Error& e) {
+    const std::string what = e.what();
+    CHECK(what.find("does not support") != std::string::npos);
+  }
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: save_core writes a core file on a stopped process",
+          "[gdbmi][live][requires_gdb]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  ldb::backend::LaunchOptions lopts;
+  lopts.stop_at_entry = true;
+  auto st = be->launch_process(open.target_id, lopts);
+  if (st.state != ldb::backend::ProcessState::kStopped) {
+    be->close_target(open.target_id);
+    SUCCEED("fixture exited before stop_at_entry could fire");
+    return;
+  }
+
+  auto path = std::filesystem::temp_directory_path() /
+              ("ldb-gdbmi-save-core-" + std::to_string(::getpid()) + ".core");
+  // Best-effort delete leftover from a prior crashed run.
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+
+  bool ok = be->save_core(open.target_id, path.string());
+  CHECK(ok);
+  CHECK(std::filesystem::exists(path));
+  std::filesystem::remove(path, ec);
+
+  be->kill_process(open.target_id);
+  be->close_target(open.target_id);
+}
+
+TEST_CASE("GdbMiBackend: save_core without a live process throws",
+          "[gdbmi][live][requires_gdb][error]") {
+  if (!gdb_available()) SKIP("gdb not on PATH");
+  auto be = std::make_unique<GdbMiBackend>();
+  auto open = be->open_executable(kFixturePath);
+  try {
+    be->save_core(open.target_id, "/tmp/should-not-exist.core");
+    FAIL("save_core without live process should throw");
+  } catch (const ldb::backend::Error& e) {
+    const std::string what = e.what();
+    CHECK(what.find("no live process") != std::string::npos);
+  }
   be->close_target(open.target_id);
 }

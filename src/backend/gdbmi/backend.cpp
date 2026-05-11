@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -26,6 +27,17 @@ namespace ldb::backend::gdbmi {
 // complex (per-inferior thread namespace, target-select state); a
 // session-per-target trades a small RSS hit for clean isolation.
 
+// Per-breakpoint callback registry entry. The LldbBackend equivalent
+// is an SBBreakpoint::SetCallback baton fired from LLDB's event
+// thread; the gdb-MI path has no equivalent event thread, so callbacks
+// only fire on continue_process / step_thread return paths where
+// wait_for_stop() observes a *stopped,reason="breakpoint-hit",bkptno=N.
+// Best-effort by design; see set_breakpoint_callback for the contract.
+struct GdbBreakpointCb {
+  BreakpointCallback cb;
+  void*              baton = nullptr;
+};
+
 struct TargetState {
   std::unique_ptr<GdbMiSession>                       session;
   std::optional<std::string>                          exe_path;
@@ -36,6 +48,9 @@ struct TargetState {
   // Cached on first launch/attach so subsequent get_process_state
   // calls can report kRunning vs kStopped without re-issuing MI.
   ProcessStatus                                       last_status;
+  // Per-bp_id callback record. See GdbBreakpointCb above for the
+  // best-effort firing semantics.
+  std::unordered_map<std::int32_t, GdbBreakpointCb>   bp_callbacks;
 };
 
 struct GdbMiBackend::Impl {
@@ -52,7 +67,10 @@ namespace {
 // `not implemented yet` stub used by virtuals that will land in later
 // commits. Surfaces through the dispatcher as -32000 backend error,
 // which is the right shape for "this backend doesn't do that yet."
-[[noreturn]] void todo(const char* method) {
+// As of v1.4 final batch, every virtual is implemented — the helper
+// is retained for future use during partial-coverage refactors so we
+// don't have to re-introduce it.
+[[maybe_unused, noreturn]] void todo(const char* method) {
   throw Error(std::string("GdbMiBackend::") + method +
               ": not implemented yet (post-V1 #8 staged work)");
 }
@@ -449,16 +467,85 @@ ProcessStatus GdbMiBackend::detach_process(TargetId tid) {
   st.last_status.state = ProcessState::kDetached;
   return st.last_status;
 }
-ProcessStatus GdbMiBackend::connect_remote_target(TargetId,
-    const std::string&, const std::string&) {
-  todo("connect_remote_target");
+ProcessStatus GdbMiBackend::connect_remote_target(TargetId tid,
+    const std::string& url, const std::string& plugin_name) {
+  if (url.empty()) {
+    throw Error("connect_remote: url must not be empty");
+  }
+  // rr:// URL-scheme dispatch. The LldbBackend route shells out to
+  // `rr replay` and rewrites the URL to a local connect:// port; we
+  // do not replicate that orchestration on the gdb side in v1.4.
+  // Surface as a -32003 forbidden via the "does not support" pattern
+  // so agents can branch to --backend=lldb cleanly.
+  if (url.size() >= 5 && url.compare(0, 5, "rr://") == 0) {
+    throw Error("gdbmi: rr:// URL via gdb backend does not support v1.4; "
+                "use --backend=lldb for rr:// targets");
+  }
+  auto& st = must_get_target(*impl_, tid);
+  // plugin_name "gdb-remote" or empty → plain remote; anything else
+  // → extended-remote (gdbserver-multi, host-multi sessions).
+  const bool extended = !plugin_name.empty() && plugin_name != "gdb-remote";
+  const std::string verb = extended ? "-target-select extended-remote "
+                                    : "-target-select remote ";
+  send_or_throw(*st.session, verb + url);
+  // gdb stops the inferior on a successful connect.
+  st.last_status.state = ProcessState::kStopped;
+  return st.last_status;
 }
+
 ConnectRemoteSshResult GdbMiBackend::connect_remote_target_ssh(
     TargetId, const ConnectRemoteSshOptions&) {
-  todo("connect_remote_target_ssh");
+  // The LldbBackend SSH-tunnel transport is a separate Tier-2 surface
+  // (post-V1 #11); landing a parallel implementation for gdb is not on
+  // the v1.4 critical path. Honest punt — message includes "does not
+  // support" so the dispatcher maps to -32003 forbidden.
+  throw Error("gdbmi: connect_remote_target_ssh: gdb backend SSH transport "
+              "does not support v1.4");
 }
-bool GdbMiBackend::save_core(TargetId, const std::string&) {
-  todo("save_core");
+
+bool GdbMiBackend::save_core(TargetId tid, const std::string& path) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot save_core");
+  }
+  // `generate-core-file PATH` CLI fall-through — no MI verb exposes
+  // the same functionality on gdb 15.x. The CLI treats PATH as a
+  // single token (no shell escaping); paths with embedded whitespace
+  // or quotes are not supported. Refuse those up front so the failure
+  // mode is clean rather than gdb writing to a mangled filename.
+  for (char c : path) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '"' || c == '\\') {
+      throw Error(
+          "gdbmi: save_core: path must not contain whitespace or quotes");
+    }
+  }
+  st.session->drain_async();
+  // The success marker arrives on the console stream as
+  // "Saved corefile <path>".
+  auto r = st.session->send_command("generate-core-file " + path);
+  if (!r.has_value()) {
+    throw Error("gdbmi: save_core: subprocess died");
+  }
+  if (r->klass == "error") {
+    // gdb surfaces filesystem failures (no perm, no space, ...) as
+    // ^error,msg=...; convert to a typed Error.
+    throw_gdb_error(error_msg_of(*r));
+  }
+  std::string text;
+  for (const auto& rec : st.session->drain_async()) {
+    if (rec.kind == MiRecordKind::kConsoleStream) text += rec.stream_text;
+  }
+  // gdb's console wording is not a stable API — "Saved corefile" is
+  // what gdb 12-15 emit; future versions may rephrase. Log loudly on
+  // mismatch so the false return isn't silently misinterpreted by an
+  // agent as "no permissions" when the core was actually written.
+  bool ok = text.find("Saved corefile") != std::string::npos;
+  if (!ok) {
+    log::warn(std::string("gdbmi: save_core: success marker not found "
+                          "in gdb console output (gdb version drift?); "
+                          "core may still have been written to ") + path);
+  }
+  return ok;
 }
 
 // ── Static analysis ───────────────────────────────────────────────────
@@ -580,9 +667,291 @@ std::vector<Module> GdbMiBackend::list_modules(TargetId tid) {
   return out;
 }
 
+namespace {
+
+// Parse one `ptype /o NAME` console-stream blob into TypeLayout.
+//
+// The output we expect (gdb 9–15 share this shape):
+//
+//   /* offset      |    size */  type = struct foo {
+//   /*      0      |       4 */    int x;
+//   /*      4      |       4 */    int y;
+//   /* XXX  3-byte hole      */
+//   /*      8      |       8 */    uint64_t sid;
+//
+//                                  /* total size (bytes):    8 */
+//                                }
+//
+// Nested struct members emit their own opening brace + nested fields.
+// We treat any line containing "type = struct" / "union" / "class"
+// as the *outer* declaration only when we haven't seen one yet (the
+// inner declarations don't carry "type = " on gdb 15.1). Lines with
+// XXX-hole markers populate the *previous* field's holes_after.
+// Returns nullopt on malformed input (defensive — ptype output varies
+// across gdb versions).
 std::optional<TypeLayout>
-GdbMiBackend::find_type_layout(TargetId, const std::string&) {
-  todo("find_type_layout");
+parse_ptype_offsets(const std::string& text, const std::string& name) {
+  TypeLayout out;
+  out.name = name;
+
+  int depth = 0;             // nesting depth across { } pairs
+  bool saw_decl = false;     // outer "type = ..." line seen
+  // Index into out.fields rather than a raw pointer — push_back
+  // invalidates references / pointers into a vector. Using SIZE_MAX
+  // as the "no field yet" sentinel avoids accessing out.fields[-1u].
+  std::size_t last_field_idx = std::numeric_limits<std::size_t>::max();
+
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    auto nl = text.find('\n', pos);
+    std::string line = (nl == std::string::npos)
+                         ? text.substr(pos) : text.substr(pos, nl - pos);
+    if (nl == std::string::npos) pos = text.size();
+    else pos = nl + 1;
+
+    // Strip trailing whitespace/CR for cleaner parsing.
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t' ||
+                              line.back() == '\r')) {
+      line.pop_back();
+    }
+    if (line.empty()) continue;
+
+    // Detect the outer type opener. We require the line to contain
+    // "type = " AND a struct/union/class keyword AND an opening "{".
+    if (!saw_decl) {
+      const auto teq = line.find("type = ");
+      if (teq != std::string::npos && line.find('{') != std::string::npos) {
+        saw_decl = true;
+        depth = 1;
+        continue;
+      }
+    }
+
+    // Detect total-size line: "/* total size (bytes):    N */".
+    // Always at outer-struct close (depth becomes 0 immediately after).
+    const auto tsz = line.find("total size (bytes):");
+    if (tsz != std::string::npos) {
+      auto colon = line.find(':', tsz);
+      if (colon != std::string::npos) {
+        std::string s = line.substr(colon + 1);
+        // pull digits
+        std::uint64_t v = 0;
+        bool got = false;
+        for (char c : s) {
+          if (c >= '0' && c <= '9') {
+            v = v * 10 + static_cast<std::uint64_t>(c - '0');
+            got = true;
+          } else if (got) break;
+        }
+        if (got && depth == 1) out.byte_size = v;
+      }
+      continue;
+    }
+
+    // Detect XXX hole annotation: "/* XXX  N-byte hole      */".
+    if (line.find("XXX") != std::string::npos &&
+        line.find("hole") != std::string::npos) {
+      auto x = line.find("XXX");
+      std::uint64_t v = 0;
+      bool got = false;
+      for (std::size_t i = x + 3; i < line.size(); ++i) {
+        char c = line[i];
+        if (c >= '0' && c <= '9') {
+          v = v * 10 + static_cast<std::uint64_t>(c - '0');
+          got = true;
+        } else if (got) break;
+      }
+      if (got && last_field_idx < out.fields.size()) {
+        out.fields[last_field_idx].holes_after = v;
+      }
+      continue;
+    }
+
+    // Detect a member line. The shape is:
+    //   /* offset | size */   TYPENAME NAME;
+    // where the comment may contain spaces / a trailing "*/" before
+    // the actual member declaration. Only count *direct* members of
+    // the outer type (depth == 1).
+    const auto cstart = line.find("/*");
+    const auto cend   = line.find("*/");
+    if (cstart == std::string::npos || cend == std::string::npos ||
+        cend <= cstart) {
+      // Track brace depth on free-standing lines (e.g. "} origin;" or
+      // a "{" continuing a nested struct).
+      for (char c : line) {
+        if (c == '{') ++depth;
+        else if (c == '}') --depth;
+      }
+      continue;
+    }
+
+    // Extract offset and size from inside the comment.
+    std::string inside = line.substr(cstart + 2, cend - cstart - 2);
+    auto bar = inside.find('|');
+    if (bar == std::string::npos) continue;
+    std::uint64_t off  = 0;
+    std::uint64_t bsz  = 0;
+    {
+      bool got = false;
+      for (char c : inside.substr(0, bar)) {
+        if (c >= '0' && c <= '9') {
+          off = off * 10 + static_cast<std::uint64_t>(c - '0');
+          got = true;
+        } else if (got) break;
+      }
+      if (!got) continue;
+    }
+    {
+      bool got = false;
+      for (char c : inside.substr(bar + 1)) {
+        if (c >= '0' && c <= '9') {
+          bsz = bsz * 10 + static_cast<std::uint64_t>(c - '0');
+          got = true;
+        } else if (got) break;
+      }
+    }
+
+    // Pull the trailing "TYPENAME NAME;" portion. Some members open a
+    // nested struct ({); their declared name follows the closing brace
+    // a few lines later. We only emit those as outer-struct members
+    // (depth becomes 1 again at the closing-brace line), which the
+    // brace counter below handles. For now, capture the simple case.
+    std::string tail = line.substr(cend + 2);
+    while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t')) {
+      tail.erase(tail.begin());
+    }
+
+    if (depth == 1 && !tail.empty()) {
+      // Simple "TYPENAME NAME;" — split at the last whitespace before
+      // the semicolon, taking the trailing identifier as the field
+      // name. If we see an opening "{" the field is a nested aggregate
+      // and we'll handle it after the brace block.
+      if (tail.find('{') != std::string::npos) {
+        // Nested anonymous-typed field opens here; the field's *name*
+        // appears after the matching '}'. We still want to record the
+        // member with the right offset/size now and patch in the name
+        // on the close line.
+        Field f;
+        f.offset    = off;
+        f.byte_size = bsz;
+        // type_name is everything up to the '{' (e.g. "struct point2 {").
+        auto br = tail.find('{');
+        std::string tn = tail.substr(0, br);
+        while (!tn.empty() && (tn.back() == ' ' || tn.back() == '\t')) tn.pop_back();
+        f.type_name = std::move(tn);
+        out.fields.push_back(std::move(f));
+        last_field_idx = out.fields.size() - 1;
+        // Step depth for the inner block.
+        ++depth;
+        continue;
+      }
+
+      // Strip trailing ';'
+      while (!tail.empty() &&
+             (tail.back() == ';' || tail.back() == ' ' || tail.back() == '\t')) {
+        tail.pop_back();
+      }
+      // Find last whitespace; name is after it, type is before.
+      auto sp = tail.find_last_of(" \t");
+      std::string ty;
+      std::string nm;
+      if (sp == std::string::npos) {
+        nm = tail;
+      } else {
+        ty = tail.substr(0, sp);
+        nm = tail.substr(sp + 1);
+        // The name may carry a leading '*' / '[N]' decorator; pull '*'
+        // back onto the type for canonical "int *" style.
+        while (!nm.empty() && nm.front() == '*') {
+          ty += '*';
+          nm.erase(nm.begin());
+        }
+      }
+      Field f;
+      f.name      = std::move(nm);
+      f.type_name = std::move(ty);
+      f.offset    = off;
+      f.byte_size = bsz;
+      out.fields.push_back(std::move(f));
+      last_field_idx = out.fields.size() - 1;
+    } else if (depth > 1) {
+      // Inside a nested struct; track braces on this comment line so
+      // depth tracks correctly when the inner closes.
+      for (char c : line) {
+        if (c == '{') ++depth;
+        else if (c == '}') --depth;
+      }
+    }
+  }
+
+  if (!saw_decl) return std::nullopt;
+
+  // Recompute holes_total from holes_after; the XXX-hole pass populated
+  // per-field. Also compute a trailing-hole for the last field if it
+  // exists (e.g. struct ending with a 7-byte tail padding).
+  if (!out.fields.empty() && out.byte_size > 0) {
+    auto& last = out.fields.back();
+    std::uint64_t end_of_last = last.offset + last.byte_size;
+    if (out.byte_size > end_of_last && last.holes_after == 0) {
+      last.holes_after = out.byte_size - end_of_last;
+    }
+  }
+  out.holes_total = 0;
+  for (const auto& f : out.fields) out.holes_total += f.holes_after;
+  // alignment: ptype doesn't surface alignof. Leave at 0 per task spec.
+  return out;
+}
+
+}  // namespace
+
+std::optional<TypeLayout>
+GdbMiBackend::find_type_layout(TargetId tid, const std::string& name) {
+  auto& st = must_get_target(*impl_, tid);
+
+  // ptype is a CLI fall-through; we never paste user input directly
+  // into the shell-like parser without sanitising. Restrict to typical
+  // C/C++ type-name shapes: alnum, '_', '*', '&', ':', '<', '>', ' '.
+  // Refuse anything else — return nullopt rather than throw so the
+  // caller treats it as "unknown type" instead of a transport error.
+  for (char raw : name) {
+    auto c = static_cast<unsigned char>(raw);
+    if (!std::isalnum(c) && c != '_' && c != ':' && c != '<' &&
+        c != '>' && c != ' ' && c != '*' && c != '&') {
+      return std::nullopt;
+    }
+  }
+  if (name.empty()) return std::nullopt;
+
+  // Try the name verbatim first; if gdb rejects it (e.g. C tag names
+  // need "struct " prefix), retry with "struct ", then "union ".
+  auto attempt = [&](const std::string& q) -> std::optional<TypeLayout> {
+    st.session->drain_async();
+    auto r = st.session->send_command("ptype /o " + q);
+    if (!r.has_value() || r->klass != "done") {
+      // Drain any console-stream the failed command produced; we don't
+      // want it polluting the next CLI call's parse.
+      st.session->drain_async();
+      return std::nullopt;
+    }
+    std::string text;
+    for (const auto& rec : st.session->drain_async()) {
+      if (rec.kind == MiRecordKind::kConsoleStream) text += rec.stream_text;
+    }
+    // gdb prints "No symbol \"X\" in current context." on the console
+    // stream when it can't resolve the type — treat as miss.
+    if (text.find("No symbol") != std::string::npos) return std::nullopt;
+    return parse_ptype_offsets(text, name);
+  };
+
+  if (auto r = attempt(name); r.has_value()) return r;
+  if (name.compare(0, 7, "struct ") != 0) {
+    if (auto r = attempt("struct " + name); r.has_value()) return r;
+  }
+  if (name.compare(0, 6, "union ") != 0 &&
+      name.compare(0, 7, "struct ") != 0) {
+    if (auto r = attempt("union " + name); r.has_value()) return r;
+  }
+  return std::nullopt;
 }
 
 std::vector<SymbolMatch>
@@ -672,13 +1041,107 @@ GdbMiBackend::find_symbols(TargetId tid, const SymbolQuery& query) {
 }
 
 std::vector<GlobalVarMatch> GdbMiBackend::find_globals_of_type(
-    TargetId, std::string_view, bool&) {
-  todo("find_globals_of_type");
+    TargetId tid, std::string_view type_name, bool& truncated) {
+  if (type_name.empty()) {
+    throw Error("type_name must be non-empty");
+  }
+  auto& st = must_get_target(*impl_, tid);
+  std::vector<GlobalVarMatch> out;
+  // v1.4 has no enumeration cap; truncated stays false. Documented as
+  // a known gap (see docs/18 — gdb's symbol enumeration is bounded by
+  // the binary's debug-info size, not by our config).
+  truncated = false;
+
+  // -symbol-info-variables --type PATTERN — PATTERN is a regex on the
+  // *DWARF type string*. We escape regex metacharacters in the
+  // caller's string so it behaves as a literal substring match (mirrors
+  // find_symbols' --name policy).
+  std::string pat;
+  pat.reserve(type_name.size() * 2);
+  for (char c : type_name) {
+    if (std::strchr(".^$*+?()[]{}|\\", c)) pat.push_back('\\');
+    pat.push_back(c);
+  }
+
+  auto rec = st.session->send_command(
+      "-symbol-info-variables --type " + pat);
+  if (!rec.has_value() || rec->klass == "error") return out;
+  if (!rec->payload.is_tuple()) return out;
+  auto sit = rec->payload.as_tuple().find("symbols");
+  if (sit == rec->payload.as_tuple().end() || !sit->second.is_tuple()) {
+    return out;
+  }
+  auto dit = sit->second.as_tuple().find("debug");
+  if (dit == sit->second.as_tuple().end() || !dit->second.is_list()) {
+    return out;
+  }
+  for (const auto& file_entry : dit->second.as_list()) {
+    if (!file_entry.is_tuple()) continue;
+    const auto& fe = file_entry.as_tuple();
+    std::string filename;
+    if (auto fnit = fe.find("filename");
+        fnit != fe.end() && fnit->second.is_string()) {
+      filename = fnit->second.as_string();
+    }
+    auto inner = fe.find("symbols");
+    if (inner == fe.end() || !inner->second.is_list()) continue;
+    for (const auto& sym_v : inner->second.as_list()) {
+      if (!sym_v.is_tuple()) continue;
+      const auto& sym = sym_v.as_tuple();
+      GlobalVarMatch g;
+      if (auto it = sym.find("name");
+          it != sym.end() && it->second.is_string()) {
+        g.name = it->second.as_string();
+      }
+      if (auto it = sym.find("type");
+          it != sym.end() && it->second.is_string()) {
+        g.type = it->second.as_string();
+      }
+      if (auto it = sym.find("line");
+          it != sym.end() && it->second.is_string()) {
+        try { g.line = static_cast<std::uint32_t>(
+            std::stoul(it->second.as_string()));
+        } catch (...) {}
+      }
+      // Use the source filename verbatim (basename trim is the
+      // dispatcher's concern). `module` mirrors LldbBackend's
+      // basename of the owning module.
+      g.file = filename;
+      if (st.exe_path.has_value()) {
+        // Best-effort basename of exe_path.
+        auto& p = *st.exe_path;
+        auto slash = p.find_last_of('/');
+        g.module = (slash == std::string::npos) ? p : p.substr(slash + 1);
+      }
+      out.push_back(std::move(g));
+    }
+  }
+
+  // Resolve file_address for each match via `info address NAME` (CLI
+  // fall-through). Slow on large result sets — same trade-off as
+  // find_symbols's per-result address resolution.
+  for (auto& g : out) {
+    if (!g.name.empty()) {
+      g.file_address = resolve_symbol_address(*st.session, g.name);
+    }
+  }
+  return out;
 }
 
 std::vector<StringMatch>
-GdbMiBackend::find_strings(TargetId, const StringQuery&) {
-  todo("find_strings");
+GdbMiBackend::find_strings(TargetId tid, const StringQuery&) {
+  // gdb-MI has no built-in string scanner; replicating LldbBackend's
+  // section-walking ASCII-run detector would require either embedding
+  // a stand-alone ELF/Mach-O parser in the backend or shelling out to
+  // `objdump -s -j .rodata`. Both are out of scope for v1.4 abstraction
+  // validation. v1.4 contract: return empty, do not throw. The
+  // dispatcher's string.list endpoint surfaces the gap; agents needing
+  // string scanning switch to --backend=lldb. Re-visit in v1.5.
+  //
+  // We still validate target_id so callers get the same "unknown
+  // target_id" semantics as every other endpoint.
+  (void)must_get_target(*impl_, tid);
+  return {};
 }
 
 std::vector<DisasmInsn>
@@ -748,13 +1211,28 @@ GdbMiBackend::disassemble_range(TargetId tid, std::uint64_t lo,
 }
 
 std::vector<XrefMatch>
-GdbMiBackend::xref_address(TargetId, std::uint64_t) {
-  todo("xref_address");
+GdbMiBackend::xref_address(TargetId tid, std::uint64_t) {
+  // LldbBackend's xref_address walks every instruction in .text and
+  // greps each operand string for the literal address — expensive
+  // even there. We could replicate via -data-disassemble across the
+  // whole .text range, but the full-text scan is materially worse on
+  // gdb (per-call MI tuple overhead, no SBProcess::ReadMemoryFromFileCache
+  // equivalent). v1.4 punt: empty result. Agents that need xrefs on
+  // a gdb-backed session switch to --backend=lldb.
+  (void)must_get_target(*impl_, tid);
+  return {};
 }
 
 std::vector<StringXrefResult>
-GdbMiBackend::find_string_xrefs(TargetId, const std::string&) {
-  todo("find_string_xrefs");
+GdbMiBackend::find_string_xrefs(TargetId tid, const std::string&) {
+  // Same scope decision as xref_address — composed of find_strings
+  // (also punted on this backend) + xref_address (also punted), so
+  // the result would always be empty even if we wired it up. Keep
+  // the no-op explicit so the call returns cleanly rather than
+  // throwing. Documented gap in docs/18; revisit in v1.5 when a
+  // shared static-analysis layer lands above the backend.
+  (void)must_get_target(*impl_, tid);
+  return {};
 }
 
 // ── Threads / frames / values ─────────────────────────────────────────
@@ -1212,7 +1690,8 @@ EvalResult GdbMiBackend::evaluate_expression(TargetId tid,
   // lookup is gated.
   auto is_simple_ident = [](const std::string& e) -> bool {
     if (e.empty()) return false;
-    for (unsigned char c : e) {
+    for (char raw : e) {
+      auto c = static_cast<unsigned char>(raw);
       if (!std::isalnum(c) && c != '_' && c != ':') return false;
     }
     return true;
@@ -1478,24 +1957,169 @@ GdbMiBackend::search_memory(TargetId tid, std::uint64_t lo,
   return out;
 }
 
-// ── Breakpoints (stubbed) ─────────────────────────────────────────────
+// ── Breakpoints ───────────────────────────────────────────────────────
 
 BreakpointHandle
-GdbMiBackend::create_breakpoint(TargetId, const BreakpointSpec&) {
-  todo("create_breakpoint");
+GdbMiBackend::create_breakpoint(TargetId tid, const BreakpointSpec& spec) {
+  if (!spec.function.has_value() && !spec.address.has_value() &&
+      !spec.file.has_value()) {
+    throw Error(
+        "create_breakpoint: spec must set function, address, or file+line");
+  }
+  if (spec.file.has_value() &&
+      (!spec.line.has_value() || *spec.line <= 0)) {
+    throw Error("create_breakpoint: file form requires positive 'line'");
+  }
+  auto& st = must_get_target(*impl_, tid);
+
+  // Compose the -break-insert LOCATION argument. The three forms gdb
+  // accepts (per MI3 spec):
+  //   * "--function NAME"            → resolved at insert time
+  //   * "*0xADDR"                    → raw code address
+  //   * "FILE:LINE"                  → source coordinate
+  // We prefer --function when both function and file+line are set
+  // (matches LldbBackend's precedence in BreakpointCreateByName).
+  // All caller-supplied strings flow through mi_quote so MI's
+  // tokenizer treats them as a single argument and spaces / quotes /
+  // backslashes can't smuggle additional commands or close the
+  // argument early. The function name + file path are both
+  // operator-controlled and may carry C++ namespace / template
+  // punctuation; assume nothing about their contents.
+  std::string loc;
+  if (spec.function.has_value()) {
+    loc = "--function " + mi_quote(*spec.function);
+  } else if (spec.address.has_value()) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "*0x%llx",
+                  static_cast<unsigned long long>(*spec.address));
+    loc = buf;
+  } else {
+    // file:line form. Quote the composed string so embedded spaces
+    // in file paths can't fragment the MI argument list.
+    loc = mi_quote(*spec.file + ":" + std::to_string(*spec.line));
+  }
+
+  // Drain stale async records (e.g. a stop event from a prior step)
+  // so the response parser pairs the ^done correctly.
+  st.session->drain_async();
+  auto rec = send_or_throw(*st.session, "-break-insert " + loc);
+  BreakpointHandle h;
+  if (!rec.payload.is_tuple()) {
+    throw Error("create_breakpoint: malformed -break-insert response");
+  }
+  auto bit = rec.payload.as_tuple().find("bkpt");
+  if (bit == rec.payload.as_tuple().end() || !bit->second.is_tuple()) {
+    throw Error("create_breakpoint: response missing bkpt tuple");
+  }
+  const auto& bkpt = bit->second.as_tuple();
+  if (auto it = bkpt.find("number");
+      it != bkpt.end() && it->second.is_string()) {
+    try { h.bp_id = static_cast<std::int32_t>(
+        std::stoi(it->second.as_string()));
+    } catch (...) {}
+  }
+  // gdb's -break-insert reports a single "addr" for a non-pending
+  // resolution; pending breakpoints carry addr="<PENDING>" instead
+  // (we treat that as 0). LldbBackend exposes locations count via
+  // BreakpointHandle::locations — gdb has no direct equivalent in the
+  // single-line response, default to 1 when we got an address.
+  if (auto it = bkpt.find("addr");
+      it != bkpt.end() && it->second.is_string()) {
+    h.locations = (parse_hex_addr(it->second.as_string()) != 0) ? 1 : 0;
+  }
+  if (h.bp_id == 0) {
+    throw Error("create_breakpoint: gdb did not return a bp id");
+  }
+  return h;
 }
-void GdbMiBackend::set_breakpoint_callback(TargetId, std::int32_t,
-                                              BreakpointCallback, void*) {
-  todo("set_breakpoint_callback");
+
+void GdbMiBackend::set_breakpoint_callback(TargetId tid, std::int32_t bp_id,
+                                              BreakpointCallback cb,
+                                              void* baton) {
+  // Callback semantics on this backend differ materially from LLDB:
+  // gdb-MI emits *stopped,reason="breakpoint-hit",bkptno=N async records
+  // when the breakpoint fires, but there is no per-callback event
+  // dispatch thread analogous to LLDB's process-event thread. The
+  // callback can therefore only fire on continue_process / step_thread
+  // return paths where wait_for_stop() actively drains async records
+  // and matches the bkptno. wait_for_stop in v1.4 does NOT route to
+  // these callbacks (that would entangle process control with the
+  // probe-callback contract); the registration here is store-only so
+  // the orchestrator's "register a callback now, fire on hit" path
+  // doesn't throw. Tracking item for v1.5: wire wait_for_stop to call
+  // bp_callbacks[bkptno] when it observes a breakpoint-hit stop.
+  auto& st = must_get_target(*impl_, tid);
+  if (bp_id <= 0) {
+    throw Error("set_breakpoint_callback: invalid bp_id");
+  }
+  GdbBreakpointCb rec;
+  rec.cb    = std::move(cb);
+  rec.baton = baton;
+  st.bp_callbacks[bp_id] = std::move(rec);
 }
-void GdbMiBackend::disable_breakpoint(TargetId, std::int32_t) {
-  todo("disable_breakpoint");
+
+void GdbMiBackend::disable_breakpoint(TargetId tid, std::int32_t bp_id) {
+  auto& st = must_get_target(*impl_, tid);
+  // gdb returns ^done even for unknown bp ids (the warning goes to the
+  // console stream as "No breakpoint number N."). Mirror LldbBackend's
+  // strict contract: unknown bp_id → throw "unknown bp_id".
+  st.session->drain_async();
+  auto r = st.session->send_command("-break-disable " + std::to_string(bp_id));
+  if (!r.has_value()) {
+    throw Error("gdbmi: disable_breakpoint: subprocess died");
+  }
+  if (r->klass == "error") {
+    throw_gdb_error(error_msg_of(*r));
+  }
+  std::string text;
+  for (const auto& rec : st.session->drain_async()) {
+    if (rec.kind == MiRecordKind::kConsoleStream) text += rec.stream_text;
+  }
+  if (text.find("No breakpoint number") != std::string::npos) {
+    throw Error("disable_breakpoint: unknown bp_id");
+  }
 }
-void GdbMiBackend::enable_breakpoint(TargetId, std::int32_t) {
-  todo("enable_breakpoint");
+
+void GdbMiBackend::enable_breakpoint(TargetId tid, std::int32_t bp_id) {
+  auto& st = must_get_target(*impl_, tid);
+  st.session->drain_async();
+  auto r = st.session->send_command("-break-enable " + std::to_string(bp_id));
+  if (!r.has_value()) {
+    throw Error("gdbmi: enable_breakpoint: subprocess died");
+  }
+  if (r->klass == "error") {
+    throw_gdb_error(error_msg_of(*r));
+  }
+  std::string text;
+  for (const auto& rec : st.session->drain_async()) {
+    if (rec.kind == MiRecordKind::kConsoleStream) text += rec.stream_text;
+  }
+  if (text.find("No breakpoint number") != std::string::npos) {
+    throw Error("enable_breakpoint: unknown bp_id");
+  }
 }
-void GdbMiBackend::delete_breakpoint(TargetId, std::int32_t) {
-  todo("delete_breakpoint");
+
+void GdbMiBackend::delete_breakpoint(TargetId tid, std::int32_t bp_id) {
+  auto& st = must_get_target(*impl_, tid);
+  // Drop the callback record first so a still-firing async event
+  // can't dereference a soon-to-be-deleted baton. Matches LldbBackend's
+  // belt-and-braces ordering.
+  st.bp_callbacks.erase(bp_id);
+  st.session->drain_async();
+  auto r = st.session->send_command("-break-delete " + std::to_string(bp_id));
+  if (!r.has_value()) {
+    throw Error("gdbmi: delete_breakpoint: subprocess died");
+  }
+  if (r->klass == "error") {
+    throw_gdb_error(error_msg_of(*r));
+  }
+  std::string text;
+  for (const auto& rec : st.session->drain_async()) {
+    if (rec.kind == MiRecordKind::kConsoleStream) text += rec.stream_text;
+  }
+  if (text.find("No breakpoint number") != std::string::npos) {
+    throw Error("delete_breakpoint: unknown bp_id");
+  }
 }
 
 }  // namespace ldb::backend::gdbmi
