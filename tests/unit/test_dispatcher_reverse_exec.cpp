@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-// Tests for the dispatcher routing of:
-//   * thread.continue({target_id, tid})
-//   * process.continue({target_id, tid?})  — tid is the new optional
-//     param (Tier 4 §14, scoped slice).
+// Tests for dispatcher routing of the reverse-execution endpoints:
 //
-// Both endpoints exercise the new backend::DebuggerBackend::continue_thread
-// virtual when a `tid` is provided. In v0.3 continue_thread is a sync
-// passthrough into continue_process (LLDB SetAsync(false) — no per-thread
-// keep-running runtime). The protocol surface is async-shaped now so
-// agent code can switch behavior on the daemon handshake when v0.4 lands
-// true SBProcess::SetAsync(true).
+//   * process.reverse_continue({target_id})
+//   * process.reverse_step    ({target_id, tid, kind})
+//   * thread.reverse_step     ({target_id, tid, kind})
 //
-// We use a CountingStub backend (not a live LldbBackend) so the tests
-// run without a target / fixture. The stub records which method the
-// dispatcher routed into and returns a deterministic ProcessStatus.
+// v0.3 scope: kind="insn" only. kind="in" / kind="over" are accepted
+// strings but rejected with -32602 because their reverse semantics
+// require client-side step-over emulation (decode current insn, set
+// internal stops, send `bc` and watch). They are reserved so the wire
+// shape doesn't change when v0.4 fills them in.
+//
+// Capability gating happens in the backend (per-target is_reverse_capable
+// flag, set on rr:// connect). The dispatcher just routes — these tests
+// use a CountingStub backend so they run without rr / a fixture.
 
 #include <catch_amalgamated.hpp>
 
@@ -28,6 +28,7 @@
 using ldb::backend::DebuggerBackend;
 using ldb::backend::ProcessState;
 using ldb::backend::ProcessStatus;
+using ldb::backend::ReverseStepKind;
 using ldb::backend::TargetId;
 using ldb::backend::ThreadId;
 using ldb::daemon::Dispatcher;
@@ -44,38 +45,38 @@ class CountingStub : public DebuggerBackend {
   using ThrID = ThreadId;
 
   // Recording state.
-  int continue_process_calls = 0;
-  int continue_thread_calls  = 0;
-  ThrID last_continue_thread_tid = 0;
-  TID  last_continue_thread_target = 0;
+  int reverse_continue_calls       = 0;
+  int reverse_step_thread_calls    = 0;
+  TID  last_rev_step_target        = 0;
+  ThrID last_rev_step_tid          = 0;
+  ReverseStepKind last_rev_step_kind = ReverseStepKind::kInsn;
 
-  // The single registered target id; throws Error for anything else.
   TID known_target = 1;
-
-  ProcessState ret_state = ProcessState::kStopped;
 
   ProcessStatus make_status() const {
     ProcessStatus s;
-    s.state = ret_state;
+    s.state = ProcessState::kStopped;
     s.pid   = 42;
     return s;
   }
 
-  ProcessStatus continue_process(TID t) override {
+  ProcessStatus reverse_continue(TID t) override {
     if (t != known_target) throw ldb::backend::Error("unknown target_id");
-    ++continue_process_calls;
+    ++reverse_continue_calls;
     return make_status();
   }
 
-  ProcessStatus continue_thread(TID t, ThrID th) override {
+  ProcessStatus
+  reverse_step_thread(TID t, ThrID th, ReverseStepKind k) override {
     if (t != known_target) throw ldb::backend::Error("unknown target_id");
-    ++continue_thread_calls;
-    last_continue_thread_target = t;
-    last_continue_thread_tid    = th;
+    ++reverse_step_thread_calls;
+    last_rev_step_target = t;
+    last_rev_step_tid    = th;
+    last_rev_step_kind   = k;
     return make_status();
   }
 
-  // The rest are unused stubs.
+  // The rest are unused stubs (mirror test_dispatcher_thread_continue).
   ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }
   ldb::backend::OpenResult load_core(const std::string&) override { return {}; }
@@ -96,6 +97,8 @@ class CountingStub : public DebuggerBackend {
       find_string_xrefs(TID, const std::string&) override { return {}; }
   ProcessStatus launch_process(TID, const ldb::backend::LaunchOptions&) override { return {}; }
   ProcessStatus get_process_state(TID) override { return {}; }
+  ProcessStatus continue_process(TID) override { return {}; }
+  ProcessStatus continue_thread(TID, ThrID) override { return {}; }
   ProcessStatus kill_process(TID) override { return {}; }
   ProcessStatus attach(TID, std::int32_t) override { return {}; }
   ProcessStatus detach_process(TID) override { return {}; }
@@ -112,11 +115,6 @@ class CountingStub : public DebuggerBackend {
       list_frames(TID, ThrID, std::uint32_t) override { return {}; }
   ProcessStatus
       step_thread(TID, ThrID, ldb::backend::StepKind) override { return {}; }
-  ProcessStatus reverse_continue(TID) override { return {}; }
-  ProcessStatus
-      reverse_step_thread(TID, ThrID, ldb::backend::ReverseStepKind) override {
-    return {};
-  }
   std::vector<ldb::backend::ValueInfo>
       list_locals(TID, ThrID, std::uint32_t) override { return {}; }
   std::vector<ldb::backend::ValueInfo>
@@ -162,7 +160,8 @@ class CountingStub : public DebuggerBackend {
       std::unique_ptr<DebuggerBackend::TargetResource>) override {}
 };
 
-Request make_req(const std::string& method, json params, const std::string& id = "1") {
+Request make_req(const std::string& method, json params,
+                 const std::string& id = "1") {
   Request r;
   r.id = id;
   r.method = method;
@@ -172,123 +171,163 @@ Request make_req(const std::string& method, json params, const std::string& id =
 
 }  // namespace
 
-TEST_CASE("process.continue: no tid routes to backend.continue_process",
-          "[dispatcher][process][continue]") {
+// ---- process.reverse_continue -------------------------------------------
+
+TEST_CASE("process.reverse_continue: routes to backend.reverse_continue",
+          "[dispatcher][process][reverse_continue]") {
   auto be = std::make_shared<CountingStub>();
   Dispatcher d(be);
-  auto resp = d.dispatch(make_req("process.continue", json{{"target_id", 1}}));
+  auto resp = d.dispatch(make_req("process.reverse_continue",
+                                  json{{"target_id", 1}}));
   REQUIRE(resp.ok);
-  CHECK(be->continue_process_calls == 1);
-  CHECK(be->continue_thread_calls  == 0);
-  // Response carries the standard process_status shape.
+  CHECK(be->reverse_continue_calls == 1);
   CHECK(resp.data.contains("state"));
   CHECK(resp.data.contains("pid"));
 }
 
-TEST_CASE("process.continue: with tid routes to backend.continue_thread",
-          "[dispatcher][process][continue]") {
+TEST_CASE("process.reverse_continue: missing target_id → -32602",
+          "[dispatcher][process][reverse_continue][error]") {
   auto be = std::make_shared<CountingStub>();
   Dispatcher d(be);
-  auto resp = d.dispatch(make_req("process.continue",
-      json{{"target_id", 1}, {"tid", 7777}}));
-  REQUIRE(resp.ok);
-  CHECK(be->continue_process_calls == 0);
-  CHECK(be->continue_thread_calls  == 1);
-  CHECK(be->last_continue_thread_target == 1);
-  CHECK(be->last_continue_thread_tid    == 7777u);
-}
-
-TEST_CASE("process.continue: missing target_id → -32602",
-          "[dispatcher][process][continue][error]") {
-  auto be = std::make_shared<CountingStub>();
-  Dispatcher d(be);
-  auto resp = d.dispatch(make_req("process.continue", json::object()));
+  auto resp = d.dispatch(make_req("process.reverse_continue", json::object()));
   REQUIRE_FALSE(resp.ok);
   CHECK(resp.error_code == ErrorCode::kInvalidParams);
 }
 
-TEST_CASE("thread.continue: routes to backend.continue_thread",
-          "[dispatcher][thread][continue]") {
+TEST_CASE("process.reverse_continue: unknown target_id surfaces backend error",
+          "[dispatcher][process][reverse_continue][error]") {
   auto be = std::make_shared<CountingStub>();
   Dispatcher d(be);
-  auto resp = d.dispatch(make_req("thread.continue",
-      json{{"target_id", 1}, {"tid", 12345}}));
-  REQUIRE(resp.ok);
-  CHECK(be->continue_thread_calls == 1);
-  CHECK(be->last_continue_thread_target == 1);
-  CHECK(be->last_continue_thread_tid    == 12345u);
-  CHECK(resp.data.contains("state"));
-  CHECK(resp.data.contains("pid"));
-}
-
-TEST_CASE("thread.continue: missing target_id → -32602",
-          "[dispatcher][thread][continue][error]") {
-  auto be = std::make_shared<CountingStub>();
-  Dispatcher d(be);
-  auto resp = d.dispatch(make_req("thread.continue", json{{"tid", 1}}));
-  REQUIRE_FALSE(resp.ok);
-  CHECK(resp.error_code == ErrorCode::kInvalidParams);
-}
-
-TEST_CASE("thread.continue: missing tid → -32602",
-          "[dispatcher][thread][continue][error]") {
-  auto be = std::make_shared<CountingStub>();
-  Dispatcher d(be);
-  auto resp = d.dispatch(make_req("thread.continue", json{{"target_id", 1}}));
-  REQUIRE_FALSE(resp.ok);
-  CHECK(resp.error_code == ErrorCode::kInvalidParams);
-}
-
-TEST_CASE("thread.continue: unknown target_id surfaces backend error (-32000)",
-          "[dispatcher][thread][continue][error]") {
-  auto be = std::make_shared<CountingStub>();
-  Dispatcher d(be);
-  auto resp = d.dispatch(make_req("thread.continue",
-      json{{"target_id", 9999}, {"tid", 1}}));
+  auto resp = d.dispatch(make_req("process.reverse_continue",
+                                  json{{"target_id", 9999}}));
   REQUIRE_FALSE(resp.ok);
   CHECK(resp.error_code == ErrorCode::kBackendError);
 }
 
-TEST_CASE("describe.endpoints: thread.continue is registered with v0.3-sync disclosure",
-          "[dispatcher][describe][thread][continue]") {
+// ---- process.reverse_step ----------------------------------------------
+
+TEST_CASE("process.reverse_step kind=insn routes to backend.reverse_step_thread",
+          "[dispatcher][process][reverse_step]") {
+  auto be = std::make_shared<CountingStub>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(make_req("process.reverse_step",
+      json{{"target_id", 1}, {"tid", 7777}, {"kind", "insn"}}));
+  REQUIRE(resp.ok);
+  CHECK(be->reverse_step_thread_calls == 1);
+  CHECK(be->last_rev_step_target == 1);
+  CHECK(be->last_rev_step_tid    == 7777u);
+  CHECK(be->last_rev_step_kind   == ReverseStepKind::kInsn);
+}
+
+TEST_CASE("process.reverse_step kind=in/over rejected with -32602 (deferred)",
+          "[dispatcher][process][reverse_step][error]") {
+  auto be = std::make_shared<CountingStub>();
+  Dispatcher d(be);
+
+  auto r_in = d.dispatch(make_req("process.reverse_step",
+      json{{"target_id", 1}, {"tid", 7}, {"kind", "in"}}));
+  REQUIRE_FALSE(r_in.ok);
+  CHECK(r_in.error_code == ErrorCode::kInvalidParams);
+
+  auto r_over = d.dispatch(make_req("process.reverse_step",
+      json{{"target_id", 1}, {"tid", 7}, {"kind", "over"}}));
+  REQUIRE_FALSE(r_over.ok);
+  CHECK(r_over.error_code == ErrorCode::kInvalidParams);
+
+  // The stub backend method must not have been called.
+  CHECK(be->reverse_step_thread_calls == 0);
+}
+
+TEST_CASE("process.reverse_step kind=out rejected with -32602",
+          "[dispatcher][process][reverse_step][error]") {
+  // Reverse step-out is semantically ambiguous (the inverse of "run to
+  // parent return" is "rewind to call instruction at depth-1"). Not a
+  // priority; reject so the kind-space stays disciplined.
+  auto be = std::make_shared<CountingStub>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(make_req("process.reverse_step",
+      json{{"target_id", 1}, {"tid", 7}, {"kind", "out"}}));
+  REQUIRE_FALSE(resp.ok);
+  CHECK(resp.error_code == ErrorCode::kInvalidParams);
+}
+
+TEST_CASE("process.reverse_step missing tid → -32602",
+          "[dispatcher][process][reverse_step][error]") {
+  auto be = std::make_shared<CountingStub>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(make_req("process.reverse_step",
+      json{{"target_id", 1}, {"kind", "insn"}}));
+  REQUIRE_FALSE(resp.ok);
+  CHECK(resp.error_code == ErrorCode::kInvalidParams);
+}
+
+// ---- thread.reverse_step -----------------------------------------------
+
+TEST_CASE("thread.reverse_step kind=insn routes to backend.reverse_step_thread",
+          "[dispatcher][thread][reverse_step]") {
+  auto be = std::make_shared<CountingStub>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(make_req("thread.reverse_step",
+      json{{"target_id", 1}, {"tid", 12345}, {"kind", "insn"}}));
+  REQUIRE(resp.ok);
+  CHECK(be->reverse_step_thread_calls == 1);
+  CHECK(be->last_rev_step_target == 1);
+  CHECK(be->last_rev_step_tid    == 12345u);
+  CHECK(be->last_rev_step_kind   == ReverseStepKind::kInsn);
+}
+
+TEST_CASE("thread.reverse_step missing target_id → -32602",
+          "[dispatcher][thread][reverse_step][error]") {
+  auto be = std::make_shared<CountingStub>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(make_req("thread.reverse_step",
+      json{{"tid", 1}, {"kind", "insn"}}));
+  REQUIRE_FALSE(resp.ok);
+  CHECK(resp.error_code == ErrorCode::kInvalidParams);
+}
+
+// ---- describe.endpoints --------------------------------------------------
+
+TEST_CASE("describe.endpoints: reverse-exec endpoints are registered",
+          "[dispatcher][describe][reverse]") {
   auto be = std::make_shared<CountingStub>();
   Dispatcher d(be);
   auto resp = d.dispatch(make_req("describe.endpoints", json::object()));
   REQUIRE(resp.ok);
   REQUIRE(resp.data.contains("endpoints"));
 
-  bool found_thread_continue = false;
-  bool found_process_continue_with_tid = false;
-
+  bool found_rc = false, found_prs = false, found_trs = false;
   for (const auto& e : resp.data["endpoints"]) {
     const auto m = e.value("method", "");
-    if (m == "thread.continue") {
-      found_thread_continue = true;
-      // Schema must declare both target_id and tid as required.
+    if (m == "process.reverse_continue") {
+      found_rc = true;
       const auto& ps = e["params_schema"];
       REQUIRE(ps.contains("required"));
-      const auto& req = ps["required"];
       bool has_target_id = false;
-      bool has_tid = false;
-      for (const auto& r : req) {
+      for (const auto& r : ps["required"]) {
+        if (r == "target_id") has_target_id = true;
+      }
+      CHECK(has_target_id);
+    }
+    if (m == "process.reverse_step") {
+      found_prs = true;
+      const auto& ps = e["params_schema"];
+      REQUIRE(ps.contains("required"));
+      bool has_target_id = false, has_tid = false, has_kind = false;
+      for (const auto& r : ps["required"]) {
         if (r == "target_id") has_target_id = true;
         if (r == "tid")       has_tid = true;
+        if (r == "kind")      has_kind = true;
       }
       CHECK(has_target_id);
       CHECK(has_tid);
-      // Summary must surface the v0.3-sync caveat so agents see it
-      // without round-tripping into docs/11-non-stop.md.
-      const auto summary = e.value("summary", std::string{});
-      CHECK(summary.find("v0.3") != std::string::npos);
+      CHECK(has_kind);
     }
-    if (m == "process.continue") {
-      const auto& ps = e["params_schema"];
-      // tid must be advertised as a property; only target_id required.
-      REQUIRE(ps.contains("properties"));
-      const auto& props = ps["properties"];
-      if (props.contains("tid")) found_process_continue_with_tid = true;
+    if (m == "thread.reverse_step") {
+      found_trs = true;
     }
   }
-  CHECK(found_thread_continue);
-  CHECK(found_process_continue_with_tid);
+  CHECK(found_rc);
+  CHECK(found_prs);
+  CHECK(found_trs);
 }

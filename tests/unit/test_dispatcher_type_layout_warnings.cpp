@@ -92,6 +92,11 @@ class TypeLayoutStub : public DebuggerBackend {
       list_frames(TID, ThrID, std::uint32_t) override { return {}; }
   ldb::backend::ProcessStatus
       step_thread(TID, ThrID, ldb::backend::StepKind) override { return {}; }
+  ldb::backend::ProcessStatus reverse_continue(TID) override { return {}; }
+  ldb::backend::ProcessStatus
+      reverse_step_thread(TID, ThrID, ldb::backend::ReverseStepKind) override {
+    return {};
+  }
   std::vector<ldb::backend::ValueInfo>
       list_locals(TID, ThrID, std::uint32_t) override { return {}; }
   std::vector<ldb::backend::ValueInfo>

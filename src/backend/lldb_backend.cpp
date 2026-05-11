@@ -239,6 +239,12 @@ struct LldbBackend::Impl {
   // bumped by continue_process / step_thread, invalidated by
   // detach / kill / close_target. Guarded by `mu`.
   std::unordered_map<TargetId, LiveSnapshotState> live_state;
+  // Per-target reverse-execution capability flag. Set true when a
+  // target connects via `rr://` (the only reverse-capable transport
+  // today). Reverse-exec backend methods consult this — non-rr targets
+  // get a "target does not support reverse execution" error which the
+  // dispatcher maps to -32003 forbidden. Guarded by `mu`.
+  std::unordered_map<TargetId, bool> reverse_capable;
   // Tier 3 §9 — per-target labels. `labels` maps target_id → label;
   // `label_owners` is the inverse (label → target_id) used to enforce
   // string uniqueness in O(1). Both protected by `mu` (no second mutex
@@ -2127,6 +2133,14 @@ ProcessStatus LldbBackend::connect_remote_target(TargetId tid,
     };
     attach_target_resource(
         tid, std::make_unique<RrReplayResource>(std::move(rr_replay)));
+    // Mark the target as reverse-capable for reverse_continue /
+    // reverse_step_thread. Today only rr satisfies this; future
+    // transports (replay daemons, hardware-trace replay) will set the
+    // same flag.
+    {
+      std::lock_guard<std::mutex> lk(impl_->mu);
+      impl_->reverse_capable[tid] = true;
+    }
   }
 
   return snapshot(proc);
@@ -2475,6 +2489,162 @@ ProcessStatus LldbBackend::step_thread(TargetId tid, ThreadId thread_id,
   // <gen> regardless of whether the step landed at a new PC. The
   // register digest will reflect any actual state change on the next
   // snapshot_for_target call.
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    bump_live_gen_locked(impl_->live_state[tid]);
+  }
+  return snapshot(proc);
+}
+
+// ---------------------------------------------------------------------------
+// Reverse execution (rr-backed)
+// ---------------------------------------------------------------------------
+//
+// LLDB exposes no SBProcess::ReverseContinue / ReverseStep API and ships
+// no `process reverse-continue` CLI command. The only path through SBAPI
+// is the gdb-remote plugin's `process plugin packet send <packet>` CLI,
+// which forwards a raw RSP packet to the active process. rr's gdbserver
+// implements `bc` (reverse-continue) and `bs` (reverse-step, one
+// instruction); we send those and then pump the listener for the next
+// stop event, mirroring connect_remote_target's pattern.
+
+namespace {
+
+// Send a raw GDB RSP packet through `process plugin packet send`.
+// Stdout is silenced around the call because the gdb-remote plugin
+// occasionally writes diagnostics to C stdio that would corrupt the
+// JSON-RPC channel (same dup2 pattern as save_core / connect_remote_target).
+lldb::SBCommandReturnObject
+run_packet_send(lldb::SBDebugger& debugger, lldb::SBTarget& target,
+                const std::string& packet) {
+  debugger.SetSelectedTarget(target);
+
+  int saved_stdout = ::dup(STDOUT_FILENO);
+  int devnull      = ::open("/dev/null", O_WRONLY);
+  if (saved_stdout >= 0 && devnull >= 0) {
+    ::dup2(devnull, STDOUT_FILENO);
+    ::close(devnull);
+  }
+
+  std::string cmd = "process plugin packet send " + packet;
+  lldb::SBCommandReturnObject ro;
+  debugger.GetCommandInterpreter().HandleCommand(cmd.c_str(), ro,
+                                                  /*add_to_history=*/false);
+
+  if (saved_stdout >= 0) {
+    ::dup2(saved_stdout, STDOUT_FILENO);
+    ::close(saved_stdout);
+  }
+  return ro;
+}
+
+// After `bc`/`bs` the gdb-remote plugin returns ~immediately but rr's
+// stop reply arrives asynchronously on the listener. Pump events until
+// the SBProcess state reflects the stop, or `timeout` elapses.
+void pump_until_stopped(lldb::SBDebugger& debugger, lldb::SBProcess& proc,
+                        std::chrono::seconds timeout) {
+  lldb::SBListener listener = debugger.GetListener();
+  using clock = std::chrono::steady_clock;
+  const auto deadline = clock::now() + timeout;
+  while (clock::now() < deadline) {
+    auto cur = proc.GetState();
+    if (cur != lldb::eStateInvalid && cur != lldb::eStateRunning &&
+        cur != lldb::eStateStepping) {
+      break;
+    }
+    lldb::SBEvent ev;
+    listener.WaitForEvent(/*num_seconds=*/1u, ev);
+    if (ev.IsValid() && lldb::SBProcess::EventIsProcessEvent(ev)) {
+      (void)lldb::SBProcess::GetStateFromEvent(ev);
+    }
+  }
+}
+
+}  // namespace
+
+ProcessStatus LldbBackend::reverse_continue(TargetId tid) {
+  lldb::SBTarget target;
+  bool capable = false;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+    auto rit = impl_->reverse_capable.find(tid);
+    capable = (rit != impl_->reverse_capable.end()) && rit->second;
+  }
+
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) throw Error("no process");
+  auto st = proc.GetState();
+  if (st != lldb::eStateStopped && st != lldb::eStateSuspended) {
+    throw Error("process is not stopped; cannot reverse-continue");
+  }
+  if (!capable) {
+    throw Error("target does not support reverse execution "
+                "(connect via rr:// to a record/replay trace)");
+  }
+
+  auto ro = run_packet_send(impl_->debugger, target, "bc");
+  if (!ro.Succeeded()) {
+    const char* err = ro.GetError();
+    throw Error(std::string("reverse-continue packet failed: ") +
+                (err ? err : "unknown error"));
+  }
+
+  pump_until_stopped(impl_->debugger, proc, std::chrono::seconds(5));
+
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    bump_live_gen_locked(impl_->live_state[tid]);
+  }
+  return snapshot(proc);
+}
+
+ProcessStatus LldbBackend::reverse_step_thread(TargetId tid,
+                                                ThreadId thread_id,
+                                                ReverseStepKind kind) {
+  if (kind != ReverseStepKind::kInsn) {
+    throw Error("reverse step kind not supported in v0.3; "
+                "only 'insn' is implemented (see docs/16-reverse-exec.md)");
+  }
+  lldb::SBTarget target;
+  bool capable = false;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) throw Error("unknown target_id");
+    target = it->second;
+    auto rit = impl_->reverse_capable.find(tid);
+    capable = (rit != impl_->reverse_capable.end()) && rit->second;
+  }
+
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) throw Error("no process");
+  auto st = proc.GetState();
+  if (st != lldb::eStateStopped && st != lldb::eStateSuspended) {
+    throw Error("process is not stopped; cannot reverse-step");
+  }
+  if (!capable) {
+    throw Error("target does not support reverse execution "
+                "(connect via rr:// to a record/replay trace)");
+  }
+  auto thr = proc.GetThreadByID(thread_id);
+  if (!thr.IsValid()) throw Error("unknown thread id");
+
+  // rr's gdbserver uses the selected thread for the `bs` packet; LLDB
+  // tracks selection per-process.
+  proc.SetSelectedThreadByID(thread_id);
+
+  auto ro = run_packet_send(impl_->debugger, target, "bs");
+  if (!ro.Succeeded()) {
+    const char* err = ro.GetError();
+    throw Error(std::string("reverse-step packet failed: ") +
+                (err ? err : "unknown error"));
+  }
+
+  pump_until_stopped(impl_->debugger, proc, std::chrono::seconds(5));
+
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
     bump_live_gen_locked(impl_->live_state[tid]);
@@ -3316,6 +3486,7 @@ void LldbBackend::close_target(TargetId tid) {
     }
     impl_->core_sha256.erase(tid);
     impl_->live_state.erase(tid);
+    impl_->reverse_capable.erase(tid);
     // §9 — drop the label so its string becomes available for reuse.
     if (auto lit = impl_->labels.find(tid); lit != impl_->labels.end()) {
       impl_->label_owners.erase(lit->second);

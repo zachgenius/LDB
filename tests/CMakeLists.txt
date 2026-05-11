@@ -238,6 +238,15 @@ set_tests_properties(smoke_connect_rr PROPERTIES
 )
 
 add_test(
+  NAME smoke_reverse_exec
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_reverse_exec.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_reverse_exec PROPERTIES
+  TIMEOUT 60
+)
+
+add_test(
   NAME smoke_artifact
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_artifact.py"
           "$<TARGET_FILE:ldbd>"
