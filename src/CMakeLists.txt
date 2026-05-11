@@ -16,6 +16,7 @@ set(LDBD_SOURCES
   backend/gdbmi/backend.cpp
   backend/gdbmi/parser.cpp
   backend/gdbmi/session.cpp
+  python/embed.cpp
   store/artifact_store.cpp
   store/hypothesis.cpp
   store/recipe_store.cpp
@@ -45,6 +46,7 @@ target_include_directories(ldbd PRIVATE
 target_link_libraries(ldbd PRIVATE
   ldb_lldb
   ldb_capstone
+  ldb_python
   ldb_json
   ldb_sodium
   ldb_warnings

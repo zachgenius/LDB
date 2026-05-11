@@ -96,6 +96,7 @@ set(LDB_UNIT_SOURCES
   test_dap_transport.cpp
   test_dap_rpc_channel.cpp
   test_dap_handlers.cpp
+  test_embedded_python.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -113,6 +114,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/backend.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/parser.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/session.cpp
+  ${CMAKE_SOURCE_DIR}/src/python/embed.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/hypothesis.cpp
   ${CMAKE_SOURCE_DIR}/src/store/recipe_store.cpp
@@ -157,6 +159,7 @@ target_link_libraries(ldb_unit_tests PRIVATE
   ldb_json
   ldb_lldb
   ldb_capstone
+  ldb_python
   ldb_sodium
   ldb_warnings
   SQLite::SQLite3
