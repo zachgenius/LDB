@@ -906,15 +906,61 @@ std::vector<FrameInfo> GdbMiBackend::list_frames(TargetId tid,
   }
   return out;
 }
-ProcessStatus GdbMiBackend::step_thread(TargetId, ThreadId, StepKind) {
-  todo("step_thread");
+ProcessStatus GdbMiBackend::step_thread(TargetId tid, ThreadId thread_id,
+                                          StepKind kind) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot step");
+  }
+  // v0.3 sync passthrough on thread selection — gdb's --thread on
+  // -exec-* is supported but our tid is a kernel tid; the per-thread
+  // step is process-wide for now (matches LldbBackend).
+  (void)thread_id;
+  const char* verb = nullptr;
+  switch (kind) {
+    case StepKind::kIn:   verb = "-exec-step";        break;
+    case StepKind::kOver: verb = "-exec-next";        break;
+    case StepKind::kOut:  verb = "-exec-finish";      break;
+    case StepKind::kInsn: verb = "-exec-step-instruction"; break;
+  }
+  send_or_throw(*st.session, verb);
+  st.last_status = wait_for_stop(*st.session, std::chrono::seconds(30));
+  return st.last_status;
 }
-ProcessStatus GdbMiBackend::reverse_continue(TargetId) {
-  todo("reverse_continue");
+
+ProcessStatus GdbMiBackend::reverse_continue(TargetId tid) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot reverse-continue");
+  }
+  // gdb returns ^error,msg="Target does not support this command."
+  // when reverse exec isn't active (no `record` running, no rr
+  // backend). The dispatcher's classifier sees "does not support"
+  // and emits -32003 forbidden — that's the correct semantic for
+  // "target isn't reverse-capable."
+  send_or_throw(*st.session, "-exec-reverse-continue");
+  st.last_status = wait_for_stop(*st.session, std::chrono::seconds(30));
+  return st.last_status;
 }
-ProcessStatus GdbMiBackend::reverse_step_thread(TargetId, ThreadId,
-                                                  ReverseStepKind) {
-  todo("reverse_step_thread");
+
+ProcessStatus GdbMiBackend::reverse_step_thread(TargetId tid,
+                                                  ThreadId thread_id,
+                                                  ReverseStepKind kind) {
+  auto& st = must_get_target(*impl_, tid);
+  if (st.last_status.state == ProcessState::kNone) {
+    throw Error("no live process; cannot reverse-step");
+  }
+  (void)thread_id;
+  const char* verb = nullptr;
+  switch (kind) {
+    case ReverseStepKind::kIn:   verb = "-exec-reverse-step";        break;
+    case ReverseStepKind::kOver: verb = "-exec-reverse-next";        break;
+    case ReverseStepKind::kOut:  verb = "-exec-reverse-finish";      break;
+    case ReverseStepKind::kInsn: verb = "-exec-reverse-step-instruction"; break;
+  }
+  send_or_throw(*st.session, verb);
+  st.last_status = wait_for_stop(*st.session, std::chrono::seconds(30));
+  return st.last_status;
 }
 std::vector<ValueInfo> GdbMiBackend::list_locals(TargetId, ThreadId,
                                                     std::uint32_t) {
