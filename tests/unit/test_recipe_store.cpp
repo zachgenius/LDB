@@ -245,6 +245,36 @@ TEST_CASE("recipe_store: substitution leaves placeholder for unknown slot alone"
   CHECK(out.params["other"] == "{not_a_slot}");
 }
 
+TEST_CASE("recipe_store: python-v1 envelope round-trips with body, empty calls",
+          "[store][recipe][envelope][python]") {
+  // python-v1 recipes carry `python_body` instead of a `calls` array.
+  // The envelope must preserve the body verbatim across serialisation,
+  // and the absence of `calls` must not corrupt parsing of `parameters`.
+  Recipe r;
+  r.id = 0;
+  r.name = "py-echo";
+  r.description = "trivial python recipe";
+  r.parameters = {RecipeParameter{"target_id", "integer", json(1)}};
+  r.python_body =
+      "def run(ctx):\n"
+      "    return {\"echoed\": ctx.get(\"target_id\")}\n";
+
+  auto env = RecipeStore::envelope_from_recipe(r);
+  REQUIRE(env.contains("python_body"));
+  CHECK(env["python_body"] == r.python_body.value());
+  // calls is present-but-empty so older clients don't crash on missing key.
+  REQUIRE(env.contains("calls"));
+  CHECK(env["calls"].empty());
+
+  auto back = RecipeStore::recipe_from_envelope(99, "py-echo", 0, env);
+  CHECK(back.id == 99);
+  REQUIRE(back.python_body.has_value());
+  CHECK(*back.python_body == *r.python_body);
+  CHECK(back.calls.empty());
+  REQUIRE(back.parameters.size() == 1);
+  CHECK(back.parameters[0].name == "target_id");
+}
+
 TEST_CASE("recipe_store: envelope round-trips through artifact bytes",
           "[store][recipe][envelope]") {
   // Pin the on-disk JSON shape: bytes_b64 should decode to a recipe-v1

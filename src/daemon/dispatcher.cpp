@@ -13,6 +13,7 @@
 #include "perf/perf_parser.h"
 #include "perf/perf_runner.h"
 #include "probes/probe_orchestrator.h"
+#include "python/embed.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
 #include "store/hypothesis.h"
@@ -2078,21 +2079,28 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
 
     add("recipe.create",
         "Create a named, parameterized recipe — a reusable RPC sequence "
-        "the agent can replay against fresh inputs. Storage is a "
-        "`recipe-v1` artifact under build_id \"_recipes\"; the recipe_id "
-        "IS the artifact id, so artifact.delete is a valid GC path. "
-        "Parameter substitution is whole-string-match: a STRING value "
-        "in calls[].params equal to \"{slot}\" is replaced with the "
-        "caller's parameter value at recipe.run time.",
+        "(format=\"recipe-v1\", default) OR an embedded Python module "
+        "with `def run(ctx): ...` (format=\"python-v1\", post-V1 #9). "
+        "Storage is a `recipe-v1` artifact under build_id \"_recipes\"; "
+        "the recipe_id IS the artifact id, so artifact.delete is a "
+        "valid GC path. For recipe-v1, parameter substitution is "
+        "whole-string-match: a STRING value in calls[].params equal to "
+        "\"{slot}\" is replaced with the caller's parameter value at "
+        "recipe.run time. For python-v1, the recipe.run `args` dict is "
+        "passed verbatim as the `ctx` parameter to `run(ctx)`; see "
+        "docs/20-embedded-python.md.",
         obj({
             {"name",        str()},
             {"description", str()},
+            {"format",      enum_str({"recipe-v1", "python-v1"})},
             {"calls",       arr_of(recipe_call_schema)},
+            {"body",        str("Python module source (python-v1 only)")},
             {"parameters",  arr_of(recipe_param_schema)},
-        }, {"name", "calls"}),
+        }, {"name"}),
         obj({
             {"recipe_id",  int_()},
             {"name",       str()},
+            {"format",     enum_str({"recipe-v1", "python-v1"})},
             {"call_count", int_()},
         }, {"recipe_id", "name", "call_count"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "low");
@@ -5493,21 +5501,24 @@ Response Dispatcher::handle_recipe_create(const Request& req) {
     }
     description = it->get<std::string>();
   }
-  auto cit = req.params.find("calls");
-  if (cit == req.params.end() || !cit->is_array() || cit->empty()) {
-    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
-                              "missing non-empty array param 'calls'");
-  }
-  std::vector<ldb::store::RecipeCall> calls;
-  calls.reserve(cit->size());
-  for (const auto& c : *cit) {
-    std::string err;
-    auto call = parse_recipe_call(c, &err);
-    if (!err.empty()) {
-      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+
+  // Format dispatch. Absent / "recipe-v1" → call-sequence recipe (the
+  // long-standing shape). "python-v1" → embed.h Callable; requires
+  // `body`, ignores `calls`. The two formats share `parameters`.
+  std::string format = "recipe-v1";
+  if (auto it = req.params.find("format");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'format' must be a string");
     }
-    calls.push_back(std::move(call));
+    format = it->get<std::string>();
+    if (format != "recipe-v1" && format != "python-v1") {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'format' must be one of {\"recipe-v1\", \"python-v1\"}");
+    }
   }
+
   std::vector<ldb::store::RecipeParameter> parameters;
   if (auto pit = req.params.find("parameters");
       pit != req.params.end() && !pit->is_null()) {
@@ -5526,12 +5537,53 @@ Response Dispatcher::handle_recipe_create(const Request& req) {
     }
   }
 
+  if (format == "python-v1") {
+    if (!ldb::python::Interpreter::available()) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "python-v1 recipes require ldbd built with LDB_ENABLE_PYTHON "
+          "(pkg-config python3-embed >= 3.11)");
+    }
+    auto bit = req.params.find("body");
+    if (bit == req.params.end() || !bit->is_string()
+        || bit->get<std::string>().empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "python-v1 recipes require non-empty string param 'body'");
+    }
+    ldb::store::RecipeStore rs(*artifacts_);
+    auto r = rs.create_python_recipe(*name, std::move(description),
+                                     std::move(parameters),
+                                     bit->get<std::string>());
+    json data;
+    data["recipe_id"]  = r.id;
+    data["name"]       = r.name;
+    data["format"]     = "python-v1";
+    data["call_count"] = 0;
+    return protocol::make_ok(req.id, std::move(data));
+  }
+
+  auto cit = req.params.find("calls");
+  if (cit == req.params.end() || !cit->is_array() || cit->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty array param 'calls'");
+  }
+  std::vector<ldb::store::RecipeCall> calls;
+  calls.reserve(cit->size());
+  for (const auto& c : *cit) {
+    std::string err;
+    auto call = parse_recipe_call(c, &err);
+    if (!err.empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+    }
+    calls.push_back(std::move(call));
+  }
+
   ldb::store::RecipeStore rs(*artifacts_);
   auto r = rs.create(*name, std::move(description),
                      std::move(parameters), std::move(calls));
   json data;
   data["recipe_id"]  = r.id;
   data["name"]       = r.name;
+  data["format"]     = "recipe-v1";
   data["call_count"] = static_cast<std::int64_t>(r.calls.size());
   return protocol::make_ok(req.id, std::move(data));
 }
@@ -5771,7 +5823,25 @@ Response Dispatcher::handle_recipe_lint(const Request& req) {
                               "recipe not found: " + std::to_string(id));
   }
 
-  auto warnings = ldb::store::lint_recipe(*r);
+  std::vector<ldb::store::LintWarning> warnings;
+  if (r->python_body.has_value()) {
+    // python-v1 recipes have no `calls` to lint; the meaningful check
+    // is "does the body compile?". Attempt construction; SyntaxError
+    // becomes a single LintWarning at step_index=0. Other Python
+    // errors at construction time (e.g. missing run() callable) also
+    // land here so the agent can fix them before a recipe.run.
+    try {
+      ldb::python::Callable c(*r->python_body, "<recipe:" + r->name + ">");
+      (void)c;  // construction-only lint; don't invoke.
+    } catch (const ldb::backend::Error& e) {
+      ldb::store::LintWarning w;
+      w.step_index = 0;
+      w.message    = e.what();
+      warnings.push_back(std::move(w));
+    }
+  } else {
+    warnings = ldb::store::lint_recipe(*r);
+  }
   json warn_arr = json::array();
   for (const auto& w : warnings) {
     warn_arr.push_back(json{{"step_index", w.step_index},
@@ -5883,12 +5953,68 @@ Response Dispatcher::handle_recipe_run(const Request& req) {
     }
     caller_args = *it;
   }
+  // python-v1 recipes use `args` instead of `parameters` since there is
+  // no placeholder substitution — the dict is the literal `ctx` passed
+  // into the recipe's `run(ctx)`. Accept both shapes; `args` wins when
+  // both are present so callers can keep typed-shape predictability.
+  json py_args = caller_args;
+  if (auto it = req.params.find("args");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'args' must be an object");
+    }
+    py_args = *it;
+  }
 
   ldb::store::RecipeStore rs(*artifacts_);
   auto r = rs.get(id);
   if (!r.has_value()) {
     return protocol::make_err(req.id, ErrorCode::kBackendError,
                               "recipe not found: " + std::to_string(id));
+  }
+
+  if (r->python_body.has_value()) {
+    if (!ldb::python::Interpreter::available()) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "python-v1 recipes require ldbd built with LDB_ENABLE_PYTHON");
+    }
+    try {
+      ldb::python::Callable c(*r->python_body,
+                              "<recipe:" + r->name + ">");
+      json result = c.invoke(py_args);
+      json data;
+      data["recipe_id"] = id;
+      data["format"]    = "python-v1";
+      data["result"]    = std::move(result);
+      // Surface captured stdout/stderr so an agent can keep prints
+      // useful for debugging without violating the JSON-RPC stdout
+      // discipline. Empty strings stay in the response so the shape
+      // is stable across runs.
+      data["stdout"]    = c.last_stdout();
+      data["stderr"]    = c.last_stderr();
+      return protocol::make_ok(req.id, std::move(data));
+    } catch (const ldb::backend::Error& e) {
+      // The embed wrapper sets last_exception_* on the Callable but
+      // we've destructed it by now — extract from the message. The
+      // wrapper formats as "python: <type>: <msg>"; split on the
+      // first ": " after "python:" to recover the structured shape.
+      std::string what = e.what();
+      json err_data = json::object();
+      const std::string prefix = "python: ";
+      if (what.rfind(prefix, 0) == 0) {
+        std::string rest = what.substr(prefix.size());
+        auto colon = rest.find(": ");
+        if (colon != std::string::npos) {
+          err_data["exception_type"] = rest.substr(0, colon);
+          err_data["message"]        = rest.substr(colon + 2);
+        } else {
+          err_data["exception_type"] = rest;
+        }
+      }
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+                                what, std::move(err_data));
+    }
   }
 
   // Stop-on-first-error policy. The brief asks for either stop or

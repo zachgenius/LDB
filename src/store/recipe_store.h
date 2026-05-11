@@ -84,6 +84,12 @@ struct Recipe {
   // created in-band via create() / from_session leave this nullopt.
   // recipe.reload (post-V1 plan #3) requires source_path to be set.
   std::optional<std::string>   source_path;
+  // Post-V1 plan #9 — python-v1 recipes carry executable Python code
+  // (a module that defines `def run(ctx): ...`) instead of a `calls`
+  // sequence. When set, `calls` is expected to be empty; the dispatcher
+  // routes recipe.run / recipe.lint through src/python/embed.{h,cpp}.
+  // See docs/20-embedded-python.md.
+  std::optional<std::string>   python_body;
 };
 
 // Methods an extract-from-session pass strips — these are protocol
@@ -132,6 +138,14 @@ class RecipeStore {
                 std::optional<std::string>   description,
                 std::vector<RecipeParameter> parameters,
                 std::vector<RecipeCall>      calls);
+
+  // Post-V1 plan #9 — create a python-v1 recipe. The body is the
+  // module source; the recipe.run dispatcher compiles and invokes it
+  // via src/python/embed.h. Throws backend::Error on empty body.
+  Recipe create_python_recipe(std::string                  name,
+                              std::optional<std::string>   description,
+                              std::vector<RecipeParameter> parameters,
+                              std::string                  python_body);
 
   // Look up by id; nullopt if not found.
   std::optional<Recipe> get(std::int64_t id);
@@ -192,6 +206,16 @@ class RecipeStore {
                             std::vector<RecipeParameter> parameters,
                             std::vector<RecipeCall>      calls,
                             std::optional<std::string>   source_path);
+
+  // Internal workhorse — handles both recipe-v1 (calls) and python-v1
+  // (python_body) shapes. Public callers go through create() /
+  // create_python_recipe() / create_with_source().
+  Recipe create_internal(std::string                  name,
+                         std::optional<std::string>   description,
+                         std::vector<RecipeParameter> parameters,
+                         std::vector<RecipeCall>      calls,
+                         std::optional<std::string>   python_body,
+                         std::optional<std::string>   source_path);
 
   ArtifactStore* store_;
 };

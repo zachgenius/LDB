@@ -326,6 +326,17 @@ set_tests_properties(smoke_recipe PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #9 phase-2: python-v1 recipe format end-to-end.
+# SKIPs when ldbd was built without LDB_ENABLE_PYTHON.
+add_test(
+  NAME smoke_recipe_python
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe_python.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_recipe_python PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_probe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe.py"
