@@ -77,6 +77,7 @@ set(LDB_UNIT_SOURCES
   test_bpftrace_program.cpp
   test_bpftrace_live.cpp
   test_dispatcher_uprobe_bpf.cpp
+  test_perf_parser.cpp
   test_observer_tcpdump_parser.cpp
   test_observer_tcpdump_live.cpp
   test_dispatcher_tcpdump.cpp
@@ -127,6 +128,8 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/exec_allowlist.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/bpftrace_engine.cpp
+  ${CMAKE_SOURCE_DIR}/src/perf/perf_parser.cpp
+  ${CMAKE_SOURCE_DIR}/src/perf/perf_runner.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
   ${CMAKE_SOURCE_DIR}/src/dap/transport.cpp
@@ -173,6 +176,7 @@ target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_CPPSYMS_PATH="$<TARGET_FILE:ldb_fix_cppsyms>"
   LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
   LDB_FIXTURE_KEYS_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/keys"
+  LDB_FIXTURE_PERF_SCRIPT_SAMPLE="${CMAKE_SOURCE_DIR}/tests/fixtures/perf_script_sample.txt"
   LDBD_PATH="$<TARGET_FILE:ldbd>"
   LDB_VERSION_STRING="${PROJECT_VERSION}"
 )

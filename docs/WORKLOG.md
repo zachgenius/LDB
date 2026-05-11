@@ -4,6 +4,122 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-11 — v1.4 #13: perf record/report integration (phase 1)
+
+**Goal:** Land post-V1 plan item #13 (`docs/17-version-plan.md`) — a
+synchronous `perf record` / `perf script` wrapper exposing
+call-stack-attributed samples through the same probe-event lens
+`#12` (libbpf agent) is landing in a parallel worktree. Three
+endpoints (`perf.record`, `perf.report`, `perf.cancel`), one design
+note, parser unit tests against a checked-in fixture, smoke test
+that SKIPs cleanly when `perf` is unavailable.
+
+**Done:**
+- `docs/22-perf-integration.md` — design note covering the three
+  endpoints, GPLv2 / kernel-coupling rationale for shelling out
+  rather than linking libperf, the `perf script` text format we
+  consume, the failure matrix (perf missing, paranoid > 1, target
+  pid vanished, malformed perf.data, store not configured), the
+  security stance ("daemon does NOT escalate"), and the explicit
+  out-of-scope list for phase 1 (async / remote-ssh / streaming).
+- `src/perf/perf_parser.{h,cpp}` — pure-text parser for `perf script
+  --header --fields comm,pid,tid,cpu,time,event,ip,sym,dso`. Lines:
+  blank-line-delimited samples, event header line, indented stack
+  frame lines. Tolerant of "(dso)"-less frames, "[unknown]" symbols,
+  "+offset" suffix stripping, and missing periods (older perf builds).
+  `sample_to_json` emits the canonical wire shape:
+  `{ts_ns, tid, pid, cpu, comm, event, stack: [{addr, sym, mod}]}`,
+  shape-aligned with #12's agent events.
+- `src/perf/perf_runner.{h,cpp}` — synchronous wrapper over `perf
+  record` + `perf script`. Invokes via `transport::local_exec` so
+  the subprocess's stdout is piped (never leaks to ldbd's fd 1),
+  stderr captured to a 4 KiB tail for diagnostics. `perf_data_path`
+  is a mkstemps-allocated tempfile; the dispatcher persists it via
+  `ArtifactStore::put` and unlinks. `kMaxDurationMs = 5 min` cap.
+- `src/daemon/dispatcher.cpp` + `dispatcher.h` — handlers for
+  `perf.record` / `perf.report` / `perf.cancel`. Catalog entries
+  in `describe.endpoints`. perf.cancel intentionally returns -32002
+  (kBadState) in phase 1 since record is synchronous; agents can
+  detect "async unsupported" without parsing strings.
+- `tests/unit/test_perf_parser.cpp` — 9 Catch2 cases against
+  `tests/fixtures/perf_script_sample.txt`: header parsing,
+  sample-boundary detection, missing-dso tolerance, `[unknown]`
+  pass-through, stack frame parsing, `sample_to_json` shape.
+- `tests/smoke/test_perf_record.py` — SKIPs cleanly on missing
+  `perf` or paranoid-gated `perf stat -e cycles /bin/true`. When
+  live, drives a 500 ms record against `ldb_fix_sleeper` and
+  asserts sample_count > 0, perf.report returns samples, at least
+  one stack is non-empty. Registered in `tests/CMakeLists.txt`
+  with timeout 30.
+
+**Decisions:**
+- **Shell out, don't link.** GPLv2 license incompatibility +
+  kernel-version coupling + zero build dependencies. One subprocess
+  fork per `perf.record`; bounded and reversible. Documented in
+  `docs/22 §2`.
+- **Event shape aligned with #12, not shared C++ type.** Probes'
+  `ProbeEvent` carries registers/memory/site (breakpoint engine)
+  that perf samples don't, and perf samples carry stacks that
+  probes don't. We keep separate types in C++ and align the JSON
+  shape on the wire. `docs/22 §"event shape alignment"` is the
+  contract.
+- **Synchronous phase 1.** `perf.record` blocks for `duration_ms`
+  and returns the artifact in one round-trip. `perf.cancel` is
+  registered for catalog completeness but returns kBadState; the
+  async variant slots in cleanly later (PerfRunner already owns
+  the subprocess as `unique_ptr` — async flips the wait to a
+  background thread). Avoids dragging in record-id allocation /
+  cancellation plumbing in this batch.
+- **`perf.data` as ArtifactStore artifact**, not a separate store.
+  Reuses the existing `(build_id, name)` addressing + GC + pack
+  round-tripping. Default `build_id` = `_perf` (synthetic, same
+  pattern as `_recipes`).
+- **Permission-error → SKIP, not FAIL** in the smoke test. If
+  `perf stat -e cycles /bin/true` exits zero but `perf record -p
+  PID` is denied (different paranoid sensitivities), we surface
+  the error message in -32000 and the smoke test re-SKIPs rather
+  than failing the suite. Defensive — keeps the test honest on
+  varied dev boxes.
+
+**Surprises / blockers:**
+- This dev box has NO `perf` installed and `kernel.perf_event_paranoid=2`.
+  The smoke test SKIPs cleanly; the C++ side compiles and links
+  fine because perf is shelled, not linked. End-to-end verification
+  of the live record path will happen on a runner with linux-tools
+  installed + sudoer paranoid relaxation (CI matrix entry that
+  doesn't currently exist; flagging for v1.4 release prep).
+- `local_exec` defaults work cleanly for `perf record` — it writes
+  to its `-o <file>` argument, so the only chatter is a one-line
+  "captured and wrote N MB" tail that we silence with `perf record
+  -q`. No need for the `save_core` dup2 trick because the subprocess
+  isn't ours; the parent pipe captures stdout/stderr.
+- `mkstemps` (not `mkstemp`) so we can pin a `.data` suffix on the
+  tempfile, matching what perf consumers expect.
+
+**Verification:**
+- `cmake --build build` — clean, warning-free with the full
+  `-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wold-style-cast
+   -Wconversion -Wsign-conversion -Wnull-dereference` set.
+- `build/bin/ldb_unit_tests "[perf]"` → 9/9 cases pass, 56 assertions.
+- `ctest --test-dir build -j4` → 55/62 passing, 7 failing — *identical*
+  to the v1.4 baseline (`smoke_attach`, `smoke_memory`, `smoke_mem_dump`,
+  `smoke_live_provenance`, `smoke_live_dlopen`, `smoke_dap_shim`,
+  `unit_tests` ptrace-attach group). Zero new regressions; one new
+  test (`smoke_perf_record`, currently SKIPPED).
+- perf availability on this box: not installed (linux-tools-generic
+  not present, no sudo). `perf_event_paranoid=2`. Smoke test SKIPs
+  on first probe.
+
+**Next:**
+v1.4 remaining (per `docs/17-version-plan.md`): #9 embedded Python
+probe callbacks, #14 custom Python frame unwinders. The async
+variant of perf.record + perf.cancel becomes interesting once a
+user case demands it; phase 1 covers the planning-loop use-case
+("record 500ms, look at samples") without the cancellation
+machinery.
+
+---
+
 ## 2026-05-11 — v1.4 #11: ssh-remote daemon mode (CLI transport)
 
 **Goal:** Land post-V1 plan item #11 (`docs/17-version-plan.md`) — let

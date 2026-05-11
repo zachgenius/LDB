@@ -373,6 +373,19 @@ set_tests_properties(smoke_uprobe_bpf PROPERTIES
   TIMEOUT 60
 )
 
+# Post-V1 plan #13: perf record/report integration. SKIPs cleanly on
+# hosts without `perf` (no linux-tools) or with kernel.perf_event_paranoid
+# too strict for unprivileged use.
+add_test(
+  NAME smoke_perf_record
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_perf_record.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_perf_record PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_observer_tcpdump
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_observer_tcpdump.py"
