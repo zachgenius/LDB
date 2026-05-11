@@ -70,6 +70,16 @@ int main(int argc, char** argv) {
   std::unique_ptr<pa::BpfRuntime> runtime;
 
   while (true) {
+    // If a prior send_frame hit a broken pipe (daemon died, parent
+    // closed stdout), std::cout enters a fail state and every
+    // subsequent write_frame returns false silently. Without this
+    // gate the loop would spin reading frames + dropping responses
+    // until stdin closed too. Bail out as soon as the channel
+    // becomes one-way unusable.
+    if (!std::cout) {
+      log_stderr("stdout closed; exiting protocol loop");
+      return 0;
+    }
     std::string body;
     auto ferr = pa::read_frame(std::cin, &body);
     if (ferr == pa::FrameError::kEof) break;

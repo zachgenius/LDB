@@ -16,6 +16,7 @@
 #include "probe_agent/protocol.h"
 
 #include <cstdint>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -221,4 +222,41 @@ TEST_CASE("base64: rejects malformed input",
   std::vector<std::uint8_t> out;
   REQUIRE_FALSE(base64_decode("@@@", &out));
   REQUIRE_FALSE(base64_decode("abc", &out));  // length not multiple of 4
+}
+
+TEST_CASE("base64: rejects pad-then-data in the final group",
+          "[probe_agent][protocol][base64]") {
+  // RFC 4648 §3.3: once a pad character appears in a group, every
+  // remaining position MUST also be a pad. The original decoder
+  // accepted `AB=C` and silently emitted two garbage bytes; this case
+  // pins the corrected behaviour.
+  std::vector<std::uint8_t> out;
+  REQUIRE_FALSE(base64_decode("AB=C", &out));
+  REQUIRE(out.empty());
+}
+
+TEST_CASE("base64: RFC 4648 §10 canonical test vectors",
+          "[probe_agent][protocol][base64]") {
+  struct Vec { const char* plain; const char* encoded; };
+  // From RFC 4648 §10. Round-trip in both directions to catch
+  // simultaneously-broken encode/decode pairs that round-trip alone
+  // would miss.
+  const Vec vectors[] = {
+      {"",       ""},
+      {"f",      "Zg=="},
+      {"fo",     "Zm8="},
+      {"foo",    "Zm9v"},
+      {"foob",   "Zm9vYg=="},
+      {"fooba",  "Zm9vYmE="},
+      {"foobar", "Zm9vYmFy"},
+  };
+  for (const auto& v : vectors) {
+    auto plain_bytes = reinterpret_cast<const std::uint8_t*>(v.plain);
+    std::string enc = base64_encode(plain_bytes,
+                                    std::strlen(v.plain));
+    REQUIRE(enc == v.encoded);
+    std::vector<std::uint8_t> dec;
+    REQUIRE(base64_decode(v.encoded, &dec));
+    REQUIRE(std::string(dec.begin(), dec.end()) == v.plain);
+  }
 }

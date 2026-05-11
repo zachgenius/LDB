@@ -56,9 +56,14 @@ if(LDB_BPF_HAVE_TOOLCHAIN)
     VERBATIM
   )
 
+  # add_custom_command COMMAND does NOT invoke a shell, so the trailing
+  # `>` redirect would be passed as a literal argv element to bpftool.
+  # Wrap in sh -c so the redirect actually works. The dev box has no
+  # clang+bpftool toolchain so this path was silently broken at first;
+  # CI exercises it on hosts with the full BPF toolchain.
   add_custom_command(
     OUTPUT "${LDB_BPF_SKEL_HEADER}"
-    COMMAND "${LDB_BPF_BPFTOOL}" gen skeleton "${LDB_BPF_OBJ}" > "${LDB_BPF_SKEL_HEADER}"
+    COMMAND sh -c "${LDB_BPF_BPFTOOL} gen skeleton ${LDB_BPF_OBJ} > ${LDB_BPF_SKEL_HEADER}"
     DEPENDS "${LDB_BPF_OBJ}"
     COMMENT "Generating BPF skeleton hello.skel.h"
     VERBATIM

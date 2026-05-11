@@ -266,6 +266,9 @@ bool base64_decode(std::string_view s, std::vector<std::uint8_t>* out) {
       return false;
     }
     if (v[0] < 0 || v[1] < 0) { out->clear(); return false; }
+    // Once v[2] is pad, v[3] MUST also be pad. RFC 4648 §3.3 — input
+    // like "AB=C" had been silently producing two bytes; reject cleanly.
+    if (v[2] < 0 && v[3] >= 0) { out->clear(); return false; }
     std::uint32_t w =
         (static_cast<std::uint32_t>(v[0]) << 18) |
         (static_cast<std::uint32_t>(v[1]) << 12) |
