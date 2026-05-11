@@ -4,6 +4,103 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-11 — v1.4 #11: ssh-remote daemon mode (CLI transport)
+
+**Goal:** Land post-V1 plan item #11 (`docs/17-version-plan.md`) — let
+`ldb --ssh user@host[:port]` spawn `ldbd --stdio` on a remote target,
+without any daemon-side change. The goal is "ssh as transport," not "new
+RPC over network."
+
+**Done:**
+- `tools/ldb/ldb`: new `DaemonSpec` value type carrying either a local
+  ldbd path or an ssh target + extras. Threaded the spec through
+  `spawn_daemon`, `fetch_catalog`, `do_rpc`, `run_repl`, and
+  `_ReplSession`. New CLI flags `--ssh`, `--ssh-key`, `--ssh-options`,
+  `--ldbd-path` parsed via `_set_long_arg`. Top-level help / docstring
+  updated. `LDB_SSH_TARGET` env beats the flag (matches
+  `LDB_STORE_ROOT` precedence); `--ssh` + `--ldbd` are mutually
+  exclusive → rc=2.
+- Helpers `_split_ssh_target` (strip trailing numeric `:NNN`) and
+  `_build_ssh_argv` (compose `ssh [-p P] [-i K -o IdentitiesOnly=yes]
+  [...raw-options...] HOST -- REMOTE_LDBD --stdio --format FMT
+  --log-level error`). The `IdentitiesOnly=yes` pairing with `-i`
+  avoids ssh-agent surprises picking the wrong key.
+- `docs/19-ssh-remote.md` — short design note (shape, failure matrix,
+  out-of-scope list, what's tested). Mirrors `docs/16-reverse-exec.md`
+  style.
+- `tests/smoke/test_ldb_cli_ssh.py` — shim-based smoke. A fake `ssh`
+  on PATH either records its argv (composition cases) or `exec`s the
+  local ldbd (end-to-end JSON-RPC case). Covers argv composition with
+  host+port+key+options+remote-path, the `--` separator, the
+  `LDB_SSH_TARGET` env-only path, `--ssh`/`--ldbd` mutex exit code,
+  and a real `hello` round-trip through the spec-threaded transport.
+  Registered as `smoke_cli_ssh` in `tests/CMakeLists.txt`.
+
+**Decisions:**
+- **Transport-only.** The daemon already speaks JSON-RPC over an
+  arbitrary byte stream (`--stdio`). ssh's exec channel is a byte
+  stream. There is nothing on the protocol side to add. Any change
+  to ldbd for this item would be wasted code.
+- **`DaemonSpec` is a plain bag.** No methods beyond `is_ssh`. Argv
+  composition is a free function so the test can call it (or, more
+  accurately, observe its output via the shim) in isolation.
+- **Env beats flag.** Matches the `LDB_STORE_ROOT` precedence and lets
+  CI/agent harnesses set a remote target without rewriting argv. The
+  `--ssh`+`--ldbd` mutex check fires *after* env override — passing
+  `--ldbd` with `LDB_SSH_TARGET` set in the surrounding env is treated
+  as ambiguous (exit rc=2) rather than silently preferring one. Could
+  be relaxed later if users hit it; flagging now.
+- **No connection multiplexing.** Each one-shot `ldb` spawns a fresh
+  ssh; `--repl` keeps one ssh for the session, which is the right
+  tool when latency matters. ssh's own ControlMaster is reachable via
+  `--ssh-options "-o ControlPersist=10m"` for users who want it; we
+  don't auto-enable to avoid surprise persistent connections.
+- **Shim-based test, not real ssh.** Real ssh in CI would require
+  passwordless ssh-to-localhost (which `test_connect_remote_ssh.py`
+  already does for the lldb-server tunnel path). A shim on PATH
+  isolates the CLI-side regression surface — argv composition,
+  spec threading, env-override — without inheriting flaky network
+  setup. Documented in `docs/19`.
+- **IPv6 literal parsing deferred.** `_split_ssh_target` only strips
+  trailing numeric `:NNN`; IPv6 like `[::1]:22` is not parsed.
+  Users can pass `-p 22` via `--ssh-options`. Documented limitation.
+
+**TDD red-state confirmation:**
+The new smoke test was run against `git show HEAD:tools/ldb/ldb` (the
+pre-impl version) and failed with `ldb: unknown option: --ssh` on all
+four cases — confirming the test actually exercises the new surface
+rather than passing on accident. Then re-run against the working tree
+and got `OK: ldb --ssh smoke`.
+
+**Surprises / blockers:**
+- **`libsodium-dev` missing on this dev box.** Pre-existing — the
+  `pack_signing.cpp` translation unit fails to compile (`sodium.h: No
+  such file or directory`). The runtime library `libsodium.so.23` is
+  installed; only the headers are absent. Unrelated to #11 (Python +
+  test only), but blocks any C++ work the rest of v1.4 needs.
+  Verified by stashing my changes and re-running `cmake --build` —
+  identical failure. `apt-get install libsodium-dev` requires sudo.
+  Flagging for the user; spawned agents will need this resolved.
+- **Existing `ldbd` binary is fresh enough.** Built 22:10 from current
+  master sources; the partial-build failure on pack_signing didn't
+  prevent ldbd-target completion in earlier sessions.
+
+**Verification:**
+- `python3 tests/smoke/test_ldb_cli_ssh.py … → OK: ldb --ssh smoke`.
+- `ctest --test-dir build -j4` → 53/60 passing, 7 failing — *identical*
+  set to the v1.3 baseline (smoke_attach, smoke_memory, smoke_mem_dump,
+  smoke_live_provenance, smoke_live_dlopen, smoke_dap_shim, unit_tests
+  ptrace-attach group). Zero new regressions.
+
+**Next:**
+v1.4 remaining (per `docs/17-version-plan.md`): #9 embedded Python probe
+callbacks, #14 custom Python frame unwinders (shares Python embed with
+#9), #12 libbpf `ldb-probe-agent`, #13 perf record/report integration.
+Spawning worktree-isolated agents for these next, with code-reviewer
+gating each before merge to `feat/v1.4-backend`.
+
+---
+
 ## 2026-05-11 — v1.4 #10: interactive REPL for `tools/ldb/ldb`
 
 **Goal:** Land post-V1 plan item #10 (`docs/17-version-plan.md`) — an interactive REPL for the Python CLI. The headline win is daemon persistence: one `ldbd --stdio` survives across many commands, so `target_id` from `target.open` is usable in later `module.list` / `disasm.*` calls without re-opening the binary.

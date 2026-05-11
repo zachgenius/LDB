@@ -5,7 +5,8 @@ Spawns `ldbd --stdio` as a child process per invocation, sends one
 JSON-RPC request, and prints the response.
 
 Usage:
-    ldb [--ldbd PATH] [--format json|cbor] [--verbose] [--raw]
+    ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]
+        [--verbose] [--raw]
         <subcommand> [key=value ...] [--view k=v ...]
 
 Subcommands are discovered dynamically from `describe.endpoints` on
@@ -27,6 +28,11 @@ Design notes:
   • Stdout discipline. The daemon's stdout is the JSON-RPC channel — we
     pipe it through, capture stderr separately, and print our own output
     on the CLI's stdout.
+  • Transport. By default the daemon runs locally as a child process.
+    With --ssh user@host the same `ldbd --stdio` is spawned on the remote
+    via `ssh user@host -- ldbd --stdio`; the agent's wire bytes flow
+    through ssh's stdin/stdout exec channel unchanged. No daemon-side
+    code changes — ssh is just a transport. See post-V1 plan #11.
 
 The CLI depends only on Python's stdlib. Optional: prompt_toolkit for
 nicer REPL completion; readline is the fallback. CBOR support is
@@ -227,6 +233,27 @@ class CborTransport:
 # Daemon discovery + lifecycle.
 # ----------------------------------------------------------------------
 
+class DaemonSpec:
+    """How to spawn the daemon. Either local (a path to ldbd) or ssh.
+
+    The rest of the CLI treats both the same — `spawn_daemon(spec, ...)`
+    returns a Popen whose stdin/stdout speak the JSON-RPC channel.
+    """
+    __slots__ = ("local_ldbd", "ssh_target", "ssh_key", "ssh_options",
+                 "remote_ldbd")
+
+    def __init__(self):
+        self.local_ldbd: str | None = None
+        self.ssh_target: str | None = None
+        self.ssh_key: str | None = None
+        self.ssh_options: str | None = None  # extra raw "-o ..." string
+        self.remote_ldbd: str = "ldbd"
+
+    @property
+    def is_ssh(self) -> bool:
+        return self.ssh_target is not None
+
+
 def find_ldbd(explicit: str | None) -> str:
     if explicit:
         if not os.access(explicit, os.X_OK):
@@ -246,8 +273,56 @@ def find_ldbd(explicit: str | None) -> str:
     sys.exit(2)
 
 
-def spawn_daemon(ldbd: str, fmt: str, verbose: bool):
-    cmd = [ldbd, "--stdio", "--format", fmt, "--log-level", "error"]
+def _split_ssh_target(target: str) -> tuple[str, str | None]:
+    """Parse `[user@]host[:port]` into (user@host, port-or-None).
+
+    ssh accepts `-p PORT` as a separate arg; we strip a trailing `:NNN`
+    here so the user can write the natural `user@host:2222` form.
+    """
+    if ":" in target:
+        host, _, port = target.rpartition(":")
+        if port.isdigit():
+            return host, port
+    return target, None
+
+
+def _build_ssh_argv(spec: DaemonSpec, fmt: str) -> list[str]:
+    """Compose the full `ssh ...` command line for spawning ldbd remote."""
+    assert spec.ssh_target is not None
+    host, port = _split_ssh_target(spec.ssh_target)
+    argv = ["ssh"]
+    if port:
+        argv += ["-p", port]
+    if spec.ssh_key:
+        # IdentitiesOnly avoids ssh-agent surprises picking the wrong key.
+        argv += ["-i", spec.ssh_key, "-o", "IdentitiesOnly=yes"]
+    if spec.ssh_options:
+        # User passed a raw chunk; shlex-split so they can use `-o A=B -o C=D`.
+        import shlex
+        argv += shlex.split(spec.ssh_options)
+    argv += [host, "--", spec.remote_ldbd,
+             "--stdio", "--format", fmt, "--log-level", "error"]
+    return argv
+
+
+def spawn_daemon(spec_or_path, fmt: str, verbose: bool):
+    """Spawn a daemon by spec (local or ssh).
+
+    Accepts either a DaemonSpec or, for backward-compat with older
+    call-sites that already had a resolved ldbd path string, the bare
+    path string (which it wraps into a local spec).
+    """
+    if isinstance(spec_or_path, DaemonSpec):
+        spec = spec_or_path
+    else:
+        spec = DaemonSpec()
+        spec.local_ldbd = spec_or_path
+
+    if spec.is_ssh:
+        cmd = _build_ssh_argv(spec, fmt)
+    else:
+        cmd = [spec.local_ldbd, "--stdio", "--format", fmt,
+               "--log-level", "error"]
     if verbose:
         sys.stderr.write(f"ldb: spawning {' '.join(cmd)}\n")
     return subprocess.Popen(
@@ -441,14 +516,22 @@ def render_top_help(catalog: list[dict]) -> str:
         "ldb — thin CLI for ldbd (LDB daemon)\n"
         "\n"
         "Usage:\n"
-        "  ldb [--ldbd PATH] [--format json|cbor] [--verbose] [--raw]\n"
+        "  ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]\n"
+        "      [--verbose] [--raw]\n"
         "      <subcommand> [key=value ...] [--view k=v ...]\n"
-        "  ldb [--ldbd PATH] [--format json|cbor] [--verbose] --repl\n"
+        "  ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]\n"
+        "      [--verbose] --repl\n"
         "  ldb <subcommand> --help\n"
         "  ldb --help | --version\n"
         "\n"
         "Top-level options:\n"
-        "  --ldbd PATH          ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
+        "  --ldbd PATH          local ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
+        "  --ssh TARGET         spawn ldbd on TARGET ([user@]host[:port]) via ssh\n"
+        "                       (mutually exclusive with --ldbd)\n"
+        "                       env LDB_SSH_TARGET overrides this flag\n"
+        "  --ssh-key PATH       ssh identity file (forwarded as `ssh -i`)\n"
+        "  --ssh-options STR    extra raw ssh options, e.g. \"-o ProxyJump=bastion\"\n"
+        "  --ldbd-path PATH     where ldbd lives on the remote (default: ldbd on $PATH)\n"
         "  --format json|cbor   wire format on the daemon channel (default: json)\n"
         "  --verbose            log JSON-RPC traffic to stderr\n"
         "  --raw                print the full JSON-RPC envelope, not just data\n"
@@ -479,12 +562,13 @@ def render_top_help(catalog: list[dict]) -> str:
 # Catalog fetch (one daemon roundtrip).
 # ----------------------------------------------------------------------
 
-def fetch_catalog(ldbd: str, fmt: str, verbose: bool) -> list[dict]:
+def fetch_catalog(spec, fmt: str, verbose: bool) -> list[dict]:
     """Spawn ldbd, ask describe.endpoints, return the catalog list.
 
     Errors here are fatal (CLI can't function without the catalog).
+    Accepts either a DaemonSpec or a bare ldbd path string.
     """
-    proc = spawn_daemon(ldbd, fmt, verbose)
+    proc = spawn_daemon(spec, fmt, verbose)
     try:
         if fmt == "cbor":
             tr = CborTransport(proc)
@@ -530,9 +614,9 @@ def fetch_catalog(ldbd: str, fmt: str, verbose: bool) -> list[dict]:
 # RPC call.
 # ----------------------------------------------------------------------
 
-def do_rpc(ldbd: str, fmt: str, verbose: bool, method: str,
+def do_rpc(spec, fmt: str, verbose: bool, method: str,
            params: dict) -> dict:
-    proc = spawn_daemon(ldbd, fmt, verbose)
+    proc = spawn_daemon(spec, fmt, verbose)
     try:
         tr = CborTransport(proc) if fmt == "cbor" else JsonTransport(proc)
         req = {"jsonrpc": "2.0", "id": "1", "method": method,
@@ -570,7 +654,8 @@ def do_rpc(ldbd: str, fmt: str, verbose: bool, method: str,
 #   1. Strip top-level options (anything starting with `--` recognized).
 #   2. Whatever's left: first token = method; the rest = params + --view.
 
-TOP_OPTIONS_WITH_ARG = {"--ldbd", "--format"}
+TOP_OPTIONS_WITH_ARG = {"--ldbd", "--format", "--ssh", "--ssh-key",
+                        "--ssh-options", "--ldbd-path"}
 TOP_OPTIONS_NOARG    = {"--verbose", "--raw", "--repl"}
 HELP_FLAGS           = {"--help", "-h"}
 
@@ -591,7 +676,30 @@ def parse_argv(argv: list[str]) -> dict:
         "method_help": False,
         "params": [],     # list[str] — key=value
         "view": [],       # list[(key, value)]
+        "ssh": None,
+        "ssh_key": None,
+        "ssh_options": None,
+        "ldbd_path": None,
     }
+
+    def _set_long_arg(key: str, val: str):
+        if key == "--format":
+            if val not in ("json", "cbor"):
+                raise ValueError(
+                    f"--format must be json|cbor, got {val!r}")
+            out["format"] = val
+        elif key == "--ldbd":
+            out["ldbd"] = val
+        elif key == "--ssh":
+            out["ssh"] = val
+        elif key == "--ssh-key":
+            out["ssh_key"] = val
+        elif key == "--ssh-options":
+            out["ssh_options"] = val
+        elif key == "--ldbd-path":
+            out["ldbd_path"] = val
+        else:
+            raise ValueError(f"unknown option: {key}")
 
     i = 0
     n = len(argv)
@@ -600,14 +708,7 @@ def parse_argv(argv: list[str]) -> dict:
         if a in TOP_OPTIONS_WITH_ARG:
             if i + 1 >= n:
                 raise ValueError(f"{a} requires an argument")
-            if a == "--ldbd":
-                out["ldbd"] = argv[i + 1]
-            elif a == "--format":
-                fmt = argv[i + 1]
-                if fmt not in ("json", "cbor"):
-                    raise ValueError(
-                        f"--format must be json|cbor, got {fmt!r}")
-                out["format"] = fmt
+            _set_long_arg(a, argv[i + 1])
             i += 2
         elif a == "--verbose":
             out["verbose"] = True
@@ -624,16 +725,10 @@ def parse_argv(argv: list[str]) -> dict:
         elif a == "--version" and out["method"] is None:
             out["version"] = True
             i += 1
-        elif a.startswith("--format=") or a.startswith("--ldbd="):
+        elif "=" in a and a.startswith("--") and a.split("=", 1)[0] in TOP_OPTIONS_WITH_ARG:
             # Accept --foo=bar form too.
             key, _, val = a.partition("=")
-            if key == "--format":
-                if val not in ("json", "cbor"):
-                    raise ValueError(
-                        f"--format must be json|cbor, got {val!r}")
-                out["format"] = val
-            else:
-                out["ldbd"] = val
+            _set_long_arg(key, val)
             i += 1
         elif out["method"] is None:
             if a.startswith("--"):
@@ -709,12 +804,12 @@ class _ReplSession:
 
     EXIT = object()
 
-    def __init__(self, ldbd: str, fmt: str, verbose: bool, raw: bool):
-        self.ldbd = ldbd
+    def __init__(self, spec, fmt: str, verbose: bool, raw: bool):
+        self.spec = spec
         self.fmt = fmt
         self.verbose = verbose
         self.raw = raw
-        self.proc = spawn_daemon(ldbd, fmt, verbose)
+        self.proc = spawn_daemon(spec, fmt, verbose)
         self.tr = CborTransport(self.proc) if fmt == "cbor" else JsonTransport(self.proc)
         self.next_id = 0
         self.catalog = self._fetch_catalog()
@@ -1064,14 +1159,14 @@ def _install_readline_completion(session: _ReplSession):
     readline.parse_and_bind("tab: complete")
 
 
-def run_repl(ldbd: str, fmt: str, verbose: bool, raw: bool) -> int:
+def run_repl(spec, fmt: str, verbose: bool, raw: bool) -> int:
     """Drive an interactive ldb session against ONE persistent daemon.
 
     Returns the exit code. EOF, :quit, :q, :exit all exit cleanly with
     code 0. Daemon-spawn / catalog-fetch errors exit nonzero.
     """
     try:
-        session = _ReplSession(ldbd, fmt, verbose, raw)
+        session = _ReplSession(spec, fmt, verbose, raw)
     except (IOError, RuntimeError) as e:
         sys.stderr.write(f"ldb: repl startup failed: {e}\n")
         return 1
@@ -1138,14 +1233,34 @@ def main(argv: list[str]) -> int:
         print(f"ldb {CLIENT_VERSION}")
         return 0
 
-    ldbd = find_ldbd(opts["ldbd"])
+    # LDB_SSH_TARGET (if set) overrides --ssh, matching the convention
+    # used elsewhere (env beats flag — same precedence as LDB_STORE_ROOT
+    # for the daemon). Empty env value is treated as unset.
+    env_ssh = os.environ.get("LDB_SSH_TARGET") or None
+    if env_ssh:
+        opts["ssh"] = env_ssh
+
+    if opts["ssh"] and opts["ldbd"]:
+        sys.stderr.write(
+            "ldb: --ssh and --ldbd are mutually exclusive\n")
+        return 2
+
+    spec = DaemonSpec()
+    if opts["ssh"]:
+        spec.ssh_target = opts["ssh"]
+        spec.ssh_key = opts["ssh_key"]
+        spec.ssh_options = opts["ssh_options"]
+        if opts["ldbd_path"]:
+            spec.remote_ldbd = opts["ldbd_path"]
+    else:
+        spec.local_ldbd = find_ldbd(opts["ldbd"])
     fmt = opts["format"]
     verbose = opts["verbose"]
 
     if opts["repl"]:
         # --repl ignores any positional method; the user drives the
         # session interactively. We still respect --raw/--verbose/--format.
-        return run_repl(ldbd, fmt, verbose, opts["raw"])
+        return run_repl(spec, fmt, verbose, opts["raw"])
 
     # Fetch catalog only when we need it.
     needs_catalog = (
@@ -1153,7 +1268,7 @@ def main(argv: list[str]) -> int:
     )
     catalog: list[dict] = []
     if needs_catalog:
-        catalog = fetch_catalog(ldbd, fmt, verbose)
+        catalog = fetch_catalog(spec, fmt, verbose)
 
     if opts["help_top"]:
         sys.stdout.write(render_top_help(catalog))
@@ -1200,7 +1315,7 @@ def main(argv: list[str]) -> int:
             f"     run `ldb {method} --help` for the parameter list.\n")
         return 2
 
-    resp = do_rpc(ldbd, fmt, verbose, method, params)
+    resp = do_rpc(spec, fmt, verbose, method, params)
 
     if opts["raw"]:
         sys.stdout.write(json.dumps(resp, indent=2) + "\n")

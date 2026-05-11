@@ -530,6 +530,18 @@ set_tests_properties(smoke_cli_repl PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #11: --ssh transport on the `ldb` CLI. A shell shim on
+# PATH stands in for `ssh`, so this test runs without a real remote.
+add_test(
+  NAME smoke_cli_ssh
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_ldb_cli_ssh.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+)
+set_tests_properties(smoke_cli_ssh PROPERTIES
+  TIMEOUT 30
+)
+
 # Post-V1 plan #8: cross-backend smoke under ldbd --backend=gdb.
 # SKIPs cleanly when gdb is not on PATH.
 add_test(
