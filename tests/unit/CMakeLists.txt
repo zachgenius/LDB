@@ -76,6 +76,7 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_observer_exec.cpp
   test_describe_endpoints_schema.cpp
   test_pack.cpp
+  test_pack_signing.cpp
   test_util_sha256.cpp
   test_protocol_provenance.cpp
   test_backend_provenance.cpp
@@ -103,6 +104,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/store/recipe_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/pack.cpp
+  ${CMAKE_SOURCE_DIR}/src/store/pack_signing.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/ssh.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/local_exec.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/streaming_exec.cpp
@@ -141,6 +143,7 @@ target_link_libraries(ldb_unit_tests PRIVATE
   ldb_json
   ldb_lldb
   ldb_capstone
+  ldb_sodium
   ldb_warnings
   SQLite::SQLite3
   ZLIB::ZLIB
@@ -155,6 +158,7 @@ target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_SLEEPER_PATH="$<TARGET_FILE:ldb_fix_sleeper>"
   LDB_FIXTURE_CPPSYMS_PATH="$<TARGET_FILE:ldb_fix_cppsyms>"
   LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
+  LDB_FIXTURE_KEYS_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/keys"
   LDBD_PATH="$<TARGET_FILE:ldbd>"
 )
 

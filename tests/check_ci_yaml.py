@@ -137,6 +137,7 @@ def main():
         "actions/checkout@v4",
         "ninja-build",
         "liblldb-dev",
+        "libsodium-dev",
         "bpftrace",
         "tcpdump",
         "kernel.yama.ptrace_scope=0",

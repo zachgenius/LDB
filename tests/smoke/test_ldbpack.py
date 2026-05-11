@@ -232,6 +232,98 @@ def main():
             except Exception: pass
             proc2.wait(timeout=10)
 
+        # ---- signing flow (docs/14-pack-signing.md tests 11 + 12) ----
+        # Currently expected-to-skip: the dispatcher does not yet honor
+        # `sign_key` / `trust_root` / `require_signed`. Once the
+        # implementation lands, remove the `signing_xfail` early-return
+        # and the rest of this block runs as full positive + negative
+        # coverage.
+        signing_xfail = True
+        if signing_xfail:
+            print("ldbpack signing smoke: SKIP (dispatcher integration "
+                  "pending — docs/14 §Test Plan items 11 + 12)")
+        else:
+            key_priv = os.path.join(
+                os.path.dirname(__file__), "..",
+                "fixtures", "keys", "alice_ed25519")
+            key_pub  = key_priv + ".pub"
+            bob_pub  = os.path.join(
+                os.path.dirname(__file__), "..",
+                "fixtures", "keys", "bob_ed25519.pub")
+            trust_ok = tempfile.mkdtemp(prefix="ldb_smoke_trust_alice_")
+            trust_no = tempfile.mkdtemp(prefix="ldb_smoke_trust_bob_")
+            try:
+                shutil.copy(key_pub, os.path.join(trust_ok, "alice.pub"))
+                shutil.copy(bob_pub, os.path.join(trust_no, "bob.pub"))
+                signed_pack = os.path.join(pack_dir, "signed.ldbpack")
+
+                # Positive: A signs, B verifies with alice in trust_ok.
+                src2 = tempfile.mkdtemp(prefix="ldb_smoke_pack_src2_")
+                dst2 = tempfile.mkdtemp(prefix="ldb_smoke_pack_dst2_")
+                try:
+                    procA = start(src2)
+                    try:
+                        callA = caller(procA)
+                        sa = callA("session.create",
+                                   {"name": "signed-alpha"})
+                        expect(sa["ok"], f"create: {sa}")
+                        callA("artifact.put", {
+                            "build_id": "buildA",
+                            "name": "s.bin",
+                            "bytes_b64": "AAEC",
+                        })
+                        ex = callA("session.export", {
+                            "id": sa["data"]["id"],
+                            "path": signed_pack,
+                            "sign_key": key_priv,
+                            "signer": "alice@smoke",
+                        })
+                        expect(ex["ok"], f"signed-export: {ex}")
+                        expect(ex["data"]["manifest"]["format"]
+                               == "ldbpack/1+sig",
+                               f"signed format: {ex['data']}")
+                        expect(ex["data"]["signature"]["algorithm"]
+                               == "ed25519",
+                               f"signed algo: {ex['data']}")
+                    finally:
+                        try: procA.stdin.close()
+                        except Exception: pass
+                        procA.wait(timeout=10)
+
+                    procB = start(dst2)
+                    try:
+                        callB = caller(procB)
+                        im_ok = callB("session.import", {
+                            "path": signed_pack,
+                            "trust_root": trust_ok,
+                            "require_signed": True,
+                        })
+                        expect(im_ok["ok"], f"signed-import-ok: {im_ok}")
+                        expect(im_ok["data"]["signature"]["verified"]
+                               is True,
+                               f"verified=true: {im_ok['data']}")
+
+                        # Negative: same pack, trust root missing alice.
+                        im_bad = callB("session.import", {
+                            "path": signed_pack,
+                            "trust_root": trust_no,
+                            "require_signed": True,
+                        })
+                        expect(not im_bad["ok"],
+                               f"untrusted should fail: {im_bad}")
+                        expect(im_bad.get("error", {}).get("code") == -32003,
+                               f"expected -32003 untrusted: {im_bad}")
+                    finally:
+                        try: procB.stdin.close()
+                        except Exception: pass
+                        procB.wait(timeout=10)
+                finally:
+                    for p in (src2, dst2):
+                        shutil.rmtree(p, ignore_errors=True)
+            finally:
+                for p in (trust_ok, trust_no):
+                    shutil.rmtree(p, ignore_errors=True)
+
         if failures:
             for f in failures:
                 sys.stderr.write(f"FAIL: {f}\n")
