@@ -12,6 +12,8 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_hello.cpp
   test_protocol_cost.cpp
   test_cost_samples.cpp
+  test_mi_parser.cpp
+  test_mi_session.cpp
   test_protocol_cbor.cpp
   test_protocol_view.cpp
   test_view_diff.cpp
@@ -107,6 +109,8 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
   ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/parser.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/session.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/hypothesis.cpp
   ${CMAKE_SOURCE_DIR}/src/store/recipe_store.cpp
