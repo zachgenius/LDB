@@ -163,6 +163,7 @@ target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
   LDB_FIXTURE_KEYS_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/keys"
   LDBD_PATH="$<TARGET_FILE:ldbd>"
+  LDB_VERSION_STRING="${PROJECT_VERSION}"
 )
 
 # lldb-server path for the connect_remote positive-path test. Discovery

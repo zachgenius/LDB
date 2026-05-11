@@ -609,7 +609,7 @@ nlohmann::json make_manifest_skeleton() {
   nlohmann::json m;
   m["format"]      = "ldbpack/1";
   m["created_at"]  = epoch_seconds_now();
-  m["creator"]     = "ldbd 0.1.0";
+  m["creator"]     = std::string("ldbd ") + LDB_VERSION_STRING;
   m["sessions"]    = nlohmann::json::array();
   m["artifacts"]   = nlohmann::json::array();
   // Relations live alongside artifacts (post-v0.1 §7). Endpoint ids on
