@@ -10,6 +10,7 @@
 #include "probes/probe_orchestrator.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
+#include "store/hypothesis.h"
 #include "store/pack.h"
 #include "store/pack_signing.h"
 #include "store/recipe_store.h"
@@ -566,6 +567,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "mem.dump_artifact")  return handle_mem_dump_artifact(req);
 
     if (req.method == "artifact.put")       return handle_artifact_put(req);
+    if (req.method == "artifact.hypothesis_template")
+      return handle_artifact_hypothesis_template(req);
     if (req.method == "artifact.get")       return handle_artifact_get(req);
     if (req.method == "artifact.list")      return handle_artifact_list(req);
     if (req.method == "artifact.tag")       return handle_artifact_tag(req);
@@ -1458,7 +1461,12 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
 
   add("artifact.put",
       "Store a binary blob in the artifact store, keyed by "
-      "(build_id, name). bytes_b64 is base64-encoded.",
+      "(build_id, name). bytes_b64 is base64-encoded. format is a "
+      "caller-supplied content tag; a few formats trigger typed "
+      "validation: format=\"hypothesis-v1\" requires the bytes to "
+      "parse as a JSON envelope with a numeric `confidence` in [0..1] "
+      "and an `evidence_refs` array of artifact_id integers. Fetch "
+      "artifact.hypothesis_template() for a starter envelope.",
       obj({
           {"build_id",  str()},
           {"name",      str()},
@@ -1473,6 +1481,18 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"stored_path", str()},
       }, {"id", "sha256", "byte_size", "stored_path"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+  add("artifact.hypothesis_template",
+      "Return a JSON skeleton suitable as the body of a "
+      "hypothesis-v1 artifact. The template already validates; "
+      "agents fill in optional fields (statement, rationale, author) "
+      "and base64-encode it as artifact.put's bytes_b64. See "
+      "docs/18-hypothesis.md for the schema rationale.",
+      obj({}, {}),
+      obj({
+          {"template", obj_open("JSON envelope ready for artifact.put.")},
+      }, {"template"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   add("artifact.get",
       "Fetch an artifact by (build_id, name) or by id. Cap with "
@@ -3927,6 +3947,26 @@ Response Dispatcher::handle_artifact_put(const Request& req) {
     meta = *it;
   }
 
+  // Post-V1 plan #6: when the caller declares the hypothesis-v1 format,
+  // parse the bytes as JSON and validate the envelope. The artifact
+  // store accepts arbitrary blobs; the dispatcher is the layer that
+  // enforces typed formats so the store stays format-agnostic.
+  if (format.has_value() && *format == ldb::store::kHypothesisFormat) {
+    json env;
+    try {
+      env = json::parse(bytes->begin(), bytes->end());
+    } catch (const std::exception& e) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("hypothesis-v1 bytes must be valid JSON: ") +
+          e.what());
+    }
+    auto v = ldb::store::validate_hypothesis_envelope(env);
+    if (!v.ok) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("hypothesis-v1: ") + v.error);
+    }
+  }
+
   auto row = artifacts_->put(*build_id, *name, *bytes, std::move(format),
                               meta);
   json data;
@@ -3934,6 +3974,13 @@ Response Dispatcher::handle_artifact_put(const Request& req) {
   data["sha256"]      = row.sha256;
   data["byte_size"]   = row.byte_size;
   data["stored_path"] = row.stored_path;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_artifact_hypothesis_template(const Request& req) {
+  // Pure helper; no artifact store required, no params.
+  json data;
+  data["template"] = ldb::store::default_hypothesis_template();
   return protocol::make_ok(req.id, std::move(data));
 }
 

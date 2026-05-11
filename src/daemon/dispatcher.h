@@ -107,6 +107,8 @@ class Dispatcher {
   protocol::Response handle_mem_dump_artifact(const protocol::Request& req);
 
   protocol::Response handle_artifact_put(const protocol::Request& req);
+  protocol::Response handle_artifact_hypothesis_template(
+      const protocol::Request& req);
   protocol::Response handle_artifact_get(const protocol::Request& req);
   protocol::Response handle_artifact_list(const protocol::Request& req);
   protocol::Response handle_artifact_tag(const protocol::Request& req);

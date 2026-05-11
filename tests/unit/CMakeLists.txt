@@ -39,6 +39,7 @@ set(LDB_UNIT_SOURCES
   test_fixture_sleeper.cpp
   test_artifact_store.cpp
   test_artifact_relations.cpp
+  test_hypothesis.cpp
   test_dispatcher_artifact_relate.cpp
   test_recipe_store.cpp
   test_recipe_reload.cpp
@@ -105,6 +106,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
+  ${CMAKE_SOURCE_DIR}/src/store/hypothesis.cpp
   ${CMAKE_SOURCE_DIR}/src/store/recipe_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/session_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/pack.cpp

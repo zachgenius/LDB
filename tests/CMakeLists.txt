@@ -484,6 +484,17 @@ set_tests_properties(smoke_recipe_reload PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #6: hypothesis-v1 artifact type validation +
+# artifact.hypothesis_template helper.
+add_test(
+  NAME smoke_hypothesis
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_hypothesis.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_hypothesis PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_provenance_replay
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_provenance_replay.py"
