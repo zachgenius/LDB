@@ -147,4 +147,39 @@ gzip_decompress(const std::vector<std::uint8_t>& in,
 // its own copy of the helper to avoid linkage shenanigans for now).
 std::string sha256_hex(const std::vector<std::uint8_t>& bytes);
 
+// ---- Internal pack-body builders (shared with pack_signing.cpp) ---------
+//
+// `build_session_pack_body` and `build_artifacts_pack_body` produce the
+// raw tar-body entries (sessions/db, sessions/meta.json, artifacts/...,
+// artifacts/.../meta/*.json) plus the assembled manifest. The manifest
+// entry itself is NOT prepended — callers are expected to serialize the
+// manifest after any final mutations (the signing layer bumps
+// `manifest["format"]` to `"ldbpack/1+sig"` before serialization), then
+// insert the manifest TarEntry at index 0 and gzip+write themselves.
+//
+// Exposed here so `src/store/pack_signing.cpp` can compose signed packs
+// without duplicating session-export / artifact-export logic. Not part
+// of the dispatcher surface.
+struct PackBodyBuild {
+  std::vector<TarEntry> tar_body;
+  nlohmann::json        manifest;
+};
+
+PackBodyBuild
+build_session_pack_body(SessionStore& sessions,
+                        ArtifactStore& artifacts,
+                        std::string_view session_id);
+
+PackBodyBuild
+build_artifacts_pack_body(ArtifactStore& artifacts,
+                          const std::optional<std::string>& build_id,
+                          const std::optional<std::vector<std::string>>& names);
+
+// Serialize [manifest] into a TarEntry named "manifest.json" with the
+// supplied mtime (epoch seconds). Used by both the unsigned and signed
+// finalize paths so the bytes shape is identical when no signature is
+// added.
+TarEntry make_manifest_entry(const nlohmann::json& manifest,
+                             std::uint64_t         mtime);
+
 }  // namespace ldb::store

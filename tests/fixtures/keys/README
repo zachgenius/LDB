@@ -1,0 +1,19 @@
+TEST FIXTURES — NOT SECRETS
+
+These ed25519 keys exist only to drive `tests/unit/test_pack_signing.cpp`
+and the smoke variants in `tests/smoke/test_ldbpack.py`. They have no
+authority anywhere, they are not used to sign any release artifact, and
+they live in the public git history. Do NOT copy any of these files
+into a real SSH agent, `authorized_keys`, or trust root.
+
+  * alice_ed25519, alice_ed25519.pub — unencrypted ed25519 key pair
+    used as the canonical signing key in tests.
+  * bob_ed25519.pub — public key only; used as a trust-root entry that
+    is NOT the signer in the negative-path tests.
+  * charlie_ed25519_enc, charlie_ed25519_enc.pub — passphrase-protected
+    ed25519 key (passphrase `hunter2`) used to exercise the
+    "encrypted OpenSSH keys not supported in v1" rejection path.
+
+Regenerate with `ssh-keygen -t ed25519 -N '' -C '<label>' -f <name>`
+(or with `-N <pass>` for the encrypted variant). The exact key bytes
+don't matter to the tests — they verify behavior, not key identity.

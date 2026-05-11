@@ -4,6 +4,43 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-11 — README refresh for v1.1.0; post-V1 plan; `.ldbpack` ed25519 signing
+
+**Goal:** Update the v1.1.0 README to match reality, then start working through the post-V1 deferred list. First target: `.ldbpack` signing — the README's #3 deferred item, smallest scope of the lot.
+
+**Done:**
+- `10d98dd` docs(readme): refresh status (Pre-V1 → V1 released, v1.1.0 current), endpoint count 65 → 82, add cross-target correlation / recipes rows to capability matrix, drop the "session diff" deferred bullet (it's a shipped endpoint), s/MVP/V1/ across prose. Pushed to `origin/master`.
+- Branched `feat/pack-signing`.
+- `dfe03c0` docs(plan): added `docs/15-post-v1-plan.md`. Tiered breakdown of all post-V1 work (7 Tier 1, 7 Tier 2, 12 Tier 3) with dependency graph and a proposed execution order. Surfaced that the roadmap's "future" v0.2–v0.6 items are mostly shipped already — `session.diff`, `correlate.*`, `recipe.*`, `artifact.relate*`, `static.globals_of_type`, DAP shim, rr:// URLs, Capstone, arm64 CI, multi-binary sessions. Critical chain identified: own DWARF reader → own symbol index → easier provenance audit → session.replay.
+- `b8cd21c` docs(pack-signing): added `docs/14-pack-signing.md`. Decisions: embedded sidecar tar entries (signature.json + signature.sig at indices 1–2, manifest.format bumped to `ldbpack/1+sig`); ed25519 via libsodium (rejected vendored ref10); accept OpenSSH-format keys directly so `~/.ssh/id_ed25519` works; trust root = directory of `*.pub` or single `authorized_keys`-format file; 8-row failure semantics matrix locked.
+- `e832ad9` test(pack-signing): unconditional libsodium build dep wired through `CMakeLists.txt` + `src/CMakeLists.txt` + `tests/unit/CMakeLists.txt` mirroring Capstone shape; `libsodium-dev`/`libsodium` added to all CI legs (`.github/workflows/ci.yml`, `docs/06-ci.md`, `tests/check_ci_yaml.py`); new `src/store/pack_signing.{h,cpp}` with real implementations of the four "glue" functions (`sign_buffer`, `verify_buffer`, `parse_openssh_secret_key`, `parse_openssh_public_key`, `compute_key_id`) and three stubs throwing `pack_signing: not implemented` for the producer/verifier path (`pack_session_signed`, `pack_artifacts_signed`, `verify_pack`); 10 Catch2 unit cases in `tests/unit/test_pack_signing.cpp` pinning the design-doc contract as executable checks; OpenSSH key fixtures under `tests/fixtures/keys/`; two smoke cases in `tests/smoke/test_ldbpack.py` scaffolded with `signing_xfail` flag. State: 4 pass / 6 fail with the expected `pack_signing: not implemented` message.
+- `e548988` feat(pack-signing): refactored `pack.cpp` to extract `build_session_pack_body` / `build_artifacts_pack_body` / `make_manifest_entry` as shared symbols so signed and unsigned producers share one tar-construction path; implemented the three stubbed functions with the canonical signed-bytes scheme from the design doc; `unpack()` accepts both `ldbpack/1` and `ldbpack/1+sig` format strings.
+- `a4638b4` feat(pack-signing): added `sign_key` / `signer` to `session.export` + `artifact.export`, `trust_root` / `require_signed` to `session.import` + `artifact.import`; `describe.endpoints` schemas extended; error mapping per design-doc failure matrix (`-32002` for "env not configured", `-32003` for "operation refused"); response shape adds `signature` field; smoke `signing_xfail` flag flipped to `false`.
+
+**Decisions:**
+- **Embedded sidecar tar entries, not external `.ldbpack.sig`.** Packs travel as single attachments; paired-file conventions lose on chat/USB drops, and the verifier already speaks gzip+tar.
+- **libsodium unconditional, not behind `LDB_ENABLE_SIGNING`.** Build deps for `liblldb` and `sqlite3` already force operators to tolerate distro-specific install paths; one more is cheaper than owning curve arithmetic. CI legs add the dep to apt/brew steps so this is invisible to operators.
+- **OpenSSH key format, not PEM PKCS#8 or raw libsodium output.** Most operators already have `~/.ssh/id_ed25519`; asking them to mint a second key for one tool is friction. Parser is ~150 lines for unencrypted keys; encrypted keys rejected with `kInvalidParams` in v1.
+- **`verify_pack` always runs on import**, even for unsigned packs (a one-pass tar walk gives free bit-rot protection). Unsigned import responses simply omit the `signature` field.
+- **Per-entry sha256 list lives inside `signature.json`**, not in a separate manifest. Auditable with `sha256sum` alone; defender can read the JSON and check bytes by hand.
+- **Refactored shared producer body into `pack.cpp` rather than duplicating into `pack_signing.cpp`** — the alternative carried too much duplication of the manifest+tar construction logic.
+- **Worked through agent delegation** (the user asked for it explicitly): Plan agent for the post-V1 sweep, cpp-pro for the design doc, then for failing tests, then for the implementation. Each subagent's output was verified by independent ctest run before moving on, per CLAUDE.md "tests confirm green" gate.
+
+**Surprises / blockers:**
+- Local dev box (`/home/zach`) had `libsodium.so.23` runtime but no `libsodium-dev` headers; first subagent installed headers into `/tmp/sodium-prefix` to keep working. CI hosts use real distro packages. No actual problem — just noting for future replay.
+- `ptrace_scope=1` on this host means 9 pre-existing unit_tests cases and 3 smoke cases (`smoke_memory`, `smoke_mem_dump`, `smoke_dap_shim`) still fail unrelated to pack-signing. Confirmed by spot-comparing the failure list against the cases pack-signing did not touch.
+- Roadmap doc (`docs/03-ldb-full-roadmap.md`) is now materially stale — the post-V1 plan flags 12+ items it still lists as "future" that have shipped. Worth a future cleanup pass; explicitly out of scope for this session.
+
+**Verification:**
+- `build/bin/ldb_unit_tests "[signing]"`: **10 passed / 0 failed** (304 assertions).
+- `ctest --test-dir build -R "smoke_ldbpack|smoke_agent_workflow"`: **2/2 passed**. Signing positive + negative both exercised; unsigned round-trip preserved.
+- Full `unit_tests`: **589/601 passed**, 9 failed (env-gated ptrace), 3 skipped (env-gated rr / CAP_NET_RAW). 12404 assertions / 12395 passed.
+- Build warning-clean under the project's full `-W...` set.
+
+**Next:** Push `feat/pack-signing` and (optionally) open a PR for review. Then per `docs/15-post-v1-plan.md` §4 execution order: reverse-execution endpoints via `SBCommandInterpreter` wrapper (Tier 1 item #2, ~1 session). After that: hot-reload of probe recipes, then the token-budget regression CI gate.
+
+---
+
 ## 2026-05-09 — V1 gate close: agent workflow smoke, cbor formats, Capstone include fix, Apache-2.0 license
 
 **Goal:** Land all uncommitted in-progress work and close the final V1 release gate (license).

@@ -119,6 +119,63 @@ endif()
 message(STATUS "ldb: liblldb at ${LDB_LLDB_LIBRARY}")
 message(STATUS "ldb: lldb headers at ${LDB_LLDB_INCLUDE_DIR}")
 
+# ----- libsodium ----------------------------------------------------------
+#
+# Used by store/pack_signing.{h,cpp} (docs/14-pack-signing.md) — ed25519
+# detached signatures over `.ldbpack` payloads. Discovery mirrors the
+# Capstone shape: pkg-config first, then a manual find_library/find_path
+# fallback. NOT optional — the design (docs/14 §"Crypto Choice") commits
+# to libsodium being unconditional. If the host lacks it the configure
+# step fails with a clear apt/brew hint rather than silently disabling
+# signing.
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LDB_SODIUM QUIET libsodium)
+endif()
+
+add_library(ldb_sodium INTERFACE)
+if(LDB_SODIUM_FOUND)
+  set(LDB_SODIUM_SYSTEM_INCLUDE_DIRS "")
+  foreach(_inc IN LISTS LDB_SODIUM_INCLUDE_DIRS)
+    list(APPEND LDB_SODIUM_SYSTEM_INCLUDE_DIRS "${_inc}")
+  endforeach()
+  list(REMOVE_DUPLICATES LDB_SODIUM_SYSTEM_INCLUDE_DIRS)
+  target_include_directories(ldb_sodium SYSTEM INTERFACE
+    ${LDB_SODIUM_SYSTEM_INCLUDE_DIRS}
+  )
+  target_link_directories(ldb_sodium INTERFACE
+    ${LDB_SODIUM_LIBRARY_DIRS}
+  )
+  target_link_libraries(ldb_sodium INTERFACE
+    ${LDB_SODIUM_LIBRARIES}
+  )
+  target_compile_options(ldb_sodium INTERFACE
+    ${LDB_SODIUM_CFLAGS_OTHER}
+  )
+  message(STATUS "ldb: libsodium via pkg-config (${LDB_SODIUM_VERSION})")
+else()
+  find_path(LDB_SODIUM_INCLUDE_DIR
+    NAMES sodium.h
+  )
+  find_library(LDB_SODIUM_LIBRARY
+    NAMES sodium
+  )
+  if(NOT LDB_SODIUM_INCLUDE_DIR OR NOT LDB_SODIUM_LIBRARY)
+    message(FATAL_ERROR
+      "libsodium not found. Install libsodium-dev (Debian/Ubuntu) or "
+      "libsodium (Homebrew on macOS), or set CMAKE_PREFIX_PATH to a "
+      "prefix that contains include/sodium.h and lib/libsodium.{so,dylib}.")
+  endif()
+  target_include_directories(ldb_sodium SYSTEM INTERFACE
+    "${LDB_SODIUM_INCLUDE_DIR}"
+  )
+  target_link_libraries(ldb_sodium INTERFACE
+    "${LDB_SODIUM_LIBRARY}"
+  )
+  message(STATUS "ldb: libsodium at ${LDB_SODIUM_LIBRARY}")
+endif()
+
 # ----- Capstone ------------------------------------------------------------
 #
 # Optional disassembly backend. LLDB remains the default when this is OFF.

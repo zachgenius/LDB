@@ -339,6 +339,8 @@ docs/                Design docs and engineering worklog
 | [`docs/06-ci.md`](docs/06-ci.md) | What CI runs, what SKIPs on the runner, how to reproduce locally |
 | [`docs/07-dap-shim.md`](docs/07-dap-shim.md) | `ldb-dap` Debug Adapter Protocol shim — supported requests, capabilities, VS Code launch.json example |
 | [`docs/13-v1-readiness.md`](docs/13-v1-readiness.md) | V1 release gates, supported matrix, validation commands, and known limitations |
+| [`docs/14-pack-signing.md`](docs/14-pack-signing.md) | `.ldbpack` ed25519 signing design (in-flight on `feat/pack-signing`) |
+| [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) | Tiered breakdown of post-V1 deferred work with dependency graph and execution order |
 | [`docs/WORKLOG.md`](docs/WORKLOG.md) | Engineering journal — newest entries on top |
 | [`CLAUDE.md`](CLAUDE.md) | Workflow rules for AI-assisted development on this repo |
 

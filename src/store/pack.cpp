@@ -710,17 +710,17 @@ emit_relations_for(ArtifactStore& as,
 
 }  // namespace
 
-PackResult pack_session(SessionStore& sessions,
+PackBodyBuild
+build_session_pack_body(SessionStore& sessions,
                         ArtifactStore& artifacts,
-                        std::string_view session_id,
-                        const std::filesystem::path& output_path) {
+                        std::string_view session_id) {
   auto info = sessions.info(session_id);
   if (!info.has_value()) {
     throw backend::Error("pack: no such session: " + std::string(session_id));
   }
 
-  std::vector<TarEntry> tar;
-  auto manifest = make_manifest_skeleton();
+  PackBodyBuild out;
+  out.manifest = make_manifest_skeleton();
 
   // session db + meta sidecar. Read the rows via sqlite read-only,
   // then materialize a clean non-WAL .db in a temp file and ship those
@@ -744,7 +744,7 @@ PackResult pack_session(SessionStore& sessions,
   db_entry.name  = db_name;
   db_entry.data  = std::move(db_bytes);
   db_entry.mtime = static_cast<std::uint64_t>(info->created_at / 1'000'000'000);
-  tar.push_back(std::move(db_entry));
+  out.tar_body.push_back(std::move(db_entry));
 
   nlohmann::json sess_meta;
   sess_meta["id"]         = info->id;
@@ -760,8 +760,8 @@ PackResult pack_session(SessionStore& sessions,
   TarEntry mt_entry;
   mt_entry.name  = mt_name;
   mt_entry.data  = std::vector<std::uint8_t>(mt_str.begin(), mt_str.end());
-  mt_entry.mtime = db_entry.mtime;
-  tar.push_back(std::move(mt_entry));
+  mt_entry.mtime = out.tar_body.back().mtime;
+  out.tar_body.push_back(std::move(mt_entry));
 
   nlohmann::json srow;
   srow["id"]         = info->id;
@@ -769,52 +769,30 @@ PackResult pack_session(SessionStore& sessions,
   srow["call_count"] = info->call_count;
   srow["path"]       = db_name;
   if (info->target_id.has_value()) srow["target_id"] = *info->target_id;
-  manifest["sessions"].push_back(std::move(srow));
+  out.manifest["sessions"].push_back(std::move(srow));
 
   // every artifact in the store. This is the documented MVP
   // simplification — narrowing to "artifacts referenced by the session
   // log" is a separate, post-MVP slice.
   auto rows = artifacts.list(std::nullopt, std::nullopt);
   for (const auto& r : rows) {
-    auto mrow = emit_artifact(tar, artifacts, r);
-    manifest["artifacts"].push_back(std::move(mrow));
+    auto mrow = emit_artifact(out.tar_body, artifacts, r);
+    out.manifest["artifacts"].push_back(std::move(mrow));
   }
 
   // Knowledge-graph relations (post-v0.1 §7). Endpoints not in the
   // exported artifact set are filtered out so the import side never has
   // to chase a dangling id.
-  manifest["relations"] = emit_relations_for(artifacts, rows);
-
-  // manifest goes first inside the tar (top-level introspection), but
-  // building the tar requires knowing the manifest, so push it onto
-  // the front now that everything else is known.
-  std::string manifest_str = manifest.dump();
-  TarEntry m_entry;
-  m_entry.name  = "manifest.json";
-  m_entry.data  = std::vector<std::uint8_t>(manifest_str.begin(),
-                                             manifest_str.end());
-  m_entry.mtime = static_cast<std::uint64_t>(epoch_seconds_now());
-  tar.insert(tar.begin(), std::move(m_entry));
-
-  auto raw  = tar_pack(tar);
-  auto comp = gzip_compress(raw);
-
-  write_file_all(output_path, comp);
-
-  PackResult res;
-  res.path      = output_path;
-  res.byte_size = static_cast<std::uint64_t>(comp.size());
-  res.sha256    = sha256_hex(comp);
-  res.manifest  = std::move(manifest);
-  return res;
+  out.manifest["relations"] = emit_relations_for(artifacts, rows);
+  return out;
 }
 
-PackResult pack_artifacts(ArtifactStore& artifacts,
-                          std::optional<std::string> build_id,
-                          std::optional<std::vector<std::string>> names,
-                          const std::filesystem::path& output_path) {
-  std::vector<TarEntry> tar;
-  auto manifest = make_manifest_skeleton();
+PackBodyBuild
+build_artifacts_pack_body(ArtifactStore& artifacts,
+                          const std::optional<std::string>& build_id,
+                          const std::optional<std::vector<std::string>>& names) {
+  PackBodyBuild out;
+  out.manifest = make_manifest_skeleton();
 
   auto rows = artifacts.list(build_id, std::nullopt);
   std::vector<ArtifactRow> exported;
@@ -826,21 +804,60 @@ PackResult pack_artifacts(ArtifactStore& artifacts,
       }
       if (!matched) continue;
     }
-    auto mrow = emit_artifact(tar, artifacts, r);
-    manifest["artifacts"].push_back(std::move(mrow));
+    auto mrow = emit_artifact(out.tar_body, artifacts, r);
+    out.manifest["artifacts"].push_back(std::move(mrow));
     exported.push_back(r);
   }
-  manifest["relations"] = emit_relations_for(artifacts, exported);
+  out.manifest["relations"] = emit_relations_for(artifacts, exported);
+  return out;
+}
 
+TarEntry make_manifest_entry(const nlohmann::json& manifest,
+                             std::uint64_t         mtime) {
   std::string manifest_str = manifest.dump();
   TarEntry m_entry;
   m_entry.name  = "manifest.json";
   m_entry.data  = std::vector<std::uint8_t>(manifest_str.begin(),
                                              manifest_str.end());
-  m_entry.mtime = static_cast<std::uint64_t>(epoch_seconds_now());
-  tar.insert(tar.begin(), std::move(m_entry));
+  m_entry.mtime = mtime;
+  return m_entry;
+}
 
-  auto raw  = tar_pack(tar);
+PackResult pack_session(SessionStore& sessions,
+                        ArtifactStore& artifacts,
+                        std::string_view session_id,
+                        const std::filesystem::path& output_path) {
+  auto built = build_session_pack_body(sessions, artifacts, session_id);
+
+  // manifest goes first inside the tar (top-level introspection).
+  auto m_entry = make_manifest_entry(built.manifest,
+      static_cast<std::uint64_t>(epoch_seconds_now()));
+  built.tar_body.insert(built.tar_body.begin(), std::move(m_entry));
+
+  auto raw  = tar_pack(built.tar_body);
+  auto comp = gzip_compress(raw);
+
+  write_file_all(output_path, comp);
+
+  PackResult res;
+  res.path      = output_path;
+  res.byte_size = static_cast<std::uint64_t>(comp.size());
+  res.sha256    = sha256_hex(comp);
+  res.manifest  = std::move(built.manifest);
+  return res;
+}
+
+PackResult pack_artifacts(ArtifactStore& artifacts,
+                          std::optional<std::string> build_id,
+                          std::optional<std::vector<std::string>> names,
+                          const std::filesystem::path& output_path) {
+  auto built = build_artifacts_pack_body(artifacts, build_id, names);
+
+  auto m_entry = make_manifest_entry(built.manifest,
+      static_cast<std::uint64_t>(epoch_seconds_now()));
+  built.tar_body.insert(built.tar_body.begin(), std::move(m_entry));
+
+  auto raw  = tar_pack(built.tar_body);
   auto comp = gzip_compress(raw);
   write_file_all(output_path, comp);
 
@@ -848,7 +865,7 @@ PackResult pack_artifacts(ArtifactStore& artifacts,
   res.path      = output_path;
   res.byte_size = static_cast<std::uint64_t>(comp.size());
   res.sha256    = sha256_hex(comp);
-  res.manifest  = std::move(manifest);
+  res.manifest  = std::move(built.manifest);
   return res;
 }
 
@@ -883,10 +900,17 @@ ImportReport unpack(SessionStore& sessions,
     throw backend::Error(std::string("pack: manifest.json parse error: ") +
                          e.what());
   }
-  if (!manifest.is_object() ||
-      !manifest.contains("format") ||
-      manifest["format"] != "ldbpack/1") {
-    throw backend::Error("pack: manifest format != ldbpack/1");
+  if (!manifest.is_object() || !manifest.contains("format")) {
+    throw backend::Error("pack: manifest format missing");
+  }
+  {
+    auto fmt = manifest["format"].is_string()
+                   ? manifest["format"].get<std::string>()
+                   : std::string{};
+    if (fmt != "ldbpack/1" && fmt != "ldbpack/1+sig") {
+      throw backend::Error("pack: manifest format != ldbpack/1 (got '" +
+                           fmt + "')");
+    }
   }
 
   auto find_entry = [&](const std::string& name)

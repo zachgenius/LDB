@@ -17,6 +17,7 @@ set(LDBD_SOURCES
   store/recipe_store.cpp
   store/session_store.cpp
   store/pack.cpp
+  store/pack_signing.cpp
   transport/ssh.cpp
   transport/local_exec.cpp
   transport/streaming_exec.cpp
@@ -41,6 +42,7 @@ target_link_libraries(ldbd PRIVATE
   ldb_lldb
   ldb_capstone
   ldb_json
+  ldb_sodium
   ldb_warnings
   SQLite::SQLite3
   ZLIB::ZLIB
