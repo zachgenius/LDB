@@ -10,6 +10,7 @@ project(ldb
 option(LDB_BUILD_TESTS "Build LDB tests" ON)
 option(LDB_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(LDB_ENABLE_CAPSTONE "Enable the opt-in Capstone disassembly backend" OFF)
+option(LDB_ENABLE_PYTHON "Enable embedded Python probe callbacks (post-V1 #9)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -240,6 +241,57 @@ if(LDB_ENABLE_CAPSTONE)
   endif()
 else()
   message(STATUS "ldb: capstone disabled (set -DLDB_ENABLE_CAPSTONE=ON to enable)")
+endif()
+
+# ----- Python (embedded, post-V1 #9) --------------------------------------
+#
+# Detection via pkg-config's `python3-embed` module (the libpython3.X
+# variant that includes Py_Initialize symbols, as opposed to the
+# `python3` module which is suitable only for building extensions).
+# Auto-disable with a notice if the host lacks python3-embed >= 3.11 —
+# we don't FATAL_ERROR because the rest of the daemon should still
+# build on a host that just doesn't want Python (e.g. minimal CI legs).
+#
+# When the gate is OFF the `python-v1` recipe format surfaces as
+# kNotImplemented at dispatch time; the rest of the daemon is unchanged.
+
+add_library(ldb_python INTERFACE)
+if(LDB_ENABLE_PYTHON)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LDB_PYTHON QUIET python3-embed>=3.11)
+  endif()
+
+  if(LDB_PYTHON_FOUND)
+    set(LDB_PYTHON_SYSTEM_INCLUDE_DIRS "")
+    foreach(_inc IN LISTS LDB_PYTHON_INCLUDE_DIRS)
+      list(APPEND LDB_PYTHON_SYSTEM_INCLUDE_DIRS "${_inc}")
+    endforeach()
+    list(REMOVE_DUPLICATES LDB_PYTHON_SYSTEM_INCLUDE_DIRS)
+    target_include_directories(ldb_python SYSTEM INTERFACE
+      ${LDB_PYTHON_SYSTEM_INCLUDE_DIRS}
+    )
+    target_link_directories(ldb_python INTERFACE
+      ${LDB_PYTHON_LIBRARY_DIRS}
+    )
+    target_link_libraries(ldb_python INTERFACE
+      ${LDB_PYTHON_LIBRARIES}
+    )
+    target_compile_options(ldb_python INTERFACE
+      ${LDB_PYTHON_CFLAGS_OTHER}
+    )
+    target_compile_definitions(ldb_python INTERFACE LDB_ENABLE_PYTHON=1)
+    message(STATUS "ldb: python3-embed via pkg-config (${LDB_PYTHON_VERSION})")
+  else()
+    set(LDB_ENABLE_PYTHON OFF)
+    message(STATUS
+      "ldb: python3-embed (>=3.11) not found — embedded Python disabled. "
+      "Install python3-dev / python3-embed >=3.11 to enable; the daemon "
+      "will still build, but recipe.create with format=python-v1 returns "
+      "-32001 kNotImplemented.")
+  endif()
+else()
+  message(STATUS "ldb: embedded Python disabled (set -DLDB_ENABLE_PYTHON=ON to enable)")
 endif()
 
 # ----- Vendored deps ------------------------------------------------------

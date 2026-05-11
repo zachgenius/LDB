@@ -120,6 +120,126 @@ machinery.
 
 ---
 
+## 2026-05-11 — v1.4 #9 phase-1: embedded CPython for probe callbacks
+
+**Goal:** Land post-V1 plan item #9 (`docs/17-version-plan.md`) — embed
+CPython 3.11+ so probes / recipes can be authored in user-supplied
+Python instead of C++-only. Phase-1 scope: design note, the C++ embed
+wrapper, build-system gating, and unit tests. Recipe-format wiring is
+deferred to phase-2.
+
+**Done (commits on branch `worktree-agent-a9b7ac6fe65969841`):**
+- `8beda58 docs(python): design note for embedded Python probe callbacks` —
+  `docs/20-embedded-python.md` (354 lines). Sandbox decision (no sandbox
+  in v1.4; trust model = bpftrace-equivalent; v1.5 gates listed),
+  lifecycle (lazy init, GIL via PyGILState_Ensure, no Py_Finalize at
+  exit — known-imperfect with held PyObject refs in static-storage
+  Callable destructors), stdout discipline (sys.stdout → StringIO per
+  invoke; never fd 1), JSON↔Python mapping, hot-reload semantics.
+- `e33aacb feat(python): embedded CPython wrapper for probe callbacks` —
+  `src/python/embed.{h,cpp}` (~680 lines). `Interpreter` singleton +
+  `Callable` (compile module_source via `Py_CompileString`, run into
+  fresh dict, look up `run`, store callable). `Callable::invoke`
+  acquires GIL, converts JSON → Python via `json_to_py`, calls `run`,
+  drains stdout/stderr StringIOs, converts the return value back via
+  `py_to_json`, surfaces Python exceptions as `backend::Error("python:
+  <type>: <msg>")` with `last_exception_*` / `last_traceback`
+  accessors. 13 unit tests in `tests/unit/test_embedded_python.cpp`
+  (round-trip, exception, stdout capture, idempotence). CMake option
+  `LDB_ENABLE_PYTHON` (default ON) gated on `pkg-config python3-embed
+  >= 3.11`; auto-disables with a notice if missing — daemon still
+  builds.
+- `<this commit> fix(python): refcount leak + unsigned int overflow +
+  deprecated-API + SyntaxError doc honesty` — review fixes (see
+  Decisions). +1 unit test for the unsigned overflow path; doc
+  updated to remove the structured-SyntaxError claim that the impl
+  didn't actually deliver.
+
+**Decisions:**
+- **LLDB-shares-interpreter.** LLDB embeds Python itself. Initial
+  attempt at `PyConfig_InitIsolatedConfig` ran fine standalone but
+  crashed when the daemon also loaded liblldb. Solution: detect via
+  `Py_IsInitialized()` and re-use LLDB's interpreter if it got there
+  first; only call `Py_InitializeFromConfig` when we're the first
+  embedder. TDD caught this on the first integration test — recorded
+  in `embed.cpp` comments + design note §4.
+- **stdout capture via StringIO, not fd-level dup2.** dup2 over fd 1
+  would hijack the JSON-RPC channel; we redirect Python's `sys.stdout`
+  to a `io.StringIO` instance per invoke and drain after. Same for
+  `sys.stderr`. Truncate captures at 8 KiB to bound response size.
+- **Per-Callable isolation; no shared module globals.** Each Callable
+  compiles into a fresh dict. Tradeoff: agents writing recipes that
+  share state across runs must use module-level state explicitly (via
+  the recipe context dict). Avoids the "recipe A's globals stomp
+  recipe B" failure mode we'd inherit otherwise.
+- **No `Py_Finalize` at exit.** Known imperfect with held PyObject
+  refs in static-storage Callable destructors. Process exit handles
+  the OS-level cleanup; a clean shutdown path is a phase-2 concern
+  once the recipe store owns Callable lifetimes deterministically.
+- **`PyDict_SetItemString` does not steal value refs.** Initial impl
+  passed a raw `PyUnicode_FromString` directly — leaks one PyObject
+  per Callable. Caught by code review; fixed by wrapping in `PyRef`.
+  Generic lesson: every CPython API needs the "steals?" question
+  answered before passing a fresh ref into it.
+- **`PyEval_GetBuiltins` deprecated in 3.13.** Wrapped in a
+  `PY_VERSION_HEX` guard so a 3.13 strict-warnings build doesn't
+  fail; falls back to `PyEval_GetFrameBuiltins` on 3.13+.
+- **Unsigned ints > INT64_MAX route through `backend::Error`.**
+  nlohmann::json raises `type_error` (NOT a `backend::Error` subclass)
+  if you `get<int64_t>` an out-of-range unsigned. That exception would
+  escape `invoke()` uncaught. Now branch on `is_number_unsigned()`,
+  range-check, throw typed.
+- **Doc-vs-impl honesty on `SyntaxError`.** Original design doc
+  promised structured `lineno`/`offset`/`text` JSON fields; the impl
+  only delivered type/message/traceback. Rather than ship the doc as
+  a lie (a future client would build to it and get empty `data`), the
+  doc now marks those fields as phase-2 deferred and shows the
+  actually-emitted shape.
+
+**Surprises / blockers:**
+- **Original session ended in an API error mid-edit** while the
+  recipe-store / dispatcher integration was being wired up. The two
+  committed commits are clean and standalone; the uncommitted
+  changes (probe_orchestrator + dispatcher) were partial and are NOT
+  in this branch — they were dropped. Phase-2 will re-do that
+  integration cleanly from the now-stable embed surface.
+- **Stdout-redirect timing matters.** Initial impl drained the
+  capture buffer before snapshotting the error, so syntax-error
+  responses came back with `what() == "python: : "` (empty type +
+  empty message). Fix: `capture_and_clear_error()` runs first, then
+  `drain_and_reset_capture()`. Commit message on e33aacb records the
+  symptom.
+
+**Verification:**
+- `cmake --build build` clean.
+- `build/bin/ldb_unit_tests "[python]"` → 14 cases, 31 assertions,
+  all pass. Includes the new unsigned-overflow case.
+- Full ctest matches the documented baseline (53/60 pass; 7
+  ptrace-gated). No new regressions from #9.
+
+**Next:**
+Phase-2 wires the embed wrapper into `RecipeStore` as a `python-v1`
+format:
+- `recipe.create format=python-v1 body=<src>` stores the source.
+- `recipe.lint` compiles via `Py_CompileString` and surfaces compile
+  errors with `kInvalidParams`.
+- `recipe.run` invokes with a context dict and stores the JSON
+  return value as an artifact.
+- Dispatcher maps `Callable::invoke` `backend::Error` → -32000.
+The interfaces for this integration are stable; the uncommitted
+phase-1.5 attempt that didn't land tried to do it inside the orch
+class but the cleaner home is `RecipeStore`. Documented in
+`docs/20-embedded-python.md §2`.
+
+Phase-3 covers the v1.5 sandbox (RestrictedPython / subinterpreters)
+once the threat model demands it; gates listed in `docs/20 §5`.
+
+#14 (custom Python frame unwinders) shares the embed surface and can
+land in a follow-up session once phase-2 stabilises the recipe-side
+contract.
+
+---
+
 ## 2026-05-11 — v1.4 #11: ssh-remote daemon mode (CLI transport)
 
 **Goal:** Land post-V1 plan item #11 (`docs/17-version-plan.md`) — let
