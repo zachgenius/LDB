@@ -4,6 +4,152 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #17 phase-1 part 3: RspChannel + endpoint + smoke
+
+**Goal:** Land the integration layer of the own RSP client: async TCP
+transport (RspChannel), the parallel `target.connect_remote_rsp`
+dispatcher endpoint, and a live smoke against `lldb-server gdbserver`.
+The framing (b7b26be) and typed packet vocabulary (bebdf26) commits
+already paved the way; this session ties them to a real socket with
+a reader thread, retry budget, and ack/nack state machine.
+
+**Done:**
+
+- **`src/transport/rsp/channel.{h,cpp}`** (`d968c01`) — `RspChannel`:
+  - Constructor blocks on TCP connect + bounded `qSupported`
+    handshake. Test-only `AdoptFd` ctor takes a pre-made fd so the
+    unit tests can drive the wire via `socketpair()` instead of faking
+    DNS.
+  - Reader thread drains the socket, decodes packets via the existing
+    framing layer, pushes payloads onto a bounded `std::queue` guarded
+    by mutex+condvar (cap `kMaxQueueDepth=1024`). It also observes
+    `+`/`-` ack bytes and toggles the writer-side ack-state machine.
+  - Writer holds a small mutex around `framing::encode_packet` +
+    `::send`, then waits up to `packet_timeout` on a condvar for the
+    reader to report ack/nack. Retry budget (default 3) — on nack we
+    retransmit; on `retry_budget+1` consecutive nacks we throw
+    `backend::Error("retry budget exhausted")`. Timeout is treated as
+    a nack for the retry loop.
+  - Destructor flips `shutdown_`, calls `shutdown(fd, SHUT_RDWR)` to
+    unblock the reader's blocking `recv()`, signals the condvars,
+    joins, then closes. Idempotent — the destructor races cleanly
+    against an outstanding `recv()` on another thread (covered by a
+    unit case).
+  - 7 unit cases against socketpair() peers covering connect refused,
+    QStartNoAckMode handshake, `?`-stop-reply round-trip, retry on
+    nack, retry exhaustion, server EOF, destructor mid-recv.
+
+- **`target.connect_remote_rsp` endpoint** (`17f07b8`):
+  - Wire shape per docs/25 §3:
+    `{target_id, url}` → process_status; URL grammar
+    `connect://host:port` only (anything else → -32602).
+  - Dispatcher owns `rsp_channels_ : map<target_id, unique_ptr<RspChannel>>`.
+    Cleared on `target.close` (joins reader thread + closes fd) and
+    on dispatcher destruction via map destruction order.
+  - After connect, issues `?` and runs `parse_stop_reply` over the
+    response to fill in `ProcessStatus.state` (T/S → kStopped,
+    W → kExited+exit_code, X → kExited+killed-by-signal).
+  - Dual-stack promise: the existing `target.connect_remote`
+    behaviour is unchanged — agents opt into the new client by
+    calling the new endpoint. v1.7 flips the default per the design
+    note's migration plan.
+  - 6 unit cases: missing target_id, missing url, malformed scheme,
+    missing host/port, nothing-listening (→ -32000 within bounded
+    time), describe.endpoints registration.
+
+- **`tests/smoke/test_rsp_connect.py`** (`f627adc`) — end-to-end:
+  spawns `lldb-server gdbserver --pipe ... 127.0.0.1:0 -- sleeper`,
+  scrapes the kernel-assigned port, drives ldbd through
+  target.create_empty → target.connect_remote_rsp → target.close,
+  asserts on the response shape. SKIPs cleanly when lldb-server is
+  missing. Registered in tests/CMakeLists.txt with TIMEOUT 30.
+
+**Decisions:**
+
+- **Ack ownership on the reader thread.** The reader is the only
+  thing that sees raw incoming bytes; making it the source of truth
+  for ack/nack state matches the gdb spec and avoids a second
+  socket-reading thread. The writer (`send_once`) waits on a condvar
+  the reader notifies. Stray acks outside the `kWaiting` window are
+  dropped silently — they happen on `+`-pipelined servers and aren't
+  bugs.
+
+- **Test-mode ctor exposed in the public header.** The directive
+  flagged "purity vs. testability"; the testability won. The unit
+  tests need to drive the wire byte-for-byte (force a nack, simulate
+  EOF, control the qSupported reply). socketpair()-faking from inside
+  the production ctor would have been bigger. The `AdoptFd` form is
+  documented as test-only and not used anywhere in `src/`.
+
+- **Handshake bounded by `packet_timeout × (retry_budget + 1)`** —
+  the inner `request()` call carries the same retry semantics as any
+  other send, so a flaky handshake retries naturally before the
+  channel throws. Connect timeout is separate (defaults to 5s).
+
+- **`skip_handshake` config knob** — the unit tests that drive a
+  custom MockPeer don't want the channel to synthesize qSupported
+  bytes. Production callers always leave it at the default `false`.
+
+- **No-ack mode toggle ordering.** Per the gdb spec we ack the
+  server's "OK" reply under the old ack discipline, *then* stop
+  acking subsequent packets. The implementation flips `ack_mode_`
+  *after* `request()` returns, so the request's ack-of-OK still
+  fires.
+
+- **Dispatcher-owned RspChannel map vs. per-target backend ownership.**
+  Phase-1 keeps the channel in the dispatcher (not in
+  `LldbBackend`'s per-target state). The reasoning: LldbBackend's
+  existing `connect_remote_target` is the legacy path; it stays on
+  LLDB's plugin. The new channel is "above the backend" — it's the
+  dispatcher's parallel resource. Phase-2 (when the channel pumps
+  register/memory state through the SBTarget) likely sinks it back
+  into the backend, but phase-1 boundary stability matters more.
+
+**Surprises / blockers:**
+
+- `Response`'s field is `ok`/`data`, not `is_ok`/`result`. Caught it
+  on the first compile; trivial fix. The Catch2 `static_cast<int>`
+  on enum comparisons is also unneeded — `error_code == ErrorCode::kX`
+  type-checks fine.
+
+- The qSupported reply from lldb-server includes lots of features we
+  don't currently parse (`PacketSize=4000;qXfer:auxv:read+;...`);
+  `parse_qSupported_reply` already handles the `name+`/`name-`/`name=value`
+  shapes from the part-2 commit, so the only field the dispatcher
+  reads is the bool toggle for `QStartNoAckMode+`. The rest are
+  stashed in `server_features_` for diagnostics in phase-2.
+
+- No change needed to `parse_stop_reply` for phase-1 — the `T05thread:1;`
+  shape lldb-server emits on first stop falls out of the part-2
+  parser cleanly. The dispatcher just consumes the type+signal fields
+  today; per-thread vectors are deferred to the #21 commit.
+
+**Next:**
+
+- **#17 phase-2:** reverse-exec (`bc`/`bs`) routes through the new
+  channel when the target was opened via `connect_remote_rsp`; the
+  existing rr fallback (`process plugin packet send`) stays for the
+  legacy path. The wire is already there; it's plumbing in the
+  dispatcher's `handle_process_reverse_*`.
+- **#17 phase-2:** flip the default — `target.connect_remote` routes
+  through `RspChannel`; legacy LLDB plugin moves behind
+  `target.connect_remote_lldb`. Pre-req: matrix coverage against
+  gdbserver + rr + qemu (this dev box only has lldb-server + rr).
+- **#21:** non-stop runtime. The reader thread + bounded queue +
+  `StopEvent`-shaped payloads are ready; #21 adds the
+  per-thread state machine and the JSON-RPC notification channel for
+  push events.
+
+Commits this session (all on `feat/v1.6-17-rsp`, none pushed):
+- `d968c01` feat(rsp): async channel transport (#17 phase-1 part 3)
+- `17f07b8` feat(dispatcher): target.connect_remote_rsp endpoint (#17 phase-1)
+- `f627adc` test(rsp): live smoke for target.connect_remote_rsp (#17 phase-1)
+
+ctest 70/70 on this dev box (was 69; one new smoke). `ldb_unit_tests
+"[rsp]"` → 175 assertions / 45 cases. Warning-clean.
+
+---
+
 ## 2026-05-12 — v1.6 kickoff: #17 design note (own RSP client)
 
 **Goal:** Start v1.6's non-stop chain (#17 → #21 → #25 → #26 per
