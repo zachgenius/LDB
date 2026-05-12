@@ -27,6 +27,7 @@
 #include "store/session_store.h"
 #include "agent_expr/bytecode.h"
 #include "agent_expr/compiler.h"
+#include "probes/rate_limit.h"
 #include "transport/rsp/channel.h"
 #include "transport/rsp/packets.h"
 #include "util/base64.h"
@@ -813,6 +814,13 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "probe.enable")       return handle_probe_enable(req);
     if (req.method == "probe.delete")       return handle_probe_delete(req);
     if (req.method == "predicate.compile")  return handle_predicate_compile(req);
+
+    if (req.method == "tracepoint.create")  return handle_tracepoint_create(req);
+    if (req.method == "tracepoint.list")    return handle_tracepoint_list(req);
+    if (req.method == "tracepoint.enable")  return handle_tracepoint_enable(req);
+    if (req.method == "tracepoint.disable") return handle_tracepoint_disable(req);
+    if (req.method == "tracepoint.delete")  return handle_tracepoint_delete(req);
+    if (req.method == "tracepoint.frames")  return handle_tracepoint_frames(req);
 
     if (req.method == "perf.record")        return handle_perf_record(req);
     if (req.method == "perf.report")        return handle_perf_report(req);
@@ -2664,6 +2672,113 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"mnemonics",    arr_of(str())},
           {"reg_table",    arr_of(str())},
       }, {"bytecode_b64", "bytes", "mnemonics", "reg_table"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== tracepoint.* (post-V1 #26 phase-1) ==============
+  //
+  // Tracepoints are no-stop probes with rate limits — sugar over
+  // probe.create with kind="tracepoint" + action=log_and_continue
+  // locked. The wire surface is split from probe.* so the no-stop
+  // contract is visible at the endpoint name. See docs/30.
+
+  add("tracepoint.create",
+      "Create a tracepoint: a no-stop probe with an optional "
+      "predicate filter and an optional rate-limit. action is "
+      "always log-and-continue (inferior never pauses on hit). "
+      "rate_limit grammar: '<int>/<unit>' where unit is "
+      "s | ms | us | total. predicate accepts {source} or "
+      "{bytecode_b64} via the agent-expression compiler "
+      "(post-V1 #25). See docs/30-tracepoints.md.",
+      obj({
+          {"target_id",  target_id_param()},
+          {"where",      obj({
+              {"function",  str()},
+              {"address",   uint_()},
+              {"file",      str()},
+              {"line",      int_()},
+          }, {})},
+          {"capture",    obj({
+              {"registers", arr_of(str())},
+          }, {})},
+          {"predicate",  obj({
+              {"source",       str()},
+              {"bytecode_b64", str()},
+          }, {})},
+          {"rate_limit", str("e.g. \"1000/s\", \"10/ms\", \"500/total\"")},
+      }, {"target_id", "where"}),
+      obj({
+          {"tracepoint_id", str()},
+          {"kind",          str()},
+      }, {"tracepoint_id", "kind"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
+
+  add("tracepoint.list",
+      "List all tracepoints (kind=\"tracepoint\" entries only). "
+      "Returns each with its hit_count + predicate / rate-limit "
+      "counters.",
+      obj({}, {}),
+      obj({
+          {"tracepoints", arr_of(obj({
+              {"tracepoint_id",     str()},
+              {"where_expr",        str()},
+              {"enabled",           bool_()},
+              {"hit_count",         uint_()},
+              {"has_predicate",     bool_()},
+              {"predicate_dropped", uint_()},
+              {"predicate_errored", uint_()},
+              {"rate_limited",      uint_()},
+          }, {}))},
+          {"total", int_()},
+      }, {"tracepoints", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("tracepoint.enable",
+      "Enable a tracepoint. Idempotent.",
+      obj({{"tracepoint_id", str()}}, {"tracepoint_id"}),
+      obj({{"tracepoint_id", str()}, {"enabled", bool_()}},
+          {"tracepoint_id", "enabled"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("tracepoint.disable",
+      "Disable a tracepoint without deleting it. Captured frames "
+      "are preserved.",
+      obj({{"tracepoint_id", str()}}, {"tracepoint_id"}),
+      obj({{"tracepoint_id", str()}, {"enabled", bool_()}},
+          {"tracepoint_id", "enabled"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("tracepoint.delete",
+      "Delete a tracepoint: removes the underlying breakpoint + "
+      "drops its captured frames.",
+      obj({{"tracepoint_id", str()}}, {"tracepoint_id"}),
+      obj({{"tracepoint_id", str()}, {"deleted", bool_()}},
+          {"tracepoint_id", "deleted"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("tracepoint.frames",
+      "Pull captured frames for a tracepoint. since=N returns "
+      "frames with hit_seq > N. Phase-1 frames have the same "
+      "shape as probe.events; phase-2 will add gdb-remote "
+      "QTFrame metadata for in-target captures.",
+      obj({
+          {"tracepoint_id", str()},
+          {"since",         uint_()},
+          {"max",           uint_()},
+      }, {"tracepoint_id"}),
+      obj({
+          {"frames",     arr_of(obj({
+              {"tracepoint_id", str()},
+              {"hit_seq",       uint_()},
+              {"ts_ns",         int_()},
+              {"tid",           uint_()},
+              {"pc",            uint_()},
+              {"registers",     obj({}, {})},
+              {"memory",        arr_of(obj({}, {}))},
+              {"site",          obj({}, {})},
+          }, {}))},
+          {"total",      int_()},
+          {"next_since", uint_()},
+      }, {"frames", "total", "next_since"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== perf.* (post-V1 plan #13) ==============
@@ -8788,6 +8903,351 @@ Response Dispatcher::handle_predicate_compile(const Request& req) {
   for (const auto& name : prog.reg_table) {
     data["reg_table"].push_back(name);
   }
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+// ---- tracepoint.* handlers (#26 phase-1) ----------------------------
+//
+// Tracepoints are sugar over probe.create with kind="tracepoint"
+// locked + action=log_and_continue. The orchestrator handles them
+// through the same lldb_breakpoint code path; the dispatcher's job
+// is to enforce the contract (no `action` field accepted; rate_limit
+// is mandatory-shaped when provided; the kind is fixed).
+
+Response Dispatcher::handle_tracepoint_create(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+
+  // Tracepoint contract: agent doesn't get to pick the action. We
+  // reject the field with a clear hint rather than silently
+  // overwriting it.
+  if (req.params.contains("action")) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "tracepoint action is always log-and-continue; do not "
+        "set the action field");
+  }
+
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto wit = req.params.find("where");
+  if (wit == req.params.end() || !wit->is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing object param 'where'");
+  }
+  backend::BreakpointSpec where;
+  if (auto fit = wit->find("function");
+      fit != wit->end() && !fit->is_null()) {
+    if (!fit->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.function must be string");
+    }
+    where.function = fit->get<std::string>();
+  }
+  if (auto ait = wit->find("address");
+      ait != wit->end() && !ait->is_null()) {
+    std::uint64_t addr = 0;
+    if (ait->is_number_unsigned()) addr = ait->get<std::uint64_t>();
+    else if (ait->is_string()) {
+      const std::string& s = ait->get_ref<const std::string&>();
+      try { addr = std::stoull(s, nullptr, 0); }
+      catch (...) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "where.address: invalid integer");
+      }
+    } else {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.address must be uint or hex string");
+    }
+    where.address = addr;
+  }
+  if (auto fit = wit->find("file");
+      fit != wit->end() && !fit->is_null()) {
+    if (!fit->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.file must be string");
+    }
+    where.file = fit->get<std::string>();
+  }
+  if (auto lit = wit->find("line");
+      lit != wit->end() && !lit->is_null()) {
+    if (!lit->is_number_integer() && !lit->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "where.line must be integer");
+    }
+    where.line = lit->get<int>();
+  }
+  if (!where.function.has_value() && !where.address.has_value() &&
+      !where.file.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "where must set function, address, or file+line");
+  }
+
+  // capture (optional) — same parser as probe.create's lldb path.
+  probes::CaptureSpec capture;
+  if (auto cit = req.params.find("capture");
+      cit != req.params.end() && !cit->is_null()) {
+    if (!cit->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "capture must be object");
+    }
+    if (auto rit = cit->find("registers");
+        rit != cit->end() && !rit->is_null()) {
+      if (!rit->is_array()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "capture.registers must be array of string");
+      }
+      for (const auto& r : *rit) {
+        if (!r.is_string()) {
+          return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                    "capture.registers entries must be strings");
+        }
+        capture.registers.push_back(r.get<std::string>());
+      }
+    }
+    // Memory capture: same shape as probe.create, deferred to phase-2
+    // for in-target collection. For phase-1 (daemon-side), allow it
+    // via the probe machinery — but tests don't currently exercise it.
+  }
+
+  // rate_limit (optional). When set, must parse to a valid grammar.
+  std::string rate_limit_text;
+  if (auto it = req.params.find("rate_limit");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "rate_limit must be string");
+    }
+    rate_limit_text = it->get<std::string>();
+    if (!rate_limit_text.empty() &&
+        !probes::parse_rate_limit(rate_limit_text).has_value()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "rate_limit grammar: '<int>/<unit>' where unit is "
+          "s | ms | us | total (got: '" + rate_limit_text + "')");
+    }
+  }
+
+  // predicate (optional) — same parser as probe.create.
+  std::optional<agent_expr::Program> predicate;
+  if (auto pit = req.params.find("predicate");
+      pit != req.params.end() && !pit->is_null()) {
+    if (!pit->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "predicate must be object");
+    }
+    bool has_source = pit->contains("source") && !(*pit)["source"].is_null();
+    bool has_b64    = pit->contains("bytecode_b64")
+                      && !(*pit)["bytecode_b64"].is_null();
+    if (!has_source && !has_b64) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "predicate must set source or bytecode_b64");
+    }
+    if (has_source && has_b64) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "predicate must set exactly one of source / bytecode_b64");
+    }
+    if (has_source) {
+      if (!(*pit)["source"].is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "predicate.source must be string");
+      }
+      auto result = agent_expr::compile(
+          (*pit)["source"].get<std::string>());
+      if (result.error.has_value()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "predicate.source compile error at " +
+            std::to_string(result.error->line) + ":" +
+            std::to_string(result.error->column) + ": " +
+            result.error->message);
+      }
+      predicate = std::move(*result.program);
+    } else {
+      if (!(*pit)["bytecode_b64"].is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "predicate.bytecode_b64 must be string");
+      }
+      std::vector<std::uint8_t> raw;
+      try {
+        raw = util::base64_decode(
+            (*pit)["bytecode_b64"].get<std::string>());
+      } catch (const backend::Error&) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "predicate.bytecode_b64: invalid base64");
+      }
+      auto decoded = agent_expr::decode(std::string_view(
+          reinterpret_cast<const char*>(raw.data()), raw.size()));
+      if (!decoded.has_value()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "predicate.bytecode_b64: malformed bytecode");
+      }
+      predicate = std::move(*decoded);
+    }
+  }
+
+  probes::ProbeSpec ps;
+  ps.target_id       = static_cast<backend::TargetId>(target_id);
+  ps.kind            = "tracepoint";
+  ps.where           = std::move(where);
+  ps.capture         = std::move(capture);
+  ps.action          = probes::Action::kLogAndContinue;
+  ps.rate_limit_text = std::move(rate_limit_text);
+  ps.predicate       = std::move(predicate);
+
+  std::string tracepoint_id;
+  try {
+    tracepoint_id = probes_->create(ps);
+  } catch (const std::invalid_argument& e) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
+  }
+
+  json data;
+  data["tracepoint_id"] = tracepoint_id;
+  data["kind"]          = ps.kind;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_tracepoint_list(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  // Filter the orchestrator's rows to kind="tracepoint" so the
+  // surface is honest — probe.list shows everything, tracepoint.list
+  // shows only tracepoints.
+  auto rows = probes_->list();
+  json arr = json::array();
+  for (const auto& e : rows) {
+    if (e.kind != "tracepoint") continue;
+    json j;
+    j["tracepoint_id"]    = e.probe_id;
+    j["where_expr"]       = e.where_expr;
+    j["enabled"]          = e.enabled;
+    j["hit_count"]        = e.hit_count;
+    j["has_predicate"]    = e.has_predicate;
+    if (e.has_predicate) {
+      j["predicate_dropped"] = e.predicate_dropped;
+      j["predicate_errored"] = e.predicate_errored;
+    }
+    j["rate_limited"]     = e.rate_limited;
+    arr.push_back(std::move(j));
+  }
+  json data;
+  data["tracepoints"] = std::move(arr);
+  data["total"]       = static_cast<std::int64_t>(arr.size());
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+namespace {
+// Validate that probe_id refers to a kind="tracepoint" entry.
+// Returns nullopt on success; an error Response otherwise.
+std::optional<protocol::Response> require_tracepoint_kind(
+    protocol::Request const& req,
+    probes::ProbeOrchestrator& orch,
+    std::string const& tid) {
+  auto info = orch.info(tid);
+  if (!info.has_value()) {
+    return protocol::make_err(req.id, protocol::ErrorCode::kInvalidParams,
+        "unknown tracepoint_id: " + tid);
+  }
+  if (info->kind != "tracepoint") {
+    return protocol::make_err(req.id, protocol::ErrorCode::kInvalidParams,
+        tid + " is not a tracepoint (use probe.* for kind='" +
+        info->kind + "')");
+  }
+  return std::nullopt;
+}
+}  // namespace
+
+Response Dispatcher::handle_tracepoint_enable(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* tid = require_string(req.params, "tracepoint_id");
+  if (!tid || tid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'tracepoint_id'");
+  }
+  if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+  probes_->enable(*tid);
+  return protocol::make_ok(req.id,
+      json{{"tracepoint_id", *tid}, {"enabled", true}});
+}
+
+Response Dispatcher::handle_tracepoint_disable(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* tid = require_string(req.params, "tracepoint_id");
+  if (!tid || tid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'tracepoint_id'");
+  }
+  if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+  probes_->disable(*tid);
+  return protocol::make_ok(req.id,
+      json{{"tracepoint_id", *tid}, {"enabled", false}});
+}
+
+Response Dispatcher::handle_tracepoint_delete(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* tid = require_string(req.params, "tracepoint_id");
+  if (!tid || tid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'tracepoint_id'");
+  }
+  if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+  probes_->remove(*tid);
+  return protocol::make_ok(req.id,
+      json{{"tracepoint_id", *tid}, {"deleted", true}});
+}
+
+Response Dispatcher::handle_tracepoint_frames(const Request& req) {
+  if (auto e = require_probe_orchestrator(req, probes_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* tid = require_string(req.params, "tracepoint_id");
+  if (!tid || tid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'tracepoint_id'");
+  }
+  if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+
+  std::uint64_t since = 0;
+  if (req.params.contains("since") &&
+      !require_uint(req.params, "since", &since)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'since' must be a non-negative integer");
+  }
+  std::uint64_t max = 0;
+  if (req.params.contains("max") &&
+      !require_uint(req.params, "max", &max)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "'max' must be a non-negative integer");
+  }
+
+  auto evs = probes_->events(*tid, since, max);
+  json arr = json::array();
+  std::uint64_t next_since = since;
+  for (const auto& e : evs) {
+    if (e.hit_seq > next_since) next_since = e.hit_seq;
+    arr.push_back(probe_event_to_json(e, *tid));
+  }
+  json data;
+  data["frames"]     = std::move(arr);
+  data["total"]      = static_cast<std::int64_t>(evs.size());
+  data["next_since"] = next_since;
   return protocol::make_ok(req.id, std::move(data));
 }
 

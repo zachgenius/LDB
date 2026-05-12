@@ -312,6 +312,18 @@ class Dispatcher {
   // pre-flight a predicate before pinning it on a probe.
   protocol::Response handle_predicate_compile(const protocol::Request& req);
 
+  // Post-V1 #26 phase-1 (docs/30-tracepoints.md). Tracepoints are
+  // no-stop probes with rate limits. The six endpoints map 1:1 to
+  // probe.* but lock kind="tracepoint" + action=log_and_continue,
+  // and validate the rate_limit grammar before reaching the
+  // orchestrator.
+  protocol::Response handle_tracepoint_create(const protocol::Request& req);
+  protocol::Response handle_tracepoint_list(const protocol::Request& req);
+  protocol::Response handle_tracepoint_enable(const protocol::Request& req);
+  protocol::Response handle_tracepoint_disable(const protocol::Request& req);
+  protocol::Response handle_tracepoint_delete(const protocol::Request& req);
+  protocol::Response handle_tracepoint_frames(const protocol::Request& req);
+
   // Post-V1 plan #12 phase-2: ldb-probe-agent wire shim
   // (docs/21-probe-agent.md). Phase-2 ships hello; attach_* + poll
   // come with the orchestrator wiring in a follow-up commit.

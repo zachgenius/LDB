@@ -105,6 +105,7 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_predicate_compile.cpp
   test_probe_predicate.cpp
   test_rate_limit.cpp
+  test_dispatcher_tracepoint.cpp
   test_pack.cpp
   test_pack_signing.cpp
   test_util_sha256.cpp
