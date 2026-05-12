@@ -1567,15 +1567,23 @@ with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("thread.continue",
-      "Resume the given thread. WARNING: in v0.3 this is SYNC — all "
-      "threads resume together (passthrough into process.continue) "
-      "because the daemon runs LLDB in SBProcess::SetAsync(false). The "
-      "wire shape is async-ready: in v0.4+ when async mode lands this "
-      "endpoint will keep sibling threads stopped (true non-stop). "
-      "Post-V1 #21 phase-1: the call records the thread as running in "
-      "the non-stop runtime so a subsequent thread.list_state reflects "
-      "the resumption; phase-2 will deliver thread.event notifications "
-      "when the thread parks again. See docs/26-nonstop-runtime.md.",
+      "Resume the given thread. WARNING: in v0.3 this is SYNC for "
+      "LLDB-backed targets — all threads resume together (passthrough "
+      "into process.continue) because the daemon runs LLDB in "
+      "SBProcess::SetAsync(false). The wire shape is async-ready: in "
+      "v0.4+ when async mode lands this endpoint will keep sibling "
+      "threads stopped (true non-stop). "
+      "Post-V1 #21 phase-1: records the thread as running in the "
+      "non-stop runtime so a subsequent thread.list_state reflects the "
+      "resumption. "
+      "Post-V1 #17 phase-2: for targets opened via "
+      "target.connect_remote_rsp, the call emits vCont;c over the "
+      "channel and returns IMMEDIATELY with state=running — true async "
+      "non-stop semantics. The actual stop is delivered as a "
+      "thread.event{kind:stopped} notification once the server emits "
+      "the stop reply. Agents driving connect_remote_rsp targets must "
+      "consume notifications rather than block on this response. "
+      "See docs/26-nonstop-runtime.md.",
       obj({
           {"target_id", target_id_param()},
           {"tid",       tid_param()},
@@ -3971,6 +3979,9 @@ Response Dispatcher::handle_thread_continue(const Request& req) {
   if (auto it = rsp_channels_.find(backend_tid); it != rsp_channels_.end()) {
     transport::rsp::VContAction act;
     act.action = 'c';
+    // packets.h §VContAction: tid == 0 is the sentinel for "all
+    // threads." tid_param() is uint_min(1) so the schema rejects 0
+    // at the wire — the cast is safe here.
     act.tid    = static_cast<std::int64_t>(thread_id);
     try {
       it->second->send(transport::rsp::build_vCont({act}));
@@ -4018,6 +4029,11 @@ Response Dispatcher::handle_thread_suspend(const Request& req) {
   if (auto it = rsp_channels_.find(backend_tid); it != rsp_channels_.end()) {
     transport::rsp::VContAction act;
     act.action = 't';   // stop the named thread
+    // packets.h §VContAction: tid == 0 is the sentinel for "all
+    // threads." tid_param() in describe_schema.h is uint_min(1) so
+    // schema validation rejects 0 at the wire — the cast is safe
+    // here, but worth flagging at the call site so future callers
+    // know the sentinel exists.
     act.tid    = static_cast<std::int64_t>(thread_id);
     try {
       it->second->send(transport::rsp::build_vCont({act}));
@@ -4025,12 +4041,14 @@ Response Dispatcher::handle_thread_suspend(const Request& req) {
       return protocol::make_err(req.id, ErrorCode::kBackendError,
           std::string("rsp: vCont;t: ") + e.what());
     }
-    // Don't optimistically mark kStopped — the server may or may not
-    // actually park the thread (some servers ignore vCont;t for
-    // already-stopped threads). The listener will record set_stopped
-    // when the server confirms with a stop reply.
+    // Return kRunning rather than kStopped: the call is fire-and-
+    // forget at the wire (no synchronous ack-wait), and some servers
+    // ignore vCont;t for already-stopped threads. Ground truth comes
+    // from the listener's thread.event{kind:stopped} notification
+    // when the server confirms. Agents that need to know the suspend
+    // landed must read thread.event, not this return value.
     backend::ProcessStatus status;
-    status.state = backend::ProcessState::kStopped;
+    status.state = backend::ProcessState::kRunning;
     return protocol::make_ok(req.id, process_status_to_json(status));
   }
   return protocol::make_err(

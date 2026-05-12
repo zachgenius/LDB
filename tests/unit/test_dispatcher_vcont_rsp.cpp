@@ -61,8 +61,14 @@ Request req(const std::string& method, const json& params) {
 }
 
 // Read everything currently sitting in the peer fd's recv buffer.
-// We set a tight non-blocking read deadline so we don't stall when the
-// dispatcher's vCont write hasn't reached us yet — caller loops.
+// The timeout is conservative (default 200ms) and covers the OS
+// socket-buffer round-trip latency between the dispatcher's send()
+// and our recv(), NOT any protocol delay — vCont is fire-and-forget.
+// Do NOT trim the timeout below ~50ms even on a fast box; CI runners
+// schedule unpredictably and a tighter bound would be flaky for no
+// real-world gain. The function keeps draining via `continue` after
+// any successful read so a packet that arrives in fragments still
+// assembles before the deadline.
 std::string drain_peer(int fd, std::chrono::milliseconds timeout) {
   std::string out;
   auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -176,6 +182,12 @@ TEST_CASE("vCont-RSP: thread.suspend emits vCont;t:<tid> + drops the -32001 stub
   auto resp = disp.dispatch(req("thread.suspend",
       json{{"target_id", inst.target_id}, {"tid", 7}}));
   REQUIRE(resp.ok);   // no longer -32001 for RSP-backed targets
+  // The return state is intentionally "running" — the call is
+  // fire-and-forget (no synchronous server confirmation), and some
+  // servers ignore vCont;t for already-stopped threads. The agent
+  // gets ground truth from thread.event{kind:stopped} when the
+  // listener observes the server's stop reply.
+  CHECK(resp.data.value("state", std::string{}) == "running");
 
   std::string bytes = drain_peer(inst.peer_fd, std::chrono::milliseconds(200));
   REQUIRE_FALSE(bytes.empty());
