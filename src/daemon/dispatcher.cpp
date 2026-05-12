@@ -552,17 +552,59 @@ backend::TargetId extract_target_id(const json& params) {
   }
 }
 
+// Extract target_ids[] (plural) from request params — the shape correlate.*
+// and session.* use. Returns the parsed list, or empty when absent /
+// malformed. Validation lives in parse_target_ids; this helper is
+// best-effort for provenance decoration only.
+std::vector<backend::TargetId> extract_target_ids(const json& params) {
+  std::vector<backend::TargetId> out;
+  if (!params.is_object()) return out;
+  auto it = params.find("target_ids");
+  if (it == params.end() || !it->is_array()) return out;
+  out.reserve(it->size());
+  for (const auto& el : *it) {
+    if (el.is_number_unsigned()) {
+      out.push_back(el.get<backend::TargetId>());
+    } else if (el.is_number_integer()) {
+      auto s = el.get<std::int64_t>();
+      if (s >= 0) out.push_back(static_cast<backend::TargetId>(s));
+    }
+  }
+  return out;
+}
+
 // Decorate `resp` with the cores-only `_provenance.snapshot` per plan
 // §3.5. Best-effort: a thrown exception inside snapshot_for_target
 // degrades to "none" rather than poisoning the whole response.
+//
+// v1.5 #15 phase-1: extended to handle `target_ids[]` (the multi-target
+// shape used by correlate.*). When every id resolves to the same
+// snapshot string we use it; heterogeneous lists degrade to "none" —
+// there's no single "the snapshot" to honestly report in that case.
+// See docs/04-determinism-audit.md §12.
 void decorate_provenance(Response& resp,
                          backend::DebuggerBackend* backend,
                          const Request& req) {
   if (!resp.ok || !backend) return;
-  backend::TargetId tid = extract_target_id(req.params);
   std::string snap;
   try {
-    snap = backend->snapshot_for_target(tid);
+    backend::TargetId tid = extract_target_id(req.params);
+    if (tid != 0) {
+      snap = backend->snapshot_for_target(tid);
+    } else {
+      auto ids = extract_target_ids(req.params);
+      if (!ids.empty()) {
+        snap = backend->snapshot_for_target(ids.front());
+        for (std::size_t i = 1; i < ids.size(); ++i) {
+          if (backend->snapshot_for_target(ids[i]) != snap) {
+            snap = "none";
+            break;
+          }
+        }
+      } else {
+        snap = backend->snapshot_for_target(0);
+      }
+    }
   } catch (...) {
     snap = "none";
   }
