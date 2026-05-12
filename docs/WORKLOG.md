@@ -4,6 +4,73 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.5 #15 phase-1 (correlate.* determinism gate)
+
+**Goal:** Extend the cross-daemon byte-identity gate
+(`tests/smoke/test_provenance_replay.py`) to cover the index-routed
+correlate.* endpoints that #18 phase-1 just wired up. Second item in
+v1.5's critical chain (#18 → #15 → #16).
+
+**Done:**
+- `9a55976 feat(provenance): extend cross-daemon byte-identity gate
+  to correlate.* (#15 phase-1)` — TDD red→green:
+  - Test additions: `correlate.types name="dxp_login_frame"`,
+    `correlate.symbols name="main"`, `correlate.strings
+    text="LDB_SLEEPER_MARKER_v1"` against the sleeper-core fixture.
+    Test now pins nine endpoints (was six).
+  - First red: every correlate.* response carried `snapshot="none"`,
+    `deterministic=false` — `decorate_provenance` only looked at
+    `target_id` (singular). correlate.* binds via `target_ids[]`.
+  - Fix: extended decorator with `extract_target_ids` plus a
+    same-snapshot fold over the list; heterogeneous lists degrade
+    to `"none"` (no single trustworthy snapshot to print).
+  - Green confirmed via the smoke + full ctest 68/68. No byte
+    divergence in correlate.* bodies — #18's `ORDER BY address`
+    already made the data deterministic; #15 just exposes that to
+    the `_provenance` bit.
+- `d98f25b docs(determinism): §12 — index-routed correlate.*
+  determinism (#15 phase-1)` — addendum to
+  `docs/04-determinism-audit.md` capturing the new contract, why
+  it holds (index ordering, schema not on wire, reproducible cache
+  key), and three phase-2-worthy edge cases (heterogeneous
+  `target_ids[]`, stale-cache invalidation, opportunistic
+  `strings.callsites` xref cache).
+
+**Decisions:**
+- Decorator semantic for `target_ids[]`: take `target_ids[0]`'s
+  snapshot when every entry shares the same snapshot string;
+  otherwise `"none"`. The alternative — always treat correlate.* as
+  deterministic regardless of snapshot — was rejected because it
+  would hide a real failure mode (a core + a live target correlated
+  together IS non-deterministic from the live side, and the bit
+  should report that honestly). Single-target callers (today's
+  test, today's clients) get the right answer for free.
+- Reused the existing sleeper fixture. `dxp_login_frame` from
+  structs.c isn't in sleeper.c, so `correlate.types` returns
+  `"missing"` — that's still a byte-identical deterministic
+  result, and exercising the cache's "name not found" path is
+  arguably more useful than asserting a hit. The smoke test
+  comment notes this so a future reader doesn't think it's a
+  bug.
+
+**Surprises / blockers:**
+- None. The hard work was already done in #18 (index ordering)
+  and v0.3 slice 2 (provenance plumbing). #15 phase-1 is the
+  smaller piece docs/15 predicted: "Easier after #18 owns
+  timestamps + ordering."
+
+**Next:**
+- Next session: #16 (v1.5 critical chain item 3 — see
+  `docs/17-version-plan.md`).
+- Future #15 phase-2 widening worth queuing: exercise
+  heterogeneous-`target_ids[]` snapshot fold (today only the
+  homogeneous path has coverage). Also: once xrefs land in the
+  symbol index, `correlate.strings.callsites` graduates from
+  "deterministic by cold-walk accident" to "deterministic by
+  cached row" — same gate will catch any regression.
+
+---
+
 ## 2026-05-12 — v1.5 #18 phase-1 integration (bulk iterate + dispatcher rewire + smoke)
 
 **Goal:** Land the integration layer for the own symbol index that
