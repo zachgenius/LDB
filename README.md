@@ -20,52 +20,46 @@ graph that survives across sessions.
 
 ## Status
 
-**V1 released.** `v1.0.0` closed all release gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.5.0` is the
-current tag — "Own the critical path: indexing + replay" — three
-items closing the loop on deterministic, reusable investigation
-state ([docs/17-version-plan.md](docs/17-version-plan.md)):
+**V1.** The protocol contract is stable; everything in the wire surface is
+additive. The architectural arc — own the critical investigation path
+(symbol indexing, deterministic replay, async runtime, in-target predicates)
+without forking LLDB — is in place. Future work is responsive to user pull,
+not a planned roadmap.
 
-- **Own symbol index** ([docs/23](docs/23-symbol-index.md)) —
-  SQLite-backed cache of LLDB-derived symbols / types / strings,
-  keyed by build_id. The dispatcher routes `correlate.types /
-  symbols / strings` through the cache; cold queries walk LLDB
-  once and write back, warm queries are sub-millisecond. Cross-
-  binary indexing means an agent fanning out across many targets
-  pays O(1) on the shared structure instead of O(N).
-- **Live-process provenance gate extended to correlate.\*** — every
-  index-routed response carries `_provenance.deterministic = true`
-  for fixed inputs, and `tests/smoke/test_provenance_replay.py`
-  pins byte-identity across daemon processes. The audit lives in
-  [docs/04](docs/04-determinism-audit.md) §12.
-- **`session.fork` + `session.replay`** ([docs/24](docs/24-session-fork-replay.md))
-  — the v1.5 prize. `session.fork` clones an existing rpc_log up
-  to a seq into a new session id (transactional, no half-state on
-  crash). `session.replay` re-issues captured calls against a
-  fresh dispatcher and byte-compares deterministic rows; non-
-  deterministic rows surface as honest `replay_error` /
-  `captured_error` entries. A new `rpc_log.snapshot` column carries
-  the captured determinism signal across daemon restarts;
-  `read_log` falls back to the legacy SELECT for pre-v1.5 dbs so
-  upgrades don't brick.
+What V1 delivers end-to-end:
 
-Earlier additive features remain from v1.4 (GdbMiBackend, CLI REPL,
-ssh transport, embedded Python probes, libbpf agent, perf
-integration), v1.3 (recipe.reload, hypothesis artifact,
-view.diff_against, reverse-step kinds, measured cost preview,
-token-budget CI gate), v1.2 (`.ldbpack` ed25519 signing
-[docs/14](docs/14-pack-signing.md), reverse-execution endpoints
-[docs/16](docs/16-reverse-exec.md)), and the v1.1 dogfood fixes.
-
-No breaking wire changes since v1.0.0; everything since is additive.
-See [docs/17-version-plan.md](docs/17-version-plan.md) for the full
-v1.3 / v1.4 / v1.5 bundling and [docs/15-post-v1-plan.md](docs/15-post-v1-plan.md)
-for the item-level catalog.
+- **Static + cross-binary investigation.** Type layouts, symbol queries,
+  string and xref hunting across a symbol index keyed by build-ID, cached
+  to SQLite so warm queries are sub-millisecond.
+- **Process control.** Live attach / launch / detach, core load, remote
+  targets over the daemon's own GDB RSP client OR LLDB's gdb-remote, all
+  through one wire surface.
+- **Async non-stop runtime.** Per-thread suspend/resume, push notifications
+  (`thread.event{kind:stopped}`) on a listener thread, and `vCont`-routed
+  resume verbs against the own RSP transport. Phase-2 of the LLDB-backed
+  non-stop integration is post-V1; the daemon-side state machine and the
+  wire surface are stable.
+- **Probes + tracepoints.** Auto-resuming breakpoints with structured
+  capture (`probe.*`) and no-stop high-frequency observation
+  (`tracepoint.*`) with rate-limit grammar (`<N>/{s,ms,us,total}`) and
+  agent-expression predicates compiled from a small S-expression DSL.
+- **Determinism + replay.** Per-endpoint provenance audit
+  (`_provenance.deterministic`), byte-identical replay across daemon
+  restarts via `session.fork` / `session.replay`, signed `.ldbpack`
+  portable bundles.
+- **Multi-backend.** LLDB SBAPI (default) or GDB/MI subprocess
+  (`--backend=gdb`) through a single `DebuggerBackend` interface.
+- **Scriptable probes + recipes.** Embedded Python callbacks for
+  `lldb_breakpoint` probes; user-authored frame unwinders;
+  parametric replayable RPC scripts captured from sessions.
+- **Observers + perf + BPF.** Typed `/proc`, `ss`, `tcpdump`, `igmp`
+  observers; `perf record/report` integration; `libbpf`-backed
+  `ldb-probe-agent` for CO-RE BPF uprobes.
 
 | | |
 |---|---|
-| **Validation** | Default `ctest` suite (69 tests, 100% pass on a stock Linux dev box; SKIP-gated live-attach tests run when `kernel.yama.ptrace_scope=0` or with CAP_SYS_PTRACE) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
-| **Endpoints** | 96 across target / process / thread / frame / value / memory / probe / agent / perf / observer / session / artifact / recipe / correlate |
+| **Validation** | `ctest` suite (100% pass on a stock Linux dev box; SKIP-gated live-attach tests run when `kernel.yama.ptrace_scope=0` or with CAP_SYS_PTRACE) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
+| **Endpoints** | 100+ across target / process / thread / frame / value / memory / probe / tracepoint / predicate / agent / perf / observer / session / artifact / recipe / correlate |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
 | **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
@@ -86,21 +80,27 @@ for the item-level catalog.
 │  • Artifacts (build-ID keyed, portable bundles)  │
 │  • View descriptors (projection / pagination /   │
 │    summary / cost preview)                       │
-│  • Probe orchestrator (LLDB breakpoint + uprobe  │
-│    BPF, one event shape)                         │
+│  • Probe + tracepoint orchestrator with          │
+│    agent-expression predicate evaluation         │
+│  • Symbol index (SQLite, build-ID keyed)         │
+│  • Non-stop runtime + listener thread for        │
+│    push-notification stop events                 │
+│  • Own GDB RSP transport (parallel to LLDB's     │
+│    gdb-remote plugin)                            │
 │  • Typed observer plugins (/proc, ss, tcpdump,   │
 │    igmp; allowlisted exec escape hatch)          │
-│  • DebuggerBackend abstraction                   │
+│  • DebuggerBackend abstraction (LLDB / GDB-MI)   │
 └──────────────────────────────────────────────────┘
-       ↓ liblldb (SBAPI)              ↓ ssh
-  local target / core            remote target host:
-                                   • lldb-server platform
-                                   • bpftrace (optional)
-                                   • observer probes
+       ↓ liblldb (SBAPI)        ↓ ssh         ↓ TCP
+  local target / core      remote target host:    gdb-remote target
+                            • lldb-server         (lldb-server,
+                            • bpftrace             gdbserver, qemu,
+                            • observer probes      OpenOCD, rr)
 ```
 
-The daemon runs on the operator's machine. Remote targets are reached over SSH
-plus `lldb-server platform` — no LDB-specific code on the target.
+The daemon runs on the operator's machine. Remote targets are reached over
+SSH plus `lldb-server platform`, OR directly over TCP to any gdb-remote
+server via the own RSP client (`target.connect_remote_rsp`).
 
 ---
 
@@ -109,15 +109,20 @@ plus `lldb-server platform` — no LDB-specific code on the target.
 | Surface | Endpoints | Replaces |
 |---|---|---|
 | **Static analysis** | `target.open`, `target.close`, `target.list`, `target.label`, `module.list`, `type.layout`, `symbol.find`, `string.list`, `string.xref`, `disasm.range`, `disasm.function`, `xref.addr`, `static.globals_of_type` | `pahole`, `nm`, `readelf`, `strings`, `objdump` |
-| **Cross-target correlation** | `correlate.types`, `correlate.symbols`, `correlate.strings` | hand-rolled diffing between two binaries / cores |
-| **Process control** | `target.attach`, `target.connect_remote`, `target.connect_remote_ssh`, `target.load_core`, `target.create_empty`, `process.launch`, `process.state`, `process.continue`, `process.kill`, `process.detach`, `process.save_core`, `process.step`, `process.reverse_continue`, `process.reverse_step` | `gdb`, `lldb`, `rr` |
-| **Thread / frame / value** | `thread.list`, `thread.frames`, `thread.continue`, `thread.reverse_step`, `frame.locals`, `frame.args`, `frame.registers`, `value.eval`, `value.read` | `gdb` `bt`/`info`/`print`, `lldb` `frame` family |
+| **Cross-target correlation** | `correlate.types`, `correlate.symbols`, `correlate.strings` (build-ID keyed, SQLite-cached) | hand-rolled diffing between two binaries / cores |
+| **Process control** | `target.attach`, `target.connect_remote`, `target.connect_remote_ssh`, `target.connect_remote_rsp`, `target.load_core`, `target.create_empty`, `process.launch`, `process.state`, `process.continue`, `process.kill`, `process.detach`, `process.save_core`, `process.step`, `process.reverse_continue`, `process.reverse_step` | `gdb`, `lldb`, `rr` |
+| **Thread / frame / value** | `thread.list`, `thread.list_state`, `thread.frames`, `thread.continue`, `thread.suspend`, `thread.reverse_step`, `frame.locals`, `frame.args`, `frame.registers`, `value.eval`, `value.read` | `gdb` `bt`/`info`/`print`, `lldb` `frame` family |
+| **Non-stop events** | `thread.event{kind:stopped}` push notifications via JSON-RPC §4.1 framing on the same stdio channel | replaces polling `process.state` after `process.continue` |
 | **Memory** | `mem.read`, `mem.read_cstr`, `mem.regions`, `mem.search`, `mem.dump_artifact` | `gdb` `x`/`find`, `/proc/<pid>/mem` scraping |
-| **Probes** | `probe.create` (kind: `lldb_breakpoint` or `uprobe_bpf`), `probe.events`, `probe.list`, `probe.enable`, `probe.disable`, `probe.delete` | `strace`, `bpftrace`, hand-rolled tracepoints |
+| **Probes** | `probe.create` (kind: `lldb_breakpoint`, `uprobe_bpf`, `agent`), `probe.events`, `probe.list`, `probe.enable`, `probe.disable`, `probe.delete` | `strace`, `bpftrace`, hand-rolled tracepoints |
+| **Tracepoints (no-stop)** | `tracepoint.create`, `tracepoint.list`, `tracepoint.enable`, `tracepoint.disable`, `tracepoint.delete`, `tracepoint.frames` — agent-expression predicate + rate-limit grammar (`<N>/{s,ms,us,total}`) | `bpftrace`-style filtered observation, but with the same wire-typed schema as LDB probes |
+| **Agent expressions** | `predicate.compile({source})` — S-expression DSL compiled to a stack-based bytecode VM, used by probes and tracepoints for cheap per-hit filtering | hand-rolling C++ callbacks per filter |
 | **Typed observers** | `observer.proc.fds`, `observer.proc.maps`, `observer.proc.status`, `observer.net.sockets`, `observer.net.tcpdump`, `observer.net.igmp`, `observer.exec` (allowlisted) | `lsof`, `ss`, `tcpdump`, `cat /proc/...`, `run_host_command` |
-| **Sessions** | `session.create`, `session.attach`, `session.detach`, `session.list`, `session.info`, `session.diff`, `session.targets`, `session.export`, `session.import` | sqlite-backed RPC log; `.ldbpack` portable bundles |
+| **Sessions** | `session.create`, `session.attach`, `session.detach`, `session.list`, `session.info`, `session.diff`, `session.targets`, `session.export`, `session.import`, `session.fork`, `session.replay` | sqlite-backed RPC log; `.ldbpack` portable bundles; deterministic-byte replay across daemon restarts |
 | **Artifacts** | `artifact.put`, `artifact.get`, `artifact.list`, `artifact.tag`, `artifact.delete`, `artifact.relate`, `artifact.relations`, `artifact.unrelate`, `artifact.export`, `artifact.import` | build-ID-keyed store with typed relations, queryable across sessions |
-| **Recipes** | `recipe.create`, `recipe.from_session`, `recipe.list`, `recipe.get`, `recipe.run`, `recipe.delete`, `recipe.lint` | parametric replayable RPC scripts captured from sessions |
+| **Recipes** | `recipe.create`, `recipe.from_session`, `recipe.list`, `recipe.get`, `recipe.run`, `recipe.delete`, `recipe.lint`, `recipe.reload` — `format=python-v1` recipes run user-authored Python callbacks against the dispatcher | parametric replayable RPC scripts captured from sessions |
+| **Perf** | `perf.record`, `perf.report`, `perf.cancel` | `perf` CLI invocations |
+| **Probe agent** | `agent.hello` + `ldb-probe-agent` binary speaking length-prefixed JSON over libbpf for CO-RE BPF uprobes | bpftrace shellout |
 
 Every endpoint accepts a `view` descriptor (`fields`/`limit`/`offset`/`summary`)
 for token-budget control. Every successful response carries `_cost: {bytes,
@@ -132,15 +137,15 @@ items?, tokens_est}` and `_provenance: {snapshot, deterministic}`.
 | C++ compiler | GCC 13+ / Clang 16+ | C++20 features used in the daemon |
 | CMake | 3.20+ | Ninja generator recommended |
 | LLDB / liblldb | 18 or newer | 22.1.x verified; older versions likely work via SBAPI stability |
-| SQLite | 3.40+ | Sessions and artifact index |
+| SQLite | 3.40+ | Sessions, artifact index, symbol index |
 | zlib | system | `.ldbpack` gzip compression |
 | libsodium | 1.0.18+ | `.ldbpack` ed25519 signing (hard dep) |
 | Python | 3.11+ | Smoke tests and `tools/ldb/ldb` client |
-| `python3-embed` | 3.11+ | Optional; embedded CPython for `format=python-v1` recipes + `process.set_python_unwinder` (post-V1 #9, #14). Auto-detected via pkg-config; `cmake -DLDB_ENABLE_PYTHON=OFF` opts out |
-| libbpf | 1.0+ | Optional; required to build `ldb-probe-agent` (post-V1 #12). Auto-detected via pkg-config; `cmake -DLDB_ENABLE_BPF_AGENT=OFF` opts out. Live BPF programs additionally need `clang` + `bpftool` |
+| `python3-embed` | 3.11+ | Optional; embedded CPython for `format=python-v1` recipes + `process.set_python_unwinder`. Auto-detected via pkg-config; `cmake -DLDB_ENABLE_PYTHON=OFF` opts out |
+| libbpf | 1.0+ | Optional; required to build `ldb-probe-agent`. Auto-detected via pkg-config; `cmake -DLDB_ENABLE_BPF_AGENT=OFF` opts out. Live BPF programs additionally need `clang` + `bpftool` |
 | Ninja | 1.10+ | Optional; default build generator |
 | `bpftrace` | 0.18+ | Optional; required for `kind: "uprobe_bpf"` probes |
-| `linux-tools-generic` | match kernel | Optional; provides `perf` for `perf.record` / `perf.report` (post-V1 #13) |
+| `linux-tools-generic` | match kernel | Optional; provides `perf` for `perf.record` / `perf.report` |
 | `lldb-server` | from LLDB | Optional; required for `target.connect_remote*` live tests |
 | `tcpdump` | system | Optional; required for `observer.net.tcpdump` (needs CAP_NET_RAW) |
 | `rr` | 5.6+ | Optional; required for reverse-execution endpoints. Linux only; needs `kernel.perf_event_paranoid <= 1` to record |
@@ -176,7 +181,7 @@ macOS (Apple Silicon / Homebrew):
 ```bash
 brew install llvm ninja cmake sqlite libsodium python@3.12
 # libbpf, bpftool, perf, rr, bpftrace are Linux-only — the libbpf-agent
-# (#12) and perf-integration (#13) build paths are auto-disabled on macOS.
+# and perf-integration build paths are auto-disabled on macOS.
 ```
 
 Optional Capstone backend:
@@ -192,9 +197,9 @@ reverse-execution / sampling / agent / scripted-recipe paths; the
 static analysis and core-backed paths build without them. `libsodium`
 is a hard build dep (used by `.ldbpack` ed25519 signing). `rr` is
 Linux x86-64 / arm64 only — macOS has no equivalent. The `ldb-probe-
-agent` binary (post-V1 #12) is only built when libbpf is present;
-embedded CO-RE BPF programs additionally require `clang` and
-`bpftool` (from `linux-tools-generic` or `bpfcc-tools`).
+agent` binary is only built when libbpf is present; embedded CO-RE BPF
+programs additionally require `clang` and `bpftool` (from
+`linux-tools-generic` or `bpfcc-tools`).
 
 ---
 
@@ -252,12 +257,12 @@ reproduction notes.
 
 ## Supported platforms
 
-The intended V1 support matrix is intentionally narrow:
+The V1 support matrix is intentionally narrow:
 
 | Platform | Status | Notes |
 |---|---:|---|
 | Linux x86-64 | Supported | Primary CI leg; apt LLDB 18 in CI, local LLVM roots supported |
-| Linux arm64 | Validation | CI validates behavior; V1 remains source-only and does not promise separate arm64 packaging |
+| Linux arm64 | Validation | CI validates behavior; source-only, no separate arm64 packaging |
 | macOS arm64 | Supported | Homebrew LLVM plus Apple's signed `debugserver`; some Linux-only observers SKIP |
 | Windows | Out of scope | No V1 support claim |
 | FreeBSD | Out of scope | Roadmap item, not a V1 promise |
@@ -289,6 +294,9 @@ argparse subcommands from each endpoint's JSON Schema.
 # Inspect a struct
 ./tools/ldb/ldb type.layout target_id=1 name=dxp_login_frame
 
+# Compile an agent-expression predicate (returns bytecode_b64)
+./tools/ldb/ldb predicate.compile source='(eq (reg "rax") (const 42))'
+
 # Use the CBOR wire format (binary; for tooling clients)
 ./tools/ldb/ldb --format=cbor describe.endpoints --view summary=true
 
@@ -319,6 +327,13 @@ Responses:
   "_provenance": { "snapshot": "core:e3b0c44...", "deterministic": true } }
 ```
 
+Notifications (JSON-RPC 2.0 §4.1, no `id`):
+```json
+{ "jsonrpc": "2.0", "method": "thread.event",
+  "params": { "seq": 42, "target_id": 1, "tid": 1234,
+              "kind": "stopped", "reason": "trace", "pc": 0x7f8c123456 } }
+```
+
 Errors carry a typed `error.code` from a fixed enum so an agent can match on
 code rather than prose. Codes in the V1 surface:
 
@@ -329,20 +344,35 @@ code rather than prose. Codes in the V1 surface:
 | `-32602` | Invalid params |
 | `-32700` | Parse error / framing error |
 | `-32000` | Backend error (typed `backend::Error` from the daemon) |
+| `-32001` | Not implemented (e.g. `thread.suspend` on LLDB-backed targets pre-SetAsync flip) |
 | `-32002` | Bad state (store / allowlist not configured) |
 | `-32003` | Forbidden (operator allowlist denied the argv) |
+| `-32011` | Protocol version mismatch |
 
 ---
 
 ## Known limitations
 
-These are acceptable in the planned V1 cut and are part of the public contract:
+These are acceptable in V1 and part of the public contract:
 
 - LLDB remains the default backend and owns target, process, and DWARF semantics.
 - Capstone is opt-in and affects only `disasm.range` and `disasm.function`.
 - `xref.addr` and `string.xref` intentionally keep LLDB disassembly/comment semantics.
-- True async/non-stop runtime is deferred; the per-thread protocol surface is present but sync-backed.
-- Reverse execution is supported only against rr-backed targets (reached via `target.connect_remote rr://`); `process.reverse_step` / `thread.reverse_step` accept all four kinds (`in`/`over`/`out`/`insn`) — `in`/`over`/`out` use a bounded `bs`-loop emulation with source-line + frame-depth termination ([`docs/16-reverse-exec.md`](docs/16-reverse-exec.md) §"Reverse-step-over/into").
+- `thread.suspend` on LLDB-backed targets returns `-32001` — requires the
+  pending `SBDebugger::SetAsync(true)` flip + LLDB-side listener integration.
+  RSP-backed targets (`target.connect_remote_rsp`) honour `thread.suspend`
+  via `vCont;t` and have full non-stop semantics today.
+- Tracepoints run daemon-side in V1. The `QTDP` / `QTStart` / `QTFrame`
+  in-target collection path is a follow-up; the bytecode VM and wire surface
+  are stable so the migration is non-breaking.
+- The rate-limit grammar is fixed-pivot, not true sliding window — worst-
+  case burst is `2 × cap` events in `window + ε`. Token-bucket sliding is
+  a follow-up; agents needing a hard bound should over-budget by 2× or use
+  a tighter window.
+- Reverse execution is supported only against rr-backed targets (reached via
+  `target.connect_remote rr://`); `process.reverse_step` / `thread.reverse_step`
+  accept all four kinds (`in`/`over`/`out`/`insn`) — `in`/`over`/`out` use a
+  bounded `bs`-loop emulation with source-line + frame-depth termination.
 - Linux-only observers and BPF/tcpdump paths SKIP on macOS or unprivileged runners.
 - macOS local-process tests depend on Apple's signed `debugserver`.
 
@@ -350,9 +380,9 @@ These are acceptable in the planned V1 cut and are part of the public contract:
 
 ## Release artifact policy
 
-Planned V1 releases are **source-only**: semantic-version tags plus release
-notes, with no promise of prebuilt binary tarballs yet. Binary packaging can
-move to post-V1 without changing the wire contract.
+V1 releases are **source-only**: semantic-version tags plus release notes,
+with no promise of prebuilt binary tarballs. Binary packaging can move to a
+later milestone without changing the wire contract.
 
 ---
 
@@ -361,18 +391,22 @@ move to post-V1 without changing the wire contract.
 ```
 include/ldb/         Public headers
 src/main.cpp         Entry point
-src/protocol/        JSON-RPC framing, CBOR transport, view, cost, provenance
+src/protocol/        JSON-RPC framing, CBOR transport, view, cost, provenance, notifications
 src/daemon/          Stdio loop, dispatcher, describe.endpoints catalog
-src/backend/         DebuggerBackend interface, LldbBackend implementation
+src/backend/         DebuggerBackend interface, LldbBackend, GdbMiBackend
 src/store/           Artifact store, session store, .ldbpack pack/unpack
-src/probes/          Probe orchestrator, lldb_breakpoint + bpftrace engines
+src/probes/          Probe orchestrator, lldb_breakpoint + bpftrace engines, rate-limit grammar
 src/observers/       Typed proc/net observers, exec allowlist
-src/transport/       SSH (exec, port-forward, tunneled-cmd), local exec, streaming exec
-src/util/            sha256, log
+src/transport/       SSH (exec, port-forward, tunneled-cmd), local exec, streaming exec, own GDB RSP client
+src/index/           SQLite-backed symbol index
+src/runtime/         Non-stop runtime + listener thread
+src/agent_expr/      Agent-expression bytecode VM + S-expression compiler
+src/util/            sha256, base64, log
+src/dap/             ldb-dap shim (Debug Adapter Protocol)
 tools/ldb/           Python CLI client
 tests/smoke/         End-to-end tests via ldbd subprocess
 tests/unit/          Catch2 unit tests
-tests/fixtures/      Test binaries (structs, sleeper) + canned text fixtures
+tests/fixtures/      Test binaries + canned text fixtures
 third_party/         Vendored deps (nlohmann/json, Catch2 amalgamated)
 docs/                Design docs and engineering worklog
 ```
@@ -384,15 +418,22 @@ docs/                Design docs and engineering worklog
 | File | Purpose |
 |---|---|
 | [`docs/00-README.md`](docs/00-README.md) | Architecture overview, design decisions, reading order |
-| [`docs/01-gdb-core-methodology.md`](docs/01-gdb-core-methodology.md) | Analysis of GDB 17.1's architecture — foundational reading |
-| [`docs/02-ldb-mvp-plan.md`](docs/02-ldb-mvp-plan.md) | V1 plan: protocol spec, RPC surface, milestones, reference workflow |
-| [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md) | Post-V1 trajectory: progressive replacement of LLDB components |
+| [`docs/01-gdb-core-methodology.md`](docs/01-gdb-core-methodology.md) | Analysis of GDB's architecture — foundational reading |
+| [`docs/02-ldb-mvp-plan.md`](docs/02-ldb-mvp-plan.md) | Protocol spec, RPC surface, reference workflow |
+| [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md) | Progressive replacement of LLDB components |
 | [`docs/06-ci.md`](docs/06-ci.md) | What CI runs, what SKIPs on the runner, how to reproduce locally |
-| [`docs/07-dap-shim.md`](docs/07-dap-shim.md) | `ldb-dap` Debug Adapter Protocol shim — supported requests, capabilities, VS Code launch.json example |
-| [`docs/13-v1-readiness.md`](docs/13-v1-readiness.md) | V1 release gates, supported matrix, validation commands, and known limitations |
-| [`docs/14-pack-signing.md`](docs/14-pack-signing.md) | `.ldbpack` ed25519 signing — design, key format, failure matrix |
-| [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) | Tiered breakdown of post-V1 deferred work with dependency graph and execution order |
-| [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md) | Reverse-execution endpoints over rr via RSP packet injection — design, scope, kind=insn-only contract |
+| [`docs/07-dap-shim.md`](docs/07-dap-shim.md) | `ldb-dap` Debug Adapter Protocol shim |
+| [`docs/13-v1-readiness.md`](docs/13-v1-readiness.md) | V1 release gates, supported matrix, validation commands |
+| [`docs/14-pack-signing.md`](docs/14-pack-signing.md) | `.ldbpack` ed25519 signing |
+| [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) | Tiered breakdown of post-V1 work with dependency graph |
+| [`docs/16-reverse-exec.md`](docs/16-reverse-exec.md) | Reverse-execution endpoints over rr |
+| [`docs/23-symbol-index.md`](docs/23-symbol-index.md) | SQLite-backed cross-binary symbol index |
+| [`docs/24-session-fork-replay.md`](docs/24-session-fork-replay.md) | `session.fork` / `session.replay` design |
+| [`docs/25-own-rsp-client.md`](docs/25-own-rsp-client.md) | Own GDB Remote Serial Protocol transport |
+| [`docs/26-nonstop-runtime.md`](docs/26-nonstop-runtime.md) | Per-thread state machine + push notifications |
+| [`docs/27-nonstop-listener.md`](docs/27-nonstop-listener.md) | Listener thread + stream-locked notifications |
+| [`docs/28-agent-expressions.md`](docs/28-agent-expressions.md) | Agent-expression bytecode VM (GDB-compatible subset) |
+| [`docs/29-predicate-compiler.md`](docs/29-predicate-compiler.md) | S-expression DSL → bytecode compiler |
 | [`docs/WORKLOG.md`](docs/WORKLOG.md) | Engineering journal — newest entries on top |
 | [`CLAUDE.md`](CLAUDE.md) | Workflow rules for AI-assisted development on this repo |
 
@@ -426,28 +467,6 @@ See [`CLAUDE.md`](CLAUDE.md) for the full workflow rules.
 
 ---
 
-## Out of scope (post-v1.x)
-
-The cores-only provenance scope was a deliberate decision; live-process
-provenance is the largest deferred item and is tracked as a major post-V1
-milestone in [`docs/03-ldb-full-roadmap.md`](docs/03-ldb-full-roadmap.md).
-Other deferrals:
-
-- **Live-process provenance** — resume-counter + register-hash snapshot
-  model + per-endpoint determinism audit. Unblocks `session.fork` and
-  `session.replay` against live targets. Scheduled for v1.5.
-- **`session.fork` / `session.replay`** — depend on live provenance.
-- **GDB/MI second backend** — proves the `DebuggerBackend` abstraction
-  doesn't quietly leak LLDB-isms. Scheduled for v1.4.
-- **Embedded Python for user-authored probe callbacks** — current probes
-  are C++-only. Scheduled for v1.4.
-- **CLI: interactive REPL, ssh-remote daemon mode.** Scheduled for v1.4.
-
-See [`docs/15-post-v1-plan.md`](docs/15-post-v1-plan.md) for the full
-tiered breakdown of post-V1 work with dependencies and execution order.
-
----
-
 ## License
 
 Apache 2.0 — see [`LICENSE`](LICENSE).
@@ -463,6 +482,7 @@ required tests, and the PR checklist.
 ## References
 
 - [LLVM project (LLDB SBAPI)](https://github.com/llvm/llvm-project) — Apache 2.0 with LLVM exception
-- [GDB 17.1](https://www.gnu.org/software/gdb/) — referenced in `docs/01-gdb-core-methodology.md`
+- [GDB](https://www.gnu.org/software/gdb/) — referenced in `docs/01-gdb-core-methodology.md`
+- [GDB Agent Expressions](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Agent-Expressions.html) — the bytecode subset LDB's `predicate.compile` emits
 - [nlohmann/json](https://github.com/nlohmann/json) — vendored under `third_party/nlohmann/`
 - [Catch2 v3](https://github.com/catchorg/Catch2) — amalgamated under `third_party/catch2/`
