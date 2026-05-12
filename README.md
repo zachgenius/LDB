@@ -21,30 +21,40 @@ graph that survives across sessions.
 ## Status
 
 **V1 released.** `v1.0.0` closed all release gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.3.0` is the
-current tag — an agent-UX polish release on top of v1.2.0's signing
-+ reverse-exec foundations:
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.4.0` is the
+current tag — "Backend abstraction + observability" — eight items
+ranging from a second backend implementation to ldb-scriptable probes
+and a libbpf agent ([docs/17-version-plan.md](docs/17-version-plan.md)):
 
-- `recipe.reload` + `LDB_RECIPE_DIR` startup scan for hot-reloading
-  file-backed probe recipes;
-- `artifact.put format="hypothesis-v1"` + `artifact.hypothesis_template`
-  for structured belief tracking;
-- `view.diff_against=<snapshot>` on `module.list` / `thread.list`
-  (set-symmetric-difference against a cached baseline snapshot);
-- `process.reverse_step` / `thread.reverse_step` now accept
-  `kind=in/over/out` via client-side `bs`-loop emulation
-  (see [docs/16-reverse-exec.md](docs/16-reverse-exec.md));
-- `describe.endpoints` with `view.include_cost_stats=true` returns
-  measured `cost_p50_tokens` alongside the static `cost_hint`;
-- Token-budget regression CI gate (`tests/baselines/agent_workflow_tokens.json`)
-  locks `_cost.tokens_est` totals across a canonical RPC sequence,
-  fails on ±10% drift.
+- **GdbMiBackend** ([docs/18-gdbmi-backend.md](docs/18-gdbmi-backend.md))
+  — second `DebuggerBackend` implementation over `gdb --interpreter=mi3`.
+  Validates the abstraction before v1.5's deeper rewrites; selectable
+  per-session via `target.create_empty backend=gdb`.
+- **Interactive REPL** for `tools/ldb/ldb` — persistent daemon across
+  many calls, `:explain` / `:cost` / `:replay` meta-commands, tab
+  completion via prompt_toolkit or readline.
+- **ssh-remote daemon mode** ([docs/19](docs/19-ssh-remote.md)) —
+  `ldb --ssh user@host` spawns `ldbd --stdio` on the remote; daemon
+  itself is unchanged (ssh is the byte stream).
+- **Embedded Python probe callbacks** ([docs/20](docs/20-embedded-python.md))
+  — `recipe.create format=python-v1 body=<src>`; `recipe.run` invokes
+  `def run(ctx)` and returns the result. `process.set_python_unwinder`
+  + `process.list_frames_python` reuse the embed for custom frame
+  walking.
+- **ldb-probe-agent** ([docs/21](docs/21-probe-agent.md)) — standalone
+  libbpf+CO-RE binary speaking length-prefixed JSON over stdio. Probes
+  with `kind="agent"` route to a persistent AgentEngine; daemon stays
+  unprivileged, agent holds CAP_BPF.
+- **perf integration** ([docs/22](docs/22-perf-integration.md)) —
+  `perf.record` / `perf.report` / `perf.cancel` shell to `perf`,
+  parse `perf script` output, store the trace as a binary artifact.
+  Command-mode allowlist-gated; 256 MiB perf.data cap; 10 kHz freq cap.
 
-Earlier additive features remain: `.ldbpack` ed25519 signing
-([docs/14](docs/14-pack-signing.md)), reverse-execution endpoints
-([docs/16](docs/16-reverse-exec.md)), and the dogfood fixes from
-v1.1.0 (qualified C++ symbol lookup, DWARF `byte_size` warnings,
-`address` alias on disassembled instructions).
+Earlier additive features remain from v1.3 (recipe.reload, hypothesis
+artifact, view.diff_against, reverse-step kinds, measured cost preview,
+token-budget CI gate), v1.2 (`.ldbpack` ed25519 signing
+[docs/14](docs/14-pack-signing.md), reverse-execution endpoints
+[docs/16](docs/16-reverse-exec.md)), and the v1.1 dogfood fixes.
 
 No breaking wire changes since v1.0.0; everything since is additive.
 See [docs/17-version-plan.md](docs/17-version-plan.md) for the full
@@ -53,8 +63,8 @@ for the item-level catalog.
 
 | | |
 |---|---|
-| **Validation** | Default `ctest` suite (58 tests) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
-| **Endpoints** | 87 across target / process / thread / frame / value / memory / probe / observer / session / artifact / recipe / correlate |
+| **Validation** | Default `ctest` suite (67 tests, 100% pass on a stock Linux dev box; SKIP-gated live-attach tests run when `kernel.yama.ptrace_scope=0` or with CAP_SYS_PTRACE) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
+| **Endpoints** | 94 across target / process / thread / frame / value / memory / probe / agent / perf / observer / session / artifact / recipe / correlate |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
 | **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
