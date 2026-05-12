@@ -4,6 +4,107 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #17 phase-2: vCont write path via RspChannel
+
+**Goal:** Close the loop on the v1.6 #21 phase-2 commit by giving the
+own RSP client real data-path responsibility for the thread.* resume
+verbs. With #21 phase-2 the listener already consumed the channel's
+recv queue (read path); this commit makes the dispatcher emit
+`vCont;c:<tid>` and `vCont;t:<tid>` packets on the channel's send
+side (write path), so RSP-backed targets get fully async non-stop
+semantics + the thread.suspend -32001 stub drops for them.
+
+**Done:**
+
+- **Dispatcher routing** (`cbb5dc7`) — handle_thread_continue and
+  handle_thread_suspend gate on rsp_channels_.find(target_id). When
+  a channel is parked, they construct a transport::rsp::VContAction
+  with the appropriate action byte ('c' for continue, 't' for stop)
+  + the tid, and emit it via chan->send (fire-and-forget — the
+  listener thread from #21 phase-2 consumes the eventual stop reply
+  and fires thread.event). thread.continue returns kRunning
+  immediately; thread.suspend returns kRunning too (fixed in
+  reviewer pass — see below). Non-RSP targets keep the existing
+  LldbBackend path unchanged.
+
+- **Dispatcher test seam** (`cbb5dc7`) — Dispatcher::
+  install_rsp_channel_for_test is a public method that bypasses the
+  qSupported handshake and parks a pre-built RspChannel + registers
+  it with the listener. Tests build AdoptFd channels over
+  socketpair() and inject them.
+
+- **Tests** (`cbb5dc7`) — tests/unit/test_dispatcher_vcont_rsp.cpp
+  with 3 cases:
+    * thread.continue against RSP-backed target emits
+      `$vCont;c:2a#cs8` on the peer fd (verified via socketpair
+      drain); response state=running; thread.list_state shows the
+      thread as running.
+    * thread.suspend against RSP-backed target emits
+      `$vCont;t:7#cs8`; response state=running (post-reviewer
+      change); -32001 stub is gone.
+    * thread.suspend against a non-RSP target STILL returns -32001
+      with the phase-2 hint preserved (so the existing
+      test_dispatcher_nonstop.cpp assertion doesn't regress).
+
+- **Reviewer pass** (`b1f8f82`) — four findings, all fixed:
+    * thread.suspend was returning kStopped while the comment said
+      "don't optimistically mark kStopped." Code/comment disagreed;
+      code was wrong. Returns kRunning now; ground truth comes
+      from thread.event via the listener.
+    * describe.endpoints thread.continue summary now spells out the
+      async-for-RSP contract change so an agent reading the
+      catalog doesn't expect synchronous v0.3 semantics on
+      connect_remote_rsp targets.
+    * install_rsp_channel_for_test header explicitly warns about
+      the handshake bypass — production callers would silently
+      misbehave on servers that don't speak vCont.
+    * vCont tid=0 sentinel (all-threads in build_vCont) flagged at
+      both cast sites in the dispatcher; tid_param() is uint_min(1)
+      so the schema rejects 0, but the trap deserves a comment.
+
+**Decisions:**
+
+- **Async thread.continue for RSP-backed targets is the right
+  contract change**. The whole point of non-stop is that the resume
+  doesn't block until the next stop. Returning kRunning immediately
+  + thread.event notification is the honest model. Documented in
+  describe.endpoints so existing agents know to switch event loops.
+- **thread.suspend returns kRunning, not kStopped**. Some servers
+  ignore vCont;t for already-stopped threads; the dispatcher doesn't
+  know ground truth until the server's stop reply arrives. Returning
+  kRunning makes the agent rely on the listener's
+  thread.event{kind:stopped} for confirmation.
+- **LldbBackend resume path keeps the -32001 stub**. Flipping
+  LldbBackend's resume verbs to async requires SBDebugger::SetAsync
+  (true) + its own listener integration. Out-of-scope for this PR;
+  documented in docs/27 §6.
+- **install_rsp_channel_for_test is a public test seam**, not
+  hidden behind #ifdef. Project-of-this-size hygiene — the header
+  comment now strongly warns production callers off, which is
+  cheaper than CMake plumbing.
+
+**Surprises / blockers:**
+
+- The pre-existing assertion in test_dispatcher_nonstop.cpp's
+  thread.suspend test (-32001 path) checks
+  `error_message.find("phase-2")`. My first stab at the new error
+  message dropped that string; restored it so the legacy test
+  doesn't regress. Future trim of the message still has to keep
+  "phase-2" or update the test in lockstep.
+
+**Next:**
+
+- **LldbBackend SetAsync(true) flip** can land as its own commit
+  with its own test cascade — the runtime + listener + write path
+  are all ready; LldbBackend just needs to grow a SBListener pump.
+- **#25 (in-target agent-expression predicates)** can ride the
+  same listener surface — predicate hits become thread.event-shaped
+  notifications.
+- **#26 (tracepoints / no-stop collection)** similarly: tracepoints
+  are no-stop probes that emit via the listener.
+
+---
+
 ## 2026-05-12 — v1.6 #21 phase-2: listener thread + stream-locked notifications
 
 **Goal:** Close phase-1's write-mirror-vs-ground-truth gap for
