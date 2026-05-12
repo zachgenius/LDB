@@ -228,6 +228,18 @@ set_tests_properties(smoke_connect_remote_ssh PROPERTIES
   TIMEOUT 60
 )
 
+# Post-V1 plan #17 phase-1 (docs/25-own-rsp-client.md §3): own RSP
+# client end-to-end. SKIPs cleanly when lldb-server isn't on PATH.
+add_test(
+  NAME smoke_rsp_connect
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_rsp_connect.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_rsp_connect PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_connect_rr
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_connect_rr.py"
