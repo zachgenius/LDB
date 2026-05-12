@@ -27,6 +27,7 @@
 #include "transport/ssh.h"
 #include "util/log.h"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -4107,18 +4108,28 @@ resolve_main_module(
 
 std::optional<index::FileFingerprint>
 fingerprint_for(const std::string& path) {
-  std::error_code ec;
-  auto sz = std::filesystem::file_size(path, ec);
-  if (ec) return std::nullopt;
-  auto last = std::filesystem::last_write_time(path, ec);
-  if (ec) return std::nullopt;
-  auto sys = std::chrono::clock_cast<std::chrono::system_clock>(last);
-  auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                 sys.time_since_epoch()).count();
+  // POSIX stat() rather than fs::last_write_time + clock_cast: Apple
+  // clang's libc++ doesn't ship std::chrono::clock_cast (libstdc++
+  // does — diverged C++20 conformance). stat() works portably on
+  // Linux + macOS and gives us nanosecond resolution directly via
+  // st_mtim / st_mtimespec. For the cache-key purpose any consistent
+  // monotonic-on-change conversion suffices; we don't need
+  // absolute-epoch semantics.
+  struct ::stat st{};
+  if (::stat(path.c_str(), &st) != 0) return std::nullopt;
+#if defined(__APPLE__)
+  std::int64_t ns = static_cast<std::int64_t>(st.st_mtimespec.tv_sec)
+                      * 1'000'000'000LL
+                  + static_cast<std::int64_t>(st.st_mtimespec.tv_nsec);
+#else
+  std::int64_t ns = static_cast<std::int64_t>(st.st_mtim.tv_sec)
+                      * 1'000'000'000LL
+                  + static_cast<std::int64_t>(st.st_mtim.tv_nsec);
+#endif
   index::FileFingerprint fp;
   fp.path     = path;
   fp.mtime_ns = ns;
-  fp.size     = static_cast<std::int64_t>(sz);
+  fp.size     = static_cast<std::int64_t>(st.st_size);
   return fp;
 }
 

@@ -29,6 +29,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -68,19 +69,25 @@ fs::path make_fake_binary(const fs::path& root,
 }
 
 FileFingerprint fingerprint_of(const fs::path& p) {
-  auto st = fs::file_size(p);
-  auto last = fs::last_write_time(p);
-  // Convert to a stable epoch-ns. The conversion is platform-y;
-  // since the only purpose is comparing same-platform fingerprints
-  // we cast via the system_clock duration. This matches what
-  // SymbolIndex computes internally on populate / cache_status.
-  auto sys = std::chrono::clock_cast<std::chrono::system_clock>(last);
-  auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                 sys.time_since_epoch()).count();
+  // POSIX stat() — apple-clang libc++ doesn't ship clock_cast yet.
+  // The dispatcher uses the same approach (see dispatcher.cpp
+  // fingerprint_for); identical formula here so unit tests and the
+  // production cache key agree.
+  struct ::stat st{};
+  REQUIRE(::stat(p.c_str(), &st) == 0);
+#if defined(__APPLE__)
+  std::int64_t ns = static_cast<std::int64_t>(st.st_mtimespec.tv_sec)
+                      * 1'000'000'000LL
+                  + static_cast<std::int64_t>(st.st_mtimespec.tv_nsec);
+#else
+  std::int64_t ns = static_cast<std::int64_t>(st.st_mtim.tv_sec)
+                      * 1'000'000'000LL
+                  + static_cast<std::int64_t>(st.st_mtim.tv_nsec);
+#endif
   FileFingerprint fp;
   fp.path     = p.string();
   fp.mtime_ns = ns;
-  fp.size     = static_cast<std::int64_t>(st);
+  fp.size     = static_cast<std::int64_t>(st.st_size);
   return fp;
 }
 
