@@ -91,28 +91,37 @@ void NonStopListener::apply_stop_reply_for_test(backend::TargetId target,
 
 void NonStopListener::thread_main_() {
   while (!shutdown_.load(std::memory_order_acquire)) {
-    // Hold shared_lock for the entire iteration (snapshot + recv +
-    // apply). unregister_target waits at most one iteration; given a
-    // poll_interval of ~20 ms and a handful of channels, the
-    // upper bound is well under a typical RPC's response latency.
+    // The per-iteration shared_lock is held only over a sequence of
+    // *non-blocking* try_recvs (timeout=0). RspChannel::recv(0ms)
+    // checks recv_q_ once and returns std::nullopt if empty. Iteration
+    // cost is microseconds even with many registered channels, so
+    // unregister_target's exclusive-lock wait is bounded at
+    // microseconds — not N × poll_interval. The actual poll cadence
+    // comes from the sleep at the bottom of the loop, which happens
+    // outside the lock.
+    //
+    // We deliberately keep the lock held across the try_recv calls
+    // (rather than snapshotting the raw pointers and releasing the
+    // lock before iterating) because dropping the lock would leave a
+    // window where unregister_target could return, the dispatcher
+    // could destroy the channel via rsp_channels_.erase, and the
+    // listener's still-held raw pointer would dangle. Shared_lock
+    // held across try_recv is the cheapest correct ownership
+    // discipline; per-channel shared_ptr refactor would also work
+    // but is more invasive.
     {
       std::shared_lock lk(map_mu_);
       for (const auto& [tid, chan] : by_target_) {
-        auto payload = chan->recv(poll_interval_);
+        auto payload = chan->recv(std::chrono::milliseconds(0));
         if (payload.has_value()) {
           apply_payload_(tid, *payload);
         }
       }
     }
-    // If we have no registrations, recv() didn't run — burn poll
-    // interval here so the busy loop doesn't spin on shutdown_.
-    {
-      std::shared_lock lk(map_mu_);
-      if (by_target_.empty()) {
-        lk.unlock();
-        std::this_thread::sleep_for(poll_interval_);
-      }
-    }
+    // Burn the poll interval OUTSIDE the lock so unregister_target
+    // never has to wait the full interval — only one (microsec-bounded)
+    // try_recv pass.
+    std::this_thread::sleep_for(poll_interval_);
   }
 }
 

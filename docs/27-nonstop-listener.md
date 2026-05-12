@@ -98,21 +98,32 @@ The listener thread loop:
 
 ```
 while (!shutdown_.load()) {
-  std::vector<std::pair<TargetId, RspChannel*>> snap;
   {
     std::shared_lock lk(map_mu_);
-    snap.reserve(by_target_.size());
-    for (auto& kv : by_target_) snap.emplace_back(kv.first, kv.second);
+    for (auto& [tid, chan] : by_target_) {
+      auto p = chan->recv(0ms);    // NON-BLOCKING — checks queue once
+      if (p.has_value()) apply_stop_reply_(tid, *p);
+    }
   }
-  for (auto& [tid, chan] : snap) {
-    auto p = chan->recv(poll_interval_);   // returns nullopt on timeout
-    if (!p.has_value()) continue;
-    apply_stop_reply_(tid, *p);
-  }
-  // poll_interval is short (50 ms) but uniform across all channels —
-  // the per-channel recv is itself bounded by the same interval.
+  std::this_thread::sleep_for(poll_interval_);   // outside the lock
 }
 ```
+
+The shared_lock is held only across a sequence of non-blocking
+`try_recv`s; iteration cost is microseconds even with many channels,
+so `unregister_target`'s exclusive lock waits microseconds — not
+`N × poll_interval`. The poll cadence comes from the sleep at the
+bottom of the loop, which runs outside the lock so an unregister
+during the sleep is a clean exclusive-lock acquire.
+
+We deliberately keep the lock held across the `try_recv` calls
+rather than snapshotting raw pointers and releasing — dropping the
+lock would leave a window where `unregister_target` returns, the
+dispatcher destroys the channel via `rsp_channels_.erase`, and the
+listener's still-held raw pointer dangles. Shared_lock-across-try_recv
+is the cheapest correct ownership discipline. A `shared_ptr<RspChannel>`
+refactor would let unregister be instantaneous independent of the
+snapshot pattern, but is more invasive than needed today.
 
 `apply_stop_reply_` parses the payload with `parse_stop_reply`,
 maps the gdb stop kv-pairs to `runtime::ThreadStop`, and calls
@@ -148,44 +159,52 @@ dominated by network RTT, not the poll.
 ```cpp
 class Dispatcher {
   …
-  runtime::NonStopRuntime      nonstop_;
-  // NEW:
-  std::unique_ptr<runtime::NonStopListener>  listener_;
+  runtime::NonStopRuntime    nonstop_;
+  runtime::NonStopListener   nonstop_listener_;   // declared AFTER nonstop_
 };
 ```
 
-`listener_` is lazily constructed on the first
-`target.connect_remote_rsp` that succeeds; the listener exists as
-long as the dispatcher does. `handle_target_connect_remote_rsp`
-calls `listener_->register_target(tid, chan.get())` *after* parking
-the channel in `rsp_channels_` but *before* returning to the agent.
-`handle_target_close` calls `listener_->unregister_target(tid)`
-*before* destroying the channel — so the listener never holds a
-dangling pointer past the channel's destructor.
+`nonstop_listener_` is a value-typed member constructed eagerly in
+the dispatcher's init list with a reference to `nonstop_`. The
+declaration order matters: on destruction, the listener joins
+*first* (its thread's last reference to `runtime_` is dropped
+before the runtime itself goes out of scope). Eager construction is
+simpler than lazy (no atomic init-flag, no first-connect race
+window) and the thread cost is one OS thread per daemon — well
+within budget.
+
+`handle_target_connect_remote_rsp` calls
+`nonstop_listener_.register_target(tid, chan.get())` *after*
+parking the channel in `rsp_channels_`. The two-step is safe
+because the dispatcher is single-threaded (see dispatcher.h's
+class comment): no other thread can observe the partial state
+between the park and the register.
+
+`handle_target_close` calls `nonstop_listener_.unregister_target(tid)`
+*before* destroying the channel — after unregister returns, the
+listener cannot be mid-recv on this channel, so the `unique_ptr`'s
+destructor can join the channel's reader + close the fd without
+racing the listener.
 
 The order of operations in `handle_target_close` becomes:
 
 ```
-1. listener_->unregister_target(tid)   // listener stops touching the channel
-2. backend_->close_target(tid)          // backend tears down its half
-3. target_main_module_.erase(tid)
-4. rsp_channels_.erase(tid)             // channel destructor joins its reader
+1. backend_->close_target(tid)              // backend tears down its half
+2. target_main_module_.erase(tid)
+3. nonstop_listener_.unregister_target(tid) // listener stops touching the channel
+4. rsp_channels_.erase(tid)                  // channel destructor joins its reader
 5. nonstop_.forget_target(tid)
 ```
 
-`unregister_target` must wait for any in-flight `recv()` against
-that channel to return before returning. Implementation: the
-listener thread takes `map_mu_` in shared mode for the *snapshot
-copy*, then releases it before the per-channel recv loop. So an
-unregister has to wait at most one poll cycle (~50 ms) for the
-listener to next take the lock and observe the missing entry.
-Better: `unregister_target` records the tid in a `pending_drops_`
-set, the listener checks the set after each per-channel recv and
-skips the entry, and only when the listener has confirmed no more
-recvs against that channel will pending_drops_.erase + the actual
-map_mu_-protected erase happen. (Implementation prefers the
-single-pass version because the simpler design works; we'll grow
-the pending-drops dance only if a test catches a race.)
+`unregister_target` is a single `unique_lock(map_mu_) + erase`. It
+waits until the listener thread's current iteration's `shared_lock`
+releases. Because the iteration is `try_recv` over each channel
+(non-blocking) + apply (microseconds), the upper bound is
+microseconds independent of `N`. After `unregister_target` returns,
+the listener cannot dereference the channel pointer again until it
+re-takes the lock, by which time `rsp_channels_.erase` is the only
+reader allowed — and the channel pointer has been removed from
+`by_target_`, so the iteration doesn't see it.
 
 ## 5. Tests
 
@@ -207,10 +226,13 @@ runtime + sink shape. Phase-2 adds:
 - **`tests/unit/test_output_channel.cpp`** — concurrent
   write_response + write_notification from two threads, assert
   every emitted frame is a valid JSON line (no byte interleave).
-- **`tests/unit/test_dispatcher_listener_register.cpp`** —
-  target.connect_remote_rsp + target.close. Asserts the listener
-  sees the channel between connect and close; uses a captor sink
-  installed on the dispatcher's runtime.
+- **`tests/unit/test_dispatcher_listener_register.cpp`** — deferred.
+  The dispatcher wiring is two lines (register_target after parking
+  in rsp_channels_; unregister_target before erasing); the unit-level
+  listener tests cover the listener behaviour, and the live integration
+  arrives with the smoke test once #17-phase-2 lets us drive `vCont`
+  through `RspChannel`. Revisit if a future bug invalidates that
+  judgement.
 
 Live smoke (real `lldb-server` over RSP) is deferred to the same
 follow-up that wires #17-phase-2's data path through `RspChannel` —
