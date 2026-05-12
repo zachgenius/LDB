@@ -4,6 +4,119 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #25 phase-1: agent-expression bytecode VM
+
+**Goal:** The third item in v1.6's non-stop chain (per
+docs/17-version-plan.md), after #17 (own RSP) and #21 (non-stop
+runtime). Phase-1 lands a small stack-based bytecode VM for
+evaluating probe/breakpoint predicates daemon-side, against the
+existing `DebuggerBackend.read_register` / `read_memory` API. The
+opcode set is a deliberate subset of GDB's agent expression spec
+(gdb manual §28) so phase-3 (#26 territory) can push the same
+bytecode through `QTDP` for in-target evaluation without
+translation.
+
+**Done:**
+
+- **`docs/28-agent-expressions.md`** (`c933917`) — phase-1 design
+  note. Opcode table (~25 ops), wire format (length-prefixed
+  opcode stream + inline reg name table), anti-DoS caps (4 KiB
+  program / 64 stack depth / 10K instructions), failure matrix,
+  phase scoping (phase-1 = VM only; phase-2 = compiler + probe
+  wiring; phase-3 = in-target).
+
+- **`src/agent_expr/bytecode.h`** (`d0e210c`) — `Op` enum, `Program`
+  struct (code + reg name table), `EvalContext` (target/tid/frame/
+  backend), `EvalResult` (error + value), public `eval()` /
+  `encode()` / `decode()` / `mnemonic()`. Anti-DoS caps as `constexpr`
+  (kMaxStackDepth=64, kMaxProgramBytes=4 KiB, kMaxInsnCount=10K).
+
+- **`src/agent_expr/codec.cpp`** (`d0e210c`) — wire encoder/decoder.
+  Refuses oversize at decode-time (before allocating). Refuses any
+  truncation point. Refuses program_size header mismatch
+  (silent-truncation guard).
+
+- **`src/agent_expr/evaluator.cpp`** (`d0e210c`, `cc5d44f`) — the
+  VM. Stack-based, signed-64-bit values. ~25 ops: const8/16/32/64,
+  reg (by name-table index), ref8/16/32/64 (LE memory deref via
+  backend.read_memory), arithmetic (add/sub/mul/div_signed with
+  div-by-zero guard), comparison ladder (eq/ne/lt/le/gt/ge signed),
+  bitwise (and/or/xor/not), logical (and/or/not), stack (dup/drop/
+  swap), end.
+
+- **Tests** (`d0e210c`, `cc5d44f`) — 31 cases / 86 assertions:
+    * codec.cpp — round-trip, empty program, every truncation
+      point rejected, program_size mismatch rejected, oversize
+      rejected, multi-byte reg names round-trip.
+    * evaluator.cpp — every opcode in the table, sign-extension
+      via const8 0xff = -1, div_by_zero, comparison ladder,
+      bitwise vs logical, dup/drop/swap, reg via MockBackend, ref32
+      LE decode, ref64 against unmapped addr → kMemReadFailed,
+      stack underflow on bare binop, bad opcode 0xfe, truncated
+      const32 imm, 65-deep push exceeds cap (kStackOverflow),
+      programmer-bypassed codec cap (kProgramTooLong), missing
+      kEnd → kMissingEnd.
+
+- **Reviewer pass** (`cc5d44f`) — five findings, all fixed:
+    * **Critical**: `read_be(n=8)` had UB on `sign_bit << 1`
+      shifting bit 63 of a signed int64_t. Guarded with `n < 8`;
+      n=8 path doesn't need extension anyway.
+    * **Critical**: `do_ref` caught `(...)` swallowing std::bad_alloc.
+      Narrowed to `catch (const backend::Error&)`.
+    * Split `kProgramTooLong` into `kProgramTooLong` (byte-count
+      cap) vs `kInsnLimitExceeded` (execution cycle cap). Phase-2
+      will surface these on the wire — fixing the contract now
+      saves a break later.
+    * Missing `kEnd` was silently benign — a truncated bytecode
+      could masquerade as a valid predicate. Now surfaces
+      `kMissingEnd`. Test added.
+    * `vm.last_top` field was per-opcode-handler bookkeeping that
+      could rot. Deleted; replaced with `vm.result()` reading
+      `stack[sp-1]` at every return site.
+
+**Decisions:**
+
+- **Bytecode chosen over string AST** (docs/28 §1). Tracepoints
+  fire often — decode-once / evaluate-many is the right shape.
+  In-target injection (phase-3) needs a wire format anyway. GDB
+  already speaks this, so interop with existing gdb-remote
+  tooling is free.
+
+- **Phase-1 daemon-side first**. The in-target VM lands in phase-3
+  with the gdb-remote `QTDP` family. Proving the contract
+  daemon-side against `DebuggerBackend.read_register` /
+  `read_memory` lets phase-2 build a compiler + probe wiring
+  without simultaneously inventing the wire transport.
+
+- **No `predicate.compile` stub in phase-1** (reviewer #9 endorsed).
+  An endpoint that accepts input and ignores it teaches agents
+  it's available; phase-2's real impl would have to be
+  wire-compatible or break callers. Wait until there's real
+  behavior to expose.
+
+**Surprises / blockers:**
+
+- First-pass evaluator had `last_top` field updated in each opcode
+  handler — drop forgot to update it, and a test caught the
+  resulting wrong return. Reviewer flagged the same pattern as
+  brittle; deleted the field entirely.
+
+- Test `bit_xor(0x0f, 0xff)` expected `0xf0` but with sign-extended
+  const8 (0xff = -1) the result is -16. Test updated; the int64-
+  signed VM is the right model.
+
+**Next:**
+
+- **#25 phase-2**: S-expression → bytecode compiler + `probe.create`
+  predicate field + `predicate.compile` endpoint (returns the
+  base64-encoded bytecode for an agent-supplied source).
+
+- **#26 (tracepoints / no-stop collection)**: rides the same
+  bytecode through gdb-remote's `QTDP` packet family for in-target
+  evaluation. Bytecode format is unchanged; the wire push is new.
+
+---
+
 ## 2026-05-12 — v1.6 #17 phase-2: vCont write path via RspChannel
 
 **Goal:** Close the loop on the v1.6 #21 phase-2 commit by giving the
