@@ -24,11 +24,11 @@ ground-truth**: `thread.list_state` reported intent expressed via
   `thread.event{kind:"stopped"}` through the sink.
 - **Dispatcher** registers each `RspChannel` with the listener on
   `target.connect_remote_rsp` and unregisters on `target.close`.
-- **`thread.suspend` stub stays -32001 in this commit.** Suspending
-  a running thread requires emitting `vCont;t:tid` against an RSP
-  data path, which is #17-phase-2 territory (operations through our
-  own client, not LLDB's gdb-remote plugin). The listener side is
-  ready; the writer side waits for #17-phase-2.
+- **`thread.suspend` stub drops for RspChannel-backed targets**
+  (post-#17-phase-2 commit). The dispatcher emits `vCont;t:<tid>`
+  over the parked channel and returns ok. LLDB-backed targets still
+  hit the -32001 path until they grow their own listener
+  integration.
 - **LldbBackend SetAsync(true) stays off.** Flipping that one line
   cascades behavioural changes across every existing test that
   expects `SBProcess::Continue` to block until stop. Out-of-scope

@@ -60,6 +60,27 @@ class Dispatcher {
     nonstop_.set_notification_sink(sink);
   }
 
+  // Test-only seam: install a pre-made RspChannel under target_id +
+  // register it with the listener, bypassing the
+  // target.connect_remote_rsp handshake. Tests use AdoptFd RspChannels
+  // over socketpair() to drive the vCont write path without a real
+  // gdb-remote server.
+  //
+  // **Production callers MUST NOT use this.** Bypassing the handshake
+  // means qSupported never runs — vContSupported, PacketSize,
+  // QStartNoAckMode and the rest of the feature-negotiation surface
+  // are silently skipped. The dispatcher will happily emit vCont
+  // against a server that doesn't speak it, get back an empty reply,
+  // and surface that as a backend error. connect_remote_rsp is the
+  // production path; this seam exists to let unit tests drive the
+  // post-handshake state without depending on a real server.
+  //
+  // Throws std::runtime_error on target_id collision rather than
+  // silently overwriting — same contract as connect_remote_rsp.
+  void install_rsp_channel_for_test(
+      std::uint64_t target_id,
+      std::unique_ptr<transport::rsp::RspChannel> chan);
+
  private:
   std::shared_ptr<backend::DebuggerBackend>    backend_;
   std::shared_ptr<store::ArtifactStore>        artifacts_;

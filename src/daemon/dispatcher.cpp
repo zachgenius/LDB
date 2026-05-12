@@ -467,6 +467,22 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
 
 Dispatcher::~Dispatcher() = default;
 
+void Dispatcher::install_rsp_channel_for_test(
+    std::uint64_t target_id,
+    std::unique_ptr<transport::rsp::RspChannel> chan) {
+  auto backend_tid = static_cast<backend::TargetId>(target_id);
+  // Match connect_remote_rsp's collision contract — caller is meant
+  // to use a fresh target_id, not silently overwrite.
+  if (rsp_channels_.find(backend_tid) != rsp_channels_.end()) {
+    throw std::runtime_error(
+        "install_rsp_channel_for_test: target_id " +
+        std::to_string(target_id) + " already has a channel");
+  }
+  auto* chan_raw = chan.get();
+  rsp_channels_[backend_tid] = std::move(chan);
+  nonstop_listener_.register_target(backend_tid, chan_raw);
+}
+
 // ── DiffCache (post-V1 plan #5) ────────────────────────────────────────
 
 std::string Dispatcher::diff_cache_key(const std::string& method,
@@ -1551,15 +1567,23 @@ with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
 
   add("thread.continue",
-      "Resume the given thread. WARNING: in v0.3 this is SYNC — all "
-      "threads resume together (passthrough into process.continue) "
-      "because the daemon runs LLDB in SBProcess::SetAsync(false). The "
-      "wire shape is async-ready: in v0.4+ when async mode lands this "
-      "endpoint will keep sibling threads stopped (true non-stop). "
-      "Post-V1 #21 phase-1: the call records the thread as running in "
-      "the non-stop runtime so a subsequent thread.list_state reflects "
-      "the resumption; phase-2 will deliver thread.event notifications "
-      "when the thread parks again. See docs/26-nonstop-runtime.md.",
+      "Resume the given thread. WARNING: in v0.3 this is SYNC for "
+      "LLDB-backed targets — all threads resume together (passthrough "
+      "into process.continue) because the daemon runs LLDB in "
+      "SBProcess::SetAsync(false). The wire shape is async-ready: in "
+      "v0.4+ when async mode lands this endpoint will keep sibling "
+      "threads stopped (true non-stop). "
+      "Post-V1 #21 phase-1: records the thread as running in the "
+      "non-stop runtime so a subsequent thread.list_state reflects the "
+      "resumption. "
+      "Post-V1 #17 phase-2: for targets opened via "
+      "target.connect_remote_rsp, the call emits vCont;c over the "
+      "channel and returns IMMEDIATELY with state=running — true async "
+      "non-stop semantics. The actual stop is delivered as a "
+      "thread.event{kind:stopped} notification once the server emits "
+      "the stop reply. Agents driving connect_remote_rsp targets must "
+      "consume notifications rather than block on this response. "
+      "See docs/26-nonstop-runtime.md.",
       obj({
           {"target_id", target_id_param()},
           {"tid",       tid_param()},
@@ -1569,10 +1593,12 @@ with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
 
   add("thread.suspend",
       "Park the given thread without stopping the rest of the process. "
-      "Post-V1 #21 phase-1: returns -32001 kNotImplemented — the "
-      "implementation requires SBDebugger::SetAsync(true) + the "
-      "listener thread (phase-2). The wire surface ships now so agents "
-      "can pre-flight against it. See docs/26-nonstop-runtime.md.",
+      "For targets opened via target.connect_remote_rsp (post-V1 #17 "
+      "phase-2): emits vCont;t over the own RSP client and returns ok. "
+      "For LLDB-backed targets: still returns -32001 kNotImplemented — "
+      "the implementation requires SBDebugger::SetAsync(true) + the "
+      "listener integration on that side, which is its own follow-up "
+      "(docs/27 §6). See docs/26-nonstop-runtime.md.",
       obj({
           {"target_id", target_id_param()},
           {"tid",       tid_param()},
@@ -3943,33 +3969,52 @@ Response Dispatcher::handle_thread_continue(const Request& req) {
                               "missing uint param 'tid'");
   }
   // Tier 4 §14 + post-V1 #21 phase-1: explicit per-thread resume.
-  // Backend call is still a v0.3-shape passthrough today; the runtime
-  // records the thread as kRunning so a subsequent thread.list_state
-  // reflects the transition + phase-2's listener has the right
-  // pre-state when stop events arrive. See docs/26-nonstop-runtime.md.
-  //
-  // We record set_running only when the backend reports the process
-  // actually resumed. A backend returning kStopped / kExited means
-  // the resume didn't take (e.g. process is already dead) — recording
-  // the thread as running in that case would publish a lie.
+  // Post-V1 #17 phase-2 (docs/27 §7): for targets with a parked
+  // RspChannel, route the resume through the channel as a
+  // `vCont;c:<tid>` packet. The listener's recv loop will observe
+  // the eventual stop reply and call set_stopped; the dispatcher
+  // returns immediately with kRunning. For non-RSP targets the
+  // legacy LldbBackend path stays in place.
+  auto backend_tid = static_cast<backend::TargetId>(target_id);
+  if (auto it = rsp_channels_.find(backend_tid); it != rsp_channels_.end()) {
+    transport::rsp::VContAction act;
+    act.action = 'c';
+    // packets.h §VContAction: tid == 0 is the sentinel for "all
+    // threads." tid_param() is uint_min(1) so the schema rejects 0
+    // at the wire — the cast is safe here.
+    act.tid    = static_cast<std::int64_t>(thread_id);
+    try {
+      it->second->send(transport::rsp::build_vCont({act}));
+    } catch (const backend::Error& e) {
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+          std::string("rsp: vCont;c: ") + e.what());
+    }
+    nonstop_.set_running(backend_tid,
+                         static_cast<backend::ThreadId>(thread_id));
+    backend::ProcessStatus status;
+    status.state = backend::ProcessState::kRunning;
+    return protocol::make_ok(req.id, process_status_to_json(status));
+  }
+  // Legacy LldbBackend path: backend call is still a v0.3-shape
+  // passthrough today. We record set_running only when the backend
+  // reports the process actually resumed; a return of kStopped /
+  // kExited (process already dead) shouldn't publish a "running" lie.
   auto status = backend_->continue_thread(
-      static_cast<backend::TargetId>(target_id),
-      static_cast<backend::ThreadId>(thread_id));
+      backend_tid, static_cast<backend::ThreadId>(thread_id));
   if (status.state == backend::ProcessState::kRunning) {
-    nonstop_.set_running(static_cast<backend::TargetId>(target_id),
+    nonstop_.set_running(backend_tid,
                          static_cast<backend::ThreadId>(thread_id));
   }
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 
 Response Dispatcher::handle_thread_suspend(const Request& req) {
-  // Phase-1: not implemented. The state-machine surface is here, but
-  // suspending a running thread requires LLDB's SBDebugger::SetAsync(true)
-  // + the listener thread that pumps SBListener events
-  // (docs/26-nonstop-runtime.md §6 phase-2). Without that, calling
-  // SBThread::Suspend without async mode either no-ops or breaks
-  // process state silently. -32001 with a clear hint is the honest
-  // wire contract until the listener lands.
+  // For RSP-backed targets we now emit `vCont;t:<tid>` directly
+  // (post-V1 #17 phase-2, docs/27 §7). For LLDB-backed targets the
+  // -32001 stub stays — flipping SBDebugger::SetAsync(true) cascades
+  // test breakage and is its own follow-up. The wire surface is
+  // unchanged from #21 phase-1; only the backing changes when an
+  // RspChannel is parked.
   if (!req.params.is_object()) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "params must be object");
@@ -3980,10 +4025,38 @@ Response Dispatcher::handle_thread_suspend(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint params 'target_id' and 'tid'");
   }
+  auto backend_tid = static_cast<backend::TargetId>(target_id);
+  if (auto it = rsp_channels_.find(backend_tid); it != rsp_channels_.end()) {
+    transport::rsp::VContAction act;
+    act.action = 't';   // stop the named thread
+    // packets.h §VContAction: tid == 0 is the sentinel for "all
+    // threads." tid_param() in describe_schema.h is uint_min(1) so
+    // schema validation rejects 0 at the wire — the cast is safe
+    // here, but worth flagging at the call site so future callers
+    // know the sentinel exists.
+    act.tid    = static_cast<std::int64_t>(thread_id);
+    try {
+      it->second->send(transport::rsp::build_vCont({act}));
+    } catch (const backend::Error& e) {
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+          std::string("rsp: vCont;t: ") + e.what());
+    }
+    // Return kRunning rather than kStopped: the call is fire-and-
+    // forget at the wire (no synchronous ack-wait), and some servers
+    // ignore vCont;t for already-stopped threads. Ground truth comes
+    // from the listener's thread.event{kind:stopped} notification
+    // when the server confirms. Agents that need to know the suspend
+    // landed must read thread.event, not this return value.
+    backend::ProcessStatus status;
+    status.state = backend::ProcessState::kRunning;
+    return protocol::make_ok(req.id, process_status_to_json(status));
+  }
   return protocol::make_err(
       req.id, ErrorCode::kNotImplemented,
-      "thread.suspend requires the phase-2 listener thread "
-      "(SetAsync(true)); not available in this build. "
+      "thread.suspend on LLDB-backed targets requires the phase-2 "
+      "listener thread (SetAsync(true)); not available in this build. "
+      "For an RSP-backed target, open it via target.connect_remote_rsp "
+      "and thread.suspend will route through vCont;t. "
       "See docs/26-nonstop-runtime.md.");
 }
 
