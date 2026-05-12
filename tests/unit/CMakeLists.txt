@@ -53,6 +53,7 @@ set(LDB_UNIT_SOURCES
   test_session_store.cpp
   test_session_fork.cpp
   test_dispatcher_session_log.cpp
+  test_dispatcher_session_replay.cpp
   test_session_diff.cpp
   test_dispatcher_session_diff.cpp
   test_backend_targets.cpp

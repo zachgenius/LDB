@@ -292,6 +292,17 @@ set_tests_properties(smoke_session_diff PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #16 phase-1: session.fork + session.replay end-to-end.
+add_test(
+  NAME smoke_session_replay
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_session_replay.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_session_replay PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_multi_binary
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_multi_binary.py"
