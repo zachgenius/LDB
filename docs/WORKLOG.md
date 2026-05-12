@@ -4,6 +4,103 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — post-V1 deferred design notes (#20 / #22 / #24)
+
+**Goal:** Document the three "specialized / opt-in / defer based on
+real user pull" items from `docs/17-version-plan.md` so the gates
+for future implementation are pre-paid. Not implementing — only
+recording the design surface so a future contributor (or future
+self) doesn't start from a blank page when a triggering signal
+arrives.
+
+**Done:**
+
+- **`docs/31-own-ptrace.md`** — Post-V1 #20 (Own Linux ptrace
+  driver). Disposition stays "defer until LLDB's
+  `NativeProcessLinux` shows a concrete gap." Documents the
+  triggering signals (kernel features LLDB doesn't expose:
+  PTRACE_GET_SYSCALL_INFO, seccomp-aware tracing, io_uring
+  observability, PIDFD; measurable gaps: per-thread throughput,
+  displaced-step latency, wakeup batching), the phase-1 scope
+  (`LinuxPtraceBackend` as a `DebuggerBackend` implementation
+  alongside `LldbBackend` / `GdbMiBackend`, signalfd + waitpid
+  loop, per-tid state tracking, libunwind for DWARF unwinding),
+  what we lose (expression eval, thread plans, plugin ecosystem,
+  edge-case hardening) and what we gain (direct control over
+  event loop, no SBAPI quirks, smaller binary, no `liblldb`
+  runtime dep). Explicit "macOS is a separate driver, not a path
+  through this note" carve-out.
+
+- **`docs/32-hardware-tracing.md`** — Post-V1 #22 (Intel PT /
+  ARM ETM). Disposition stays "defer; phase-0 (shell-out to
+  perf script) is cheap if any user asks." Documents what
+  PT/ETM offer over sampling (every branch, cycle counts,
+  post-mortem call-flow reconstruction), existing access paths
+  (perf record, LLDB's SBTrace, simpleperf), the integration
+  shape (extend `perf.record` with `intel_pt//` events; new
+  `trace.decode` endpoint with three projections —
+  instructions/calls/summary), dependencies (libipt for x86_64,
+  libopencsd for arm64, kernel >= 4.1, hardware support), and
+  honest complexity assessment (~10–12 weeks for x86_64 PT
+  phase-1; ~3–4 weeks more for ARM). Gates the whole feature
+  behind `LDB_ENABLE_HARDWARE_TRACING`.
+
+- **`docs/33-criu.md`** — Post-V1 #24 (criu snapshot / fork).
+  Disposition stays "defer indefinitely; build only on concrete
+  user demand." Documents what CRIU does and the two user
+  stories that would justify it (`session.criu_fork` for parallel-
+  hypothesis investigation; periodic checkpoints as "poor man's
+  rr"), the brutal compatibility matrix (hard breaks: eBPF,
+  io_uring, GPU contexts, KVM-in-target; soft breaks: device
+  mmaps, some shm patterns; works fine: vanilla processes and
+  containerized workloads), the endpoint shape
+  (`session.criu_fork` / `criu_restore` / `criu_list_snapshots`
+  / `criu_check`), pre-flight scanning as the load-bearing piece
+  (eBPF/io_uring/GPU detection via `/proc/<pid>/fdinfo` +
+  `/proc/<pid>/maps` scan), and hard runtime requirements
+  (CAP_CHECKPOINT_RESTORE, criu installed, kernel >= 5.9,
+  matching kernel between checkpoint and restore). Gates behind
+  `LDB_ENABLE_CRIU`; refuses cleanly with -32003 when not
+  available.
+
+**Decisions:**
+
+- **Format follows `docs/23` through `docs/30`** — TL;DR, numbered
+  sections, failure matrix tables, cross-references at bottom.
+  These are deferred-design notes, not active plans, so each one
+  leads with "why deferred" and "what triggers reconsideration."
+- **Pre-paid integration shape, not commitment.** Each note
+  describes what a phase-1 implementation would look like
+  *if/when* triggered — module layout, endpoint signatures,
+  dependency matrix, failure modes. Reading the note should be
+  enough to start the work without rediscovering the design.
+  None of the notes commit to a timeline.
+- **Each note enumerates concrete triggering signals.** A future
+  reader (human or agent) should be able to look at user pull
+  signals and decide "yes, this trigger has fired" without
+  re-deriving the criteria. For #20 that's specific kernel
+  features + measurable perf gaps; for #22 it's concrete fault-
+  analysis or perf-regression workloads; for #24 it's a CRIU-
+  compatible workload poorly served by v1.5 #16 / rr.
+- **Cross-references back to existing design.** All three notes
+  point at the v1 design surface they extend (`DebuggerBackend`
+  interface, `perf.record` family, `session.fork` shape) so the
+  integration story is concrete from day one.
+
+**Surprises / blockers:**
+
+- None. The notes are documentation work; no code touched, no
+  tests run.
+
+**Next:**
+
+- Active v1.6 chain is unblocked; these notes do not change the
+  current trajectory. Next session picks up whatever's next on
+  the active plan (likely #26 phase-2 or non-stop runtime
+  follow-ups per the recent worklog entries).
+
+---
+
 ## 2026-05-12 — v1.6 #26 phase-1: tracepoints (no-stop collection)
 
 **Goal:** Land the final agent-facing piece in v1.6's non-stop chain.
