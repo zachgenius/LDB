@@ -383,3 +383,149 @@ TEST_CASE("evaluator: program without kEnd surfaces kMissingEnd",
   CHECK(r.error == EvalError::kMissingEnd);
   CHECK(r.value == 7);   // last value pushed is still surfaced
 }
+
+// --- Control flow (#25 phase-3) -------------------------------------------
+//
+// kIfGoto / kGoto added in phase-3. We picked opcode bytes 0x90 / 0x91
+// from LDB's reserved 0x90–0x9f control-flow range rather than gdb's
+// 0x20 / 0x21 (which collide with LDB's kReg at 0x20). See docs/28 §2
+// and bytecode.h for the rationale.
+//
+// Wire layout: both ops carry a u16 BE *absolute* target pc as their
+// immediate. kIfGoto pops one value and jumps only if non-zero;
+// kGoto jumps unconditionally.
+
+TEST_CASE("evaluator: kGoto jumps unconditionally over dead code",
+          "[agent_expr][eval][ctrl][goto]") {
+  EvalContext ctx;
+  //   pc=0  kGoto       0x91
+  //   pc=1  imm hi      0x00
+  //   pc=2  imm lo      0x07   → target pc 7
+  //   pc=3  kConst8     0x10
+  //   pc=4  imm         42      (dead — should not push)
+  //   pc=5  kEnd        0x00    (dead)
+  //   pc=6  pad         0x10    (dead)
+  //   pc=7  kConst8     0x10
+  //   pc=8  imm         7
+  //   pc=9  kEnd        0x00
+  auto r = eval(prog({
+      0x91, 0x00, 0x07,
+      0x10, 42, 0x00, 0x10,
+      0x10, 7, 0x00,
+  }), ctx);
+  CHECK(r.error == EvalError::kOk);
+  CHECK(r.value == 7);
+}
+
+TEST_CASE("evaluator: kIfGoto pops non-zero and jumps",
+          "[agent_expr][eval][ctrl][if_goto]") {
+  EvalContext ctx;
+  //   pc=0  kConst8 1     (push 1 — truthy)
+  //   pc=2  kIfGoto 0x0008 → branch taken
+  //   pc=5  kConst8 99    (dead)
+  //   pc=7  kEnd          (dead)
+  //   pc=8  kConst8 42    (live target)
+  //   pc=10 kEnd
+  auto r = eval(prog({
+      0x10, 1,
+      0x90, 0x00, 0x08,
+      0x10, 99, 0x00,
+      0x10, 42, 0x00,
+  }), ctx);
+  CHECK(r.error == EvalError::kOk);
+  CHECK(r.value == 42);
+}
+
+TEST_CASE("evaluator: kIfGoto pops zero and falls through",
+          "[agent_expr][eval][ctrl][if_goto]") {
+  EvalContext ctx;
+  //   pc=0  kConst8 0
+  //   pc=2  kIfGoto 0x0008 → not taken
+  //   pc=5  kConst8 99    (live — fall through)
+  //   pc=7  kEnd
+  //   pc=8  kConst8 42    (dead)
+  //   pc=10 kEnd
+  auto r = eval(prog({
+      0x10, 0,
+      0x90, 0x00, 0x08,
+      0x10, 99, 0x00,
+      0x10, 42, 0x00,
+  }), ctx);
+  CHECK(r.error == EvalError::kOk);
+  CHECK(r.value == 99);
+}
+
+TEST_CASE("evaluator: kGoto backward branch still terminates via kEnd",
+          "[agent_expr][eval][ctrl][backward]") {
+  EvalContext ctx;
+  // Backward jump anti-loop sanity. Layout:
+  //   pc=0   kGoto 0x0006   → forward to the kIfGoto guard
+  //   pc=3   kConst8 42     (the "body" — pushes 42)
+  //   pc=5   kEnd           (final exit)
+  //   pc=6   kConst8 0      (push 0 — guard says don't loop back)
+  //   pc=8   kIfGoto 0x0003 (if non-zero would go back; 0 falls through)
+  //   pc=11  kGoto 0x0003   (unconditional jump to body)
+  // Execution: 0→6 (push 0), 6→8 (ifgoto with 0 → fall through),
+  //            8→11 (kGoto), 11→3 (push 42), 3→5 (kEnd) → result 42.
+  auto r = eval(prog({
+      0x91, 0x00, 0x06,
+      0x10, 42,
+      0x00,
+      0x10, 0,
+      0x90, 0x00, 0x03,
+      0x91, 0x00, 0x03,
+  }), ctx);
+  CHECK(r.error == EvalError::kOk);
+  CHECK(r.value == 42);
+}
+
+TEST_CASE("evaluator: kGoto target past end-of-code → kBadImmediate",
+          "[agent_expr][eval][ctrl][error]") {
+  EvalContext ctx;
+  // kGoto with target = 0x00ff (past end). Bounds check must fire.
+  auto r = eval(prog({
+      0x91, 0x00, 0xff,
+      0x00,
+  }), ctx);
+  CHECK(r.error == EvalError::kBadImmediate);
+}
+
+TEST_CASE("evaluator: kIfGoto target past end-of-code → kBadImmediate (if-taken)",
+          "[agent_expr][eval][ctrl][error]") {
+  EvalContext ctx;
+  // kConst8 1 (truthy) then kIfGoto 0x00ff (out of range).
+  auto r = eval(prog({
+      0x10, 1,
+      0x90, 0x00, 0xff,
+      0x00,
+  }), ctx);
+  CHECK(r.error == EvalError::kBadImmediate);
+}
+
+TEST_CASE("evaluator: kIfGoto with empty stack → kStackUnderflow",
+          "[agent_expr][eval][ctrl][error]") {
+  EvalContext ctx;
+  auto r = eval(prog({
+      0x90, 0x00, 0x04,
+      0x00,
+      0x00,
+  }), ctx);
+  CHECK(r.error == EvalError::kStackUnderflow);
+}
+
+TEST_CASE("evaluator: kGoto with truncated immediate → kBadImmediate",
+          "[agent_expr][eval][ctrl][error][imm]") {
+  EvalContext ctx;
+  // Only one imm byte after kGoto.
+  auto r = eval(prog({0x91, 0x00}), ctx);
+  CHECK(r.error == EvalError::kBadImmediate);
+}
+
+TEST_CASE("evaluator: infinite loop via backward kGoto → kInsnLimitExceeded",
+          "[agent_expr][eval][ctrl][cap]") {
+  EvalContext ctx;
+  // kGoto 0x0000 — jumps to itself forever. The instruction-count cap
+  // (kMaxInsnCount) must fire.
+  auto r = eval(prog({0x91, 0x00, 0x00}), ctx);
+  CHECK(r.error == EvalError::kInsnLimitExceeded);
+}

@@ -384,6 +384,119 @@ Commit: `7013eba` (feat) + this worklog entry.
 - **GDB/MI `suspend_thread`.** Wire to `-exec-interrupt --thread X`
   against an MI server in non-stop mode (requires `set non-stop on`
   at session init, which is currently off in `GdbMiSession::start`).
+---
+
+## 2026-05-12 — v1.6 #25 phase-3: control-flow opcodes (if_goto / goto)
+
+**Goal:** Add the two control-flow opcodes the agent-expression VM
+needs so #26 phase-2's in-target tracepoint VM can short-circuit
+predicates without round-tripping each branch as a separate program.
+Phase-1 (#25) shipped the bytecode + evaluator with `0x90-0x9f`
+reserved for control flow; phase-2 shipped the S-expression
+compiler. Phase-3 fills the reserved slots.
+
+**Done:**
+
+- **`src/agent_expr/bytecode.h`** — `Op::kIfGoto` at 0x90,
+  `Op::kGoto` at 0x91. Comment documents the choice vs gdb's
+  0x20/0x21 — gdb's bytes would collide with LDB's `kReg`, so
+  picked the docs/28 reserved range and pushed the one-byte
+  translation into #26's eventual gdb-remote wire driver.
+
+- **`src/agent_expr/evaluator.cpp`** — `kGoto` reads u16 BE imm
+  and sets pc; `kIfGoto` pops + jumps only on non-zero. Both
+  bounds-check the target against `code.size()` (out-of-range
+  surfaces `kBadImmediate`, distinct from `kInsnLimitExceeded`
+  which still catches backward-jump infinite loops). Codec gets
+  the two new mnemonics.
+
+- **`src/agent_expr/compiler.cpp`** — `(if cond then else)` and
+  `(when cond body)` special forms. Layout: `<cond> kLogNot
+  kIfGoto Telse <then> kGoto Tend Telse: <else> Tend:`. Picked
+  "if-not-cond, jump to else" over gdb's "if-cond, jump over then"
+  because single-pass codegen would otherwise need a backward
+  jump from kIfGoto over the then-block — fighting the
+  patch-as-we-go invariant. Extra `kLogNot` is one byte and one
+  VM cycle. New `emit_jump` + `patch_u16_be` helpers on `State`
+  keep forward-branch back-patching local.
+
+- **Tests** — 9 new evaluator tests (`tests/unit/test_agent_expr_evaluator.cpp`):
+  unconditional jump, conditional taken / not-taken, backward
+  jump terminating via kEnd, target past code.size() →
+  kBadImmediate (both ops), kIfGoto with empty stack →
+  kStackUnderflow, kGoto truncated immediate, infinite loop →
+  kInsnLimitExceeded. 9 new compiler tests
+  (`tests/unit/test_agent_expr_compiler.cpp`): both branches of
+  (if 1 / 0 ...), short-circuit (the unchosen branch's
+  `(div 1 0)` does NOT execute), (when 1) → body, (when 0) → 0,
+  nested `(if (if ...) ...)`, arity errors for (if) / (when),
+  full codegen-shape assertion for `(if 1 42 99)`.
+
+- **`docs/28-agent-expressions.md`** — opcode table now lists
+  if_goto/goto with stack effects + immediate; reserved range
+  trimmed to `0x92–0x9f`; failure matrix gets the two new rows;
+  the "Phase-3" §6 entry moves from "future" to "landed in #25
+  phase-3" with a separate "still ahead" subsection for #26's
+  in-target injection.
+
+- **`docs/29-predicate-compiler.md`** — DSL grammar grows `(if
+  ...)` and `(when ...)` with worked examples (errno-guarded
+  ref32, slow-path filter). Phase-3 scoping subsection rewritten
+  to reflect what landed.
+
+**Decisions:**
+
+- **Opcode bytes 0x90 / 0x91, not gdb's 0x20 / 0x21.** gdb's
+  bytes collide with LDB's `kReg`. We could reassign `kReg`, but
+  that would break every phase-1/phase-2 bytecode payload on the
+  wire — and #26's gdb-remote variant needs a one-byte
+  translation either way (since gdb encodes `if_goto` with a
+  relative-offset immediate, not absolute pc). Picked
+  phase-1-compat over phase-3-wire-direct.
+
+- **u16 BE absolute pc, not relative offset.** Programs cap at
+  `kMaxProgramBytes` = 4 KiB, which fits comfortably in a u16
+  with three zero high bits of headroom. Absolute targets are
+  trivial to bounds-check; relative offsets would need
+  sign-extend logic that pulls its weight only for >16 KiB
+  programs we'll never have.
+
+- **"if-not-cond, jump-to-else" codegen layout.** The natural
+  single-pass alternative — `<cond> kIfGoto Tthen <else> kGoto
+  Tend Tthen: <then> Tend:` — requires parsing `then` second
+  but emitting it last. That would need a side-buffer and
+  reg-table merge logic. The "flip cond" layout emits in source
+  order at the cost of one extra `kLogNot` (1 byte, 1 cycle).
+  Tracepoints are #26's hot path; daemon-side codegen runs once
+  per `predicate.compile`, so the extra cycle never matters.
+
+- **`(when ...)` desugars at codegen time, not via AST rewrite.**
+  Emits the same shape `(if cond body 0)` would. Slightly more
+  code in compiler.cpp than a re-parse-as-if would be, but keeps
+  parse error anchors honest (the agent's `(when ...)` source
+  pos survives into the error message).
+
+**Surprises / blockers:**
+
+- The Edit tool seemed to misroute its writes during this
+  session — file changes that the tool reported as successful
+  showed up in `/home/zach/Develop/LDB/` (the main repo) but
+  not in `/home/zach/Develop/LDB/.claude/worktrees/agent-aaa056be35585e0f5/`
+  (this worktree's checkout). Worked around by doing all edits
+  via `python3` + heredoc / bash relative paths. Worth a TODO
+  for the harness — for now, future agents in worktrees should
+  verify file content on disk after each Edit.
+
+**Next:**
+
+- #26 phase-2: gdb-remote `QTDP` / `QTStart` / `QTFrame` packets
+  + the in-target VM. With control flow in place, the
+  tracepoint VM can compile a `(when ...)` predicate to a single
+  bytecode payload that short-circuits in-target instead of
+  filtering on the daemon side.
+- The "call" opcode at 0x92 is still reserved. Defer until an
+  actual use case lands; we don't need it for tracepoint
+  predicates.
 
 ---
 

@@ -241,6 +241,38 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
         break;
       }
 
+      // Control flow (#25 phase-3). Both ops carry a u16 BE absolute
+      // pc immediate. A target past code.size() is malformed bytecode
+      // — surface kBadImmediate so callers learn to validate jump
+      // targets before installing the predicate. Anti-loop sanity
+      // for backward jumps comes from kMaxInsnCount above.
+      case Op::kGoto: {
+        std::uint16_t target = 0;
+        if (!read_u16_be(prog.code, &pc, &target)) {
+          step = EvalError::kBadImmediate; break;
+        }
+        if (target > prog.code.size()) {
+          step = EvalError::kBadImmediate; break;
+        }
+        pc = target;
+        break;
+      }
+      case Op::kIfGoto: {
+        std::uint16_t target = 0;
+        if (!read_u16_be(prog.code, &pc, &target)) {
+          step = EvalError::kBadImmediate; break;
+        }
+        std::int64_t cond = 0;
+        if (!vm.pop(&cond, &step)) break;
+        if (cond != 0) {
+          if (target > prog.code.size()) {
+            step = EvalError::kBadImmediate; break;
+          }
+          pc = target;
+        }
+        break;
+      }
+
       default:
         step = EvalError::kBadOpcode;
         break;

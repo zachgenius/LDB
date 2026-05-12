@@ -78,12 +78,28 @@ Opcode  Mnemonic     Stack effect       Notes
 0x80    dup          a → a a
 0x81    drop         a →
 0x82    swap         b a → a b
+0x90    if_goto      a →                 Imm: 2 bytes BE absolute pc; jump if a != 0
+0x91    goto         —                   Imm: 2 bytes BE absolute pc; unconditional
 ```
 
 Reserved space:
-- `0x90–0x9f` — control flow (if_goto, goto, call). Phase-3 territory.
+- `0x92–0x9f` — remaining control flow (call/ret). Phase-3+ territory.
 - `0xa0–0xaf` — string ops (cstr_read). Phase-2 if probes ask for it.
 - `0xb0–0xbf` — float ops. Deferred; agent predicates today are int.
+
+### Control-flow opcode bytes vs gdb
+
+GDB's agent-expression spec puts `if_goto` at 0x20 and `goto` at 0x21,
+but 0x20 is already `kReg` in LDB's table. We can't match gdb's bytes
+for both at once. Picked 0x90 / 0x91 from the docs/28 reserved
+`0x90–0x9f` control-flow range so phase-1 / phase-2 bytecode stays
+wire-compatible. When #26's gdb-remote tracepoint variant talks to
+a third-party agent, the wire driver rewrites these two bytes —
+one-byte translation isolated from the VM contract.
+
+The compiler (docs/29 §1 "Control flow") exposes these as the
+`(if cond then else)` and `(when cond body)` special forms; agents
+never need to emit raw `if_goto` / `goto` themselves.
 
 ### Wire encoding of `reg`
 
@@ -191,6 +207,8 @@ agent wire protocol simultaneously.
 | Program byte count > kMaxProgramBytes | `EvalError::kProgramTooLong` |
 | Execution exceeds kMaxInsnCount cycles | `EvalError::kInsnLimitExceeded` |
 | Program runs off code[] without kEnd | `EvalError::kMissingEnd` |
+| `if_goto` / `goto` target > code.size() | `EvalError::kBadImmediate` — phase-3 anti-mis-jump guard |
+| `if_goto` with empty stack | `EvalError::kStackUnderflow` |
 
 Errors stop execution; `EvalResult::value` carries whatever was on
 the top of stack at the error point (useful for debugging the
@@ -232,8 +250,25 @@ predicate, not for branching on).
 - New endpoint `predicate.compile` so agents can pre-compile +
   validate ahead of probe creation.
 
-### Phase-3 (#26 territory)
+### Phase-3 — landed in #25 phase-3
+
+Control-flow opcodes (`if_goto` at 0x90, `goto` at 0x91) were added
+ahead of the in-target VM so #26 phase-2's tracepoints can compile
+predicates with branches:
+
+- `Op::kIfGoto` / `Op::kGoto` in `src/agent_expr/bytecode.h`.
+- Evaluator handlers with a u16-BE absolute-pc immediate; out-of-
+  range targets surface `kBadImmediate`; backward jumps are caught
+  by the existing `kMaxInsnCount` anti-loop cap.
+- Compiler grows `(if cond then else)` and `(when cond body)`
+  special forms (docs/29 §1). Forms emit in source order via an
+  `if-not-cond, jump to else` layout — single-pass codegen
+  doesn't need a back-buffer for the then-branch.
+
+### Phase-3 / #26 (still ahead)
 
 - gdb-remote agent injection: `QTDP` packet support, in-target VM
   via the RspChannel.
 - The bytecode format is unchanged; the wire push is the new bit.
+  The one-byte mismatch between LDB's 0x90/0x91 and gdb's 0x20/0x21
+  for if_goto/goto is translated in the wire driver, not the VM.

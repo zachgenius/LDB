@@ -71,6 +71,23 @@ enum class Op : std::uint8_t {
   kDup        = 0x80,
   kDrop       = 0x81,
   kSwap       = 0x82,
+
+  // Control flow (#25 phase-3).
+  //
+  // Opcode-byte choice: docs/28 §2 reserves 0x90–0x9f for control
+  // flow; gdb's agent-expression spec puts if_goto at 0x20 and
+  // goto at 0x21, but 0x20 already maps to LDB's kReg. We can't
+  // satisfy both — picking 0x90 / 0x91 keeps phase-1 / phase-2
+  // bytecode wire-compatible at the cost of a translation layer
+  // when #26 talks to a third-party gdb-remote agent. That layer
+  // is one byte rewrite per opcode and lives in the wire driver,
+  // not the VM, so it doesn't bleed into the bytecode contract.
+  //
+  // Both ops carry a u16 BE absolute-pc immediate. Out-of-range
+  // targets (jump past code.size()) surface kBadImmediate; the
+  // anti-DoS kMaxInsnCount cap catches infinite backward loops.
+  kIfGoto     = 0x90,
+  kGoto       = 0x91,
 };
 
 // A program is the opcode stream + the register name table that
