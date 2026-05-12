@@ -2,9 +2,11 @@
 #include "daemon/dispatcher.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "backend/debugger_backend.h"
 #include "daemon/describe_schema.h"
+#include "index/symbol_index.h"
 #include "ldb/version.h"
 #include "protocol/cost.h"
 #include "protocol/version.h"
@@ -431,7 +433,29 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
       sessions_(std::move(sessions)),
       probes_(std::move(probes)),
       exec_allowlist_(std::move(exec_allowlist)),
-      backend_name_(std::move(backend_name)) {}
+      backend_name_(std::move(backend_name)) {
+  // Own symbol index (post-V1 #18). Lazy on LDB_STORE_ROOT — if the
+  // env var resolves to a usable directory, open `${root}/symbol_index.db`
+  // and let correlate.* route through it. Failure (unset env, missing
+  // dir, sqlite open error) leaves index_ nullptr; correlate.* falls
+  // through to backend find_*.
+  if (const char* env = std::getenv("LDB_STORE_ROOT");
+      env && *env != '\0') {
+    try {
+      auto idx = std::make_unique<ldb::index::SymbolIndex>(
+          std::filesystem::path(env));
+      if (idx->available()) {
+        index_ = std::move(idx);
+      } else {
+        ::ldb::log::warn("symbol_index: opened but not available; "
+                        "correlate.* will fall through to backend");
+      }
+    } catch (const std::exception& e) {
+      ::ldb::log::warn(std::string("symbol_index ctor failed: ") + e.what()
+                      + "; correlate.* will fall through to backend");
+    }
+  }
+}
 
 Dispatcher::~Dispatcher() = default;
 
@@ -4001,8 +4025,242 @@ Response Dispatcher::handle_static_globals_of_type(const Request& req) {
 // preflight extracts a deduped target_ids list and validates each id
 // against the live target table; we surface the offending id so the
 // agent can branch without string-matching the message.
+//
+// post-V1 #18 (v1.5): when the SymbolIndex is available, correlate.*
+// routes through it. The flow:
+//
+//   1. Resolve the target's main module → build_id + on-disk path.
+//   2. Stat the file → FileFingerprint.
+//   3. cache_status(build_id, fp):
+//        kHot → query the index, convert rows → wire shape.
+//        kStale | kMissing → walk backend.iterate_*, populate, then
+//          query the index (so we use the same code path that warm
+//          calls take — keeps wire shape byte-identical).
+//   4. Any failure (no build_id, stat failure, sqlite throw) falls
+//      through silently to backend find_* — the index is a cache.
+//
+// The wire shape MUST be byte-identical to today's output. The
+// row→wire converters below mirror symbol_match_to_json /
+// type_layout_to_json bit-for-bit.
 
 namespace {
+
+// Resolve the target's main module to (build_id, on-disk path). The
+// "main module" is the executable opened via target.open — the file
+// whose path matches the OpenResult's path. We re-pick it here rather
+// than caching at target.open time because the dispatcher doesn't
+// keep its own target state today (TargetState lives on the backend).
+//
+// Returns nullopt when the build_id can't be resolved (stripped
+// binary on Linux, no .note.gnu.build-id) — the caller falls through
+// to the backend.
+struct MainModuleKey {
+  std::string build_id;
+  std::string path;
+};
+
+std::optional<MainModuleKey>
+resolve_main_module(backend::DebuggerBackend& be, backend::TargetId tid) {
+  std::vector<backend::Module> mods;
+  try {
+    mods = be.list_modules(tid);
+  } catch (const backend::Error&) {
+    return std::nullopt;
+  }
+  // The structs/sleeper fixtures (and every other target.open'd
+  // binary) reach the dispatcher with the executable as the first
+  // module before any process is launched. After process.launch +
+  // dlopen, additional modules appear; list_modules sorts by path
+  // ascending, so "first" isn't reliable. Prefer the module whose
+  // path looks like a regular executable file — but the simplest
+  // sufficient rule is: pick the first module with a non-empty
+  // uuid and a non-empty path. On a typical Linux build that's the
+  // main executable; libc/ld-linux have UUIDs but their paths sort
+  // alphabetically ahead/behind the executable's path so they can
+  // collide. Punt to the first valid one as a v1.5 phase-1 simplification;
+  // multi-binary index coverage is a phase-2 follow-up (see §10).
+  for (const auto& m : mods) {
+    if (!m.uuid.empty() && !m.path.empty()) {
+      return MainModuleKey{m.uuid, m.path};
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<index::FileFingerprint>
+fingerprint_for(const std::string& path) {
+  std::error_code ec;
+  auto sz = std::filesystem::file_size(path, ec);
+  if (ec) return std::nullopt;
+  auto last = std::filesystem::last_write_time(path, ec);
+  if (ec) return std::nullopt;
+  auto sys = std::chrono::clock_cast<std::chrono::system_clock>(last);
+  auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 sys.time_since_epoch()).count();
+  index::FileFingerprint fp;
+  fp.path     = path;
+  fp.mtime_ns = ns;
+  fp.size     = static_cast<std::int64_t>(sz);
+  return fp;
+}
+
+// Convert backend::SymbolMatch → index::SymbolRow (write path).
+index::SymbolRow symbol_match_to_row(const backend::SymbolMatch& m) {
+  index::SymbolRow r;
+  r.name        = m.mangled.empty() ? m.name : m.mangled;
+  // The backend reports `name` as the demangled (or simple) form when
+  // a separate `mangled` is present; otherwise `name` is the only label.
+  // The index keys exact-name matches on either field, so populating
+  // both is what makes query_symbols correctly match either spelling.
+  r.demangled   = m.mangled.empty() ? std::string{} : m.name;
+  switch (m.kind) {
+    case backend::SymbolKind::kFunction:  r.kind = "function"; break;
+    case backend::SymbolKind::kVariable:  r.kind = "data";     break;
+    default:                              r.kind = "other";    break;
+  }
+  r.address     = m.address;
+  r.size        = m.byte_size;
+  r.module_path = m.module_path;
+  return r;
+}
+
+// Convert index::SymbolRow → backend::SymbolMatch (read path).
+// The dispatcher then runs the existing symbol_match_to_json so the
+// wire output is byte-identical to the cold path.
+backend::SymbolMatch row_to_symbol_match(const index::SymbolRow& r) {
+  backend::SymbolMatch m;
+  if (r.demangled.empty()) {
+    m.name    = r.name;
+    // m.mangled stays empty
+  } else {
+    m.name    = r.demangled;
+    m.mangled = r.name;
+  }
+  if      (r.kind == "function") m.kind = backend::SymbolKind::kFunction;
+  else if (r.kind == "data")     m.kind = backend::SymbolKind::kVariable;
+  else                            m.kind = backend::SymbolKind::kOther;
+  m.address     = r.address;
+  m.byte_size   = r.size;
+  m.module_path = r.module_path;
+  // load_address intentionally left unset; the index is a static-
+  // analysis cache. correlate.symbols doesn't surface load_addr today
+  // either (no process is attached at correlate time in the typical
+  // call site).
+  return m;
+}
+
+// Convert backend::TypeLayout → index::TypeRow (write path). The
+// members are stored as a JSON array shaped exactly like
+// field_to_json's output, so the read path can hand the JSON straight
+// back to the wire without re-decoding individual members.
+index::TypeRow type_layout_to_row(const backend::TypeLayout& t) {
+  index::TypeRow r;
+  r.name      = t.name;
+  r.byte_size = t.byte_size;
+  // Serialise the full TypeLayout under .members so the read path
+  // can reconstruct byte_size / alignment / fields / holes_total
+  // exactly. Cheaper than three separate TEXT columns and keeps the
+  // schema stable across format tweaks.
+  nlohmann::json full;
+  full["byte_size"]   = t.byte_size;
+  full["alignment"]   = t.alignment;
+  full["holes_total"] = t.holes_total;
+  nlohmann::json arr  = nlohmann::json::array();
+  for (const auto& f : t.fields) {
+    nlohmann::json fj;
+    fj["name"]        = f.name;
+    fj["type"]        = f.type_name;
+    fj["off"]         = f.offset;
+    fj["sz"]          = f.byte_size;
+    fj["holes_after"] = f.holes_after;
+    arr.push_back(std::move(fj));
+  }
+  full["fields"] = std::move(arr);
+  r.members = std::move(full);
+  return r;
+}
+
+// Convert index::TypeRow → backend::TypeLayout (read path).
+backend::TypeLayout row_to_type_layout(const index::TypeRow& r) {
+  backend::TypeLayout t;
+  t.name      = r.name;
+  t.byte_size = r.byte_size;
+  if (r.members.is_object()) {
+    t.alignment   = r.members.value("alignment", std::uint64_t{0});
+    t.holes_total = r.members.value("holes_total", std::uint64_t{0});
+    if (r.members.contains("fields") && r.members["fields"].is_array()) {
+      for (const auto& fj : r.members["fields"]) {
+        backend::Field f;
+        f.name        = fj.value("name", std::string{});
+        f.type_name   = fj.value("type", std::string{});
+        f.offset      = fj.value("off", std::uint64_t{0});
+        f.byte_size   = fj.value("sz",  std::uint64_t{0});
+        f.holes_after = fj.value("holes_after", std::uint64_t{0});
+        t.fields.push_back(std::move(f));
+      }
+    }
+  }
+  return t;
+}
+
+// Convert backend::StringMatch → index::StringRow (write path).
+index::StringRow string_match_to_row(const backend::StringMatch& m) {
+  index::StringRow r;
+  r.address = m.address;
+  r.text    = m.text;
+  r.section = m.section;
+  return r;
+}
+
+// Ensure `build_id` is indexed and hot. Walks backend.iterate_* and
+// writes the index when the cache is cold/stale. Returns true when
+// the cache is now hot and queries are safe; false when the population
+// path failed (no fingerprint, sqlite error) — caller falls through
+// to backend.
+bool ensure_indexed(index::SymbolIndex& idx,
+                     backend::DebuggerBackend& be,
+                     backend::TargetId tid,
+                     const std::string& build_id,
+                     const std::string& path,
+                     const std::string& arch) {
+  auto fp = fingerprint_for(path);
+  if (!fp.has_value()) return false;
+  auto status = idx.cache_status(build_id, *fp);
+  if (status == index::CacheStatus::kHot) return true;
+
+  try {
+    auto ms = be.iterate_symbols(tid, build_id);
+    auto mt = be.iterate_types(tid, build_id);
+    auto mstr = be.iterate_strings(tid, build_id);
+
+    std::vector<index::SymbolRow> srows;
+    srows.reserve(ms.functions.size() + ms.data.size() + ms.other.size());
+    for (const auto& m : ms.functions) srows.push_back(symbol_match_to_row(m));
+    for (const auto& m : ms.data)      srows.push_back(symbol_match_to_row(m));
+    for (const auto& m : ms.other)     srows.push_back(symbol_match_to_row(m));
+
+    std::vector<index::TypeRow> trows;
+    trows.reserve(mt.types.size());
+    for (const auto& t : mt.types) trows.push_back(type_layout_to_row(t));
+
+    std::vector<index::StringRow> strrows;
+    strrows.reserve(mstr.strings.size());
+    for (const auto& s : mstr.strings) strrows.push_back(string_match_to_row(s));
+
+    index::BinaryEntry entry;
+    entry.build_id = build_id;
+    entry.file     = *fp;
+    entry.arch     = arch;
+    idx.populate(entry, srows, trows, strrows);
+    return true;
+  } catch (const std::exception& e) {
+    ::ldb::log::warn(std::string("symbol_index: populate failed for ")
+                    + build_id + ": " + e.what()
+                    + "; falling through to backend");
+    return false;
+  }
+}
+
 
 // Parse + validate `target_ids` as a non-empty array of uint64. Stable
 // dedupe: preserves first-occurrence order so per-result rows come back
@@ -4128,23 +4386,52 @@ Response Dispatcher::handle_correlate_types(const Request& req) {
   for (auto tid : *ids) {
     json row;
     row["target_id"] = tid;
-    try {
-      auto layout = backend_->find_type_layout(
-          static_cast<backend::TargetId>(tid), *name);
-      if (layout.has_value()) {
-        row["status"] = "found";
-        row["layout"] = type_layout_to_json(*layout);
-        found_set.push_back(std::move(*layout));
-      } else {
-        row["status"] = "missing";
-        row["layout"] = nullptr;
+    bool handled = false;
+
+    // Index-routed path (post-V1 #18). Only fires when the index is
+    // available AND we can resolve a build_id for this target. Any
+    // failure (no build_id, sqlite throw, can't populate) sets
+    // handled=false and we fall through to the original backend path
+    // below — the wire shape is unchanged in both cases.
+    if (index_ && index_->available()) {
+      if (auto key = resolve_main_module(*backend_, tid); key.has_value()) {
+        if (ensure_indexed(*index_, *backend_,
+                           static_cast<backend::TargetId>(tid),
+                           key->build_id, key->path, /*arch=*/"")) {
+          if (auto tr = index_->query_type(key->build_id, *name);
+              tr.has_value()) {
+            backend::TypeLayout layout = row_to_type_layout(*tr);
+            row["status"] = "found";
+            row["layout"] = type_layout_to_json(layout);
+            found_set.push_back(std::move(layout));
+          } else {
+            row["status"] = "missing";
+            row["layout"] = nullptr;
+          }
+          handled = true;
+        }
       }
-    } catch (const backend::Error& e) {
-      // backend exception is data, not transport-level: per-target
-      // failures shouldn't poison the whole batch.
-      row["status"] = "backend_error";
-      row["layout"] = nullptr;
-      row["error"]  = std::string(e.what());
+    }
+
+    if (!handled) {
+      try {
+        auto layout = backend_->find_type_layout(
+            static_cast<backend::TargetId>(tid), *name);
+        if (layout.has_value()) {
+          row["status"] = "found";
+          row["layout"] = type_layout_to_json(*layout);
+          found_set.push_back(std::move(*layout));
+        } else {
+          row["status"] = "missing";
+          row["layout"] = nullptr;
+        }
+      } catch (const backend::Error& e) {
+        // backend exception is data, not transport-level: per-target
+        // failures shouldn't poison the whole batch.
+        row["status"] = "backend_error";
+        row["layout"] = nullptr;
+        row["error"]  = std::string(e.what());
+      }
     }
     results.push_back(std::move(row));
   }
@@ -4194,9 +4481,33 @@ Response Dispatcher::handle_correlate_symbols(const Request& req) {
     json row;
     row["target_id"] = tid;
     json arr = json::array();
-    auto matches = backend_->find_symbols(
-        static_cast<backend::TargetId>(tid), q);
-    for (const auto& m : matches) arr.push_back(symbol_match_to_json(m));
+    bool handled = false;
+
+    // Index-routed (post-V1 #18). Same fall-through discipline as
+    // correlate.types: index hot + populate path; backend find_symbols
+    // on any failure.
+    if (index_ && index_->available()) {
+      if (auto key = resolve_main_module(*backend_, tid); key.has_value()) {
+        if (ensure_indexed(*index_, *backend_,
+                           static_cast<backend::TargetId>(tid),
+                           key->build_id, key->path, /*arch=*/"")) {
+          index::SymbolQuery iq;
+          iq.name = *name;
+          // kind stays empty → "any" filter; mirrors q.kind=kAny above.
+          auto rows = index_->query_symbols(key->build_id, iq);
+          for (const auto& r : rows) {
+            arr.push_back(symbol_match_to_json(row_to_symbol_match(r)));
+          }
+          handled = true;
+        }
+      }
+    }
+
+    if (!handled) {
+      auto matches = backend_->find_symbols(
+          static_cast<backend::TargetId>(tid), q);
+      for (const auto& m : matches) arr.push_back(symbol_match_to_json(m));
+    }
     total += static_cast<std::int64_t>(arr.size());
     row["matches"] = std::move(arr);
     results.push_back(std::move(row));
@@ -4243,18 +4554,47 @@ Response Dispatcher::handle_correlate_strings(const Request& req) {
     json row;
     row["target_id"] = tid;
     json callsites = json::array();
-    auto sxrs = backend_->find_string_xrefs(
-        static_cast<backend::TargetId>(tid), *text);
-    // Flatten across all matching string instances in this target.
-    // XrefMatch carries function name; file/line are not in scope for
-    // the v0.3 slice (XrefMatch doesn't surface them — defer to
-    // future work that resolves SBLineEntry per address).
-    for (const auto& r : sxrs) {
-      for (const auto& x : r.xrefs) {
-        json c;
-        c["addr"] = x.address;
-        if (!x.function.empty()) c["function"] = x.function;
-        callsites.push_back(std::move(c));
+
+    // Index-routed opportunistic short-circuit (post-V1 #18). When
+    // the cache is hot AND query_strings returns empty for this
+    // build_id, we KNOW the string isn't present and can skip the
+    // disasm-walking find_string_xrefs entirely. When the string IS
+    // present, the index doesn't yet cache xrefs (phase-2 — see
+    // docs/23 §6 symbol.xref), so we still need find_string_xrefs to
+    // produce the callsites. Populating the index here primes phase-2
+    // and the eventual smoke_index_cold_warm warm-path numbers.
+    bool short_circuited = false;
+    if (index_ && index_->available()) {
+      if (auto key = resolve_main_module(*backend_, tid); key.has_value()) {
+        if (ensure_indexed(*index_, *backend_,
+                           static_cast<backend::TargetId>(tid),
+                           key->build_id, key->path, /*arch=*/"")) {
+          index::StringQuery sq;
+          sq.text     = *text;
+          sq.contains = false;   // mirror find_string_xrefs's exact-text rule
+          auto strings = index_->query_strings(key->build_id, sq);
+          if (strings.empty()) {
+            short_circuited = true;
+            // callsites remains [], total stays 0 for this row
+          }
+        }
+      }
+    }
+
+    if (!short_circuited) {
+      auto sxrs = backend_->find_string_xrefs(
+          static_cast<backend::TargetId>(tid), *text);
+      // Flatten across all matching string instances in this target.
+      // XrefMatch carries function name; file/line are not in scope for
+      // the v0.3 slice (XrefMatch doesn't surface them — defer to
+      // future work that resolves SBLineEntry per address).
+      for (const auto& r : sxrs) {
+        for (const auto& x : r.xrefs) {
+          json c;
+          c["addr"] = x.address;
+          if (!x.function.empty()) c["function"] = x.function;
+          callsites.push_back(std::move(c));
+        }
       }
     }
     total += static_cast<std::int64_t>(callsites.size());

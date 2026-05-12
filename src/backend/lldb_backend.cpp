@@ -1265,11 +1265,21 @@ LldbBackend::iterate_symbols(TargetId tid, std::string_view build_id) {
   out.functions.reserve(nsym / 2);
   out.data.reserve(nsym / 4);
 
+  // Dedupe by (name, address). LLDB exposes PLT trampolines, weak
+  // aliases, and IFUNC resolvers as separate SBSymbols at the same
+  // address with the same name — the SymbolIndex primary key
+  // (build_id, name, address) would reject the duplicate insert. The
+  // existing find_symbols path dedupes by SymbolDedupeKey for the
+  // same reason; mirror it here so the cached set matches.
+  std::set<std::pair<std::string, std::uint64_t>> seen;
+
   bool truncated = false;
   for (std::size_t i = 0; i < nsym; ++i) {
     auto sym = mod.GetSymbolAtIndex(i);
     auto decorated = decorate_symbol_for_iterate(sym, target, mod_path);
     if (!decorated.has_value()) continue;
+    auto key = std::make_pair(decorated->name, decorated->address);
+    if (!seen.insert(std::move(key)).second) continue;
     switch (decorated->kind) {
       case SymbolKind::kFunction:
         if (out.functions.size() < cap) out.functions.push_back(std::move(*decorated));

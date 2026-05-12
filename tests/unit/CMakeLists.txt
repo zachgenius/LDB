@@ -102,6 +102,7 @@ set(LDB_UNIT_SOURCES
   test_bpf_agent_protocol.cpp
   test_symbol_index.cpp
   test_backend_iterate.cpp
+  test_dispatcher_correlate_indexed.cpp
 )
 
 set(LDB_LIB_SOURCES
