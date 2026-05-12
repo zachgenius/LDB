@@ -7650,6 +7650,10 @@ json probe_list_entry_to_json(const probes::ProbeOrchestrator::ListEntry& e) {
     j["predicate_dropped"] = e.predicate_dropped;
     j["predicate_errored"] = e.predicate_errored;
   }
+  // Post-V1 #26 phase-1 — rate-limit counter. Always present so
+  // agents can read it without checking has_predicate-style
+  // gating; 0 when no rate_limit was configured.
+  j["rate_limited"] = e.rate_limited;
   return j;
 }
 

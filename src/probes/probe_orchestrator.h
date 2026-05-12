@@ -225,6 +225,11 @@ class ProbeOrchestrator {
     bool          has_predicate      = false;
     std::uint64_t predicate_dropped  = 0;
     std::uint64_t predicate_errored  = 0;
+
+    // Post-V1 #26 phase-1: running count of events that fired but
+    // were dropped because the configured rate_limit (e.g. "1000/s")
+    // was already saturated. 0 when rate_limit is absent / malformed.
+    std::uint64_t rate_limited       = 0;
   };
   std::vector<ListEntry> list();
 

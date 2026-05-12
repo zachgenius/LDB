@@ -14,6 +14,7 @@ set(LDBD_SOURCES
   protocol/view.cpp
   backend/lldb_backend.cpp
   probes/probe_orchestrator.cpp
+  probes/rate_limit.cpp
   probes/bpftrace_engine.cpp
   probes/agent_engine.cpp
   probe_agent/protocol.cpp
