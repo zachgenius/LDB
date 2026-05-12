@@ -76,17 +76,42 @@ def main():
         skip(why)
 
     store_root = tempfile.mkdtemp(prefix="ldb_smoke_perf_")
-    # Spawn the sleeper fixture so we have a real, attachable pid.
-    sleeper_proc = subprocess.Popen(
-        [sleeper], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    # Spawn a CPU-busy subprocess as the recording target.
+    #
+    # The sleeper fixture sits idle, which produces zero samples on
+    # hosts where `perf_event_paranoid` forces hardware `cycles` to
+    # fall back to software `task-clock` (e.g. GitHub Actions Linux
+    # runners). task-clock only ticks while the target is on-CPU, so
+    # a sleeping pid would yield an empty trace and crash the smoke
+    # at `samples[0]`. A Python busy-loop guarantees enough on-CPU
+    # time for either `cycles` or `task-clock` to produce samples in
+    # the 500ms record window.
+    target_proc = subprocess.Popen(
+        ["python3", "-u", "-c",
+         "import time,math,sys;"
+         "print('READY=BUSY',flush=True);"
+         "t0=time.time();"
+         "s=0.0;"
+         # Run longer than the record window so perf still has work
+         # to sample at the end. We don't kill the loop ourselves;
+         # the smoke's `finally` reaps via SIGTERM.
+         "import os;\n"
+         "while time.time()-t0 < 5.0: s += math.sin(s) + 1.0; pass"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     try:
-        # Wait for the sleeper to print its PID/READY line.
-        ready_line = sleeper_proc.stdout.readline().decode("utf-8", "replace")
+        # Wait for the busy-loop to acknowledge it's running.
+        ready_line = target_proc.stdout.readline().decode("utf-8", "replace")
         if "READY=" not in ready_line:
-            sys.stderr.write(f"sleeper didn't print READY: {ready_line!r}\n")
+            sys.stderr.write(
+                f"busy-loop didn't print READY: {ready_line!r}\n")
             sys.exit(1)
-        target_pid = sleeper_proc.pid
+        target_pid = target_proc.pid
+        # Note: <sleeper> argv is accepted for backwards compat with
+        # tests/CMakeLists.txt; the previous design recorded it, the
+        # current one records the busy-loop above. Reference `sleeper`
+        # once so the unused-name warning doesn't fire.
+        _ = sleeper
 
         env = dict(os.environ)
         env["LDB_STORE_ROOT"] = store_root
@@ -229,11 +254,11 @@ def main():
     finally:
         # Kill the sleeper.
         try:
-            sleeper_proc.send_signal(signal.SIGTERM)
-            sleeper_proc.wait(timeout=5)
+            target_proc.send_signal(signal.SIGTERM)
+            target_proc.wait(timeout=5)
         except Exception:
             try:
-                sleeper_proc.kill()
+                target_proc.kill()
             except Exception:
                 pass
         shutil.rmtree(store_root, ignore_errors=True)
