@@ -66,8 +66,21 @@ int tcp_connect(const std::string& host, std::uint16_t port,
   int fd = -1;
   std::string last_err = "no address resolved";
   for (auto* p = res; p != nullptr; p = p->ai_next) {
+    // SOCK_CLOEXEC is Linux. On macOS / older BSDs we open the
+    // socket without the atomic flag and set FD_CLOEXEC right after
+    // via fcntl(). The brief window where the fd lacks CLOEXEC is
+    // not zero, but the dispatcher is single-threaded and doesn't
+    // fork() between socket() and fcntl().
+#if defined(SOCK_CLOEXEC)
     fd = ::socket(p->ai_family, p->ai_socktype | SOCK_CLOEXEC,
                   p->ai_protocol);
+#else
+    fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd >= 0) {
+      int fdflags = ::fcntl(fd, F_GETFD, 0);
+      if (fdflags >= 0) ::fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
+    }
+#endif
     if (fd < 0) { last_err = std::strerror(errno); continue; }
 
     // Non-blocking connect so we can enforce the timeout.

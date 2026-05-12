@@ -99,6 +99,8 @@ set(LDB_UNIT_SOURCES
   test_nonstop_listener.cpp
   test_dispatcher_nonstop.cpp
   test_dispatcher_vcont_rsp.cpp
+  test_agent_expr_codec.cpp
+  test_agent_expr_evaluator.cpp
   test_pack.cpp
   test_pack_signing.cpp
   test_util_sha256.cpp
@@ -158,6 +160,8 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/index/symbol_index.cpp
   ${CMAKE_SOURCE_DIR}/src/runtime/nonstop_runtime.cpp
   ${CMAKE_SOURCE_DIR}/src/runtime/nonstop_listener.cpp
+  ${CMAKE_SOURCE_DIR}/src/agent_expr/codec.cpp
+  ${CMAKE_SOURCE_DIR}/src/agent_expr/evaluator.cpp
   ${CMAKE_SOURCE_DIR}/src/probe_agent/protocol.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
