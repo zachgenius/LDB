@@ -4,6 +4,104 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.5 kickoff: #18/#19 design note (own symbol index)
+
+**Goal:** Start v1.5's critical chain (#18 → #15 → #16 per
+`docs/17-version-plan.md`). The first deliverable is the design note
+that re-evaluates whether `#19` (own DWARF reader) is actually
+needed before we commit any code to it — `docs/15-post-v1-plan.md`
+already flagged #19 ROI as questionable on the watchlist.
+
+**Done:**
+- `docs/23-symbol-index.md` (~430 lines). Covers:
+  - Today's pain: `correlate.{types,symbols,strings}` re-walks
+    LLDB's symbol/type/strings tables on every call, even when
+    multiple `target_id`s share a build_id. Cited dispatcher.cpp
+    + lldb_backend.cpp line numbers so future readers can audit.
+  - **No own DWARF reader for v1.5.** Decoupling goal is achieved
+    by the cache boundary, not by replacing libDebugInfoDWARF.
+    Maintenance burden of forking LLDB's reader vs. the marginal
+    cold-path speedup doesn't justify the swap. Recorded the
+    re-evaluation triggers for v1.6+.
+  - Schema for `${LDB_STORE_ROOT}/symbol_index.db` — separate
+    sqlite file (not a new table family on the artifact-store
+    DB) so PRAGMAs stay independently tunable. Four tables:
+    `binaries`, `symbols`, `types`, `strings`. Index keys
+    matching the existing correlate query shapes.
+  - Lazy-on-first-query population; no background thread (matches
+    single-threaded dispatcher; reconsider after #21 non-stop
+    runtime). Bulk `index.warm` endpoint for replay setup +
+    deliberate wide-sweep agents.
+  - Three invalidation triggers: file mtime/size mismatch, schema
+    version bump, explicit `index.invalidate`. Drop-and-rebuild on
+    schema bumps (no in-place migrations; cache is recoverable).
+  - Phase-1 = transparent integration into existing correlate.*;
+    phase-2 = `symbol.find` / `symbol.xref` / `index.stats` /
+    `index.warm` / `index.invalidate` endpoints; phase-3 (v1.6)
+    = cross-process index sharing + signed index packs.
+  - Failure matrix: every failure mode falls back to the backend
+    path. Index is a cache — it can fail safe.
+
+**Decisions:**
+
+- **Separate sqlite DB, not a new table family on the artifact-
+  store DB.** Index queries are read-heavy and concurrent-friendly;
+  artifact writes are infrequent. Sharing a file would force
+  `journal_mode` / `synchronous` to be the conservative of the
+  two; separate files let `symbol_index.db` run `WAL` +
+  `synchronous=NORMAL` without compromising artifact durability,
+  and means index corruption never threatens artifacts.
+- **`synchronous=NORMAL` on the index DB.** The cache is
+  recoverable from LLDB at worst-case cost. Trade-off vs `FULL` is
+  ~100x faster inserts during population; we'll re-walk one
+  binary on a power loss instead of fsyncing every row.
+- **Lazy population, not eager-at-target-open.** We don't know
+  which build_ids the agent will care about; pre-walking every
+  loaded module would burn 100s of MB of debug info on `target.open`.
+- **No background thread.** Single-threaded dispatcher means
+  populate-during-RPC. Backgrounding only buys parallelism when
+  the dispatcher learns async — v1.6's non-stop runtime
+  territory.
+- **No DWARF section hashing for cache invalidation.** mtime +
+  size catches every real-world change short of timestamp-
+  preserving in-place patches. Operators who care call
+  `index.invalidate` explicitly.
+
+**Surprises / blockers:**
+
+- None at design-note stage. The interesting tension was whether
+  to share the artifact-store DB; the analysis above is the only
+  non-obvious call.
+
+**Verification:**
+
+- Design note only — no code, no test impact. `ctest` baseline
+  preserved trivially.
+
+**Next:**
+
+Phase-1 implementation per §8:
+
+1. `src/index/symbol_index.{h,cpp}` — schema + read/write APIs +
+   cache-invalidation logic. Unit tests pin the schema round-trip
+   and invalidation behaviour without needing LLDB live targets.
+2. Dispatcher's `handle_correlate_*` routes through the index;
+   falls back to backend on miss; writes the result back.
+3. `smoke_index_cold_warm` exercises first-cold-then-warm and
+   pins the wire-shape stability.
+4. Documentation update in `docs/14-pack-signing.md` (or a new
+   `docs/24-storage-layout.md`) covering
+   `${LDB_STORE_ROOT}/symbol_index.db` alongside the existing
+   artifact / pack / session / recipe directory layout.
+
+After phase-1 lands, the critical-chain ordering is **#18 → #15
+(live-process provenance audit, easier with our own timestamps) →
+#16 (session.fork/replay, the prize)**. The non-stop chain (#17
+own RSP, #21 non-stop runtime, #25/#26 tracepoints) can
+parallelise once #18 phase-1 is in.
+
+---
+
 ## 2026-05-12 — v1.4 close-out: #12 phase-3 + #14 phase-2 + README deps
 
 **Goal:** User installed `libbpf-dev` (no more `/tmp/libbpf-extracted`
