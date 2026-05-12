@@ -21,6 +21,7 @@ set(LDBD_SOURCES
   perf/perf_runner.cpp
   index/symbol_index.cpp
   runtime/nonstop_runtime.cpp
+  runtime/nonstop_listener.cpp
   backend/gdbmi/backend.cpp
   backend/gdbmi/parser.cpp
   backend/gdbmi/session.cpp

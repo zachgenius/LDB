@@ -437,7 +437,11 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
       sessions_(std::move(sessions)),
       probes_(std::move(probes)),
       exec_allowlist_(std::move(exec_allowlist)),
-      backend_name_(std::move(backend_name)) {
+      backend_name_(std::move(backend_name)),
+      // Post-V1 #21 phase-2: listener spins up immediately so any
+      // target opened via target.connect_remote_rsp can hand its
+      // channel to register_target without an additional init step.
+      nonstop_listener_(nonstop_) {
   // Own symbol index (post-V1 #18). Lazy on LDB_STORE_ROOT — if the
   // env var resolves to a usable directory, open `${root}/symbol_index.db`
   // and let correlate.* route through it. Failure (unset env, missing
@@ -3315,7 +3319,13 @@ Response Dispatcher::handle_target_connect_remote_rsp(const Request& req) {
   // so no backend mutation here — the caller already created the
   // target via target.create_empty or target.open, and we validated
   // that above.
+  // Park first, register with the listener second — so the listener
+  // can dereference the channel pointer for the lifetime of the
+  // registration (the map's unique_ptr keeps the channel alive; the
+  // raw pointer is borrowed).
+  auto* chan_raw = chan.get();
   rsp_channels_[backend_tid] = std::move(chan);
+  nonstop_listener_.register_target(backend_tid, chan_raw);
 
   json data = process_status_to_json(status);
   data["target_id"] = tid;
@@ -3369,8 +3379,12 @@ Response Dispatcher::handle_target_close(const Request& req) {
   }
   backend_->close_target(static_cast<backend::TargetId>(tid));
   target_main_module_.erase(tid);
-  // Tear down any RspChannel parked under this target_id (post-V1 #17).
-  // The unique_ptr's destructor joins the reader thread + closes the fd.
+  // Order matters here: unregister with the listener BEFORE destroying
+  // the channel. After unregister_target returns, the listener cannot
+  // be mid-recv on this channel (docs/27 §4), so the unique_ptr's
+  // destructor can safely join the channel's reader thread + close
+  // the fd without racing the listener.
+  nonstop_listener_.unregister_target(static_cast<backend::TargetId>(tid));
   rsp_channels_.erase(static_cast<backend::TargetId>(tid));
   // Post-V1 #21 phase-1: drop the non-stop runtime's per-thread state +
   // reset stop_event_seq so a future target.open that reuses the id

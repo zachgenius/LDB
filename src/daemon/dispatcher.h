@@ -3,6 +3,7 @@
 
 #include "backend/debugger_backend.h"  // backend::TargetId
 #include "protocol/jsonrpc.h"
+#include "runtime/nonstop_listener.h"
 #include "runtime/nonstop_runtime.h"
 #include "store/session_store.h"
 
@@ -168,6 +169,13 @@ class Dispatcher {
   // dispatcher's RPC path. The runtime is internally synchronised so
   // both writers compose without a dispatcher-side lock.
   runtime::NonStopRuntime                                  nonstop_;
+
+  // Post-V1 #21 phase-2 (docs/27-nonstop-listener.md). One listener
+  // thread per dispatcher; polls registered RspChannels for stop
+  // replies + calls nonstop_.set_stopped which fires thread.event via
+  // the installed sink. Declared AFTER nonstop_ so the listener
+  // joins before the runtime is destroyed.
+  runtime::NonStopListener                                 nonstop_listener_;
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
