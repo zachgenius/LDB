@@ -22,6 +22,8 @@ set(LDBD_SOURCES
   index/symbol_index.cpp
   runtime/nonstop_runtime.cpp
   runtime/nonstop_listener.cpp
+  agent_expr/codec.cpp
+  agent_expr/evaluator.cpp
   backend/gdbmi/backend.cpp
   backend/gdbmi/parser.cpp
   backend/gdbmi/session.cpp
