@@ -71,6 +71,184 @@ v1.5's critical chain (#18 → #15 → #16).
 
 ---
 
+## 2026-05-12 — v1.5 #16 phase-1 (session.fork + session.replay)
+
+**Goal:** Land the end of v1.5's critical chain — the
+`session.fork` / `session.replay` endpoints `docs/15-post-v1-plan.md`
+flagged as "blocked on #15." Phase-1 ships fork + deterministic-row
+replay against captured rpc_logs; phase-2 picks up incremental /
+partial / cross-host replay.
+
+**Done:**
+- `39b7b99 docs: session.fork + session.replay design note (post-V1 #16 phase-1)`
+  - `docs/24-session-fork-replay.md` (~570 lines after the §3.1
+    addendum). Covers motivation, surface, schema decisions
+    (why seq re-numbers from 1; why fork inherits target_id;
+    why replay byte-compares only when both snapshots are
+    deterministic AND equal), idempotency contract, failure
+    matrix, phase-2 scope, worked-example wire shapes.
+- `dd38754 feat(store): SessionStore::fork_session (post-V1 #16 phase-1)`
+  - Header gains `ForkResult` + `fork_session(source, name,
+    description, until_seq)`. Single-sqlite-transaction copy on
+    the child db with partial-write cleanup on any failure —
+    same pattern import_session uses so the index never
+    references half-state.
+  - 8 unit tests in `tests/unit/test_session_fork.cpp` pinning:
+    until_seq=0 copies everything; cut honored; overshoot caps
+    at source.max_seq; empty source allowed; unknown source
+    throws; target_id inherited; name="" -> "<source.name>
+    (fork)"; two forks of the same source yield two ids with
+    byte-equal row payloads (idempotency on content).
+- `d7f5137 feat(store): rpc_log.snapshot column for replay determinism gate`
+  - Schema additive migration: `rpc_log.snapshot TEXT NOT NULL
+    DEFAULT ''`. Fresh dbs get the column from CREATE;
+    pre-existing dbs get it via a defensive ALTER TABLE in
+    migrate_session_db that swallows "duplicate column."
+  - Writer::append takes an optional snapshot parameter; LogRow
+    gains the field; read_log SELECTs it; fork_session copies it;
+    ImportRow + pack export/import propagate it (with a SELECT
+    fallback so old packs are still importable). The dispatcher's
+    outer dispatch() wrapper passes `resp.provenance_snapshot`
+    when appending — every session recorded going forward
+    carries the gate-required snapshot.
+- `3d1c677 feat(dispatcher): session.fork + session.replay (post-V1 #16 phase-1)`
+  - Two handlers; registered in dispatch_inner + describe.endpoints.
+  - session.replay is a row-walker over read_log: skips
+    `session.*` rows (avoid replay-internal recursion),
+    re-dispatches the rest via dispatch() (NOT dispatch_inner
+    — we need the provenance decoration to gate the comparison),
+    and byte-compares the captured data block only when BOTH
+    sides are deterministic AND the snapshots match.
+  - WriterSuspender RAII guards the active session writer slot
+    so replay's internal dispatches don't bleed into whatever
+    session the caller currently has attached.
+  - 14 dispatcher tests in `tests/unit/test_dispatcher_session_replay.cpp`
+    (6 fork + 8 replay). Smoke `tests/smoke/test_session_replay.py`
+    end-to-end against `ldb_fix_structs`.
+  - Token-budget baseline regenerated (Linux locally, Darwin
+    bumped by the same describe.endpoints delta — the schema for
+    that endpoint is platform-identical).
+- `7b66d0d refactor(dispatcher): replay uses protocol::provenance::is_deterministic`
+  - Defer to the public helper instead of duplicating the
+    "starts with core:" predicate. When #15-phase-2 lifts the
+    gate to live targets, replay inherits the new rule for free.
+
+**Decisions:**
+
+- **Replay dispatches through `dispatch`, not `dispatch_inner`.**
+  The determinism gate lives in `resp.provenance_snapshot`,
+  decorated by `decorate_provenance()` in the outer wrapper.
+  Calling dispatch_inner would give us raw data without the
+  snapshot context, so we couldn't tell whether byte-identity
+  applied. The WriterSuspender RAII guard is what makes the
+  outer dispatch safe to call recursively inside the replay
+  handler — without it, replay's internal calls would pollute
+  whatever session the caller had attached.
+
+- **Schema-additive rpc_log.snapshot column.** The captured
+  `response_json` only stores `{ok, data}`; the wire `_provenance`
+  is decorated in `serialize_response`, NOT inside `resp.data`,
+  so it doesn't survive Writer::append. Without the captured
+  snapshot, replay's byte-comparison logic was unsound for rows
+  whose original snapshot was non-deterministic (we'd compare
+  against bytes that were never promised to match). Adding the
+  column at the lowest layer + propagating through writer +
+  reader + fork + pack import/export + the dispatcher's append
+  callsite makes the gate consistent end-to-end.
+
+- **Seq re-numbers from 1 on fork.** Sqlite AUTOINCREMENT is
+  per-table; explicit seq-id preservation would create a sharp
+  edge for any later re-attach-and-append on the fork (the next
+  insert would have to skip the already-occupied IDs). What's
+  semantically preserved is the row payload; seq is a strict-
+  monotonic id, not an attestation.
+
+- **Fork inherits the source's target_id from meta.** The
+  parent's target context is part of "what we were
+  investigating"; a fork that lost it would force the caller to
+  re-pass target_id on every replay row.
+
+- **session.\*\* meta-rows are unconditionally skipped during
+  replay.** They recurse (a replay of a session that
+  contains session.replay would loop) or no-op (session.list
+  returns whatever the fresh store has). Counted in `skipped`,
+  not surfaced as divergences. Future phase-2 may revisit if a
+  use case for replaying meta-ops emerges.
+
+- **Byte-comparison requires BOTH sides deterministic.**
+  Captured-deterministic + replay-non-deterministic is the
+  cross-host / changed-corpus case; we can't compare against
+  bytes that aren't currently being promised. Same for the
+  reverse direction. Only ok-flips bubble up as drift in those
+  cases. When both sides are deterministic AND snapshots
+  match, the bytes MUST match — that's the
+  `deterministic_mismatch` divergence path.
+
+- **Token-budget baseline regenerated, not waived.** The two
+  new describe.endpoints entries add ~1143 tokens — well over
+  the 10% drift gate. Master had a pre-existing 9.57% drift
+  from parallel v1.5 work (#15 phase-1 in a sibling worktree
+  hadn't updated the baseline). The regenerated Linux entry
+  captures the unified post-#16-phase-1 state. Darwin bumped
+  by the same describe.endpoints delta — the schema is
+  platform-identical for that endpoint.
+
+**Surprises / blockers:**
+
+- The captured `response_json` doesn't include `_provenance`
+  by default — the wire-format provenance/cost blocks are
+  added in `serialize_response`, after the writer's append
+  callsite already ran. This forced an unplanned slice
+  (rpc_log.snapshot column) before the replay handler could
+  honor the docs/24 §3 gate. Caught during design-doc writing,
+  fixed before any failing dispatcher test could mislead us.
+
+- Pre-existing token-budget drift on master (9.57%) from
+  parallel v1.5 work. Documented in the commit message;
+  regeneration handles both deltas. If #15-phase-1's worktree
+  lands a second commit after the merge, that's their
+  responsibility to re-baseline.
+
+- The `against` parameter on session.replay is parsed but
+  not acted on in phase-1 — the prompt's spec wanted it for
+  pre-opening a target, but the row-walker dispatches captured
+  target.open rows verbatim today, which works for
+  same-machine replay. Cross-host replay (where the recorded
+  path no longer exists locally) is phase-2 scope; the
+  parameter is reserved so the wire shape doesn't have to
+  break to add it. Documented in docs/24 §7.
+
+**Verification:**
+
+- `ctest --test-dir build -j4 --output-on-failure` -> **69/69 PASS**
+  (was 68 on master; +1 smoke `smoke_session_replay`).
+- `ldb_unit_tests "[session][fork]"` -> 15 cases / 142
+  assertions PASS.
+- `ldb_unit_tests "[session][replay]"` -> 8 cases / 56
+  assertions PASS.
+- `smoke_session_replay` -> PASS (target.open + module.list +
+  type.layout + symbol.find + hello + describe.endpoints
+  recorded, replayed twice with idempotent counters, forked
+  at seq=2).
+
+**Next:**
+- Phase-2 candidates per docs/24 §7:
+  - `from_seq` parameter on session.replay for incremental
+    replay (today the only way is fork-then-replay).
+  - `methods: ["string.*"]` filter for partial replay.
+  - `path_remap: [["/old", "/new"]]` for cross-host replay —
+    the pack export already bundles artifacts; the remap
+    handles binary-path drift.
+  - `forked_from` lineage key in the child's meta table.
+- Eventual: once #15-phase-2 lifts the determinism gate
+  over live-state endpoints, replay's
+  `snapshot_is_deterministic` will catch the new flavor for
+  free (now that it defers to the protocol helper). A
+  follow-up smoke should add a live-target replay case once
+  that lands.
+
+---
+
 ## 2026-05-12 — v1.5 #18 phase-1 integration (bulk iterate + dispatcher rewire + smoke)
 
 **Goal:** Land the integration layer for the own symbol index that

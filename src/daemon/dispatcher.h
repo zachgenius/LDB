@@ -206,6 +206,9 @@ class Dispatcher {
   protocol::Response handle_session_import(const protocol::Request& req);
   protocol::Response handle_session_diff(const protocol::Request& req);
   protocol::Response handle_session_targets(const protocol::Request& req);
+  // Post-V1 plan #16 phase-1 (docs/24-session-fork-replay.md).
+  protocol::Response handle_session_fork(const protocol::Request& req);
+  protocol::Response handle_session_replay(const protocol::Request& req);
   protocol::Response handle_artifact_export(const protocol::Request& req);
   protocol::Response handle_artifact_import(const protocol::Request& req);
 
