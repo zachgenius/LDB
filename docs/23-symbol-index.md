@@ -405,3 +405,76 @@ hopefully deterministic" into "our cache is deterministic by
 construction; LLDB is the populator and its output is captured."
 
 That's the design. Implementation lands in the next commit.
+
+---
+
+## Phase-1 implementation addendum (post-design)
+
+This section documents three behaviours that landed in code but
+weren't in the original design above. Recorded here so #15 / #16
+implementers don't have to read the dispatcher to learn the
+contract.
+
+### A. `iterate_symbols` dedupes by `(schema-name, address)`
+
+The schema PK is `(build_id, name, address)` where `name` is what
+`symbol_match_to_row` writes — `mangled` if non-empty, else `name`.
+LLDB exposes PLT trampolines, weak aliases, and IFUNC resolvers as
+multiple `SBSymbol`s at the same `(name, address)` pair; without
+dedupe the second `INSERT` rejects with a UNIQUE constraint and
+fails the whole transaction. Mirror of the `SymbolDedupeKey` logic
+in `find_symbols` so the cached set matches the cold path exactly.
+
+### B. `correlate.strings` keeps disasm fallback when the string exists
+
+The design's §6 said correlate.strings becomes "a simple SELECT" once
+the index is hot. That's only half-true: the wire response also
+carries disasm-derived `callsites` (xrefs from `find_string_xrefs`),
+and the index doesn't yet cache xrefs (phase-2 `symbol.xref` work).
+So the dispatcher short-circuits ONLY when the cache is hot AND
+`query_strings` returns empty for the requested text — i.e. when we
+KNOW the string isn't present and the xref result must be empty.
+When the string IS present, the cold-path `find_string_xrefs` still
+runs to produce `callsites`.
+
+### C. `kIterateBucketCap` truncation requires a fall-through safety net
+
+`iterate_symbols` / `iterate_types` / `iterate_strings` cap each
+bucket at 100,000 rows for kernel-debuginfo-class binaries. A
+truncated index would silently turn "this symbol was capped" into
+"this symbol does not exist." The dispatcher now plumbs a
+`truncated` flag on `ModuleSymbols/Types/Strings` through
+`ensure_indexed` as a `cap_note`; when the indexed query returns
+empty AND the cap fired during population, the handler falls
+through to backend `find_*` instead of trusting the cache. Genuine
+"missing" (cap didn't fire) is still short-circuited from the
+index, so correlate.types against a real not-present name stays
+sub-millisecond.
+
+### D. Backends without bulk iteration are detected, not poisoned
+
+`GdbMiBackend::iterate_*` (and any future backend that can't do
+bulk enumeration) returns all-empty buckets. The dispatcher detects
+"every bucket empty after iterate_*" and refuses to populate —
+otherwise the binary would be marked `kHot` with zero rows and
+every later correlate.* call would silently short-circuit to an
+empty result, permanently bypassing the backend's working `find_*`
+path. `ensure_indexed` returns false in this case; the dispatcher
+falls through to `find_*` exactly as it does when `LDB_STORE_ROOT`
+is unset.
+
+### E. Main module is captured at `target.open`, not derived later
+
+The original design (§4) said "build_id is already in TargetState."
+There is no TargetState. The dispatcher caches `(target_id →
+{build_id, path})` from `OpenResult.modules[0]` in
+`handle_target_open` and clears it in `handle_target_close`. The
+older "first module with non-empty uuid+path from `list_modules`"
+heuristic stays as a fallback for targets opened via `load_core`
+/ `create_empty_target` (cores don't typically go through
+correlate, and create_empty is followed by `target.attach` which
+should plumb the executable through the future TargetState
+work). The first-module-with-uuid heuristic picks the wrong module
+on real-world Linux paths (`/usr/bin/...` sorts after `/lib/...`
+where libc/ld-linux live), so for executables opened via
+`target.open` the cached value is load-bearing for correctness.

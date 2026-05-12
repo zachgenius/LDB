@@ -59,6 +59,14 @@ class Dispatcher {
   // correlate.* checks index_ && index_->available() and falls through
   // to the backend find_* path otherwise.
   std::unique_ptr<index::SymbolIndex>          index_;
+  // (target_id → main-module key) cache populated on target.open. The
+  // executable's {build_id, path} is the right index cache key, but
+  // list_modules() sorts by path ascending — so the "first module with
+  // non-empty uuid + path" heuristic picks libc / ld-linux on any
+  // executable installed under /opt or /usr. Storing the value at
+  // target.open time is the only reliable way; cleared on target.close.
+  std::unordered_map<std::uint64_t, std::pair<std::string, std::string>>
+                                               target_main_module_;
   // Active backend label echoed via hello.data.capabilities.backend.
   // Set by the constructor from main.cpp's --backend resolution.
   std::string                                  backend_name_;

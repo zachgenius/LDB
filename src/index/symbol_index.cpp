@@ -93,17 +93,10 @@ std::int64_t now_ns() {
              std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// Convert fs::file_time_type → ns since unix epoch. file_time_type's
-// clock is implementation-defined; std::chrono::clock_cast<system_clock>
-// (C++20) does the math for us.
-std::int64_t file_mtime_ns(const fs::path& p) {
-  std::error_code ec;
-  auto ftime = fs::last_write_time(p, ec);
-  if (ec) return 0;
-  auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             sys.time_since_epoch()).count();
-}
+// Note: filesystem mtime → ns is computed at the dispatcher site
+// (fingerprint_for in dispatcher.cpp) so the conversion lives next to
+// the only caller. Keeping the rule in two places would be invariant-
+// breaking; one is enough.
 
 }  // namespace
 

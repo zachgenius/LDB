@@ -503,22 +503,30 @@ class DebuggerBackend {
   // sqlite WAL otherwise.
   static constexpr std::size_t kIterateBucketCap = 100000;
 
+  // `truncated` fires when any bucket hit kIterateBucketCap. The
+  // dispatcher uses this to decide whether to fall through to find_*
+  // when an indexed query returns empty results — without the flag,
+  // a truncated index would silently turn "this symbol was capped out"
+  // into "this symbol does not exist."
   struct ModuleSymbols {
     std::vector<SymbolMatch>  functions;  // SymbolKind::kFunction
     std::vector<SymbolMatch>  data;       // SymbolKind::kVariable
     std::vector<SymbolMatch>  other;      // everything else
+    bool                      truncated = false;
   };
   virtual ModuleSymbols
       iterate_symbols(TargetId tid, std::string_view build_id) = 0;
 
   struct ModuleTypes {
     std::vector<TypeLayout>   types;
+    bool                      truncated = false;
   };
   virtual ModuleTypes
       iterate_types(TargetId tid, std::string_view build_id) = 0;
 
   struct ModuleStrings {
     std::vector<StringMatch>  strings;
+    bool                      truncated = false;
   };
   virtual ModuleStrings
       iterate_strings(TargetId tid, std::string_view build_id) = 0;
