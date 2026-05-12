@@ -4,6 +4,137 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #21 phase-1: non-stop runtime state machine + wire surface
+
+**Goal:** Land the centerpiece of v1.6 (per docs/17-version-plan.md +
+the new docs/26-nonstop-runtime.md) — phase-1 of post-V1 #21 non-stop
+runtime. Phase-1 ships ONLY the state-machine contract + the wire
+surface (thread.list_state, thread.suspend stub, process.continue
+all_threads param, hello.capabilities.non_stop_runtime flag), plus
+the notification serialisation primitives. The actual listener thread
++ LldbBackend SetAsync(true) flip is intentionally deferred to
+phase-2 (separate branch / PR).
+
+**Done:**
+
+- **`docs/26-nonstop-runtime.md`** (`9556a6f`) — v1.6 #21 design note.
+  Builds on #17's async pump now that it's on master. Defines the
+  phase-1 deliverable: per-thread state machine + vCont-based
+  suspend/resume + a JSON-RPC notification surface that consumes
+  #17's reader-thread queue. Re-evaluates docs/11-non-stop.md's
+  v0.3-era pointers in light of the foundation v1.4-v1.6 built
+  underneath. Captures the failure matrix (legacy gdbserver fallback,
+  SetAsync gating, listener-thread startup failure, idempotent
+  thread.continue, stop-event for unknown tid, sink-unavailable
+  mid-emit) so impl commits don't relitigate edge cases.
+
+- **`src/protocol/notifications.{h,cpp}`** (`da25bcc`) — JSON-RPC 2.0
+  §4.1 notification primitives. `make_notification(method, params)`
+  returns the wire-shape object (jsonrpc/method/params; no id).
+  `NotificationSink` is the abstract base; `CapturingNotificationSink`
+  is the test-side captor. No production wiring yet; the layer is
+  consumed by the runtime's listener-driven set_stopped (phase-2) but
+  shipped now so phase-1 tests can pin the shape.
+
+- **`src/runtime/nonstop_runtime.{h,cpp}`** (`e9ad401`, `4359ddc`) —
+  Per-target per-thread state machine. Shared_mutex; reads
+  (snapshot, get_state, stop_event_seq) take shared locks, writes
+  (set_running, set_stopped, forget_*) take exclusive locks. Each
+  per-target slot carries a monotonic stop_event_seq that bumps on
+  every set_stopped. Notifications carry the post-transition seq so
+  agents who receive thread.event{seq:42} can correlate
+  deterministically with a thread.list_state snapshot. sink_ stored
+  as std::atomic<NotificationSink*> so phase-2's listener thread
+  doesn't race the dispatcher RPC thread on the pointer load. 10
+  unit cases in tests/unit/test_nonstop_runtime.cpp.
+
+- **Dispatcher wire-up** (`c8efe0f`, `4359ddc`) — Dispatcher::nonstop_
+  is a value-typed member. thread.continue gains a runtime hook that
+  records set_running(target, tid) ONLY when the backend reports
+  status.state == kRunning (otherwise the resume didn't take and
+  we'd be publishing a lie). process.continue gains an optional
+  all_threads param: default/absent true is the existing behaviour
+  (wire-compat), explicit false is rejected -32602 with a hint to
+  use thread.continue. process.continue does NOT touch the runtime
+  even when tid is set, because today's sync passthrough resumes
+  every thread and stops them all synchronously — recording one tid
+  as running while siblings stay unknown is a lie. target.close
+  calls nonstop_.forget_target so a reused id doesn't carry stale
+  state. hello.capabilities.non_stop_runtime = true so agents can
+  branch on availability. thread.list_state ({target_id}) returns
+  {stop_event_seq, threads:[{tid, state, reason?, signal?, pc?}]}.
+  thread.suspend ({target_id, tid}) returns -32001 kNotImplemented
+  with a phase-2 hint. 9 unit cases in
+  tests/unit/test_dispatcher_nonstop.cpp.
+
+- **describe.endpoints** — thread.list_state + thread.suspend get
+  full JSON Schema entries; process.continue picks up the
+  all_threads param in its schema; thread.continue's summary now
+  cites the runtime hook (the existing v0.3 caveat string is
+  preserved, so the legacy assertion in test_dispatcher_thread_continue.cpp
+  doesn't regress).
+
+**Decisions:**
+
+- **Phase-1 is write-mirror, not ground truth.** The reviewer flagged
+  that thread.list_state may report kRunning after thread.continue
+  even though the v0.3 sync passthrough has already stopped the
+  process. We document this explicitly in docs/26 §6 ("Known phase-1
+  limitation"). Agents that need ground truth call thread.list
+  (backend-derived); thread.list_state reports *intent* until phase-2's
+  listener lands.
+
+- **process.continue all_threads=false → -32602, not a runtime hook.**
+  Less abrupt paths (log + execute anyway) would silently do the
+  wrong thing. Hard reject with a pointer to thread.continue is the
+  honest contract; v1.7 may flip the default.
+
+- **thread.suspend ships as a -32001 stub.** The wire surface ships
+  so agents can pre-flight via describe.endpoints; the error message
+  cites phase-2 so callers don't think it's a config issue.
+
+- **sink_ as std::atomic.** Phase-1 has one writer (dispatcher RPC
+  thread) so a plain pointer would technically be safe, but the
+  design promised the locking shape was "one line to switch" for
+  phase-2. Making sink_ atomic now avoids the gotcha; relaxed
+  ordering is fine since the sink-side state has its own
+  happens-before.
+
+- **#17's H2 hazard (Dispatcher::rsp_channels_ not thread-safe) is
+  closed by spec, not yet by code.** docs/26 §2.2 documents the
+  protocol: the runtime's shared_mutex governs every read of the
+  rsp_channels_ map from the listener; structural mutation
+  (target.open / target.close) takes the same lock exclusively +
+  unregisters from the listener first. The actual lock plumbing
+  arrives with phase-2's listener-thread commit.
+
+**Surprises / blockers:**
+
+- `.gitignore` had a stale top-level `runtime/` rule (intended for
+  captured session-data; never matched anything in-tree). Scoped to
+  `/runtime/` so `src/runtime/` can hold checked-in source.
+
+- The existing test_dispatcher_thread_continue.cpp:288 assertion
+  `summary.find("v0.3") != std::string::npos` is sensitive to the
+  describe.endpoints summary. Preserved the v0.3 caveat string in
+  the new summary alongside the #21-phase-1 note so the legacy
+  test doesn't regress.
+
+**Next:**
+
+- **Phase-2 of #21 — listener thread + LldbBackend SetAsync(true)
+  flip.** Pumps SBListener::WaitForEvent (LLDB) and RspChannel::recv
+  (own RSP client) into runtime.set_stopped. Lands the real
+  thread.suspend (drops the -32001 stub). Smoke against lldb-server
+  gdbserver exercising thread.event round-trip. Closes #17's H2
+  hazard (Dispatcher::rsp_channels_ map locking) by the
+  shared_mutex pattern documented in docs/26 §2.2.
+
+- After #21 fully lands: continue with the v1.6 chain (#17 phase-2,
+  #25, #26 per user's "make everything into v1.6" directive).
+
+---
+
 ## 2026-05-12 — v1.6 #17 phase-1 part 3: RspChannel + endpoint + smoke
 
 **Goal:** Land the integration layer of the own RSP client: async TCP
