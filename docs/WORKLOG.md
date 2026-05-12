@@ -203,6 +203,106 @@ note — dispatcher integration deferred to phase-2.5.
 - **Capability cache.** Phase-2.5 should cache the "no-QTDP" verdict
   per channel so we don't retry `QTinit` on every tracepoint.create
   after the first failed negotiation.
+---
+
+## 2026-05-12 — v1.6 #21 LLDB completion: thread.suspend for LLDB-backed targets
+
+**Goal:** Close the LLDB half of the non-stop write path. Today
+`thread.suspend` returns `-32001 kNotImplemented` for non-RSP targets
+because LldbBackend has no per-thread suspend primitive — RSP-backed
+targets already route through `vCont;t` (#17 phase-2). Land a real
+backend virtual so LLDB-backed targets reach parity.
+
+**Done:**
+
+- `DebuggerBackend::suspend_thread(TargetId, ThreadId)` virtual added.
+  LldbBackend implementation calls `SBThread::Suspend()` on the
+  resolved thread; throws `backend::Error` on bad target/tid or no
+  live process. GdbMiBackend implementation throws "not implemented"
+  (MI's per-thread semantics differ enough to warrant a separate
+  item).
+- `Dispatcher::handle_thread_suspend` rewired: non-RSP path now
+  forwards to `backend_->suspend_thread`. NotImplemented errors from
+  the backend still surface as `-32001`; everything else is `-32004
+  kBackendError`. RSP path unchanged.
+- `tests/unit/test_backend_suspend_thread.cpp` (new, 4 cases) — live
+  LLDB-launched suspend against the sleeper fixture + the three error
+  paths (bad target_id, no process, unknown tid).
+- `test_dispatcher_nonstop.cpp` — the "-32001 in phase-1" case is
+  replaced with two: forwards-to-backend (happy path returns
+  `state=stopped`) + unknown target → `-32004`.
+- `test_dispatcher_vcont_rsp.cpp` — the "non-RSP target still
+  returns -32001" case is updated: same shape, now asserts the LLDB
+  backend's "no process" surfaced as `-32004` against an empty
+  target. RSP path tests unchanged.
+- The 7 other unit-test files that subclass `DebuggerBackend` got a
+  one-line `suspend_thread` override so the virtual table stays
+  abstract-complete.
+
+Commit: `7013eba` (feat) + this worklog entry.
+
+**Decisions:**
+
+- **`SBThread::Suspend()` works under `SetAsync(false)`.** This is
+  the load-bearing observation that lets us ship the LLDB-side
+  suspend without the full async-mode cascade. The suspend bit is
+  honoured by the *next* `SBProcess::Continue`, not by the suspend
+  call itself — so the synchronous-Continue semantics every other
+  endpoint depends on stay intact. docs/26 §1's table called the
+  bit-flip a "phase-1 limitation, needs SetAsync(true) to land" but
+  that turned out to be conservative: only the *delivery* of
+  per-thread stop events needs async mode; the *expression* of a
+  suspend intent does not.
+- **Stretch deferred (SetAsync(true) flip + `pump_until_stopped`
+  wrappers around continue / step).** docs/27 §7 already documents
+  that flip as its own commit — every existing endpoint that
+  depends on "Continue() returns after the next stop" cascades when
+  the mode flips, and ironing out the cascade is a multi-day audit.
+  Ships minimum scope clean.
+- **NotImplemented vs BackendError split in the dispatcher.** The
+  backend throws `backend::Error("not implemented…")` for the GDB/MI
+  path; the dispatcher pattern-matches the message to map that to
+  `-32001 kNotImplemented` and everything else to `-32004`. Not
+  ideal (string-matching is fragile), but adding a typed
+  `NotImplementedError` subclass is bigger surgery than this PR
+  warrants; flagged for the GDB/MI backend's own follow-up.
+- **Test fixture choice.** sleeper is single-threaded so we can't
+  observe "sibling threads kept running while this one stayed
+  parked" from a unit test. Multi-threaded suspend semantics are
+  covered end-to-end when #21 phase-2's listener feeds stop events
+  from a real `lldb-server` target (smoke layer). The unit test
+  here pins the per-thread bit-flip contract.
+
+**Surprises / blockers:**
+
+- Started work in the wrong cwd (main repo on a different agent's
+  uncommitted branch) and had to save my edits as a patch, reset
+  the main repo, then re-apply in the worktree. Lost ~5 minutes;
+  no work lost. Lesson: bash sessions don't persist cwd, and
+  `cd /home/zach/Develop/LDB` lands you outside the worktree even
+  when the harness says you're inside it.
+
+**Next:**
+
+- **SetAsync(true) flip + cascade.** docs/27 §7 explicitly punts
+  this; it remains the open question. Each endpoint that
+  synchronously awaits stop after Continue/Step needs either a
+  `pump_until_stopped` wrapper or a migration to an explicitly
+  async return shape (`{state: "running", request_id}` + push
+  events). Multi-day audit; not a one-line flip.
+- **Per-thread `continue_thread` semantics.** Once SetAsync(true)
+  lands, `continue_thread(target, tid)` should actually do per-
+  thread keep-running: `SBThread::Suspend(true)` on siblings,
+  unsuspend on the named thread, then `SBProcess::Continue()`. The
+  `test_backend_continue_thread.cpp` contract that says
+  "continue_thread resumes the whole process (sync passthrough)"
+  will need updating.
+- **Typed NotImplemented in `backend::Error`.** The dispatcher
+  string-matches "not implemented" today; a `NotImplementedError`
+  subclass would make the mapping precise.
+- **GDB/MI `suspend_thread`.** Wire to `-exec-interrupt --thread X`
+  against an MI server in non-stop mode (requires `set non-stop on`
+  at session init, which is currently off in `GdbMiSession::start`).
 
 ---
 
