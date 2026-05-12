@@ -98,6 +98,7 @@ set(LDB_UNIT_SOURCES
   test_nonstop_runtime.cpp
   test_nonstop_listener.cpp
   test_dispatcher_nonstop.cpp
+  test_dispatcher_vcont_rsp.cpp
   test_pack.cpp
   test_pack_signing.cpp
   test_util_sha256.cpp
