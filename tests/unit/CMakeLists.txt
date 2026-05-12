@@ -101,6 +101,7 @@ set(LDB_UNIT_SOURCES
   test_embedded_python.cpp
   test_bpf_agent_protocol.cpp
   test_symbol_index.cpp
+  test_backend_iterate.cpp
 )
 
 set(LDB_LIB_SOURCES
