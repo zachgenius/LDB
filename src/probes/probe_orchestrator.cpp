@@ -52,6 +52,11 @@ struct ProbeOrchestrator::ProbeState {
   // call into it with this attach_id to poll events and to detach at
   // remove() time.
   std::string                     agent_attach_id;
+
+  // Post-V1 #25 phase-2: running count of events filtered out by the
+  // predicate (spec.predicate evaluates to zero or returns an error).
+  // Exposed via ListEntry.predicate_dropped.
+  std::uint64_t                   predicate_dropped = 0;
 };
 
 namespace {
@@ -319,11 +324,13 @@ std::vector<ProbeOrchestrator::ListEntry> ProbeOrchestrator::list() {
   out.reserve(probes_.size());
   for (const auto& [id, st] : probes_) {
     ListEntry e;
-    e.probe_id   = id;
-    e.kind       = st->kind;
-    e.where_expr = st->where_expr;
-    e.enabled    = st->enabled;
-    e.hit_count  = st->hit_count;
+    e.probe_id          = id;
+    e.kind              = st->kind;
+    e.where_expr        = st->where_expr;
+    e.enabled           = st->enabled;
+    e.hit_count         = st->hit_count;
+    e.has_predicate     = st->spec.predicate.has_value();
+    e.predicate_dropped = st->predicate_dropped;
     out.push_back(std::move(e));
   }
   // Audit §11.4: probe ids are "p<seq>" where seq is a per-orchestrator
@@ -362,11 +369,13 @@ ProbeOrchestrator::info(const std::string& probe_id) {
   auto it = probes_.find(probe_id);
   if (it == probes_.end()) return std::nullopt;
   ListEntry e;
-  e.probe_id   = probe_id;
-  e.kind       = it->second->kind;
-  e.where_expr = it->second->where_expr;
-  e.enabled    = it->second->enabled;
-  e.hit_count  = it->second->hit_count;
+  e.probe_id          = probe_id;
+  e.kind              = it->second->kind;
+  e.where_expr        = it->second->where_expr;
+  e.enabled           = it->second->enabled;
+  e.hit_count         = it->second->hit_count;
+  e.has_predicate     = it->second->spec.predicate.has_value();
+  e.predicate_dropped = it->second->predicate_dropped;
   return e;
 }
 
@@ -631,6 +640,26 @@ bool ProbeOrchestrator::on_breakpoint_hit(
   auto* st = static_cast<ProbeState*>(baton);
   if (!st || !st->owner) return false;
   ProbeOrchestrator* self = st->owner;
+
+  // Post-V1 #25 phase-2: evaluate the predicate before doing any
+  // capture / artifact work. A zero result (or eval error) drops the
+  // event silently — agent-controlled filtering, no observable side
+  // effect except the predicate_dropped counter increment.
+  if (st->spec.predicate.has_value()) {
+    agent_expr::EvalContext ectx;
+    ectx.target      = st->spec.target_id;
+    ectx.tid         = args.tid;
+    ectx.frame_index = 0;
+    ectx.backend     = self->backend_.get();
+    auto eval_r = agent_expr::eval(*st->spec.predicate, ectx);
+    if (eval_r.error != agent_expr::EvalError::kOk || eval_r.value == 0) {
+      // Drop. Auto-continue. Bump the counter under the lock so a
+      // concurrent probe.list reads a consistent value.
+      std::lock_guard<std::mutex> lk(self->mu_);
+      st->predicate_dropped += 1;
+      return false;
+    }
+  }
 
   // Build the event before taking the orchestrator lock — register
   // and memory reads can talk to the backend (which has its own

@@ -7639,6 +7639,13 @@ json probe_list_entry_to_json(const probes::ProbeOrchestrator::ListEntry& e) {
   j["where_expr"] = e.where_expr;
   j["enabled"]    = e.enabled;
   j["hit_count"]  = e.hit_count;
+  // Post-V1 #25 phase-2 — predicate metadata. has_predicate is
+  // always present (false when no predicate is attached); the
+  // dropped counter is present whenever has_predicate is true.
+  j["has_predicate"]    = e.has_predicate;
+  if (e.has_predicate) {
+    j["predicate_dropped"] = e.predicate_dropped;
+  }
   return j;
 }
 
@@ -7668,6 +7675,16 @@ Response Dispatcher::handle_probe_create(const Request& req) {
   // (post-V1 plan #12). The dispatcher parses identically and the
   // orchestrator routes on ps.kind.
   if (*kind == "uprobe_bpf" || *kind == "agent") {
+    // Post-V1 #25 phase-2: predicate is only meaningful for
+    // lldb_breakpoint. The BPF / agent paths have their own
+    // filtering surface (bpftrace's own predicates, agent-side
+    // bytecode); a daemon-side predicate would fire after the
+    // event has already been published.
+    if (req.params.contains("predicate")) {
+      return protocol::make_err(
+          req.id, ErrorCode::kInvalidParams,
+          "predicate is only supported for kind='lldb_breakpoint'");
+    }
     auto wit = req.params.find("where");
     if (wit == req.params.end() || !wit->is_object()) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams,
@@ -7957,6 +7974,63 @@ Response Dispatcher::handle_probe_create(const Request& req) {
     rate_limit = *rl;
   }
 
+  // ---- predicate (post-V1 #25 phase-2) ---------------------------------
+  std::optional<agent_expr::Program> predicate;
+  if (auto pit = req.params.find("predicate");
+      pit != req.params.end() && !pit->is_null()) {
+    if (!pit->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "predicate must be object");
+    }
+    bool has_source = pit->contains("source") && !(*pit)["source"].is_null();
+    bool has_b64    = pit->contains("bytecode_b64")
+                      && !(*pit)["bytecode_b64"].is_null();
+    if (!has_source && !has_b64) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "predicate must set source or bytecode_b64");
+    }
+    if (has_source && has_b64) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "predicate must set exactly one of source / bytecode_b64");
+    }
+    if (has_source) {
+      if (!(*pit)["source"].is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "predicate.source must be string");
+      }
+      auto result = agent_expr::compile(
+          (*pit)["source"].get<std::string>());
+      if (result.error.has_value()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "predicate.source compile error at " +
+            std::to_string(result.error->line) + ":" +
+            std::to_string(result.error->column) + ": " +
+            result.error->message);
+      }
+      predicate = std::move(*result.program);
+    } else {
+      if (!(*pit)["bytecode_b64"].is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "predicate.bytecode_b64 must be string");
+      }
+      std::vector<std::uint8_t> raw;
+      try {
+        raw = util::base64_decode(
+            (*pit)["bytecode_b64"].get<std::string>());
+      } catch (const backend::Error&) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "predicate.bytecode_b64: invalid base64");
+      }
+      auto decoded = agent_expr::decode(std::string_view(
+          reinterpret_cast<const char*>(raw.data()), raw.size()));
+      if (!decoded.has_value()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "predicate.bytecode_b64: malformed bytecode");
+      }
+      predicate = std::move(*decoded);
+    }
+  }
+
   probes::ProbeSpec ps;
   ps.target_id              = static_cast<backend::TargetId>(target_id);
   ps.kind                   = *kind;
@@ -7966,6 +8040,7 @@ Response Dispatcher::handle_probe_create(const Request& req) {
   ps.artifact_name_template = std::move(artifact_name);
   ps.build_id               = std::move(build_id);
   ps.rate_limit_text        = std::move(rate_limit);
+  ps.predicate              = std::move(predicate);
 
   std::string probe_id;
   try {
