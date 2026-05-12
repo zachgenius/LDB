@@ -4,6 +4,126 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #21 phase-2: listener thread + stream-locked notifications
+
+**Goal:** Close phase-1's write-mirror-vs-ground-truth gap for
+RspChannel-backed targets. Phase-1 shipped the runtime + endpoints +
+notification primitives but populated state only from
+`thread.continue` (intent). Phase-2 adds the listener thread that
+observes real stop replies from the wire and feeds them through
+`runtime::set_stopped`, which already fires `thread.event` via the
+installed sink. Result: agents using `target.connect_remote_rsp`
+now get genuine push notifications when the gdb-remote server
+emits a stop.
+
+**Done:**
+
+- **`docs/27-nonstop-listener.md`** (`44b127f`) — phase-2 design
+  note. Scopes phase-2 to OutputChannel + StreamNotificationSink +
+  NonStopListener thread; documents what's deferred (real
+  thread.suspend, LldbBackend SetAsync(true) flip, live smoke).
+  Captures the listener-vs-per-channel-thread tradeoff and the
+  unregister-mid-recv ordering hazard. Doc updated in `7fa87fd` to
+  describe what actually shipped (eager-construction value member;
+  non-blocking try_recv inside shared_lock; test
+  `test_dispatcher_listener_register.cpp` deferred to #17-phase-2's
+  smoke).
+
+- **`src/protocol/output_channel.{h,cpp}`** (`f166270`) — single
+  stdout writer with mutex. `write_response` + `write_notification`
+  both acquire the mutex briefly and encode via the existing
+  `write_message`. `StreamNotificationSink` is the concrete sink
+  that forwards `NotificationSink::emit` into
+  `OutputChannel::write_notification`. `stdio_loop.cpp` rewired to
+  take an `OutputChannel&` for replies so the dispatcher's RPC
+  thread and the listener thread serialise on the same lock.
+  `main.cpp` constructs both over `std::cout` + the negotiated
+  format. 4 unit cases in `test_output_channel.cpp` including a
+  200-iter two-thread hammer that proves every emitted line parses
+  as a valid JSON object — no byte interleave.
+
+- **`src/runtime/nonstop_listener.{h,cpp}`** (`1299e0b`, `7fa87fd`)
+  — single listener thread per dispatcher. Polls registered
+  RspChannels via `chan->recv(0ms)` (non-blocking try_recv), parses
+  stop replies via the existing `transport::rsp::parse_stop_reply`,
+  maps gdb's `T`/`S`/`W`/`X` shape onto `runtime::ThreadStop` (mining
+  `thread`/`reason` kv-pairs), and calls `runtime.set_stopped` —
+  which fires `thread.event{kind:"stopped"}` via the sink. Shared
+  lock is held across try_recv but the per-iteration sleep is
+  *outside* the lock, so `unregister_target` waits microseconds (not
+  N × poll_interval) on `target.close`. 6 unit cases in
+  `test_nonstop_listener.cpp` including a live socketpair-fakery
+  round-trip that proves register → server packet → notification
+  end-to-end.
+
+- **Dispatcher integration** (`1299e0b`) — `nonstop_listener_` is
+  a value-typed member declared AFTER `nonstop_` so the listener
+  joins first on destruction. `handle_target_connect_remote_rsp`
+  parks the channel in `rsp_channels_` first, then registers the
+  raw pointer with the listener (safe because the dispatcher is
+  single-threaded). `handle_target_close` unregisters from the
+  listener BEFORE erasing the channel from `rsp_channels_`, so the
+  unique_ptr's destructor never races a listener mid-recv.
+
+**Decisions:**
+
+- **Non-blocking try_recv inside shared_lock, not snapshot+release**.
+  Reviewer first suggested snapshot+release-lock-before-recv to
+  bound unregister latency. That introduces a UAF window: unregister
+  could return + dispatcher could destroy the channel + listener's
+  raw-pointer snap would dangle. Solution: keep the lock held but
+  use `chan->recv(0ms)` so iteration is microseconds. Unregister
+  waits microseconds; correctness is preserved without a
+  `shared_ptr<RspChannel>` refactor.
+
+- **Eager-constructed value member, not lazy unique_ptr**. The
+  original design note suggested lazy construction on first
+  `connect_remote_rsp`. Eager is simpler (no init-flag, no
+  first-connect race) and a single OS thread per daemon is
+  negligible cost. The design note now matches the code.
+
+- **thread.suspend stub stays -32001**. Phase-2 added the *read*
+  path (listener consumes stop replies); the *write* path (sending
+  `vCont;t:tid` over a channel) is #17-phase-2 territory. Shipping
+  the read path now is the right sequencing — the alternative is
+  coupling two independent workstreams. Design note §6 documents
+  the gap.
+
+- **LldbBackend SetAsync(true) flip deferred**. Flipping that one
+  line cascades behavioural changes across every existing test that
+  expects `SBProcess::Continue` to block until stop. Out-of-scope
+  for #21 phase-2; revisited when #17-phase-2 lands or as its own
+  follow-up phase.
+
+**Surprises / blockers:**
+
+- A `FakeServer` move-on-return bug in the listener live test
+  closed the socketpair fd in the moved-from destructor. Caught
+  immediately by the test's empty-sink assertion. Inlined the
+  socketpair setup to dodge the implicit-move bug; reviewer
+  endorsed (a move-aware helper would be six lines of boilerplate
+  for one test case).
+
+- `<sys/socket.h>` had to be added to the listener test — RspChannel's
+  header doesn't transitively expose `socketpair`.
+
+**Next:**
+
+- **#17-phase-2** can land now — flip the data path through
+  `RspChannel` (default the connect_remote → own client; register
+  Z0/z0 breakpoints; emit vCont for resume). The listener side is
+  ready; vCont over the channel becomes the write path that drops
+  the thread.suspend -32001 stub.
+
+- **LldbBackend SetAsync(true) flip** can be its own commit with
+  its own test cascade rather than blocking the v1.6 chain.
+
+- **#25 / #26** ride the same per-thread state machine + listener
+  surface (predicates and tracepoints become listener-fed
+  notifications).
+
+---
+
 ## 2026-05-12 — v1.6 #21 phase-1: non-stop runtime state machine + wire surface
 
 **Goal:** Land the centerpiece of v1.6 (per docs/17-version-plan.md +
