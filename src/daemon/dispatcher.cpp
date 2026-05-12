@@ -619,7 +619,8 @@ Response Dispatcher::dispatch(const Request& req) {
     }
     try {
       active_session_writer_->append(req.method, req_j, rsp_j, resp.ok,
-                                     static_cast<std::int64_t>(dt_us));
+                                     static_cast<std::int64_t>(dt_us),
+                                     resp.provenance_snapshot);
     } catch (const std::exception& e) {
       // A failed log append must not poison the response we're about
       // to send. Log to stderr (the JSON-RPC channel is reserved for
@@ -5315,7 +5316,11 @@ Response Dispatcher::handle_session_detach(const Request& req) {
     rsp_j["ok"] = true;
     rsp_j["data"] = json{{"detached", true}};
     try {
-      active_session_writer_->append(req.method, req_j, rsp_j, true, 0);
+      // session.detach has no target_id; provenance is "none". Pass
+      // explicitly so the row matches what the outer dispatch wrapper
+      // would have written for any other no-target call.
+      active_session_writer_->append(req.method, req_j, rsp_j, true, 0,
+                                     "none");
     } catch (const std::exception& e) {
       log::warn(std::string("session log append (detach) failed: ") +
                 e.what());

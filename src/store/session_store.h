@@ -102,6 +102,11 @@ class SessionStore {
     std::string   response_json;
     bool          ok          = true;
     std::int64_t  duration_us = 0;
+    // Post-V1 #16 phase-1 (docs/24 §3.1): captured response's
+    // _provenance.snapshot. Empty string for rows written before
+    // this column was added — replay treats empty as
+    // "non-deterministic by default".
+    std::string   snapshot;
   };
 
   // Read the rpc_log of a session in seq-ascending order. Optional
@@ -246,6 +251,10 @@ class SessionStore {
     std::string   response_json;
     bool          ok           = true;
     std::int64_t  duration_us  = 0;
+    // Post-V1 #16 phase-1: pack-side snapshot column. Empty for
+    // packs produced before this column existed; import preserves
+    // whatever the manifest carried.
+    std::string   snapshot;
   };
 
   // import_session — used by `pack::unpack` to materialize a session
@@ -288,11 +297,16 @@ class SessionStore::Writer {
   // [request] and [response]; stores [ok] as INTEGER (0/1) and
   // [duration_us] as the wall-clock cost the dispatcher measured for
   // dispatch_inner(). [ts_ns] is taken from system_clock at append-time.
+  // [snapshot] is the dispatcher's resp.provenance_snapshot (see plan
+  // §3.5) — empty string is allowed and means "snapshot not recorded";
+  // post-V1 #16's replay gate treats empty as "non-deterministic by
+  // default" (docs/24 §3.1).
   void append(std::string_view method,
               const nlohmann::json& request,
               const nlohmann::json& response,
               bool ok,
-              std::int64_t duration_us);
+              std::int64_t duration_us,
+              std::string_view snapshot = "");
 
   ~Writer();
   Writer(const Writer&) = delete;

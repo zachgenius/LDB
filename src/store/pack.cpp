@@ -224,6 +224,9 @@ struct SessionExport {
     std::string   response_json;
     bool          ok;
     std::int64_t  duration_us;
+    // Post-V1 #16 phase-1: captured snapshot. Empty for packs
+    // produced before the column existed (read-side falls back).
+    std::string   snapshot;
   };
   std::vector<Row> rows;
 };
@@ -283,7 +286,11 @@ materialize_session_db(const SessionExport& src,
     "  request TEXT NOT NULL,"
     "  response TEXT NOT NULL,"
     "  ok INTEGER NOT NULL,"
-    "  duration_us INTEGER NOT NULL"
+    "  duration_us INTEGER NOT NULL,"
+    // Post-V1 #16 phase-1: see docs/24 §3.1. Older packs that
+    // didn't include this column are still importable — the
+    // read-side has a fallback SELECT.
+    "  snapshot TEXT NOT NULL DEFAULT ''"
     ");"
     "CREATE INDEX idx_rpc_method ON rpc_log(method);"
   );
@@ -320,8 +327,8 @@ materialize_session_db(const SessionExport& src,
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db,
         "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
-        "                    duration_us) "
-        "VALUES(?1, ?2, ?3, ?4, ?5, ?6);", -1, &stmt, nullptr) != SQLITE_OK) {
+        "                    duration_us, snapshot) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);", -1, &stmt, nullptr) != SQLITE_OK) {
       sqlite3_close(db);
       std::error_code ignore;
       fs::remove(tmp, ignore);
@@ -342,6 +349,9 @@ materialize_session_db(const SessionExport& src,
                          SQLITE_TRANSIENT);
       sqlite3_bind_int  (stmt, 5, r.ok ? 1 : 0);
       sqlite3_bind_int64(stmt, 6, r.duration_us);
+      sqlite3_bind_text (stmt, 7, r.snapshot.c_str(),
+                         static_cast<int>(r.snapshot.size()),
+                         SQLITE_TRANSIENT);
       if (sqlite3_step(stmt) != SQLITE_DONE) {
         sqlite3_finalize(stmt);
         sqlite3_close(db);
@@ -397,13 +407,27 @@ SessionExport read_session_db(const std::filesystem::path& dbpath) {
 
   // rpc_log
   {
+    // Try the post-V1-#16 schema first (snapshot column included).
+    // If the pack was produced before that column existed the prepare
+    // fails with "no such column"; fall back to the legacy SELECT
+    // and leave snapshot empty (replay treats empty as "non-
+    // deterministic by default", docs/24 §3.1).
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT ts_ns, method, request, response, ok, "
-                      "duration_us FROM rpc_log ORDER BY seq ASC;";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-      sqlite3_close(db);
-      throw backend::Error(std::string("pack: prepare rpc_log: ") +
-                           sqlite3_errmsg(db));
+    bool has_snapshot = true;
+    const char* sql_new =
+        "SELECT ts_ns, method, request, response, ok, duration_us, "
+        "       snapshot "
+        "FROM rpc_log ORDER BY seq ASC;";
+    if (sqlite3_prepare_v2(db, sql_new, -1, &stmt, nullptr) != SQLITE_OK) {
+      has_snapshot = false;
+      const char* sql_old =
+          "SELECT ts_ns, method, request, response, ok, duration_us "
+          "FROM rpc_log ORDER BY seq ASC;";
+      if (sqlite3_prepare_v2(db, sql_old, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        throw backend::Error(std::string("pack: prepare rpc_log: ") +
+                             sqlite3_errmsg(db));
+      }
     }
     while (sqlite3_step(stmt) == SQLITE_ROW) {
       SessionExport::Row r;
@@ -419,6 +443,11 @@ SessionExport read_session_db(const std::filesystem::path& dbpath) {
       r.response_json= rsp ? rsp : "{}";
       r.ok           = sqlite3_column_int(stmt, 4) != 0;
       r.duration_us  = sqlite3_column_int64(stmt, 5);
+      if (has_snapshot) {
+        auto snap = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 6));
+        r.snapshot = snap ? snap : "";
+      }
       out.rows.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -997,6 +1026,7 @@ ImportReport unpack(SessionStore& sessions,
         ir.response_json = r.response_json;
         ir.ok            = r.ok;
         ir.duration_us   = r.duration_us;
+        ir.snapshot      = r.snapshot;
         rows.push_back(std::move(ir));
       }
 

@@ -230,10 +230,10 @@ response whose `_provenance.deterministic == true`: identical
 yields byte-identical `data`. The replay handler's correctness rule
 is exactly this contract, restricted to the captured rows:
 
-> For every captured row R in the source session with
-> `_provenance.deterministic == true`, the fresh dispatch of
-> `(R.method, R.params)` against a daemon whose `snapshot_for_target`
-> returns the same string MUST produce byte-equal `data`.
+> For every captured row R in the source session whose captured
+> `_provenance.snapshot` is deterministic-flavored AND whose fresh
+> dispatch produces the *same* deterministic snapshot, replay MUST
+> produce byte-equal `data`.
 
 When the snapshot strings differ (e.g. the source was core-loaded
 from a file that no longer exists on this host), the contract no
@@ -241,9 +241,38 @@ longer applies; the replay row is tagged
 `reason: "deterministic_mismatch"` with the snapshot drift visible
 in `expected_snapshot` / `observed_snapshot`.
 
-When `_provenance.deterministic == false`, replay is *informational
-only* — we surface the observed response, but byte-identity is not
-expected. The summary counters report drift; nothing fails.
+When either side is non-deterministic (snapshot doesn't start with
+`core:`), replay is *informational only* — we surface the observed
+response, but byte-identity is not expected. The summary counters
+report drift; nothing fails.
+
+### 3.1 Capturing the snapshot at write time
+
+The existing `rpc_log` row stores `response_json` as
+`{"ok": resp.ok, "data": resp.data}` — the wire-format
+`_provenance` / `_cost` blocks are added in `serialize_response`,
+NOT inside `resp.data`, so they don't survive the capture path
+that `Dispatcher::dispatch` runs into `Writer::append`. Without
+the captured snapshot, replay can't reconstruct the original
+determinism gate; it would have to fall back to "compare bytes
+only when the *new* dispatch is deterministic," which is unsound
+when the captured snapshot was non-deterministic (we'd compare
+against non-deterministic bytes that were never promised to match).
+
+The fix is to extend `Writer::append` (and the row schema) to
+also record the dispatcher's `resp.provenance_snapshot` for the
+captured response. The schema migration is additive:
+
+```sql
+ALTER TABLE rpc_log ADD COLUMN snapshot TEXT NOT NULL DEFAULT '';
+```
+
+`SessionStore::LogRow` gains a `snapshot` string field;
+`Writer::append` takes a `std::string_view snapshot` parameter
+and binds it into the new column. Rows recorded before this
+change read back as snapshot=""; replay treats those as
+"snapshot unknown — non-deterministic by default" and skips
+byte comparison.
 
 ## 4. Schema decisions
 

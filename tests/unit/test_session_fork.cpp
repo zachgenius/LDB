@@ -64,11 +64,18 @@ struct TmpStoreRoot {
 void append_n(SessionStore& s, const std::string& sid, int n) {
   auto w = s.open_writer(sid);
   for (int i = 0; i < n; ++i) {
+    // Alternate snapshot kinds so the snapshot column gets non-empty
+    // values to compare against post-fork (the determinism-gate field
+    // post-V1 #16 phase-1 leans on).
+    std::string snap = (i % 2 == 0)
+        ? std::string("core:") + std::string(64, '0' + (i % 10))
+        : std::string("none");
     w->append("method-" + std::to_string(i),
               nlohmann::json{{"params", {{"i", i}}}},
               nlohmann::json{{"ok", true}, {"data", {{"i", i}}}},
               i % 2 == 0,                            // alternate ok flag
-              static_cast<std::int64_t>(100 + i));   // distinct duration
+              static_cast<std::int64_t>(100 + i),    // distinct duration
+              snap);
   }
 }
 
@@ -111,6 +118,11 @@ TEST_CASE("session_store: fork copies every row when until_seq=0",
     CHECK(child_rows[i].ok == src_rows[i].ok);
     CHECK(child_rows[i].duration_us == src_rows[i].duration_us);
     CHECK(child_rows[i].ts_ns == src_rows[i].ts_ns);
+    // The snapshot column is the determinism-gate field replay leans
+    // on; if fork loses it, replay against the child becomes
+    // permissive (treats every row as non-deterministic), which
+    // breaks the post-V1 #16 contract.
+    CHECK(child_rows[i].snapshot == src_rows[i].snapshot);
   }
 }
 
@@ -226,6 +238,33 @@ TEST_CASE("session_store: fork is idempotent on content",
     CHECK(rows_a[i].ok == rows_b[i].ok);
     CHECK(rows_a[i].duration_us == rows_b[i].duration_us);
   }
+}
+
+TEST_CASE("session_store: Writer::append persists snapshot column",
+          "[store][session][fork][snapshot]") {
+  // Post-V1 #16 phase-1 (docs/24 §3.1): the rpc_log row gained a
+  // `snapshot` column so replay can re-derive the captured
+  // _provenance gate. Pin that read_log surfaces it.
+  TmpStoreRoot t;
+  SessionStore s(t.root);
+  auto row = s.create("snap", std::nullopt);
+  auto w = s.open_writer(row.id);
+  w->append("hello", nlohmann::json::object(),
+            nlohmann::json{{"ok", true}}, true, 1,
+            std::string("core:abc"));
+  w->append("describe.endpoints", nlohmann::json::object(),
+            nlohmann::json{{"ok", true}}, true, 2,
+            std::string("none"));
+  // The default-empty path is the legacy contract — older callers
+  // that don't pass a snapshot get an empty-string column.
+  w->append("legacy", nlohmann::json::object(),
+            nlohmann::json{{"ok", true}}, true, 3);
+
+  auto rows = s.read_log(row.id);
+  REQUIRE(rows.size() == 3);
+  CHECK(rows[0].snapshot == "core:abc");
+  CHECK(rows[1].snapshot == "none");
+  CHECK(rows[2].snapshot.empty());
 }
 
 TEST_CASE("session_store: fork default name when caller passes empty",

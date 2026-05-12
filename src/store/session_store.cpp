@@ -139,10 +139,36 @@ void migrate_session_db(sqlite3* db,
     "  request TEXT NOT NULL,"
     "  response TEXT NOT NULL,"
     "  ok INTEGER NOT NULL,"
-    "  duration_us INTEGER NOT NULL"
+    "  duration_us INTEGER NOT NULL,"
+    // Post-V1 #16 phase-1 (docs/24 §3.1): captured snapshot for
+    // replay's determinism gate. Empty string for rows recorded
+    // before this migration — replay treats those as
+    // "snapshot unknown -> non-deterministic by default."
+    "  snapshot TEXT NOT NULL DEFAULT ''"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_rpc_method ON rpc_log(method);"
   );
+  // Backward-compat: dbs created before #16-phase-1 won't have
+  // the snapshot column. Try to add it; ignore "duplicate column"
+  // errors when we hit a freshly-created db where CREATE already
+  // included it.
+  {
+    char* err = nullptr;
+    int rc = sqlite3_exec(db,
+        "ALTER TABLE rpc_log ADD COLUMN snapshot TEXT NOT NULL DEFAULT '';",
+        nullptr, nullptr, &err);
+    if (rc != SQLITE_OK && err) {
+      std::string msg = err;
+      sqlite3_free(err);
+      // "duplicate column" is the expected case on new dbs. Anything
+      // else escalates to the canonical throw path.
+      if (msg.find("duplicate column") == std::string::npos) {
+        throw backend::Error(std::string("sqlite migrate add snapshot: ") + msg);
+      }
+    } else if (err) {
+      sqlite3_free(err);
+    }
+  }
 
   auto put_meta = [&](const char* k, const std::string& v) {
     auto stmt = prepare_or_throw(db,
@@ -410,7 +436,8 @@ SessionStore::read_log(std::string_view id,
                          session_path.string());
   }
   std::string sql =
-      "SELECT seq, ts_ns, method, request, response, ok, duration_us "
+      "SELECT seq, ts_ns, method, request, response, ok, duration_us, "
+      "       snapshot "
       "FROM rpc_log";
   bool has_since = (since_seq > 0);
   bool has_until = (until_seq > 0);
@@ -447,6 +474,9 @@ SessionStore::read_log(std::string_view id,
     r.response_json= rsp ? rsp : "{}";
     r.ok           = sqlite3_column_int(stmt.get(), 5) != 0;
     r.duration_us  = sqlite3_column_int64(stmt.get(), 6);
+    auto snap      = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt.get(), 7));
+    r.snapshot     = snap ? snap : "";
     out.push_back(std::move(r));
   }
   sqlite3_close(db);
@@ -822,7 +852,8 @@ SessionStore::fork_session(std::string_view source_id,
       // SELECT on the source. `?1 = 0` means "no upper bound"; otherwise
       // seq <= ?1.
       auto sel = prepare_or_throw(src_db,
-          "SELECT seq, ts_ns, method, request, response, ok, duration_us "
+          "SELECT seq, ts_ns, method, request, response, ok, duration_us, "
+          "       snapshot "
           "FROM rpc_log "
           "WHERE (?1 = 0 OR seq <= ?1) "
           "ORDER BY seq ASC;");
@@ -830,8 +861,8 @@ SessionStore::fork_session(std::string_view source_id,
 
       auto ins = prepare_or_throw(dst_db,
           "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
-          "                    duration_us) "
-          "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+          "                    duration_us, snapshot) "
+          "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
 
       for (;;) {
         int s = sqlite3_step(sel.get());
@@ -867,6 +898,12 @@ SessionStore::fork_session(std::string_view source_id,
                          sqlite3_column_int(sel.get(), 5));      // ok
         sqlite3_bind_int64(ins.get(), 6,
                            sqlite3_column_int64(sel.get(), 6));  // duration_us
+        const unsigned char* snap = sqlite3_column_text(sel.get(), 7);
+        int snap_n = sqlite3_column_bytes(sel.get(), 7);
+        sqlite3_bind_text(ins.get(), 7,
+                          reinterpret_cast<const char*>(snap ? snap
+                                                              : reinterpret_cast<const unsigned char*>("")),
+                          snap ? snap_n : 0, SQLITE_TRANSIENT);
 
         if (sqlite3_step(ins.get()) != SQLITE_DONE) {
           throw_sqlite(dst_db, "fork_session: insert row");
@@ -994,8 +1031,8 @@ void SessionStore::import_session(std::string_view id,
       try {
         auto ins = prepare_or_throw(sdb,
             "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
-            "                    duration_us) "
-            "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+            "                    duration_us, snapshot) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
         for (const auto& r : rows) {
           sqlite3_reset(ins.get());
           sqlite3_clear_bindings(ins.get());
@@ -1011,6 +1048,9 @@ void SessionStore::import_session(std::string_view id,
                              SQLITE_TRANSIENT);
           sqlite3_bind_int  (ins.get(), 5, r.ok ? 1 : 0);
           sqlite3_bind_int64(ins.get(), 6, r.duration_us);
+          sqlite3_bind_text (ins.get(), 7, r.snapshot.c_str(),
+                             static_cast<int>(r.snapshot.size()),
+                             SQLITE_TRANSIENT);
           if (sqlite3_step(ins.get()) != SQLITE_DONE) {
             throw_sqlite(sdb, "import_session: rpc_log insert");
           }
@@ -1076,18 +1116,20 @@ void SessionStore::Writer::append(std::string_view method,
                                   const nlohmann::json& request,
                                   const nlohmann::json& response,
                                   bool ok,
-                                  std::int64_t duration_us) {
+                                  std::int64_t duration_us,
+                                  std::string_view snapshot) {
   std::lock_guard<std::mutex> lk(impl_->mu);
   auto stmt = prepare_or_throw(impl_->db,
       "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
-      "                    duration_us) "
-      "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+      "                    duration_us, snapshot) "
+      "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
 
   auto ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
   std::string m_s(method);
   std::string req_s = request.dump();
   std::string rsp_s = response.dump();
+  std::string snap_s(snapshot);
 
   sqlite3_bind_int64(stmt.get(), 1, static_cast<sqlite3_int64>(ts_ns));
   sqlite3_bind_text (stmt.get(), 2, m_s.c_str(),
@@ -1098,6 +1140,8 @@ void SessionStore::Writer::append(std::string_view method,
                      static_cast<int>(rsp_s.size()), SQLITE_TRANSIENT);
   sqlite3_bind_int  (stmt.get(), 5, ok ? 1 : 0);
   sqlite3_bind_int64(stmt.get(), 6, static_cast<sqlite3_int64>(duration_us));
+  sqlite3_bind_text (stmt.get(), 7, snap_s.c_str(),
+                     static_cast<int>(snap_s.size()), SQLITE_TRANSIENT);
 
   if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
     throw_sqlite(impl_->db, "rpc_log: insert");
