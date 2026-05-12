@@ -387,6 +387,22 @@ struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// A backend operation that is genuinely not implemented for this
+// backend (as opposed to "implemented but the call failed"). The
+// dispatcher maps this to -32001 kNotImplemented; the generic Error
+// path maps to -32004 kBackendError.
+//
+// Why a typed subclass instead of a "not implemented" substring on
+// Error::what(): any backend that throws a descriptive error
+// containing the words "not implemented" for a legitimate runtime
+// failure (e.g. "feature X is not implemented on this kernel") would
+// otherwise get silently promoted to -32001 and hide a real bug. The
+// type discriminator is the whole point — the dispatcher catches
+// NotImplementedError BEFORE the generic Error catch.
+struct NotImplementedError : Error {
+  using Error::Error;
+};
+
 // Parameters for connect_remote_target_ssh — bundle them in a struct
 // because there are many optional fields and call-site readability
 // matters more than ABI stability for an internal interface.
@@ -600,6 +616,27 @@ class DebuggerBackend {
   // process to resume.
   virtual ProcessStatus
       continue_thread(TargetId target_id, ThreadId thread_id) = 0;
+
+  // Suspend a single thread — the inverse of continue_thread (v1.6 #21,
+  // docs/26-nonstop-runtime.md §1). Marks `thread_id` as parked so the
+  // next process-wide resume leaves it pinned at its current PC; the
+  // rest of the process is unaffected by this call alone.
+  //
+  // LldbBackend's implementation calls `SBThread::Suspend(true)` on the
+  // resolved SBThread. The process state itself doesn't change — the
+  // suspend bit only matters on the NEXT SBProcess::Continue, which
+  // honours suspended-ness even with SetAsync(false) (this is how LLDB
+  // models per-thread stepping internally). Returns a ProcessStatus
+  // snapshot for callers that want the post-call state.
+  //
+  // GdbMiBackend currently throws "not implemented" — GDB/MI's per-
+  // thread suspend semantics differ enough from LLDB's that wiring it
+  // up properly is a separate item.
+  //
+  // Throws backend::Error on invalid target_id, unknown thread_id, or
+  // no live process.
+  virtual ProcessStatus
+      suspend_thread(TargetId target_id, ThreadId thread_id) = 0;
 
   // Terminate the target's process. Idempotent: returns
   // ProcessStatus{state=kNone} when there is no process.

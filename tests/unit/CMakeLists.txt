@@ -32,6 +32,7 @@ set(LDB_UNIT_SOURCES
   test_backend_threads.cpp
   test_backend_step.cpp
   test_backend_continue_thread.cpp
+  test_backend_suspend_thread.cpp
   test_dispatcher_thread_continue.cpp
   test_dispatcher_type_layout_warnings.cpp
   test_dispatcher_disasm_address_alias.cpp

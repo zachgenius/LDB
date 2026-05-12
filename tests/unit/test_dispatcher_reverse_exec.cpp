@@ -105,6 +105,7 @@ class CountingStub : public DebuggerBackend {
   ProcessStatus get_process_state(TID) override { return {}; }
   ProcessStatus continue_process(TID) override { return {}; }
   ProcessStatus continue_thread(TID, ThrID) override { return {}; }
+  ProcessStatus suspend_thread(TID, ThrID) override { return {}; }
   ProcessStatus kill_process(TID) override { return {}; }
   ProcessStatus attach(TID, std::int32_t) override { return {}; }
   ProcessStatus detach_process(TID) override { return {}; }
