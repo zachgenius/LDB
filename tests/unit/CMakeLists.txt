@@ -102,6 +102,7 @@ set(LDB_UNIT_SOURCES
   test_agent_expr_codec.cpp
   test_agent_expr_compiler.cpp
   test_agent_expr_evaluator.cpp
+  test_dispatcher_predicate_compile.cpp
   test_pack.cpp
   test_pack_signing.cpp
   test_util_sha256.cpp
@@ -164,6 +165,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/agent_expr/codec.cpp
   ${CMAKE_SOURCE_DIR}/src/agent_expr/compiler.cpp
   ${CMAKE_SOURCE_DIR}/src/agent_expr/evaluator.cpp
+  ${CMAKE_SOURCE_DIR}/src/util/base64.cpp
   ${CMAKE_SOURCE_DIR}/src/probe_agent/protocol.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp

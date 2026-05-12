@@ -11,6 +11,7 @@
 
 #include "backend/debugger_backend.h"
 #include "store/pack.h"
+#include "util/base64.h"
 #include "util/sha256.h"
 
 #include <nlohmann/json.hpp>
@@ -45,76 +46,15 @@ void ensure_sodium_init() {
   });
 }
 
-// ---- base64 (standard alphabet, "+/", with "=" padding) -----------------
+// ---- base64 wrappers ------------------------------------------------
 //
-// OpenSSH `.pub` files use the standard alphabet, NOT URL-safe. The
-// `key_id` form ("SHA256:<base64>") historically drops trailing `=`
-// padding to match `ssh-keygen -l`'s output exactly — we do the same.
+// pack_signing historically owned its own copy; the shared
+// implementation now lives in util/base64.{h,cpp} so other call sites
+// (predicate.compile in #25 phase-2) don't duplicate the table. Local
+// aliases preserve the original call shape inside this file.
 
-constexpr char kB64Alphabet[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-std::string base64_encode(const std::uint8_t* data, std::size_t len,
-                          bool pad) {
-  std::string out;
-  out.reserve(((len + 2u) / 3u) * 4u);
-  std::size_t i = 0;
-  while (i + 3u <= len) {
-    std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
-                      (static_cast<std::uint32_t>(data[i + 1]) << 8) |
-                       static_cast<std::uint32_t>(data[i + 2]);
-    out.push_back(kB64Alphabet[(v >> 18) & 0x3Fu]);
-    out.push_back(kB64Alphabet[(v >> 12) & 0x3Fu]);
-    out.push_back(kB64Alphabet[(v >> 6)  & 0x3Fu]);
-    out.push_back(kB64Alphabet[ v        & 0x3Fu]);
-    i += 3;
-  }
-  if (i < len) {
-    std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
-    if (i + 1u < len) v |= static_cast<std::uint32_t>(data[i + 1]) << 8;
-    out.push_back(kB64Alphabet[(v >> 18) & 0x3Fu]);
-    out.push_back(kB64Alphabet[(v >> 12) & 0x3Fu]);
-    if (i + 1u < len) {
-      out.push_back(kB64Alphabet[(v >> 6) & 0x3Fu]);
-      if (pad) out.push_back('=');
-    } else if (pad) {
-      out.push_back('=');
-      out.push_back('=');
-    }
-  }
-  return out;
-}
-
-int b64_value(char c) {
-  if (c >= 'A' && c <= 'Z') return c - 'A';
-  if (c >= 'a' && c <= 'z') return 26 + (c - 'a');
-  if (c >= '0' && c <= '9') return 52 + (c - '0');
-  if (c == '+') return 62;
-  if (c == '/') return 63;
-  return -1;
-}
-
-std::vector<std::uint8_t> base64_decode(std::string_view s) {
-  std::vector<std::uint8_t> out;
-  out.reserve((s.size() / 4u) * 3u);
-  std::uint32_t acc = 0;
-  int bits = 0;
-  for (char c : s) {
-    if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
-    if (c == '=') break;
-    int v = b64_value(c);
-    if (v < 0) {
-      throw backend::Error("pack_signing: bad base64 character");
-    }
-    acc = (acc << 6) | static_cast<std::uint32_t>(v);
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push_back(static_cast<std::uint8_t>((acc >> bits) & 0xFFu));
-    }
-  }
-  return out;
-}
+using ldb::util::base64_encode;
+using ldb::util::base64_decode;
 
 // ---- OpenSSH-blob reader -------------------------------------------------
 //

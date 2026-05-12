@@ -306,6 +306,12 @@ class Dispatcher {
   protocol::Response handle_perf_report(const protocol::Request& req);
   protocol::Response handle_perf_cancel(const protocol::Request& req);
 
+  // Post-V1 #25 phase-2 (docs/29-predicate-compiler.md). Takes an
+  // S-expression source, returns base64-encoded bytecode + mnemonic
+  // listing + reg_table. Validates without executing — agents
+  // pre-flight a predicate before pinning it on a probe.
+  protocol::Response handle_predicate_compile(const protocol::Request& req);
+
   // Post-V1 plan #12 phase-2: ldb-probe-agent wire shim
   // (docs/21-probe-agent.md). Phase-2 ships hello; attach_* + poll
   // come with the orchestrator wiring in a follow-up commit.

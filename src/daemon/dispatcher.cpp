@@ -25,8 +25,11 @@
 #include "store/pack_signing.h"
 #include "store/recipe_store.h"
 #include "store/session_store.h"
+#include "agent_expr/bytecode.h"
+#include "agent_expr/compiler.h"
 #include "transport/rsp/channel.h"
 #include "transport/rsp/packets.h"
+#include "util/base64.h"
 #include "transport/ssh.h"
 #include "util/log.h"
 
@@ -809,6 +812,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "probe.disable")      return handle_probe_disable(req);
     if (req.method == "probe.enable")       return handle_probe_enable(req);
     if (req.method == "probe.delete")       return handle_probe_delete(req);
+    if (req.method == "predicate.compile")  return handle_predicate_compile(req);
 
     if (req.method == "perf.record")        return handle_perf_record(req);
     if (req.method == "perf.report")        return handle_perf_report(req);
@@ -2633,6 +2637,33 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"probe_id", str()},
           {"deleted",  bool_()},
       }, {"probe_id", "deleted"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== predicate.compile (post-V1 #25 phase-2) ==============
+  //
+  // S-expression → agent-expression bytecode. Pre-flight a predicate
+  // before pinning it on a probe; the same source can later be passed
+  // to probe.create's `predicate.source` field. See docs/29.
+
+  add("predicate.compile",
+      "Compile an S-expression predicate to agent-expression bytecode. "
+      "Returns base64-encoded bytecode (feedable to probe.create's "
+      "predicate.bytecode_b64 field), the byte length, a mnemonic "
+      "listing for debugging, and the register name table. Compile "
+      "errors surface as -32602 with a line:column anchor in the "
+      "message. Empty source compiles to a kEnd-only program (the "
+      "\"always false\" predicate). 16 KiB source cap. "
+      "See docs/29-predicate-compiler.md.",
+      obj({
+          {"source", str("S-expression source. e.g. "
+                          "\"(eq (reg \\\"rax\\\") (const 42))\"")},
+      }, {"source"}),
+      obj({
+          {"bytecode_b64", str()},
+          {"bytes",        uint_()},
+          {"mnemonics",    arr_of(str())},
+          {"reg_table",    arr_of(str())},
+      }, {"bytecode_b64", "bytes", "mnemonics", "reg_table"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== perf.* (post-V1 plan #13) ==============
@@ -8573,6 +8604,104 @@ Response Dispatcher::handle_perf_cancel(const Request& req) {
   return protocol::make_err(req.id, ErrorCode::kBadState,
                             "perf.record is synchronous in this build; "
                             "no in-flight record to cancel");
+}
+
+// ---- predicate.compile (#25 phase-2) --------------------------------
+
+Response Dispatcher::handle_predicate_compile(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  auto sit = req.params.find("source");
+  if (sit == req.params.end() || !sit->is_string()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'source'");
+  }
+  std::string source = sit->get<std::string>();
+  auto result = agent_expr::compile(source);
+  if (result.error.has_value()) {
+    // Surface the line:column anchor in the error message so an
+    // agent can render it without re-parsing.
+    std::string msg = "compile error at " +
+                      std::to_string(result.error->line) + ":" +
+                      std::to_string(result.error->column) + ": " +
+                      result.error->message;
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, msg);
+  }
+  // Should not happen — compile() returns either error or program.
+  if (!result.program.has_value()) {
+    return protocol::make_err(req.id, ErrorCode::kInternalError,
+                              "predicate.compile: empty result");
+  }
+  const auto& prog = *result.program;
+
+  // Build the wire-format bytecode + base64 encode.
+  auto bytecode = agent_expr::encode(prog);
+  std::string b64 = util::base64_encode(bytecode);
+
+  // Mnemonic listing — for agent debugging / introspection. We walk
+  // the opcode stream and emit `<op> [<imm>]` strings; immediates are
+  // decoded inline. Memory-deref ops and stack ops have no immediates.
+  json mnemonics = json::array();
+  std::size_t pc = 0;
+  while (pc < prog.code.size()) {
+    auto op = static_cast<agent_expr::Op>(prog.code[pc++]);
+    auto name = std::string(agent_expr::mnemonic(op));
+    std::string entry = name.empty()
+        ? std::string("op?(")
+              + std::to_string(static_cast<unsigned>(prog.code[pc - 1])) + ")"
+        : name;
+    auto read_be = [&](std::size_t n) -> std::int64_t {
+      std::int64_t v = 0;
+      for (std::size_t i = 0; i < n; ++i) {
+        if (pc + i >= prog.code.size()) return 0;  // truncated; defensive
+        v = (v << 8) | prog.code[pc + i];
+      }
+      pc += n;
+      // sign-extend for n < 8
+      if (n < 8) {
+        std::int64_t sign_bit = static_cast<std::int64_t>(1) << (n * 8 - 1);
+        if (v & sign_bit) v |= ~((sign_bit << 1) - 1);
+      }
+      return v;
+    };
+    switch (op) {
+      case agent_expr::Op::kConst8:
+        entry += " " + std::to_string(read_be(1));
+        break;
+      case agent_expr::Op::kConst16:
+        entry += " " + std::to_string(read_be(2));
+        break;
+      case agent_expr::Op::kConst32:
+        entry += " " + std::to_string(read_be(4));
+        break;
+      case agent_expr::Op::kConst64:
+        entry += " " + std::to_string(read_be(8));
+        break;
+      case agent_expr::Op::kReg: {
+        auto idx = static_cast<std::uint16_t>(read_be(2));
+        entry += " " + std::to_string(idx);
+        if (idx < prog.reg_table.size()) {
+          entry += " (" + prog.reg_table[idx] + ")";
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    mnemonics.push_back(std::move(entry));
+  }
+
+  json data;
+  data["bytecode_b64"] = std::move(b64);
+  data["bytes"]        = static_cast<std::uint64_t>(bytecode.size());
+  data["mnemonics"]    = std::move(mnemonics);
+  data["reg_table"]    = json::array();
+  for (const auto& name : prog.reg_table) {
+    data["reg_table"].push_back(name);
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 // ---- observer.* handlers ------------------------------------------------
