@@ -9,6 +9,7 @@
 #include "index/symbol_index.h"
 #include "ldb/version.h"
 #include "protocol/cost.h"
+#include "protocol/provenance.h"
 #include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
@@ -552,17 +553,67 @@ backend::TargetId extract_target_id(const json& params) {
   }
 }
 
+// Extract target_ids[] (plural) from request params — the shape correlate.*
+// and session.* use. Returns the parsed list, or empty when absent /
+// malformed. Validation lives in parse_target_ids; this helper is
+// best-effort for provenance decoration only.
+std::vector<backend::TargetId> extract_target_ids(const json& params) {
+  std::vector<backend::TargetId> out;
+  if (!params.is_object()) return out;
+  auto it = params.find("target_ids");
+  if (it == params.end() || !it->is_array()) return out;
+  out.reserve(it->size());
+  for (const auto& el : *it) {
+    if (el.is_number_unsigned()) {
+      out.push_back(el.get<backend::TargetId>());
+    } else if (el.is_number_integer()) {
+      auto s = el.get<std::int64_t>();
+      if (s >= 0) out.push_back(static_cast<backend::TargetId>(s));
+    }
+  }
+  return out;
+}
+
 // Decorate `resp` with the cores-only `_provenance.snapshot` per plan
 // §3.5. Best-effort: a thrown exception inside snapshot_for_target
 // degrades to "none" rather than poisoning the whole response.
+//
+// v1.5 #15 phase-1: extended to handle `target_ids[]` (the multi-target
+// shape used by correlate.*). When every id resolves to the same
+// snapshot string we use it; heterogeneous lists degrade to "none" —
+// there's no single "the snapshot" to honestly report in that case.
+// See docs/04-determinism-audit.md §12.
 void decorate_provenance(Response& resp,
                          backend::DebuggerBackend* backend,
                          const Request& req) {
   if (!resp.ok || !backend) return;
-  backend::TargetId tid = extract_target_id(req.params);
   std::string snap;
   try {
-    snap = backend->snapshot_for_target(tid);
+    backend::TargetId tid = extract_target_id(req.params);
+    if (tid != 0) {
+      snap = backend->snapshot_for_target(tid);
+    } else {
+      auto ids = extract_target_ids(req.params);
+      if (!ids.empty()) {
+        // O(N) snapshot reads, one per target_id. Safe today because
+        // the dispatcher is single-threaded; once #21 introduces the
+        // non-stop runtime, snapshot_for_target's per-target mutex
+        // could let target A's gen bump between our read of ids[0]
+        // and ids[1], turning a homogeneous list into a falsely-
+        // heterogeneous one (or vice versa). When the async pump
+        // lands, this loop needs either a batch snapshot_for_targets
+        // API or a global snapshot-pin held for the whole decoration.
+        snap = backend->snapshot_for_target(ids.front());
+        for (std::size_t i = 1; i < ids.size(); ++i) {
+          if (backend->snapshot_for_target(ids[i]) != snap) {
+            snap = "none";
+            break;
+          }
+        }
+      } else {
+        snap = backend->snapshot_for_target(0);
+      }
+    }
   } catch (...) {
     snap = "none";
   }
@@ -619,7 +670,8 @@ Response Dispatcher::dispatch(const Request& req) {
     }
     try {
       active_session_writer_->append(req.method, req_j, rsp_j, resp.ok,
-                                     static_cast<std::int64_t>(dt_us));
+                                     static_cast<std::int64_t>(dt_us),
+                                     resp.provenance_snapshot);
     } catch (const std::exception& e) {
       // A failed log append must not poison the response we're about
       // to send. Log to stderr (the JSON-RPC channel is reserved for
@@ -713,6 +765,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "session.import")     return handle_session_import(req);
     if (req.method == "session.diff")       return handle_session_diff(req);
     if (req.method == "session.targets")    return handle_session_targets(req);
+    if (req.method == "session.fork")       return handle_session_fork(req);
+    if (req.method == "session.replay")     return handle_session_replay(req);
 
     if (req.method == "recipe.create")       return handle_recipe_create(req);
     if (req.method == "recipe.from_session") return handle_recipe_from_session(req);
@@ -1939,6 +1993,97 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"next_offset", uint_()},
       }, {"targets", "total"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  add("session.fork",
+      "Branch an investigation: clone an existing session's rpc_log + "
+      "target_id into a fresh session id, optionally cut at a specific "
+      "seq. The parent is untouched; the child's rpc_log starts as a "
+      "snapshot of the source. Use case: try hypothesis X against "
+      "facts already established in the parent without losing context "
+      "(docs/24-session-fork-replay.md §2.1). The child's seq column "
+      "renumbers from 1 (sqlite AUTOINCREMENT) — row payloads are "
+      "what's semantically preserved, not the seq id itself. "
+      "Post-V1 plan #16 phase-1.",
+      obj({
+          {"source_session_id", str("32-hex session id to fork from.")},
+          {"name",              str("Optional name for the child. "
+                                    "Defaults to \"<source.name> (fork)\".")},
+          {"description",       str("Optional free-form note stored in "
+                                    "the child's meta table; not surfaced "
+                                    "on the response today.")},
+          {"until_seq",         int_("Optional: cut at this seq (inclusive). "
+                                     "0 or absent = head-of-source. "
+                                     "Negative => -32602.")},
+      }, {"source_session_id"}),
+      obj({
+          {"session_id",        str("Fresh 32-hex id assigned to the child.")},
+          {"source_session_id", str()},
+          {"name",              str()},
+          {"created_at",        int_()},
+          {"path",              str()},
+          {"forked_at_seq",     int_("Last source seq that was actually "
+                                     "copied — equals min(until_seq, "
+                                     "source.max_seq), or source.max_seq "
+                                     "when until_seq is 0.")},
+          {"rows_copied",       int_()},
+      }, {"session_id", "source_session_id", "name", "created_at",
+          "path", "forked_at_seq", "rows_copied"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  add("session.replay",
+      "Re-dispatch a recorded session's rpc_log against the current "
+      "daemon and report which rows reproduced byte-identical "
+      "responses. The replay handler skips session.* meta-rows "
+      "(they would recurse or no-op), then for each remaining row "
+      "compares the captured _provenance.snapshot against the new "
+      "dispatch's snapshot. When both are deterministic-flavored "
+      "(`core:...`) and identical, the captured `data` block must "
+      "byte-match the new `data`; mismatches go in `divergences` "
+      "tagged `deterministic_mismatch`. When either side is non-"
+      "deterministic, byte comparison is skipped — only ok-flips "
+      "(captured succeeded but replay errored, or vice versa) "
+      "surface as drift. `strict: true` stops the loop at the "
+      "first deterministic mismatch. The replay does NOT append to "
+      "the currently-attached session — the active writer slot is "
+      "suspended for the duration. Pass `view` to paginate "
+      "`divergences`. cost_hint is `unbounded` — large recorded "
+      "sessions produce large summaries. See "
+      "docs/24-session-fork-replay.md §2.2.",
+      obj({
+          {"session_id", str("32-hex session id to replay.")},
+          {"against",    str("Reserved for phase-2 (target pre-open / "
+                             "path remap). Phase-1 validates shape "
+                             "(non-empty string OR positive integer) "
+                             "but doesn't act on it. Future phase-2 "
+                             "uses string=path, integer=target_id.")},
+          {"strict",     bool_("If true, stop on the first deterministic "
+                               "byte-mismatch. Default false.")},
+          {"view",       view_param()},
+      }, {"session_id"}),
+      obj({
+          {"session_id",                 str()},
+          {"total_steps",                int_("Total rows in the source's "
+                                              "rpc_log.")},
+          {"replayed",                   int_("Rows we re-dispatched "
+                                              "(total - skipped - "
+                                              "internal-error rows).")},
+          {"skipped",                    int_("session.* meta-rows.")},
+          {"deterministic_matches",      int_()},
+          {"deterministic_mismatches",   int_()},
+          {"errors",                     int_("Rows where the captured "
+                                              "response was ok but the "
+                                              "replay errored.")},
+          {"divergences", arr_of(obj_open(
+              "One entry per non-match. Fields: seq, method, reason "
+              "(\"deterministic_mismatch\" | \"replay_error\" | "
+              "\"captured_error\"), and reason-specific snapshot/"
+              "error context."))},
+          {"total",       int_()},
+          {"next_offset", int_()},
+      }, {"session_id", "total_steps", "replayed", "skipped",
+          "deterministic_matches", "deterministic_mismatches",
+          "errors", "divergences"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "unbounded");
 
   // ============== session.export / .import — `.ldbpack` (M5 part 5) ====
 
@@ -5315,7 +5460,11 @@ Response Dispatcher::handle_session_detach(const Request& req) {
     rsp_j["ok"] = true;
     rsp_j["data"] = json{{"detached", true}};
     try {
-      active_session_writer_->append(req.method, req_j, rsp_j, true, 0);
+      // session.detach has no target_id; provenance is "none". Pass
+      // explicitly so the row matches what the outer dispatch wrapper
+      // would have written for any other no-target call.
+      active_session_writer_->append(req.method, req_j, rsp_j, true, 0,
+                                     "none");
     } catch (const std::exception& e) {
       log::warn(std::string("session log append (detach) failed: ") +
                 e.what());
@@ -5486,6 +5635,317 @@ Response Dispatcher::handle_session_targets(const Request& req) {
   auto view_spec = protocol::view::parse_from_params(req.params);
   return protocol::make_ok(req.id,
       protocol::view::apply_to_array(std::move(arr), view_spec, "targets"));
+}
+
+// ----------------------------------------------------------------------------
+// session.fork + session.replay
+// Post-V1 plan #16 phase-1 (docs/24-session-fork-replay.md).
+//
+// fork: copy a source session's rpc_log into a fresh id at or before
+//       until_seq. Renderer over SessionStore::fork_session.
+// replay: walk the source's rpc_log against a fresh dispatcher, leaning
+//       on the captured `snapshot` column (docs/24 §3.1) to decide which
+//       rows must be byte-identical. session.* meta-rows are skipped.
+
+Response Dispatcher::handle_session_fork(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* src = require_string(req.params, "source_session_id");
+  if (!src || src->empty()) {
+    return protocol::make_err(
+        req.id, ErrorCode::kInvalidParams,
+        "missing non-empty string param 'source_session_id'");
+  }
+  // name: optional string; empty -> "<source.name> (fork)" at the store layer.
+  std::string name;
+  if (auto it = req.params.find("name");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'name' must be a string");
+    }
+    name = it->get<std::string>();
+  }
+  // description: optional, stored only (not surfaced today).
+  std::optional<std::string> description;
+  if (auto it = req.params.find("description");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'description' must be a string");
+    }
+    description = it->get<std::string>();
+  }
+  // until_seq: optional non-negative integer; 0 (default) means "head".
+  std::int64_t until_seq = 0;
+  if (auto it = req.params.find("until_seq");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_number_integer() && !it->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'until_seq' must be a non-negative integer");
+    }
+    auto v = it->get<std::int64_t>();
+    if (v < 0) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'until_seq' must be >= 0");
+    }
+    until_seq = v;
+  }
+
+  auto fr = sessions_->fork_session(*src, name, description, until_seq);
+  json data;
+  data["session_id"]        = fr.id;
+  data["source_session_id"] = fr.source_session_id;
+  data["name"]              = fr.name;
+  data["created_at"]        = fr.created_at;
+  data["path"]              = fr.path;
+  data["forked_at_seq"]     = fr.forked_at_seq;
+  data["rows_copied"]       = fr.rows_copied;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+namespace {
+
+// Is this a meta-call we should skip during replay?
+//   session.* methods are skipped — they recurse or no-op against a
+//   fresh dispatcher, per docs/24 §2.2 step 1. recipe.run is
+//   intentionally NOT skipped in phase-1; it fan-outs into multiple
+//   dispatches and any non-determinism inside will surface as a
+//   replay_error or deterministic_mismatch entry, which is honest
+//   per-step accounting. Phase-2 may add an explicit recipe.run skip
+//   if the noise outweighs the signal.
+bool is_meta_method_for_replay(const std::string& method) {
+  return method.size() >= 8 &&
+         std::string_view(method).substr(0, 8) == "session.";
+}
+
+// Best-effort sanity check on a string snapshot value: defer to the
+// existing protocol::provenance::is_deterministic to avoid duplicate
+// definitions of the "what counts as deterministic" predicate
+// (docs/04 §1).
+bool snapshot_is_deterministic(const std::string& s) {
+  return ldb::protocol::provenance::is_deterministic(s);
+}
+
+// Parse `request_json` (compact JSON written by Writer::append) back
+// into a Request the dispatcher can re-issue. The captured envelope
+// is `{"method": <m>, "params": <p>, ["id": <i>]}` — we keep method
+// and params; the id is replay-internal and doesn't need to survive.
+ldb::protocol::Request request_from_captured(const std::string& method,
+                                              const json& parsed_request) {
+  ldb::protocol::Request out;
+  out.method = method;
+  if (parsed_request.is_object()) {
+    auto it = parsed_request.find("params");
+    if (it != parsed_request.end()) {
+      out.params = *it;
+    }
+  }
+  // No id — replay-internal call.
+  return out;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_session_replay(const Request& req) {
+  if (auto e = require_session_store(req, sessions_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  const auto* sid = require_string(req.params, "session_id");
+  if (!sid || sid->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty string param 'session_id'");
+  }
+  bool strict = false;
+  if (auto it = req.params.find("strict");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_boolean()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'strict' must be a boolean");
+    }
+    strict = it->get<bool>();
+  }
+  // `against` is reserved for phase-2 (cross-host / explicit target
+  // pre-open). Phase-1 doesn't act on it, but we DO validate shape so
+  // phase-2 can trust that any value reaching it has already cleared
+  // the gate. Accepts null/absent (no-op), a non-empty string (target
+  // path), or a positive integer (target_id). Anything else is
+  // rejected now to prevent garbage from accumulating in stored
+  // rpc_logs that phase-2 would then have to defend against.
+  if (auto it = req.params.find("against");
+      it != req.params.end() && !it->is_null()) {
+    bool ok = false;
+    if (it->is_string()) {
+      ok = !it->get<std::string>().empty();
+    } else if (it->is_number_unsigned()) {
+      ok = it->get<std::uint64_t>() > 0;
+    } else if (it->is_number_integer()) {
+      ok = it->get<std::int64_t>() > 0;
+    }
+    if (!ok) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'against' must be a non-empty string (path) or positive "
+          "integer (target_id); reserved for phase-2 cross-host "
+          "replay (see docs/24 §2.2 step 2)");
+    }
+  }
+
+  auto rows = sessions_->read_log(*sid);
+
+  // docs/24 §2.2 step 4 + §5: replay must not append to the active
+  // session. Pull the writer out of its slot for the duration of the
+  // call, restore on exit. RAII via unique_ptr move-pair.
+  struct WriterSuspender {
+    std::unique_ptr<ldb::store::SessionStore::Writer>& slot;
+    std::unique_ptr<ldb::store::SessionStore::Writer>  saved;
+    explicit WriterSuspender(
+        std::unique_ptr<ldb::store::SessionStore::Writer>& s)
+        : slot(s), saved(std::move(s)) {}
+    ~WriterSuspender() { slot = std::move(saved); }
+  } suspender(active_session_writer_);
+
+  std::int64_t total_steps              = static_cast<std::int64_t>(rows.size());
+  std::int64_t replayed                 = 0;
+  std::int64_t skipped                  = 0;
+  std::int64_t deterministic_matches    = 0;
+  std::int64_t deterministic_mismatches = 0;
+  std::int64_t errors                   = 0;
+  json divergences = json::array();
+
+  for (const auto& row : rows) {
+    if (is_meta_method_for_replay(row.method)) {
+      ++skipped;
+      continue;
+    }
+
+    // Parse the captured request envelope. Treat malformed rows as
+    // "replay_error" rather than throwing — replay should describe
+    // the failure mode, not abort the summary.
+    json captured_request_j;
+    json captured_response_j;
+    bool parse_ok = true;
+    try {
+      captured_request_j  = json::parse(row.request_json);
+      captured_response_j = json::parse(row.response_json);
+    } catch (const std::exception&) {
+      parse_ok = false;
+    }
+    if (!parse_ok) {
+      ++errors;
+      json div;
+      div["seq"]    = row.seq;
+      div["method"] = row.method;
+      div["reason"] = "replay_error";
+      div["observed_error"] = json{
+          {"code", static_cast<int>(ErrorCode::kInternalError)},
+          {"message", "malformed captured request/response JSON"}};
+      divergences.push_back(std::move(div));
+      ++replayed;
+      if (strict) break;
+      continue;
+    }
+
+    auto replay_req = request_from_captured(row.method, captured_request_j);
+    Response replay_resp = dispatch(replay_req);
+    ++replayed;
+
+    // Captured ok/data lookup. Writer::append writes
+    // {"ok": resp.ok, "data": resp.data} or {"ok": false, "error": {...}}.
+    bool captured_ok = false;
+    if (captured_response_j.is_object()) {
+      auto it = captured_response_j.find("ok");
+      if (it != captured_response_j.end() && it->is_boolean()) {
+        captured_ok = it->get<bool>();
+      }
+    }
+
+    bool both_deterministic =
+        snapshot_is_deterministic(row.snapshot) &&
+        snapshot_is_deterministic(replay_resp.provenance_snapshot) &&
+        row.snapshot == replay_resp.provenance_snapshot;
+
+    if (captured_ok && replay_resp.ok && both_deterministic) {
+      // The byte-identity contract applies. Compare the canonical
+      // data block.
+      json captured_data = json::object();
+      auto it = captured_response_j.find("data");
+      if (it != captured_response_j.end()) captured_data = *it;
+      if (captured_data == replay_resp.data) {
+        ++deterministic_matches;
+      } else {
+        ++deterministic_mismatches;
+        json div;
+        div["seq"]              = row.seq;
+        div["method"]           = row.method;
+        div["reason"]           = "deterministic_mismatch";
+        div["expected_snapshot"]= row.snapshot;
+        div["observed_snapshot"]= replay_resp.provenance_snapshot;
+        div["expected_ok"]      = captured_ok;
+        div["observed_ok"]      = replay_resp.ok;
+        divergences.push_back(std::move(div));
+        if (strict) break;
+      }
+      continue;
+    }
+
+    // Non-deterministic family. We don't byte-compare; only flag
+    // when ok flipped (captured succeeded but replay errored, or
+    // vice versa). Per docs/24 §2.2 step 3.
+    if (captured_ok && !replay_resp.ok) {
+      ++errors;
+      json div;
+      div["seq"]    = row.seq;
+      div["method"] = row.method;
+      div["reason"] = "replay_error";
+      div["expected_snapshot"] = row.snapshot;
+      div["observed_snapshot"] = replay_resp.provenance_snapshot;
+      div["expected_ok"]       = captured_ok;
+      div["observed_ok"]       = replay_resp.ok;
+      div["observed_error"] = json{
+          {"code", static_cast<int>(replay_resp.error_code)},
+          {"message", replay_resp.error_message}};
+      divergences.push_back(std::move(div));
+      if (strict) break;
+      continue;
+    }
+    if (!captured_ok && replay_resp.ok) {
+      // Captured error became success on replay. Surface as drift,
+      // don't bump the errors counter (replay succeeded).
+      json div;
+      div["seq"]    = row.seq;
+      div["method"] = row.method;
+      div["reason"] = "captured_error";
+      div["expected_ok"] = captured_ok;
+      div["observed_ok"] = replay_resp.ok;
+      divergences.push_back(std::move(div));
+      if (strict) break;
+      continue;
+    }
+    // captured_ok == replay_resp.ok and we're not in the
+    // deterministic-byte-compare branch: informational only,
+    // no divergence emitted.
+  }
+
+  // The view-aware pagination is on `divergences` per docs/24 §2.4.
+  // We attach it to the response under that key directly.
+  auto view_spec = protocol::view::parse_from_params(req.params);
+  json paged = protocol::view::apply_to_array(std::move(divergences),
+                                              view_spec, "divergences");
+
+  json data = std::move(paged);
+  data["session_id"]               = *sid;
+  data["total_steps"]              = total_steps;
+  data["replayed"]                 = replayed;
+  data["skipped"]                  = skipped;
+  data["deterministic_matches"]    = deterministic_matches;
+  data["deterministic_mismatches"] = deterministic_mismatches;
+  data["errors"]                   = errors;
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 // ----------------------------------------------------------------------------

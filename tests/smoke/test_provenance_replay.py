@@ -104,6 +104,12 @@ def make_core(ldbd, sleeper, core_path):
 # against the same core must yield bit-identical `data`. Keep the
 # parameter set conservative (no addresses that depend on ASLR — the
 # core captures the post-ASLR memory layout, so file_addr stays stable).
+#
+# v1.5 #15 phase-1 addition: correlate.* (types/symbols/strings) — these
+# route through the SymbolIndex sqlite cache post-#18. The wire shape is
+# byte-identical to the pre-cache cold path (smoke_correlate +
+# test_index_cold_warm pin that), but cross-daemon byte-identity is what
+# this test gate adds. See docs/04-determinism-audit.md §12.
 def deterministic_calls(target_id):
     return [
         # No-target endpoints — should still report determinism faithfully
@@ -122,6 +128,16 @@ def deterministic_calls(target_id):
                                    "view": {"limit": 5}}),
         ("symbol.find",          {"target_id": target_id,
                                    "name": "main"}),
+        # correlate.* — index-routed under #18, determinism gate added
+        # in #15 phase-1. The sleeper fixture has main + the marker
+        # string but no dxp_login_frame type; correlate.types' "missing"
+        # answer is still a byte-identical deterministic result.
+        ("correlate.types",      {"target_ids": [target_id],
+                                   "name": "dxp_login_frame"}),
+        ("correlate.symbols",    {"target_ids": [target_id],
+                                   "name": "main"}),
+        ("correlate.strings",    {"target_ids": [target_id],
+                                   "text": "LDB_SLEEPER_MARKER_v1"}),
     ]
 
 
@@ -207,8 +223,13 @@ def main():
             if prov is None:
                 continue
             # No-target endpoints (hello, describe.endpoints) → "none";
-            # target-bound endpoints → match load_core snapshot.
-            if "target_id" in params:
+            # target-bound endpoints → match load_core snapshot. correlate.*
+            # binds to targets via `target_ids` (plural); the dispatcher
+            # resolves snapshot from the (homogeneous) target_ids[] list,
+            # so the determinism contract holds identically.
+            is_target_bound = ("target_id" in params) or (
+                "target_ids" in params and len(params["target_ids"]) > 0)
+            if is_target_bound:
                 expect(prov["snapshot"] == snapshot_run1,
                        f"daemon1 {method} snapshot mismatch: "
                        f"got={prov['snapshot']} want={snapshot_run1}")
@@ -273,10 +294,14 @@ def main():
             # Patch the params with the new daemon's target_id when
             # applicable — the test fixture re-mints target_id per
             # daemon. The byte-diff is on the response data, not on
-            # the params.
+            # the params. correlate.* uses target_ids[] (plural); patch
+            # both shapes.
             if "target_id" in params:
                 params = dict(params)
                 params["target_id"] = tid2
+            if "target_ids" in params:
+                params = dict(params)
+                params["target_ids"] = [tid2 for _ in params["target_ids"]]
             resp = d2.call(method, params)
             expect(resp["ok"], f"daemon2 {method}: {resp}")
             run2_responses.append(resp)

@@ -102,6 +102,11 @@ class SessionStore {
     std::string   response_json;
     bool          ok          = true;
     std::int64_t  duration_us = 0;
+    // Post-V1 #16 phase-1 (docs/24 §3.1): captured response's
+    // _provenance.snapshot. Empty string for rows written before
+    // this column was added — replay treats empty as
+    // "non-deterministic by default".
+    std::string   snapshot;
   };
 
   // Read the rpc_log of a session in seq-ascending order. Optional
@@ -193,6 +198,41 @@ class SessionStore {
   };
   std::vector<TargetBucket> extract_target_ids(std::string_view id);
 
+  // Post-V1 plan #16 (docs/24-session-fork-replay.md §2.1).
+  //
+  // Allocate a fresh session id and copy [source_id]'s rpc_log row
+  // payloads (ts_ns/method/request/response/ok/duration_us) up to and
+  // including `until_seq` into it. `until_seq == 0` means "every row"
+  // (head-of-source). `until_seq > source.max_seq` copies everything;
+  // the reported `forked_at_seq` reflects the actual cut.
+  //
+  // The child re-numbers seq from 1 — sqlite AUTOINCREMENT is per-
+  // table; what's semantically preserved is the per-row payload, not
+  // the strict-monotonic seq id. See docs/24 §4 for the rationale.
+  //
+  // Target_id and the source's name (suffixed with " (fork)" when
+  // `name` is empty) are copied into the child's meta. The parent
+  // session is not mutated; concurrent appends to the parent during
+  // the fork are not visible to the child (single sqlite transaction
+  // on the child's db over a snapshot-read of the parent's rpc_log).
+  //
+  // Throws backend::Error if [source_id] doesn't exist or sqlite
+  // fails mid-copy (the partially-written child db is removed in
+  // that case so the index never references half-state).
+  struct ForkResult {
+    std::string  source_session_id;
+    std::string  id;             // new 32-hex session id
+    std::string  name;
+    std::int64_t created_at   = 0;
+    std::string  path;
+    std::int64_t forked_at_seq= 0; // last source seq actually copied
+    std::int64_t rows_copied  = 0;
+  };
+  ForkResult fork_session(std::string_view source_id,
+                          std::string_view name,
+                          std::optional<std::string> description,
+                          std::int64_t until_seq);
+
   // Open a per-session writer. The Writer holds its own sqlite handle
   // to the <uuid>.db; multiple Writers on the same id are allowed and
   // both can append (WAL handles it), but the dispatcher only ever
@@ -211,6 +251,10 @@ class SessionStore {
     std::string   response_json;
     bool          ok           = true;
     std::int64_t  duration_us  = 0;
+    // Post-V1 #16 phase-1: pack-side snapshot column. Empty for
+    // packs produced before this column existed; import preserves
+    // whatever the manifest carried.
+    std::string   snapshot;
   };
 
   // import_session — used by `pack::unpack` to materialize a session
@@ -253,11 +297,16 @@ class SessionStore::Writer {
   // [request] and [response]; stores [ok] as INTEGER (0/1) and
   // [duration_us] as the wall-clock cost the dispatcher measured for
   // dispatch_inner(). [ts_ns] is taken from system_clock at append-time.
+  // [snapshot] is the dispatcher's resp.provenance_snapshot (see plan
+  // §3.5) — empty string is allowed and means "snapshot not recorded";
+  // post-V1 #16's replay gate treats empty as "non-deterministic by
+  // default" (docs/24 §3.1).
   void append(std::string_view method,
               const nlohmann::json& request,
               const nlohmann::json& response,
               bool ok,
-              std::int64_t duration_us);
+              std::int64_t duration_us,
+              std::string_view snapshot = "");
 
   ~Writer();
   Writer(const Writer&) = delete;

@@ -139,10 +139,36 @@ void migrate_session_db(sqlite3* db,
     "  request TEXT NOT NULL,"
     "  response TEXT NOT NULL,"
     "  ok INTEGER NOT NULL,"
-    "  duration_us INTEGER NOT NULL"
+    "  duration_us INTEGER NOT NULL,"
+    // Post-V1 #16 phase-1 (docs/24 §3.1): captured snapshot for
+    // replay's determinism gate. Empty string for rows recorded
+    // before this migration — replay treats those as
+    // "snapshot unknown -> non-deterministic by default."
+    "  snapshot TEXT NOT NULL DEFAULT ''"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_rpc_method ON rpc_log(method);"
   );
+  // Backward-compat: dbs created before #16-phase-1 won't have
+  // the snapshot column. Try to add it; ignore "duplicate column"
+  // errors when we hit a freshly-created db where CREATE already
+  // included it.
+  {
+    char* err = nullptr;
+    int rc = sqlite3_exec(db,
+        "ALTER TABLE rpc_log ADD COLUMN snapshot TEXT NOT NULL DEFAULT '';",
+        nullptr, nullptr, &err);
+    if (rc != SQLITE_OK && err) {
+      std::string msg = err;
+      sqlite3_free(err);
+      // "duplicate column" is the expected case on new dbs. Anything
+      // else escalates to the canonical throw path.
+      if (msg.find("duplicate column") == std::string::npos) {
+        throw backend::Error(std::string("sqlite migrate add snapshot: ") + msg);
+      }
+    } else if (err) {
+      sqlite3_free(err);
+    }
+  }
 
   auto put_meta = [&](const char* k, const std::string& v) {
     auto stmt = prepare_or_throw(db,
@@ -409,18 +435,47 @@ SessionStore::read_log(std::string_view id,
     throw backend::Error("session_store.read_log: open " +
                          session_path.string());
   }
-  std::string sql =
-      "SELECT seq, ts_ns, method, request, response, ok, duration_us "
-      "FROM rpc_log";
+  // Per-session dbs created before commit d7f5137 lack the `snapshot`
+  // column on rpc_log. migrate_session_db only runs on writer-side
+  // paths (create / fork / import); reads against a pre-#16 db would
+  // otherwise throw "no such column: snapshot" — bricking every
+  // session.diff / session.targets / session.replay against legacy
+  // stores. Mirror pack.cpp's two-attempt fallback: try the new SELECT
+  // first, fall back to the legacy SELECT with snapshot="" on prepare
+  // failure. Empty snapshot maps to non-deterministic at the replay
+  // gate (docs/24 §3.1), which is the conservative semantics for any
+  // log row written before the column existed.
+  std::string sql_tail;
   bool has_since = (since_seq > 0);
   bool has_until = (until_seq > 0);
-  if (has_since || has_until) sql += " WHERE";
-  if (has_since)               sql += " seq >= ?1";
-  if (has_since && has_until)  sql += " AND";
-  if (has_until)               sql += has_since ? " seq < ?2" : " seq < ?1";
-  sql += " ORDER BY seq ASC;";
+  if (has_since || has_until) sql_tail += " WHERE";
+  if (has_since)               sql_tail += " seq >= ?1";
+  if (has_since && has_until)  sql_tail += " AND";
+  if (has_until)               sql_tail += has_since ? " seq < ?2" : " seq < ?1";
+  sql_tail += " ORDER BY seq ASC;";
 
-  auto stmt = prepare_or_throw(db, sql);
+  std::string sql_new =
+      "SELECT seq, ts_ns, method, request, response, ok, duration_us, "
+      "       snapshot "
+      "FROM rpc_log" + sql_tail;
+  std::string sql_old =
+      "SELECT seq, ts_ns, method, request, response, ok, duration_us "
+      "FROM rpc_log" + sql_tail;
+
+  sqlite3_stmt* raw_stmt = nullptr;
+  bool has_snapshot = true;
+  if (sqlite3_prepare_v2(db, sql_new.c_str(), -1, &raw_stmt, nullptr)
+      != SQLITE_OK) {
+    has_snapshot = false;
+    if (sqlite3_prepare_v2(db, sql_old.c_str(), -1, &raw_stmt, nullptr)
+        != SQLITE_OK) {
+      std::string msg = std::string("sqlite: read_log prepare: ")
+                      + sqlite3_errmsg(db);
+      sqlite3_close(db);
+      throw backend::Error(msg);
+    }
+  }
+  StmtGuard stmt(raw_stmt);
   int bind_idx = 1;
   if (has_since) sqlite3_bind_int64(stmt.get(), bind_idx++, since_seq);
   if (has_until) sqlite3_bind_int64(stmt.get(), bind_idx++, until_seq);
@@ -430,8 +485,12 @@ SessionStore::read_log(std::string_view id,
     int step = sqlite3_step(stmt.get());
     if (step == SQLITE_DONE) break;
     if (step != SQLITE_ROW) {
+      // Capture the error message BEFORE closing the handle —
+      // sqlite3_errmsg(db) on a freed handle is UB.
+      std::string msg = std::string("sqlite: read_log step: ")
+                      + sqlite3_errmsg(db);
       sqlite3_close(db);
-      throw_sqlite(db, "read_log step");
+      throw backend::Error(msg);
     }
     LogRow r;
     r.seq         = sqlite3_column_int64(stmt.get(), 0);
@@ -447,6 +506,11 @@ SessionStore::read_log(std::string_view id,
     r.response_json= rsp ? rsp : "{}";
     r.ok           = sqlite3_column_int(stmt.get(), 5) != 0;
     r.duration_us  = sqlite3_column_int64(stmt.get(), 6);
+    if (has_snapshot) {
+      auto snap    = reinterpret_cast<const char*>(
+          sqlite3_column_text(stmt.get(), 7));
+      r.snapshot   = snap ? snap : "";
+    }
     out.push_back(std::move(r));
   }
   sqlite3_close(db);
@@ -710,6 +774,233 @@ SessionStore::extract_target_ids(std::string_view id) {
 }
 
 // ---------------------------------------------------------------------------
+// Post-V1 plan #16 phase-1 — fork_session
+//
+// Implementation outline (docs/24-session-fork-replay.md §8 step 2):
+//   1. Resolve the source's index row under the index mutex; capture
+//      path / name / target_id. Release the mutex before any per-session
+//      sqlite work so other queries (info/list) don't block on the copy.
+//   2. Allocate a new id + per-session db path.
+//   3. Open the source db read-only and the new db read-write.
+//   4. Migrate the new db (same canonical schema as create()), populate
+//      meta with the inherited target_id and the resolved child name.
+//   5. BEGIN IMMEDIATE on the new db. Prepare a SELECT on the source's
+//      rpc_log (filtered by until_seq if non-zero); prepare an INSERT
+//      against the new rpc_log. Step the SELECT, bind every column to
+//      the INSERT, step it. Track the highest source seq seen.
+//   6. COMMIT on the new db.
+//   7. Insert the index row.
+//
+// If anything fails between steps 3 and 7, the partially-written child
+// db is unlinked so the index never references half-state — same
+// approach as create() and import_session().
+
+SessionStore::ForkResult
+SessionStore::fork_session(std::string_view source_id,
+                           std::string_view name,
+                           std::optional<std::string> description,
+                           std::int64_t until_seq) {
+  namespace fs = std::filesystem;
+  (void)description;  // Captured for future meta-row use; not surfaced today.
+
+  // ----- 1. resolve the source under the index mutex ----------------------
+  std::filesystem::path source_path;
+  std::string           source_name;
+  std::optional<std::string> source_target_id;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::string sql = std::string("SELECT ") + kSelectIndexCols +
+                      " FROM sessions WHERE id = ?1;";
+    auto stmt = prepare_or_throw(impl_->index_db, sql);
+    sqlite3_bind_text(stmt.get(), 1, source_id.data(),
+                      static_cast<int>(source_id.size()), SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE) {
+      throw backend::Error("session_store.fork_session: no such source id: "
+                           + std::string(source_id));
+    }
+    if (rc != SQLITE_ROW) throw_sqlite(impl_->index_db, "fork_session: lookup");
+    auto row = row_from_index_stmt(stmt.get());
+    source_path      = row.path;
+    source_name      = row.name;
+    source_target_id = row.target_id;
+  }
+
+  // ----- 2. allocate child id + path --------------------------------------
+  std::string id = make_session_id();
+  fs::path session_path = impl_->sessions_dir / (id + ".db");
+
+  // Resolve child name. Per docs/24 §2.3: empty -> "<source.name> (fork)".
+  std::string child_name(name);
+  if (child_name.empty()) {
+    child_name = source_name + " (fork)";
+  }
+
+  // The created_at timestamp is a fresh ns sample — the fork is a new
+  // session, not a clone of the source's birth time. list() sorts by
+  // created_at DESC so the freshly-forked child appears at the top of
+  // the agent's session.list, which matches the "I just made this"
+  // expectation.
+  auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count();
+
+  // ----- 3. open the source db read-only ----------------------------------
+  sqlite3* src_db = nullptr;
+  int rc = sqlite3_open_v2(source_path.c_str(), &src_db,
+                           SQLITE_OPEN_READONLY, nullptr);
+  if (rc != SQLITE_OK) {
+    if (src_db) sqlite3_close(src_db);
+    throw backend::Error("session_store.fork_session: open source "
+                         + source_path.string());
+  }
+
+  // RAII: ensure src_db is closed on every exit path. Use a small lambda
+  // wrapper rather than a class because the close is unconditional and
+  // we already have try/catch for the destination side.
+  struct SrcCloser {
+    sqlite3* db;
+    ~SrcCloser() { if (db) sqlite3_close(db); }
+  } src_closer{src_db};
+
+  // ----- 4. open + migrate the child db ----------------------------------
+  sqlite3* dst_db = nullptr;
+  rc = sqlite3_open(session_path.c_str(), &dst_db);
+  if (rc != SQLITE_OK) {
+    std::string m = "sqlite open ";
+    m.append(session_path.string());
+    m.append(": ");
+    m.append(dst_db ? sqlite3_errmsg(dst_db) : sqlite3_errstr(rc));
+    if (dst_db) sqlite3_close(dst_db);
+    throw backend::Error(m);
+  }
+
+  std::int64_t forked_at_seq = 0;
+  std::int64_t rows_copied   = 0;
+  try {
+    migrate_session_db(dst_db, child_name, source_target_id,
+                       static_cast<std::int64_t>(now));
+
+    // ----- 5. SELECT-then-INSERT row copy in one transaction --------------
+    exec_or_throw(dst_db, "BEGIN IMMEDIATE;");
+    try {
+      // SELECT on the source. `?1 = 0` means "no upper bound"; otherwise
+      // seq <= ?1.
+      auto sel = prepare_or_throw(src_db,
+          "SELECT seq, ts_ns, method, request, response, ok, duration_us, "
+          "       snapshot "
+          "FROM rpc_log "
+          "WHERE (?1 = 0 OR seq <= ?1) "
+          "ORDER BY seq ASC;");
+      sqlite3_bind_int64(sel.get(), 1, until_seq);
+
+      auto ins = prepare_or_throw(dst_db,
+          "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
+          "                    duration_us, snapshot) "
+          "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
+
+      for (;;) {
+        int s = sqlite3_step(sel.get());
+        if (s == SQLITE_DONE) break;
+        if (s != SQLITE_ROW) {
+          throw_sqlite(src_db, "fork_session: source step");
+        }
+        // SELECT column 0 = seq (informational; used for forked_at_seq).
+        std::int64_t src_seq = sqlite3_column_int64(sel.get(), 0);
+
+        sqlite3_reset(ins.get());
+        sqlite3_clear_bindings(ins.get());
+        sqlite3_bind_int64(ins.get(), 1,
+                           sqlite3_column_int64(sel.get(), 1));  // ts_ns
+        // method/request/response are TEXT; bind_text needs a length —
+        // pull from the source statement to avoid an extra copy.
+        const unsigned char* method = sqlite3_column_text(sel.get(), 2);
+        int method_n = sqlite3_column_bytes(sel.get(), 2);
+        sqlite3_bind_text(ins.get(), 2,
+                          reinterpret_cast<const char*>(method),
+                          method_n, SQLITE_TRANSIENT);
+        const unsigned char* req = sqlite3_column_text(sel.get(), 3);
+        int req_n = sqlite3_column_bytes(sel.get(), 3);
+        sqlite3_bind_text(ins.get(), 3,
+                          reinterpret_cast<const char*>(req),
+                          req_n, SQLITE_TRANSIENT);
+        const unsigned char* rsp = sqlite3_column_text(sel.get(), 4);
+        int rsp_n = sqlite3_column_bytes(sel.get(), 4);
+        sqlite3_bind_text(ins.get(), 4,
+                          reinterpret_cast<const char*>(rsp),
+                          rsp_n, SQLITE_TRANSIENT);
+        sqlite3_bind_int(ins.get(), 5,
+                         sqlite3_column_int(sel.get(), 5));      // ok
+        sqlite3_bind_int64(ins.get(), 6,
+                           sqlite3_column_int64(sel.get(), 6));  // duration_us
+        const unsigned char* snap = sqlite3_column_text(sel.get(), 7);
+        int snap_n = sqlite3_column_bytes(sel.get(), 7);
+        sqlite3_bind_text(ins.get(), 7,
+                          reinterpret_cast<const char*>(snap ? snap
+                                                              : reinterpret_cast<const unsigned char*>("")),
+                          snap ? snap_n : 0, SQLITE_TRANSIENT);
+
+        if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+          throw_sqlite(dst_db, "fork_session: insert row");
+        }
+        rows_copied   += 1;
+        forked_at_seq  = src_seq;
+      }
+      exec_or_throw(dst_db, "COMMIT;");
+    } catch (...) {
+      exec_or_throw(dst_db, "ROLLBACK;");
+      throw;
+    }
+  } catch (...) {
+    sqlite3_close(dst_db);
+    std::error_code ec;
+    fs::remove(session_path, ec);
+    throw;
+  }
+  sqlite3_close(dst_db);
+
+  // ----- 7. insert the child's index row ---------------------------------
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto ins = prepare_or_throw(impl_->index_db,
+        "INSERT INTO sessions(id, name, target_id, created_at, path) "
+        "VALUES(?1, ?2, ?3, ?4, ?5);");
+    sqlite3_bind_text(ins.get(), 1, id.c_str(),
+                      static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins.get(), 2, child_name.c_str(),
+                      static_cast<int>(child_name.size()), SQLITE_TRANSIENT);
+    if (source_target_id.has_value()) {
+      sqlite3_bind_text(ins.get(), 3, source_target_id->c_str(),
+                        static_cast<int>(source_target_id->size()),
+                        SQLITE_TRANSIENT);
+    } else {
+      sqlite3_bind_null(ins.get(), 3);
+    }
+    sqlite3_bind_int64(ins.get(), 4, static_cast<sqlite3_int64>(now));
+    std::string ps = session_path.string();
+    sqlite3_bind_text(ins.get(), 5, ps.c_str(),
+                      static_cast<int>(ps.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+      // Unlink the per-session db so the index never references half-
+      // state. Best-effort — if the unlink itself fails, the index row
+      // we never inserted is the worst we can leave behind.
+      std::error_code ec;
+      fs::remove(session_path, ec);
+      throw_sqlite(impl_->index_db, "fork_session: insert index row");
+    }
+  }
+
+  ForkResult out;
+  out.source_session_id = std::string(source_id);
+  out.id                = std::move(id);
+  out.name              = std::move(child_name);
+  out.created_at        = static_cast<std::int64_t>(now);
+  out.path              = session_path.string();
+  out.forked_at_seq     = forked_at_seq;
+  out.rows_copied       = rows_copied;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 
 void SessionStore::import_session(std::string_view id,
                                   std::string_view name,
@@ -774,8 +1065,8 @@ void SessionStore::import_session(std::string_view id,
       try {
         auto ins = prepare_or_throw(sdb,
             "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
-            "                    duration_us) "
-            "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+            "                    duration_us, snapshot) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
         for (const auto& r : rows) {
           sqlite3_reset(ins.get());
           sqlite3_clear_bindings(ins.get());
@@ -791,6 +1082,9 @@ void SessionStore::import_session(std::string_view id,
                              SQLITE_TRANSIENT);
           sqlite3_bind_int  (ins.get(), 5, r.ok ? 1 : 0);
           sqlite3_bind_int64(ins.get(), 6, r.duration_us);
+          sqlite3_bind_text (ins.get(), 7, r.snapshot.c_str(),
+                             static_cast<int>(r.snapshot.size()),
+                             SQLITE_TRANSIENT);
           if (sqlite3_step(ins.get()) != SQLITE_DONE) {
             throw_sqlite(sdb, "import_session: rpc_log insert");
           }
@@ -856,18 +1150,20 @@ void SessionStore::Writer::append(std::string_view method,
                                   const nlohmann::json& request,
                                   const nlohmann::json& response,
                                   bool ok,
-                                  std::int64_t duration_us) {
+                                  std::int64_t duration_us,
+                                  std::string_view snapshot) {
   std::lock_guard<std::mutex> lk(impl_->mu);
   auto stmt = prepare_or_throw(impl_->db,
       "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
-      "                    duration_us) "
-      "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+      "                    duration_us, snapshot) "
+      "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
 
   auto ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
   std::string m_s(method);
   std::string req_s = request.dump();
   std::string rsp_s = response.dump();
+  std::string snap_s(snapshot);
 
   sqlite3_bind_int64(stmt.get(), 1, static_cast<sqlite3_int64>(ts_ns));
   sqlite3_bind_text (stmt.get(), 2, m_s.c_str(),
@@ -878,6 +1174,8 @@ void SessionStore::Writer::append(std::string_view method,
                      static_cast<int>(rsp_s.size()), SQLITE_TRANSIENT);
   sqlite3_bind_int  (stmt.get(), 5, ok ? 1 : 0);
   sqlite3_bind_int64(stmt.get(), 6, static_cast<sqlite3_int64>(duration_us));
+  sqlite3_bind_text (stmt.get(), 7, snap_s.c_str(),
+                     static_cast<int>(snap_s.size()), SQLITE_TRANSIENT);
 
   if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
     throw_sqlite(impl_->db, "rpc_log: insert");
