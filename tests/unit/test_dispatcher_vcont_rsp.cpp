@@ -197,7 +197,13 @@ TEST_CASE("vCont-RSP: thread.suspend emits vCont;t:<tid> + drops the -32001 stub
   ::close(inst.peer_fd);
 }
 
-TEST_CASE("vCont-RSP: thread.suspend on a non-RSP target still returns -32001",
+// v1.6 #21 LLDB completion: thread.suspend now forwards to
+// LldbBackend::suspend_thread for non-RSP targets. The pre-#21 stub
+// unconditionally returned -32001; that disappeared once the backend
+// virtual landed. Against an empty target with no live process the
+// backend throws "no process", surfaced as -32004 kBackendError.
+// RSP-backed targets still flow through vCont;t (covered above).
+TEST_CASE("vCont-RSP: thread.suspend on a non-RSP target hits LldbBackend",
           "[dispatcher][rsp][vcont][thread][suspend][legacy]") {
   auto be = std::make_shared<LldbBackend>();
   Dispatcher disp(be);
@@ -206,10 +212,12 @@ TEST_CASE("vCont-RSP: thread.suspend on a non-RSP target still returns -32001",
   REQUIRE(open.ok);
   std::uint64_t target_id = open.data["target_id"].get<std::uint64_t>();
 
-  // No RspChannel installed — the legacy stub fires.
+  // No RspChannel installed — the LldbBackend path fires. The empty
+  // target has no live process, so suspend_thread throws "no process"
+  // and the dispatcher surfaces it as a backend error.
   auto resp = disp.dispatch(req("thread.suspend",
       json{{"target_id", target_id}, {"tid", 1}}));
   REQUIRE_FALSE(resp.ok);
-  CHECK(resp.error_code == ErrorCode::kNotImplemented);
-  CHECK(resp.error_message.find("phase-2") != std::string::npos);
+  CHECK(resp.error_code == ErrorCode::kBackendError);
+  CHECK(resp.error_message.find("no process") != std::string::npos);
 }

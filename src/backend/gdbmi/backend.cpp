@@ -434,6 +434,18 @@ ProcessStatus GdbMiBackend::continue_thread(TargetId target_id,
   return st.last_status;
 }
 
+// v1.6 #21: GDB/MI doesn't have a one-shot "park this thread" primitive
+// matching SBThread::Suspend. The closest equivalent requires
+// `-exec-continue --thread X` against an MI server in non-stop mode,
+// which we don't enable. Leave the endpoint as NotImplemented for now;
+// callers needing non-stop semantics use the LLDB backend.
+ProcessStatus GdbMiBackend::suspend_thread(TargetId target_id,
+                                            ThreadId thread_id) {
+  (void)target_id;
+  (void)thread_id;
+  throw Error("suspend_thread: not implemented for GDB/MI backend");
+}
+
 ProcessStatus GdbMiBackend::kill_process(TargetId tid) {
   auto& st = must_get_target(*impl_, tid);
   if (st.last_status.state == ProcessState::kNone) return st.last_status;

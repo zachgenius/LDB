@@ -2100,6 +2100,42 @@ ProcessStatus LldbBackend::continue_thread(TargetId tid, ThreadId thread_id) {
   return continue_process(tid);
 }
 
+// v1.6 #21 LLDB-side completion (docs/26-nonstop-runtime.md §1). Marks
+// the named thread as suspended via SBThread::Suspend(true). The process
+// state is unaffected by the call itself — the suspend bit is honoured
+// by the NEXT SBProcess::Continue, which LLDB already supports even
+// under SetAsync(false). That's the load-bearing observation: we don't
+// need the async-mode flip to deliver per-thread suspend semantics for
+// the LLDB-backed `thread.suspend` endpoint; we only need to set the
+// bit before the next resume.
+ProcessStatus LldbBackend::suspend_thread(TargetId tid, ThreadId thread_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+  auto proc = target.GetProcess();
+  if (!proc.IsValid()) {
+    throw Error("no process");
+  }
+  auto thr = proc.GetThreadByID(thread_id);
+  if (!thr.IsValid()) {
+    throw Error("unknown thread id");
+  }
+  // SBThread::Suspend returns bool; in current SBAPI it cannot fail on
+  // a valid SBThread (the suspend bit is purely client-side state).
+  // We treat a false return defensively in case LLDB ever grows a
+  // failure mode here.
+  if (!thr.Suspend()) {
+    throw Error("SBThread::Suspend returned false");
+  }
+  return snapshot(proc);
+}
+
 ProcessStatus LldbBackend::kill_process(TargetId tid) {
   lldb::SBTarget target;
   {

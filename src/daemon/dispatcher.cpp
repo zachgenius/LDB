@@ -4155,12 +4155,12 @@ Response Dispatcher::handle_thread_continue(const Request& req) {
 }
 
 Response Dispatcher::handle_thread_suspend(const Request& req) {
-  // For RSP-backed targets we now emit `vCont;t:<tid>` directly
-  // (post-V1 #17 phase-2, docs/27 §7). For LLDB-backed targets the
-  // -32001 stub stays — flipping SBDebugger::SetAsync(true) cascades
-  // test breakage and is its own follow-up. The wire surface is
-  // unchanged from #21 phase-1; only the backing changes when an
-  // RspChannel is parked.
+  // For RSP-backed targets we emit `vCont;t:<tid>` directly
+  // (post-V1 #17 phase-2, docs/27 §7). For LLDB-backed targets we now
+  // call backend_->suspend_thread, which sets SBThread::Suspend(true)
+  // on the resolved thread — this works under SetAsync(false) because
+  // the suspend bit is honoured by the NEXT SBProcess::Continue, not
+  // by the suspend call itself (v1.6 #21 LLDB completion).
   if (!req.params.is_object()) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "params must be object");
@@ -4197,13 +4197,21 @@ Response Dispatcher::handle_thread_suspend(const Request& req) {
     status.state = backend::ProcessState::kRunning;
     return protocol::make_ok(req.id, process_status_to_json(status));
   }
-  return protocol::make_err(
-      req.id, ErrorCode::kNotImplemented,
-      "thread.suspend on LLDB-backed targets requires the phase-2 "
-      "listener thread (SetAsync(true)); not available in this build. "
-      "For an RSP-backed target, open it via target.connect_remote_rsp "
-      "and thread.suspend will route through vCont;t. "
-      "See docs/26-nonstop-runtime.md.");
+  // LLDB-backed path: backend handles target-id / tid validation and
+  // throws backend::Error on bad inputs. Backend errors surface as
+  // -32004 (kBackendError); NotImplemented surfaces as -32001 (e.g.
+  // GdbMiBackend, which doesn't implement suspend_thread).
+  try {
+    auto status = backend_->suspend_thread(
+        backend_tid, static_cast<backend::ThreadId>(thread_id));
+    return protocol::make_ok(req.id, process_status_to_json(status));
+  } catch (const backend::Error& e) {
+    const std::string msg = e.what();
+    if (msg.find("not implemented") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kNotImplemented, msg);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, msg);
+  }
 }
 
 Response Dispatcher::handle_thread_list_state(const Request& req) {

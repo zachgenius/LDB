@@ -75,6 +75,11 @@ class CountingStub : public DebuggerBackend {
     return make_status();
   }
 
+  ProcessStatus suspend_thread(TID t, ThrID) override {
+    if (t != known_target) throw ldb::backend::Error("unknown target_id");
+    return make_status();
+  }
+
   // The rest are unused stubs.
   ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }

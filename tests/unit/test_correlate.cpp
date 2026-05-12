@@ -424,6 +424,7 @@ class StubBackend : public ldb::backend::DebuggerBackend {
   ldb::backend::ProcessStatus get_process_state(TID) override { return {}; }
   ldb::backend::ProcessStatus continue_process(TID) override { return {}; }
   ldb::backend::ProcessStatus continue_thread(TID, ThreadID) override { return {}; }
+  ldb::backend::ProcessStatus suspend_thread(TID, ThreadID) override { return {}; }
   ldb::backend::ProcessStatus kill_process(TID) override { return {}; }
   ldb::backend::ProcessStatus attach(TID, std::int32_t) override { return {}; }
   ldb::backend::ProcessStatus detach_process(TID) override { return {}; }

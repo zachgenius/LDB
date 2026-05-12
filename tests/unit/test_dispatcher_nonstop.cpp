@@ -54,6 +54,14 @@ class NoOpBackend : public DebuggerBackend {
     if (t != known) throw ldb::backend::Error("unknown target_id");
     ProcessStatus s; s.state = ProcessState::kRunning; s.pid = 42; return s;
   }
+  ProcessStatus suspend_thread(TID t, ThrID) override {
+    if (t != known) throw ldb::backend::Error("unknown target_id");
+    // Stub returns kStopped: SBThread::Suspend doesn't change the
+    // process state, so the post-suspend snapshot reflects whatever
+    // the process was already in. The dispatcher test only cares the
+    // call succeeds + returns a ProcessStatus shape.
+    ProcessStatus s; s.state = ProcessState::kStopped; s.pid = 42; return s;
+  }
   ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }
   ldb::backend::OpenResult load_core(const std::string&) override { return {}; }
@@ -190,17 +198,30 @@ TEST_CASE("thread.continue: records set_running so thread.list_state reflects it
   CHECK(t.value("state", std::string{}) == "running");
 }
 
-TEST_CASE("thread.suspend: -32001 kNotImplemented in phase-1",
+// v1.6 #21 LLDB completion: thread.suspend now forwards to the backend
+// for non-RSP targets. The original phase-1 contract returned -32001
+// kNotImplemented; that stub disappears once a backend (LldbBackend or
+// any stub that overrides suspend_thread) is wired in. RSP-backed
+// targets still go through the vCont;t path — covered by
+// test_dispatcher_vcont_rsp.cpp.
+TEST_CASE("thread.suspend: forwards to backend.suspend_thread (non-RSP path)",
           "[dispatcher][thread][suspend]") {
   auto be = std::make_shared<NoOpBackend>();
   Dispatcher d(be);
   auto resp = d.dispatch(req("thread.suspend",
       json{{"target_id", 1}, {"tid", 1}}));
+  REQUIRE(resp.ok);
+  CHECK(resp.data.value("state", std::string{}) == "stopped");
+}
+
+TEST_CASE("thread.suspend: unknown target_id → -32004 kBackendError",
+          "[dispatcher][thread][suspend][error]") {
+  auto be = std::make_shared<NoOpBackend>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(req("thread.suspend",
+      json{{"target_id", 9999}, {"tid", 1}}));
   REQUIRE_FALSE(resp.ok);
-  CHECK(resp.error_code == ErrorCode::kNotImplemented);
-  // Error message must surface that this is gated on phase-2 so an
-  // agent reading the response doesn't think it's a config issue.
-  CHECK(resp.error_message.find("phase-2") != std::string::npos);
+  CHECK(resp.error_code == ErrorCode::kBackendError);
 }
 
 TEST_CASE("process.continue: all_threads=false → -32602 with hint",
