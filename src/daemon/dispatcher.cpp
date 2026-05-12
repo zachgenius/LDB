@@ -2258,7 +2258,7 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
       "only). rate_limit is parsed but UNENFORCED.",
       obj({
           {"target_id",     optional_target_id_param()},
-          {"kind",          enum_str({"lldb_breakpoint", "uprobe_bpf"})},
+          {"kind",          enum_str({"lldb_breakpoint", "uprobe_bpf", "agent"})},
           {"where",         obj({
               {"function",   str()},
               {"address",    uint_()},
@@ -6282,8 +6282,13 @@ Response Dispatcher::handle_probe_create(const Request& req) {
                               "missing non-empty string param 'kind'");
   }
 
-  // ---- uprobe_bpf path ---------------------------------------------------
-  if (*kind == "uprobe_bpf") {
+  // ---- uprobe_bpf / agent path -------------------------------------------
+  // Both engines share the BPF-style where-shape ({uprobe, kprobe,
+  // tracepoint}) and probe-event surface. uprobe_bpf shells bpftrace;
+  // agent talks length-prefixed JSON to ldb-probe-agent via libbpf
+  // (post-V1 plan #12). The dispatcher parses identically and the
+  // orchestrator routes on ps.kind.
+  if (*kind == "uprobe_bpf" || *kind == "agent") {
     auto wit = req.params.find("where");
     if (wit == req.params.end() || !wit->is_object()) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams,
@@ -6380,7 +6385,7 @@ Response Dispatcher::handle_probe_create(const Request& req) {
 
     probes::ProbeSpec ps;
     ps.target_id           = static_cast<backend::TargetId>(target_id);
-    ps.kind                = "uprobe_bpf";
+    ps.kind                = *kind;  // "uprobe_bpf" or "agent"
     ps.bpftrace_where      = std::move(bw);
     ps.bpftrace_args       = std::move(bpf_args);
     ps.bpftrace_filter_pid = filter_pid;
@@ -6394,11 +6399,12 @@ Response Dispatcher::handle_probe_create(const Request& req) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
     }
     // backend::Error from start() (bpftrace missing, attach failed, etc.)
+    // or from AgentEngine (no agent binary, agent-side error)
     // propagates through dispatch_inner's catch → -32000.
 
     json data;
     data["probe_id"] = probe_id;
-    data["kind"]     = "uprobe_bpf";
+    data["kind"]     = ps.kind;
     return protocol::make_ok(req.id, std::move(data));
   }
 

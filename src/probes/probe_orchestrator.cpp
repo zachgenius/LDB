@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "probes/probe_orchestrator.h"
 
+#include "probes/agent_engine.h"
 #include "probes/bpftrace_engine.h"
 #include "store/artifact_store.h"
 #include "util/log.h"
@@ -45,6 +46,12 @@ struct ProbeOrchestrator::ProbeState {
   // dtor / remove() resets it before the surrounding ProbeState is
   // freed so no callback can fire against a dangling owner pointer.
   std::unique_ptr<BpftraceEngine> bpf_engine;
+
+  // For kind == "agent": the attach_id the agent assigned us. The
+  // shared AgentEngine lives on the orchestrator (one per session); we
+  // call into it with this attach_id to poll events and to detach at
+  // remove() time.
+  std::string                     agent_attach_id;
 };
 
 namespace {
@@ -112,6 +119,16 @@ ProbeOrchestrator::~ProbeOrchestrator() {
       st->bpf_engine.reset();
       continue;
     }
+    if (!st->agent_attach_id.empty()) {
+      // Best-effort detach so the agent doesn't leak per-attach
+      // state if it survives the orchestrator's tear-down (it won't,
+      // because we shut it down next, but symmetry with remove()).
+      if (agent_engine_) {
+        try { agent_engine_->detach(st->agent_attach_id); }
+        catch (...) {}
+      }
+      continue;
+    }
     try {
       backend_->disable_breakpoint(st->spec.target_id, st->bp_id);
     } catch (const std::exception& e) {
@@ -144,10 +161,14 @@ std::string ProbeOrchestrator::create(const ProbeSpec& spec_in) {
   if (spec_in.kind == "uprobe_bpf") {
     return create_uprobe_bpf(spec_in);
   }
+  if (spec_in.kind == "agent") {
+    return create_agent(spec_in);
+  }
   if (spec_in.kind != "lldb_breakpoint") {
     throw std::invalid_argument(
         "probe.create: unknown kind \"" + spec_in.kind +
-        "\"; expected lldb_breakpoint or uprobe_bpf");
+        "\"; expected one of "
+        "{lldb_breakpoint, uprobe_bpf, agent}");
   }
   if (spec_in.action == Action::kStoreArtifact) {
     if (spec_in.build_id.empty()) {
@@ -267,6 +288,19 @@ void ProbeOrchestrator::remove(const std::string& probe_id) {
     probes_.erase(probe_id);
     return;
   }
+  if (!st->agent_attach_id.empty() && agent_engine_) {
+    // Best-effort detach so the agent's bookkeeping stays in sync;
+    // ignored on error because the agent may already be gone.
+    try {
+      agent_engine_->detach(st->agent_attach_id);
+    } catch (const std::exception& e) {
+      log::warn(std::string("probe.remove(agent): detach failed: ")
+                + e.what());
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    probes_.erase(probe_id);
+    return;
+  }
   // Best-effort disable; if it fails the delete still proceeds and
   // the trampoline is unhooked there.
   try {
@@ -339,6 +373,56 @@ ProbeOrchestrator::info(const std::string& probe_id) {
 std::vector<ProbeEvent>
 ProbeOrchestrator::events(const std::string& probe_id,
                           std::uint64_t since, std::uint64_t max) {
+  // For agent probes, poll the subprocess BEFORE taking the lock —
+  // agent_engine_ may block briefly on the read frame and we don't
+  // want to stall other handlers behind probe.events. The poll +
+  // ring-buffer fill is then done under the lock.
+  std::shared_ptr<ProbeState> agent_st;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = probes_.find(probe_id);
+    if (it == probes_.end()) {
+      throw backend::Error("unknown probe_id: " + probe_id);
+    }
+    if (!it->second->agent_attach_id.empty()) {
+      agent_st = it->second;
+    }
+  }
+  if (agent_st && agent_engine_) {
+    const std::uint32_t batch =
+        max == 0 ? 256
+                 : static_cast<std::uint32_t>(std::min<std::uint64_t>(max, 256));
+    try {
+      auto poll = agent_engine_->poll_events(agent_st->agent_attach_id,
+                                              batch);
+      std::lock_guard<std::mutex> lk(mu_);
+      auto& buf = agent_st->events;
+      for (auto& ev : poll.events) {
+        ProbeEvent pe;
+        agent_st->hit_count += 1;
+        pe.hit_seq = agent_st->hit_count;
+        pe.ts_ns   = static_cast<std::int64_t>(ev.ts_ns);
+        pe.tid     = static_cast<std::uint64_t>(ev.tid);
+        // The agent's payload bytes are stored verbatim as one memory
+        // capture named "payload" so existing artifact / event
+        // consumers can treat it the same as a bp-side capture.
+        if (!ev.payload.empty()) {
+          ProbeEvent::MemCapture cap;
+          cap.name  = "payload";
+          cap.bytes = ev.payload;
+          pe.memory.push_back(std::move(cap));
+        }
+        if (buf.size() >= kEventBufferCap) buf.pop_front();
+        buf.push_back(std::move(pe));
+      }
+    } catch (const std::exception& e) {
+      log::warn(std::string("probe.events(agent): poll failed: ")
+                + e.what());
+      // Fall through to the drain — caller still gets whatever was
+      // already in the ring.
+    }
+  }
+
   std::lock_guard<std::mutex> lk(mu_);
   auto it = probes_.find(probe_id);
   if (it == probes_.end()) {
@@ -443,6 +527,98 @@ std::string ProbeOrchestrator::create_uprobe_bpf(const ProbeSpec& spec_in) {
 
   std::lock_guard<std::mutex> lk(mu_);
   probes_.emplace(probe_id, st);
+  return probe_id;
+}
+
+// ---------------------------------------------------------------------------
+// agent path — ldb-probe-agent subprocess via AgentEngine
+// (post-V1 plan #12 phase-3). Reuses the BpftraceWhere fields to spec
+// the where-form; ProbeOrchestrator owns one AgentEngine per session.
+// ---------------------------------------------------------------------------
+
+std::string ProbeOrchestrator::create_agent(const ProbeSpec& spec_in) {
+  if (!spec_in.bpftrace_where.has_value()
+      || spec_in.bpftrace_where->target.empty()) {
+    throw std::invalid_argument(
+        "probe.create(agent): where must set one of "
+        "{uprobe, tracepoint, kprobe}");
+  }
+
+  // The phase-1 agent binary embeds exactly one program — `syscall_count`.
+  // Phase-3 ships the wire shape; richer program selection is a later
+  // recipe-format extension. Empty `bpftrace_args[0]` is treated as
+  // "use the embedded program."
+  std::string program = "syscall_count";
+  if (!spec_in.bpftrace_args.empty()
+      && !spec_in.bpftrace_args.front().empty()) {
+    program = spec_in.bpftrace_args.front();
+  }
+
+  // Lazy AgentEngine — first kind=agent probe spawns the subprocess;
+  // every later probe in the same orchestrator-session reuses it.
+  if (!agent_engine_) {
+    std::string path = AgentEngine::discover_agent();
+    if (path.empty()) {
+      throw backend::Error(
+          "probe.create(agent): ldb-probe-agent not found "
+          "(set $LDB_PROBE_AGENT, install on $PATH, or build "
+          "alongside ldbd)");
+    }
+    agent_engine_ = std::make_unique<AgentEngine>(std::move(path));
+  }
+
+  std::string attach_id;
+  switch (spec_in.bpftrace_where->kind) {
+    case BpftraceWhere::Kind::kUprobe: {
+      // bpftrace's uprobe target is "path:symbol"; split on the first ':'.
+      const auto& target = spec_in.bpftrace_where->target;
+      auto colon = target.find(':');
+      if (colon == std::string::npos) {
+        throw std::invalid_argument(
+            "probe.create(agent): uprobe target must be \"path:symbol\"");
+      }
+      attach_id = agent_engine_->attach_uprobe(
+          program, target.substr(0, colon), target.substr(colon + 1),
+          spec_in.bpftrace_filter_pid);
+      break;
+    }
+    case BpftraceWhere::Kind::kKprobe:
+      attach_id = agent_engine_->attach_kprobe(
+          program, spec_in.bpftrace_where->target);
+      break;
+    case BpftraceWhere::Kind::kTracepoint: {
+      const auto& target = spec_in.bpftrace_where->target;
+      auto colon = target.find(':');
+      if (colon == std::string::npos) {
+        throw std::invalid_argument(
+            "probe.create(agent): tracepoint target must be "
+            "\"category:name\"");
+      }
+      attach_id = agent_engine_->attach_tracepoint(
+          program, target.substr(0, colon), target.substr(colon + 1));
+      break;
+    }
+  }
+
+  ProbeSpec spec = spec_in;
+  spec.where_expr = render_bpftrace_where(*spec_in.bpftrace_where);
+
+  auto st = std::make_shared<ProbeState>();
+  st->kind            = "agent";
+  st->where_expr      = spec.where_expr;
+  st->spec            = std::move(spec);
+  st->bp_id           = 0;
+  st->enabled         = true;
+  st->owner           = this;
+  st->agent_attach_id = std::move(attach_id);
+
+  std::string probe_id;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    probe_id = "p" + std::to_string(next_probe_seq_++);
+    st->probe_id = probe_id;
+    probes_.emplace(probe_id, st);
+  }
   return probe_id;
 }
 

@@ -349,6 +349,20 @@ if(LDB_BPF_AGENT_BUILD)
   set_tests_properties(smoke_probe_agent PROPERTIES
     TIMEOUT 30
   )
+
+  # Post-V1 plan #12 phase-3: orchestrator routing of kind=agent probes.
+  # Accepts both the live happy path and the no-BPF-toolchain "agent
+  # returns not_supported" path so it passes on dev boxes without
+  # clang+bpftool+CAP_BPF.
+  add_test(
+    NAME smoke_probe_agent_route
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe_agent_route.py"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb-probe-agent>"
+  )
+  set_tests_properties(smoke_probe_agent_route PROPERTIES
+    TIMEOUT 30
+  )
 endif()
 
 # Post-V1 plan #14 phase-1: Python frame unwinders.

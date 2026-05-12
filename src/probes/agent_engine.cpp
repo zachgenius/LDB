@@ -189,40 +189,106 @@ AgentEngine::~AgentEngine() {
   impl_->stdout_fd = -1;
 }
 
-pa::HelloOk AgentEngine::hello() {
+nlohmann::json AgentEngine::round_trip(const nlohmann::json& request,
+                                       std::string_view op) {
   if (!impl_ || !impl_->stdin_stream || !impl_->stdout_stream) {
     throw backend::Error("agent_engine: not initialized");
   }
-
-  if (!pa::write_frame(*impl_->stdin_stream,
-                       pa::make_hello_request().dump())) {
-    throw backend::Error("agent_engine: write_frame(hello) failed");
+  if (!pa::write_frame(*impl_->stdin_stream, request.dump())) {
+    throw backend::Error(std::string("agent_engine: write_frame(")
+                         + std::string(op) + ") failed");
   }
   impl_->stdin_stream->flush();
 
   std::string body;
   auto ferr = pa::read_frame(*impl_->stdout_stream, &body);
   if (ferr != pa::FrameError::kOk) {
-    throw backend::Error("agent_engine: read_frame failed (code="
+    throw backend::Error(std::string("agent_engine: read_frame(")
+                         + std::string(op) + ") failed (code="
                          + std::to_string(static_cast<int>(ferr)) + ")");
   }
   nlohmann::json resp;
   try {
     resp = nlohmann::json::parse(body);
   } catch (const std::exception& e) {
-    throw backend::Error(std::string("agent_engine: response parse: ")
-                         + e.what());
+    throw backend::Error(std::string("agent_engine: ") + std::string(op)
+                         + " response parse: " + e.what());
   }
   if (auto err = pa::parse_error(resp)) {
-    throw backend::Error("agent_engine: agent error " + err->code
+    throw backend::Error("agent_engine: " + std::string(op)
+                         + ": agent error " + err->code
                          + ": " + err->message);
   }
+  return resp;
+}
+
+pa::HelloOk AgentEngine::hello() {
+  auto resp = round_trip(pa::make_hello_request(), "hello");
   auto ok = pa::parse_hello_ok(resp);
   if (!ok) {
     throw backend::Error("agent_engine: response is not a hello_ok shape: "
-                         + body);
+                         + resp.dump());
   }
   return *ok;
+}
+
+std::string AgentEngine::attach_uprobe(std::string_view program,
+                                       std::string_view path,
+                                       std::string_view symbol,
+                                       std::optional<std::int64_t> pid) {
+  auto resp = round_trip(
+      pa::make_attach_uprobe_request(program, path, symbol, pid),
+      "attach_uprobe");
+  auto a = pa::parse_attached(resp);
+  if (!a) {
+    throw backend::Error("agent_engine: attach_uprobe: response is "
+                         "not an attached shape: " + resp.dump());
+  }
+  return a->attach_id;
+}
+
+std::string AgentEngine::attach_kprobe(std::string_view program,
+                                       std::string_view function) {
+  auto resp = round_trip(
+      pa::make_attach_kprobe_request(program, function), "attach_kprobe");
+  auto a = pa::parse_attached(resp);
+  if (!a) {
+    throw backend::Error("agent_engine: attach_kprobe: response is "
+                         "not an attached shape: " + resp.dump());
+  }
+  return a->attach_id;
+}
+
+std::string AgentEngine::attach_tracepoint(std::string_view program,
+                                           std::string_view category,
+                                           std::string_view name) {
+  auto resp = round_trip(
+      pa::make_attach_tracepoint_request(program, category, name),
+      "attach_tracepoint");
+  auto a = pa::parse_attached(resp);
+  if (!a) {
+    throw backend::Error("agent_engine: attach_tracepoint: response is "
+                         "not an attached shape: " + resp.dump());
+  }
+  return a->attach_id;
+}
+
+pa::PollEvents AgentEngine::poll_events(std::string_view attach_id,
+                                        std::uint32_t max) {
+  auto resp = round_trip(
+      pa::make_poll_events_request(attach_id, max), "poll_events");
+  auto p = pa::parse_events(resp);
+  if (!p) {
+    throw backend::Error("agent_engine: poll_events: response is "
+                         "not an events shape: " + resp.dump());
+  }
+  return *p;
+}
+
+void AgentEngine::detach(std::string_view attach_id) {
+  // The agent's detached-ok response carries no payload of interest;
+  // round_trip handles error envelopes. We discard the success body.
+  (void)round_trip(pa::make_detach_request(attach_id), "detach");
 }
 
 }  // namespace ldb::probes

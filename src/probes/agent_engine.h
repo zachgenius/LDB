@@ -53,9 +53,51 @@ class AgentEngine {
   //   - response not a well-formed hello_ok shape.
   ldb::probe_agent::HelloOk hello();
 
+  // ------------- Persistent-session API (post-V1 plan #12 phase-3) -------
+  //
+  // Each `attach_*` returns the agent-assigned attach_id; the caller
+  // stores it on its ProbeState and passes it back to `poll_events` /
+  // `detach`. The session stays alive across many calls; the agent is
+  // shut down only when this AgentEngine is destroyed.
+  //
+  // All four throw backend::Error on:
+  //   - frame I/O error,
+  //   - the agent returning an AgentError envelope (whose `code` and
+  //     `message` are included in the thrown text — agents reading the
+  //     error string can grep for "not_supported" / "no_capability" /
+  //     "no_btf" to branch),
+  //   - shape mismatch on the response.
+
+  std::string attach_uprobe(std::string_view program,
+                            std::string_view path,
+                            std::string_view symbol,
+                            std::optional<std::int64_t> pid);
+  std::string attach_kprobe(std::string_view program,
+                            std::string_view function);
+  std::string attach_tracepoint(std::string_view program,
+                                std::string_view category,
+                                std::string_view name);
+
+  // Pull up to `max` events that have accumulated since the last
+  // poll_events for this attach_id. Empty `events` is the steady-state
+  // for an idle attach. The `dropped` counter is informational — the
+  // agent's ring buffer over-runs are surfaced but not fatal.
+  ldb::probe_agent::PollEvents poll_events(std::string_view attach_id,
+                                            std::uint32_t max);
+
+  // Idempotent: detaching an unknown id is treated as success by the
+  // agent (the bookkeeping is gone already either way).
+  void detach(std::string_view attach_id);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  // Common helper — write a request, read a frame, dispatch on type.
+  // Used by all the attach/poll/detach methods; surfaces AgentError
+  // via backend::Error.
+  nlohmann::json round_trip(const nlohmann::json& request,
+                            std::string_view op_name_for_error);
 };
 
 }  // namespace ldb::probes
