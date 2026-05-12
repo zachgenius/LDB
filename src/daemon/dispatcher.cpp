@@ -3903,10 +3903,13 @@ Response Dispatcher::handle_process_continue(const Request& req) {
           ? backend_->continue_thread(static_cast<backend::TargetId>(tid),
                                       static_cast<backend::ThreadId>(thread_id))
           : backend_->continue_process(static_cast<backend::TargetId>(tid));
-  if (have_tid) {
-    nonstop_.set_running(static_cast<backend::TargetId>(tid),
-                         static_cast<backend::ThreadId>(thread_id));
-  }
+  // Intentional: process.continue does NOT populate the non-stop
+  // runtime, even when `tid` is set. Today's path is a sync passthrough
+  // that resumes every thread and stops them all again before
+  // returning — recording "tid is running" while leaving siblings
+  // unknown would publish a lie. The runtime is populated only by
+  // thread.continue (genuine per-thread intent) and (phase-2) by the
+  // listener's set_stopped on real stop events.
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 
@@ -3930,11 +3933,18 @@ Response Dispatcher::handle_thread_continue(const Request& req) {
   // records the thread as kRunning so a subsequent thread.list_state
   // reflects the transition + phase-2's listener has the right
   // pre-state when stop events arrive. See docs/26-nonstop-runtime.md.
+  //
+  // We record set_running only when the backend reports the process
+  // actually resumed. A backend returning kStopped / kExited means
+  // the resume didn't take (e.g. process is already dead) — recording
+  // the thread as running in that case would publish a lie.
   auto status = backend_->continue_thread(
       static_cast<backend::TargetId>(target_id),
       static_cast<backend::ThreadId>(thread_id));
-  nonstop_.set_running(static_cast<backend::TargetId>(target_id),
-                       static_cast<backend::ThreadId>(thread_id));
+  if (status.state == backend::ProcessState::kRunning) {
+    nonstop_.set_running(static_cast<backend::TargetId>(target_id),
+                         static_cast<backend::ThreadId>(thread_id));
+  }
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 

@@ -4,6 +4,7 @@
 #include "backend/debugger_backend.h"   // TargetId, ThreadId
 #include "protocol/notifications.h"
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <shared_mutex>
@@ -61,8 +62,16 @@ class NonStopRuntime {
   // before any thread starts emitting transitions. Null sink = silent
   // mode (state machine still runs; no notifications). The pointer is
   // borrowed; the caller owns the lifetime.
+  //
+  // Stored as std::atomic — phase-2's listener thread is a second
+  // writer to set_stopped, and emit_stopped_ reads sink_ on that
+  // thread. The dispatcher sets the sink once at startup; we
+  // atomic-store there and atomic-load in emit_stopped_ so the load
+  // doesn't race the (one and only) store. Relaxed ordering is enough
+  // since the sink's own state (vectors, mutexes) carries its own
+  // happens-before via the sink-side machinery.
   void set_notification_sink(protocol::NotificationSink* sink) {
-    sink_ = sink;
+    sink_.store(sink, std::memory_order_relaxed);
   }
 
   // State transitions. set_running / set_stopped insert the thread if
@@ -102,14 +111,17 @@ class NonStopRuntime {
   mutable std::shared_mutex mu_;
   std::unordered_map<backend::TargetId, TargetState> by_target_;
 
-  protocol::NotificationSink* sink_ = nullptr;
+  std::atomic<protocol::NotificationSink*> sink_{nullptr};
 
   // Build the {jsonrpc=2.0, method=thread.event, params={...}} payload
-  // and forward to sink_->emit. Holds no locks.
-  void emit_stopped_(backend::TargetId target,
-                     backend::ThreadId tid,
-                     std::uint64_t seq,
-                     const ThreadStop& info) const;
+  // and forward to sink->emit. Takes the sink as a parameter so the
+  // caller atomically loads it once (avoiding a TOCTOU between a null
+  // check and the dereference). Holds no locks.
+  void emit_stopped_via_(protocol::NotificationSink* sink,
+                          backend::TargetId target,
+                          backend::ThreadId tid,
+                          std::uint64_t seq,
+                          const ThreadStop& info) const;
 };
 
 }  // namespace ldb::runtime

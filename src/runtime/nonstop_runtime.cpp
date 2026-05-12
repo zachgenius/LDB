@@ -32,9 +32,11 @@ void NonStopRuntime::set_stopped(backend::TargetId target,
   }
   // Notification emission happens *outside* the lock. The sink may
   // block on stdout / a captor's vector mutation; we don't want to
-  // hold the runtime lock across that.
-  if (sink_ != nullptr) {
-    emit_stopped_(target, tid, seq_after, info_copy);
+  // hold the runtime lock across that. sink_ is atomic so phase-2's
+  // listener thread can call this concurrently with the dispatcher
+  // RPC thread without a race on the pointer load.
+  if (auto* sink = sink_.load(std::memory_order_relaxed); sink != nullptr) {
+    emit_stopped_via_(sink, target, tid, seq_after, info_copy);
   }
 }
 
@@ -81,10 +83,11 @@ NonStopRuntime::stop_event_seq(backend::TargetId target) const {
   return it->second.stop_event_seq;
 }
 
-void NonStopRuntime::emit_stopped_(backend::TargetId target,
-                                    backend::ThreadId tid,
-                                    std::uint64_t seq,
-                                    const ThreadStop& info) const {
+void NonStopRuntime::emit_stopped_via_(protocol::NotificationSink* sink,
+                                        backend::TargetId target,
+                                        backend::ThreadId tid,
+                                        std::uint64_t seq,
+                                        const ThreadStop& info) const {
   // params shape matches docs/26 §1 ("New notification") with phase-1
   // scope: kind/target_id/tid/seq + reason/signal/pc when available.
   protocol::json params;
@@ -95,7 +98,7 @@ void NonStopRuntime::emit_stopped_(backend::TargetId target,
   if (!info.reason.empty()) params["reason"] = info.reason;
   if (info.signal != 0)     params["signal"] = info.signal;
   if (info.pc     != 0)     params["pc"]     = info.pc;
-  sink_->emit("thread.event", std::move(params));
+  sink->emit("thread.event", std::move(params));
 }
 
 }  // namespace ldb::runtime

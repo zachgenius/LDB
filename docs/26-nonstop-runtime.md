@@ -278,24 +278,51 @@ process granularity. Existing readers don't break.
 ### Phase-1 (this PR's territory)
 
 - `src/runtime/nonstop_runtime.{h,cpp}` — class, state machine,
-  listener thread, notification sink interface.
-- `thread.continue` + `thread.suspend` + `thread.list_state`
-  endpoints. `process.continue` extended with `all_threads`
-  param.
+  notification sink interface (sink atomically stored so the
+  phase-2 listener thread doesn't race the dispatcher's RPC thread
+  on the pointer load).
+- `thread.continue` (existing — extended with the runtime hook),
+  `thread.suspend` (-32001 kNotImplemented stub), `thread.list_state`
+  (new query) endpoints. `process.continue` extended with
+  `all_threads` param (false rejected).
 - Notification framing in `src/protocol/notifications.{h,cpp}` —
   pure JSON-RPC serialisation, no transport assumptions.
 - `hello.capabilities.non_stop_runtime` flag.
 - Unit tests for the state machine + dispatcher wire shape.
-- Live smoke against `lldb-server gdbserver` exercising
-  thread.continue + thread.event round-trip.
+
+**Known phase-1 limitation** — without the listener thread (phase-2),
+the runtime is a write-only mirror of *what the agent told us*, not
+a ground-truth source. After `thread.continue` returns, the v0.3
+LLDB backend synchronously resumes-and-restops the whole process,
+but the runtime still reports the thread as `kRunning` until
+phase-2's listener delivers the stop event. The dispatcher therefore
+populates the runtime ONLY from `thread.continue` (genuine per-thread
+intent); `process.continue` doesn't touch the runtime even when
+`tid` is set, because recording one tid as running while leaving
+siblings unknown would publish a lie. We also gate `set_running`
+behind a `status.state == kRunning` check — a backend that returns
+`kStopped` (e.g. process already dead) doesn't get recorded as
+running.
+
+Agents that need ground-truth thread state in phase-1 should call
+`thread.list` (backend-derived). `thread.list_state` reports the
+*intent* expressed via `thread.continue`, plus (post-phase-2) the
+ground truth from the listener.
 
 ### Phase-2 (separate commit)
 
+- The listener thread itself: pumps `SBListener::WaitForEvent`
+  (LLDB) and `RspChannel::recv` (own RSP client) into the runtime's
+  `set_stopped` entry point, so notifications become ground-truth
+  rather than write-mirror.
+- LldbBackend integration: `SBDebugger::SetAsync(true)` flip + the
+  shutdown handshake against the listener thread.
+- Real `thread.suspend` (-32001 disappears; resumes a single thread
+  without stopping the rest).
+- Live smoke against `lldb-server gdbserver` exercising
+  thread.continue + thread.event round-trip.
 - `event.subscribe` filtering endpoint.
-- `thread.event{kind:"created"}` notifications + matching
-  destroy.
-- LldbBackend integration (today's `SBListener::SetAsync` flip is
-  what's needed; the runtime layer is already backend-agnostic).
+- `thread.event{kind:"created"}` notifications + matching destroy.
 - DAP shim wiring (`continue` request with `singleThread:true`
   → `thread.continue`).
 
