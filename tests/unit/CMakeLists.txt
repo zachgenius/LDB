@@ -95,6 +95,7 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_observer_exec.cpp
   test_describe_endpoints_schema.cpp
   test_nonstop_runtime.cpp
+  test_dispatcher_nonstop.cpp
   test_pack.cpp
   test_pack_signing.cpp
   test_util_sha256.cpp

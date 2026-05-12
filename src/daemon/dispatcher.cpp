@@ -731,6 +731,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "thread.list")        return handle_thread_list(req);
     if (req.method == "thread.frames")      return handle_thread_frames(req);
     if (req.method == "thread.continue")    return handle_thread_continue(req);
+    if (req.method == "thread.suspend")     return handle_thread_suspend(req);
+    if (req.method == "thread.list_state")  return handle_thread_list_state(req);
     if (req.method == "thread.reverse_step")
       return handle_thread_reverse_step(req);
 
@@ -870,6 +872,13 @@ Response Dispatcher::handle_hello(const Request& req) {
       // v1.4 #8: echo the active DebuggerBackend so agents can
       // branch behavior. "lldb" (default) or "gdb" (GdbMiBackend).
       {"backend", backend_name_.empty() ? "lldb" : backend_name_},
+      // Post-V1 #21 phase-1: the non-stop state-machine + push-event
+      // surface (docs/26-nonstop-runtime.md). True means: thread.continue
+      // records per-thread state in the runtime, thread.list_state is
+      // available, and the daemon will publish thread.event notifications
+      // when phase-2's listener thread lands. Agents that want to
+      // pre-flight async-event handling should branch on this.
+      {"non_stop_runtime", true},
   };
   data["formats"] = json::array({"json", "cbor"});
   return protocol::make_ok(req.id, std::move(data));
@@ -1425,16 +1434,21 @@ with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
       "Optional `tid` selects a thread for per-thread resume — in v0.3 "
       "this is SYNC PASSTHROUGH (whole-process continue regardless of "
       "tid); v0.4+ will keep sibling threads stopped (true non-stop). "
-      "See docs/11-non-stop.md.",
+      "Post-V1 #21 phase-1: passing explicit all_threads=false is "
+      "rejected with -32602 — use thread.continue instead. Absent or "
+      "true is the historical behaviour. See docs/26-nonstop-runtime.md.",
       obj({
-          {"target_id", target_id_param()},
-          {"tid",       uint_min(1, "Optional. Thread id to resume "
+          {"target_id",   target_id_param()},
+          {"tid",         uint_min(1, "Optional. Thread id to resume "
                                     "(Tier 4 §14). v0.3: tid is logged "
                                     "but the whole process resumes — "
                                     "wire-shape parity with v0.4 async "
                                     "mode. Future per-thread keep-running "
                                     "lands when SBProcess::SetAsync(true) "
                                     "ships.")},
+          {"all_threads", bool_("Optional. Default true (resume every "
+                                "thread). false is rejected — see "
+                                "thread.continue for the per-thread path.")},
       }, {"target_id"}),
       process_state_def(),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
@@ -1538,14 +1552,50 @@ with_defs(      obj({{"frames", arr_of(ref("Frame"))}}, {"frames"}),
       "because the daemon runs LLDB in SBProcess::SetAsync(false). The "
       "wire shape is async-ready: in v0.4+ when async mode lands this "
       "endpoint will keep sibling threads stopped (true non-stop). "
-      "Agents should treat thread.continue as equivalent to "
-      "process.continue under v0.3 protocol. See docs/11-non-stop.md.",
+      "Post-V1 #21 phase-1: the call records the thread as running in "
+      "the non-stop runtime so a subsequent thread.list_state reflects "
+      "the resumption; phase-2 will deliver thread.event notifications "
+      "when the thread parks again. See docs/26-nonstop-runtime.md.",
       obj({
           {"target_id", target_id_param()},
           {"tid",       tid_param()},
       }, {"target_id", "tid"}),
       process_state_def(),
       /*requires_target=*/true, /*requires_stopped=*/true, "medium");
+
+  add("thread.suspend",
+      "Park the given thread without stopping the rest of the process. "
+      "Post-V1 #21 phase-1: returns -32001 kNotImplemented — the "
+      "implementation requires SBDebugger::SetAsync(true) + the "
+      "listener thread (phase-2). The wire surface ships now so agents "
+      "can pre-flight against it. See docs/26-nonstop-runtime.md.",
+      obj({
+          {"target_id", target_id_param()},
+          {"tid",       tid_param()},
+      }, {"target_id", "tid"}),
+      process_state_def(),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
+
+  add("thread.list_state",
+      "Snapshot the non-stop runtime's per-thread state for a target. "
+      "Each entry carries {tid, state, reason?, signal?, pc?} where "
+      "state is \"running\" or \"stopped\". The outer object also "
+      "includes a monotonic stop_event_seq that bumps on every "
+      "set_stopped — agents that receive a thread.event notification "
+      "(phase-2) can correlate the carried seq with this query. "
+      "Post-V1 #21 phase-1; see docs/26-nonstop-runtime.md.",
+      obj({{"target_id", target_id_param()}}, {"target_id"}),
+      obj({
+          {"stop_event_seq", uint_()},
+          {"threads",        arr_of(obj({
+              {"tid",    uint_()},
+              {"state",  enum_str({"running", "stopped"})},
+              {"reason", str()},
+              {"signal", int_()},
+              {"pc",     uint_()},
+          }, {"tid", "state"}))},
+      }, {"stop_event_seq", "threads"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "low");
 
   add("thread.reverse_step",
       "Reverse-step the given thread. Same shape as process.reverse_step; "
@@ -3322,6 +3372,10 @@ Response Dispatcher::handle_target_close(const Request& req) {
   // Tear down any RspChannel parked under this target_id (post-V1 #17).
   // The unique_ptr's destructor joins the reader thread + closes the fd.
   rsp_channels_.erase(static_cast<backend::TargetId>(tid));
+  // Post-V1 #21 phase-1: drop the non-stop runtime's per-thread state +
+  // reset stop_event_seq so a future target.open that reuses the id
+  // doesn't look like a continuation of this session.
+  nonstop_.forget_target(static_cast<backend::TargetId>(tid));
   return protocol::make_ok(req.id, json{{"closed", true}});
 }
 
@@ -3826,6 +3880,18 @@ Response Dispatcher::handle_process_continue(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint param 'target_id'");
   }
+  // Post-V1 #21 phase-1: explicit all_threads=false is the
+  // deprecation hook for the all-threads semantics — agents that
+  // know they want per-thread control must use thread.continue.
+  // Absent param defaults to true (wire-compat with pre-#21 clients).
+  if (auto it = req.params.find("all_threads");
+      it != req.params.end() && it->is_boolean() && !it->get<bool>()) {
+    return protocol::make_err(
+        req.id, ErrorCode::kInvalidParams,
+        "process.continue with all_threads=false is not valid; "
+        "use thread.continue to resume a single thread "
+        "(docs/26-nonstop-runtime.md)");
+  }
   // Optional `tid` (Tier 4 §14, scoped slice). When present, route to
   // the per-thread continue path. In v0.3 this is a sync passthrough
   // into continue_process — see backend::DebuggerBackend::continue_thread
@@ -3837,6 +3903,10 @@ Response Dispatcher::handle_process_continue(const Request& req) {
           ? backend_->continue_thread(static_cast<backend::TargetId>(tid),
                                       static_cast<backend::ThreadId>(thread_id))
           : backend_->continue_process(static_cast<backend::TargetId>(tid));
+  if (have_tid) {
+    nonstop_.set_running(static_cast<backend::TargetId>(tid),
+                         static_cast<backend::ThreadId>(thread_id));
+  }
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 
@@ -3855,12 +3925,74 @@ Response Dispatcher::handle_thread_continue(const Request& req) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
                               "missing uint param 'tid'");
   }
-  // Tier 4 §14: explicit per-thread resume. v0.3 sync passthrough —
-  // resumes the whole process. See docs/11-non-stop.md.
+  // Tier 4 §14 + post-V1 #21 phase-1: explicit per-thread resume.
+  // Backend call is still a v0.3-shape passthrough today; the runtime
+  // records the thread as kRunning so a subsequent thread.list_state
+  // reflects the transition + phase-2's listener has the right
+  // pre-state when stop events arrive. See docs/26-nonstop-runtime.md.
   auto status = backend_->continue_thread(
       static_cast<backend::TargetId>(target_id),
       static_cast<backend::ThreadId>(thread_id));
+  nonstop_.set_running(static_cast<backend::TargetId>(target_id),
+                       static_cast<backend::ThreadId>(thread_id));
   return protocol::make_ok(req.id, process_status_to_json(status));
+}
+
+Response Dispatcher::handle_thread_suspend(const Request& req) {
+  // Phase-1: not implemented. The state-machine surface is here, but
+  // suspending a running thread requires LLDB's SBDebugger::SetAsync(true)
+  // + the listener thread that pumps SBListener events
+  // (docs/26-nonstop-runtime.md §6 phase-2). Without that, calling
+  // SBThread::Suspend without async mode either no-ops or breaks
+  // process state silently. -32001 with a clear hint is the honest
+  // wire contract until the listener lands.
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0, thread_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) ||
+      !require_uint(req.params, "tid",       &thread_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint params 'target_id' and 'tid'");
+  }
+  return protocol::make_err(
+      req.id, ErrorCode::kNotImplemented,
+      "thread.suspend requires the phase-2 listener thread "
+      "(SetAsync(true)); not available in this build. "
+      "See docs/26-nonstop-runtime.md.");
+}
+
+Response Dispatcher::handle_thread_list_state(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  auto snap = nonstop_.snapshot(static_cast<backend::TargetId>(target_id));
+  json threads = json::array();
+  for (const auto& e : snap) {
+    json t;
+    t["tid"]   = static_cast<std::uint64_t>(e.tid);
+    t["state"] = (e.state == runtime::ThreadState::kRunning) ? "running"
+                                                              : "stopped";
+    if (e.last_stop.has_value()) {
+      const auto& s = *e.last_stop;
+      if (!s.reason.empty()) t["reason"] = s.reason;
+      if (s.signal != 0)     t["signal"] = s.signal;
+      if (s.pc     != 0)     t["pc"]     = s.pc;
+    }
+    threads.push_back(std::move(t));
+  }
+  json out;
+  out["stop_event_seq"] =
+      nonstop_.stop_event_seq(static_cast<backend::TargetId>(target_id));
+  out["threads"] = std::move(threads);
+  return protocol::make_ok(req.id, std::move(out));
 }
 
 Response Dispatcher::handle_process_kill(const Request& req) {
