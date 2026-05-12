@@ -210,11 +210,21 @@ class ProbeOrchestrator {
     std::string   where_expr;
     bool          enabled            = false;
     std::uint64_t hit_count          = 0;
-    // Post-V1 #25 phase-2: predicate metadata. has_predicate=true
-    // when the probe was created with a predicate; predicate_dropped
-    // is the running count of events filtered out by the predicate.
+    // Post-V1 #25 phase-2: predicate metadata.
+    //   has_predicate     — true when the probe was created with a
+    //                        predicate.
+    //   predicate_dropped — running count of events the predicate
+    //                        filtered out by *evaluating to zero*.
+    //   predicate_errored — running count of events the predicate
+    //                        filtered out because eval() returned a
+    //                        non-kOk error (broken bytecode, mem
+    //                        read failed, etc.). Separate counter so
+    //                        an agent debugging a broken predicate
+    //                        can distinguish "filtered as designed"
+    //                        from "predicate is faulty."
     bool          has_predicate      = false;
     std::uint64_t predicate_dropped  = 0;
+    std::uint64_t predicate_errored  = 0;
   };
   std::vector<ListEntry> list();
 

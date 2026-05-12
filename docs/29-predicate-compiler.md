@@ -128,6 +128,29 @@ integer: -128..127 → kConst8, -32768..32767 → kConst16, etc. This
 saves bytes on the wire for the common small-int case and matches
 GDB's spec (gdb emits the same widening rule).
 
+**The VM is signed-int64 throughout.** `kLtSigned` / `kGeSigned` /
+etc. compare signed; there is no unsigned-compare opcode in the
+phase-1 table. Agents that need unsigned semantics on byte / word
+values should mask explicitly:
+
+```
+;; Test high bit of a byte: unsigned would be `(ge byte 0x80)`,
+;; signed must be `(eq (and byte 0x80) 0x80)`.
+(eq (and (ref8 (reg "rax")) 0x80) 0x80)
+```
+
+### Register-name resolution
+
+`(reg "name")` looks up by name at eval time through
+`backend::read_register`, which returns 0 for unknown register
+names (the backend's existing "captured-as-zero" contract — see
+`docs/02-ldb-mvp-plan.md`). A typo in a register name therefore
+silently evaluates to 0 in the predicate, which may produce a
+predicate that's always-true or always-false depending on the
+surrounding comparison. **Validate register names against the
+target's actual register table** (via `frame.registers` or
+similar) before pinning a predicate on a probe.
+
 ### Error reporting
 
 Tokeniser tracks (line, column) per token. Every parser/codegen

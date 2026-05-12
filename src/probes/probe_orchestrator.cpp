@@ -53,10 +53,14 @@ struct ProbeOrchestrator::ProbeState {
   // remove() time.
   std::string                     agent_attach_id;
 
-  // Post-V1 #25 phase-2: running count of events filtered out by the
-  // predicate (spec.predicate evaluates to zero or returns an error).
-  // Exposed via ListEntry.predicate_dropped.
+  // Post-V1 #25 phase-2: running counts of events filtered out by
+  // the predicate. _dropped is bumped on a zero-result evaluation
+  // (predicate worked as designed); _errored is bumped on any
+  // EvalError (broken bytecode, mem-read failure, etc.). Splitting
+  // them lets an agent distinguish "predicate filtered as intended"
+  // from "predicate is faulty."
   std::uint64_t                   predicate_dropped = 0;
+  std::uint64_t                   predicate_errored = 0;
 };
 
 namespace {
@@ -331,6 +335,7 @@ std::vector<ProbeOrchestrator::ListEntry> ProbeOrchestrator::list() {
     e.hit_count         = st->hit_count;
     e.has_predicate     = st->spec.predicate.has_value();
     e.predicate_dropped = st->predicate_dropped;
+    e.predicate_errored = st->predicate_errored;
     out.push_back(std::move(e));
   }
   // Audit §11.4: probe ids are "p<seq>" where seq is a per-orchestrator
@@ -376,6 +381,7 @@ ProbeOrchestrator::info(const std::string& probe_id) {
   e.hit_count         = it->second->hit_count;
   e.has_predicate     = it->second->spec.predicate.has_value();
   e.predicate_dropped = it->second->predicate_dropped;
+  e.predicate_errored = it->second->predicate_errored;
   return e;
 }
 
@@ -644,7 +650,7 @@ bool ProbeOrchestrator::on_breakpoint_hit(
   // Post-V1 #25 phase-2: evaluate the predicate before doing any
   // capture / artifact work. A zero result (or eval error) drops the
   // event silently — agent-controlled filtering, no observable side
-  // effect except the predicate_dropped counter increment.
+  // effect except the appropriate counter increment.
   if (st->spec.predicate.has_value()) {
     agent_expr::EvalContext ectx;
     ectx.target      = st->spec.target_id;
@@ -652,9 +658,17 @@ bool ProbeOrchestrator::on_breakpoint_hit(
     ectx.frame_index = 0;
     ectx.backend     = self->backend_.get();
     auto eval_r = agent_expr::eval(*st->spec.predicate, ectx);
-    if (eval_r.error != agent_expr::EvalError::kOk || eval_r.value == 0) {
-      // Drop. Auto-continue. Bump the counter under the lock so a
-      // concurrent probe.list reads a consistent value.
+    if (eval_r.error != agent_expr::EvalError::kOk) {
+      // Broken bytecode / mem-read failure / div-by-zero / etc.
+      // Drop the event and bump the *_errored* counter so the agent
+      // can debug a faulty predicate.
+      std::lock_guard<std::mutex> lk(self->mu_);
+      st->predicate_errored += 1;
+      return false;
+    }
+    if (eval_r.value == 0) {
+      // Predicate worked as designed — agent asked us to skip this
+      // event. Bump *_dropped*.
       std::lock_guard<std::mutex> lk(self->mu_);
       st->predicate_dropped += 1;
       return false;

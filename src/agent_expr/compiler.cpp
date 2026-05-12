@@ -2,6 +2,7 @@
 #include "agent_expr/compiler.h"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -133,19 +134,27 @@ struct Lexer {
       }
       if (any_digit && (at_end() || !is_sym_char(src[pos]))) {
         std::string lit(src.substr(start, pos - start));
-        try {
-          // strtoll handles 0x via base=0.
-          char* endp = nullptr;
-          std::int64_t v = std::strtoll(lit.c_str(), &endp, 0);
-          (void)endp;
-          t.kind = Tok::kInt;
-          t.int_value = v;
+        // strtoll handles 0x via base=0. It doesn't throw; overflow
+        // sets errno to ERANGE and saturates to LLONG_MIN/MAX, and a
+        // partial parse leaves `endp` short of the end. Both cases
+        // must surface as compile errors — silently truncating
+        // `(const 99999999999999999999)` to LLONG_MAX produces a
+        // predicate that behaves nothing like what the agent wrote.
+        errno = 0;
+        char* endp = nullptr;
+        std::int64_t v = std::strtoll(lit.c_str(), &endp, 0);
+        if (errno == ERANGE ||
+            endp == nullptr ||
+            endp != lit.c_str() + lit.size()) {
+          *err = "invalid integer literal '" + lit + "'";
+          t.kind = Tok::kEof;
           t.line = sline; t.column = scol;
           return t;
-        } catch (...) {
-          *err = "invalid integer literal '" + lit + "'";
-          t.kind = Tok::kEof; return t;
         }
+        t.kind = Tok::kInt;
+        t.int_value = v;
+        t.line = sline; t.column = scol;
+        return t;
       }
       // Not a valid int — fall through to symbol parsing from `start`.
       pos = start; line = sline; column = scol;

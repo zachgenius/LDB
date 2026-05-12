@@ -70,7 +70,10 @@ TEST_CASE("compiler: literal widens to const16 / const32 / const64",
 TEST_CASE("compiler: hex literal parses",
           "[agent_expr][compiler][const]") {
   auto p = must_compile("0xdead");
-  // 0xdead = 57005, doesn't fit in int8 (-128..127), const16 needed.
+  // 0xdead = 57005 — doesn't fit in signed int16 (max 32767), so
+  // the compiler promotes to kConst32. (For unsigned-byte
+  // comparisons, agents should mask explicitly; the VM is
+  // signed-only throughout, see docs/29.)
   CHECK(p.code[0] == static_cast<std::uint8_t>(Op::kConst32));
 }
 
@@ -199,6 +202,16 @@ TEST_CASE("compiler: line:column anchor tracks newlines",
   auto r = compile("\n\n(unknown)");
   REQUIRE(r.error.has_value());
   CHECK(r.error->line == 3);
+}
+
+TEST_CASE("compiler: integer overflow surfaces as compile error",
+          "[agent_expr][compiler][error]") {
+  // Bigger than LLONG_MAX. strtoll sets errno=ERANGE and saturates;
+  // silently emitting LLONG_MAX would produce a predicate that
+  // behaves nothing like what the agent wrote.
+  auto r = compile("99999999999999999999");
+  REQUIRE(r.error.has_value());
+  CHECK(r.error->message.find("invalid integer") != std::string::npos);
 }
 
 TEST_CASE("compiler: (reg ...) emits via reg_table — round-trip against null context",

@@ -7640,11 +7640,15 @@ json probe_list_entry_to_json(const probes::ProbeOrchestrator::ListEntry& e) {
   j["enabled"]    = e.enabled;
   j["hit_count"]  = e.hit_count;
   // Post-V1 #25 phase-2 — predicate metadata. has_predicate is
-  // always present (false when no predicate is attached); the
-  // dropped counter is present whenever has_predicate is true.
+  // always present (false when no predicate is attached); the two
+  // counters are present whenever has_predicate is true so agents
+  // can distinguish "predicate worked as designed and skipped these"
+  // (predicate_dropped) from "predicate is faulty and errored on
+  // these" (predicate_errored).
   j["has_predicate"]    = e.has_predicate;
   if (e.has_predicate) {
     j["predicate_dropped"] = e.predicate_dropped;
+    j["predicate_errored"] = e.predicate_errored;
   }
   return j;
 }
@@ -7679,8 +7683,12 @@ Response Dispatcher::handle_probe_create(const Request& req) {
     // lldb_breakpoint. The BPF / agent paths have their own
     // filtering surface (bpftrace's own predicates, agent-side
     // bytecode); a daemon-side predicate would fire after the
-    // event has already been published.
-    if (req.params.contains("predicate")) {
+    // event has already been published. `predicate: null` is
+    // treated as absent (matches the lldb_breakpoint path's
+    // null-tolerance) so an agent that always passes the field
+    // doesn't need conditional logic.
+    if (auto pit = req.params.find("predicate");
+        pit != req.params.end() && !pit->is_null()) {
       return protocol::make_err(
           req.id, ErrorCode::kInvalidParams,
           "predicate is only supported for kind='lldb_breakpoint'");
