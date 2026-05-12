@@ -3,6 +3,7 @@
 
 #include "probes/agent_engine.h"
 #include "probes/bpftrace_engine.h"
+#include "probes/rate_limit.h"
 #include "store/artifact_store.h"
 #include "util/log.h"
 
@@ -61,6 +62,17 @@ struct ProbeOrchestrator::ProbeState {
   // from "predicate is faulty."
   std::uint64_t                   predicate_dropped = 0;
   std::uint64_t                   predicate_errored = 0;
+
+  // Post-V1 #26 phase-1: parsed rate-limit configuration. optional
+  // because rate_limit_text may be empty. Mutated inside
+  // on_breakpoint_hit under mu_; the orchestrator owns the lock so
+  // no separate synchronisation is needed.
+  std::optional<RateLimit>        rate_limit;
+  // Running count of events dropped because the rate-limit gate
+  // returned false. Sits on ProbeState (not just RateLimit) so the
+  // list/info surface reads a consistent shape with the predicate
+  // counters.
+  std::uint64_t                   rate_limited = 0;
 };
 
 namespace {
@@ -173,11 +185,17 @@ std::string ProbeOrchestrator::create(const ProbeSpec& spec_in) {
   if (spec_in.kind == "agent") {
     return create_agent(spec_in);
   }
-  if (spec_in.kind != "lldb_breakpoint") {
+  // "tracepoint" routes through the same LLDB-breakpoint machinery
+  // as "lldb_breakpoint" — it's a sugar tag for the wire surface.
+  // The dispatcher locks tracepoints to action=kLogAndContinue and
+  // disallows artifact actions, so we don't have to re-check that
+  // here.
+  if (spec_in.kind != "lldb_breakpoint" &&
+      spec_in.kind != "tracepoint") {
     throw std::invalid_argument(
         "probe.create: unknown kind \"" + spec_in.kind +
         "\"; expected one of "
-        "{lldb_breakpoint, uprobe_bpf, agent}");
+        "{lldb_breakpoint, tracepoint, uprobe_bpf, agent}");
   }
   if (spec_in.action == Action::kStoreArtifact) {
     if (spec_in.build_id.empty()) {
@@ -205,6 +223,15 @@ std::string ProbeOrchestrator::create(const ProbeSpec& spec_in) {
   auto st = std::make_shared<ProbeState>();
   st->kind        = spec.kind;
   st->where_expr  = spec.where_expr;
+  // Parse the rate-limit grammar into the RateLimit state machine.
+  // Empty rate_limit_text → no enforcement (allow_event always
+  // true). Malformed text → rejected at the dispatcher layer with
+  // -32602, so reaching here with a non-empty unparseable string
+  // would be a dispatcher bug — we still tolerate it (no limit)
+  // rather than throw on the LLDB callback thread later.
+  if (!spec.rate_limit_text.empty()) {
+    st->rate_limit = parse_rate_limit(spec.rate_limit_text);
+  }
   st->spec        = std::move(spec);
   st->bp_id       = handle.bp_id;
   st->enabled     = true;
@@ -336,6 +363,7 @@ std::vector<ProbeOrchestrator::ListEntry> ProbeOrchestrator::list() {
     e.has_predicate     = st->spec.predicate.has_value();
     e.predicate_dropped = st->predicate_dropped;
     e.predicate_errored = st->predicate_errored;
+    e.rate_limited      = st->rate_limited;
     out.push_back(std::move(e));
   }
   // Audit §11.4: probe ids are "p<seq>" where seq is a per-orchestrator
@@ -382,6 +410,7 @@ ProbeOrchestrator::info(const std::string& probe_id) {
   e.has_predicate     = it->second->spec.predicate.has_value();
   e.predicate_dropped = it->second->predicate_dropped;
   e.predicate_errored = it->second->predicate_errored;
+  e.rate_limited      = it->second->rate_limited;
   return e;
 }
 
@@ -671,6 +700,22 @@ bool ProbeOrchestrator::on_breakpoint_hit(
       // event. Bump *_dropped*.
       std::lock_guard<std::mutex> lk(self->mu_);
       st->predicate_dropped += 1;
+      return false;
+    }
+  }
+
+  // Post-V1 #26 phase-1: rate-limit gate. Runs AFTER the predicate
+  // (predicate is the cheaper filter — bytecode eval is bounded at
+  // 10K insns, no allocations), BEFORE capture (which can touch
+  // registers + memory). The RateLimit state machine mutates under
+  // mu_ so two concurrent hits on the same probe don't race the
+  // window pivot. allow_event returns false when the configured
+  // cap is exceeded; the event is dropped + rate_limited++ +
+  // inferior auto-continues.
+  if (st->rate_limit.has_value()) {
+    std::lock_guard<std::mutex> lk(self->mu_);
+    if (!st->rate_limit->allow_event(std::chrono::steady_clock::now())) {
+      st->rate_limited += 1;
       return false;
     }
   }

@@ -104,6 +104,8 @@ set(LDB_UNIT_SOURCES
   test_agent_expr_evaluator.cpp
   test_dispatcher_predicate_compile.cpp
   test_probe_predicate.cpp
+  test_rate_limit.cpp
+  test_dispatcher_tracepoint.cpp
   test_pack.cpp
   test_pack_signing.cpp
   test_util_sha256.cpp
@@ -136,6 +138,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
   ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
+  ${CMAKE_SOURCE_DIR}/src/probes/rate_limit.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/agent_engine.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/backend.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/parser.cpp
