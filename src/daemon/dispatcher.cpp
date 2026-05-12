@@ -594,6 +594,14 @@ void decorate_provenance(Response& resp,
     } else {
       auto ids = extract_target_ids(req.params);
       if (!ids.empty()) {
+        // O(N) snapshot reads, one per target_id. Safe today because
+        // the dispatcher is single-threaded; once #21 introduces the
+        // non-stop runtime, snapshot_for_target's per-target mutex
+        // could let target A's gen bump between our read of ids[0]
+        // and ids[1], turning a homogeneous list into a falsely-
+        // heterogeneous one (or vice versa). When the async pump
+        // lands, this loop needs either a batch snapshot_for_targets
+        // API or a global snapshot-pin held for the whole decoration.
         snap = backend->snapshot_for_target(ids.front());
         for (std::size_t i = 1; i < ids.size(); ++i) {
           if (backend->snapshot_for_target(ids[i]) != snap) {
