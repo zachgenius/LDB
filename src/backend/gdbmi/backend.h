@@ -72,6 +72,12 @@ class GdbMiBackend final : public DebuggerBackend {
                            bool& truncated) override;
   std::vector<StringMatch>
       find_strings(TargetId tid, const StringQuery& query) override;
+  ModuleSymbols
+      iterate_symbols(TargetId tid, std::string_view build_id) override;
+  ModuleTypes
+      iterate_types(TargetId tid, std::string_view build_id) override;
+  ModuleStrings
+      iterate_strings(TargetId tid, std::string_view build_id) override;
   std::vector<DisasmInsn>
       disassemble_range(TargetId tid, std::uint64_t lo,
                         std::uint64_t hi) override;

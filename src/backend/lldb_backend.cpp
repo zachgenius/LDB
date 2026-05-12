@@ -500,29 +500,20 @@ std::vector<Module> LldbBackend::list_modules(TargetId tid) {
   return out;
 }
 
-std::optional<TypeLayout>
-LldbBackend::find_type_layout(TargetId tid, const std::string& name) {
-  lldb::SBTarget target;
-  {
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    auto it = impl_->targets.find(tid);
-    if (it == impl_->targets.end()) {
-      throw Error("unknown target_id");
-    }
-    target = it->second;
-  }
+namespace {
 
-  // FindFirstType matches "name" or "struct name" / "class name".
-  auto sb_type = target.FindFirstType(name.c_str());
-  if (!sb_type.IsValid()) {
-    return std::nullopt;
-  }
-
+// Extract a TypeLayout from an SBType. Shared by find_type_layout
+// (single-name lookup) and iterate_types (bulk enumeration for the
+// SymbolIndex). The two callers MUST produce byte-identical layouts
+// for the same SBType, otherwise the index's query_type and the
+// fall-through find_type_layout would disagree.
+TypeLayout extract_type_layout(lldb::SBType sb_type,
+                                const std::string& fallback_name) {
   TypeLayout out;
   if (const char* nm = sb_type.GetName()) {
     out.name = nm;
   } else {
-    out.name = name;
+    out.name = fallback_name;
   }
 
   // GetByteSize returns size in bytes; SBAPI lacks a direct alignment query,
@@ -577,6 +568,29 @@ LldbBackend::find_type_layout(TargetId tid, const std::string& name) {
 
   out.alignment = inferred_alignment;
   return out;
+}
+
+}  // namespace
+
+std::optional<TypeLayout>
+LldbBackend::find_type_layout(TargetId tid, const std::string& name) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  // FindFirstType matches "name" or "struct name" / "class name".
+  auto sb_type = target.FindFirstType(name.c_str());
+  if (!sb_type.IsValid()) {
+    return std::nullopt;
+  }
+
+  return extract_type_layout(sb_type, name);
 }
 
 namespace {
@@ -1146,6 +1160,245 @@ LldbBackend::find_strings(TargetId tid, const StringQuery& query) {
     scan_module_for_strings(mod, target, query, out);
   }
 
+  return out;
+}
+
+namespace {
+
+// Resolve the SBModule for a target whose UUID/build-id matches the
+// caller's `build_id`. The dispatcher passes the build_id it sees on
+// list_modules; this method's job is to bind that label back to a
+// concrete SBModule so we can walk symbols/types/strings off it.
+//
+// Returns invalid SBModule when no module matches. Callers iterate_*
+// return empty buckets in that case (the dispatcher's correlate.*
+// then falls through to find_*).
+lldb::SBModule resolve_module_for_build_id(lldb::SBTarget target,
+                                            std::string_view build_id) {
+  uint32_t n = target.GetNumModules();
+  for (uint32_t i = 0; i < n; ++i) {
+    auto m = target.GetModuleAtIndex(i);
+    if (!m.IsValid()) continue;
+    const char* uuid = m.GetUUIDString();
+    if (uuid && build_id == uuid) return m;
+  }
+  // Fallback: empty build_id (caller didn't know) → first module is
+  // the main executable on every target we open. This matches the
+  // default scope of find_strings and the implicit module-0 LLDB uses
+  // for find_type_layout's FindFirstType.
+  if (build_id.empty() && n > 0) {
+    auto m = target.GetModuleAtIndex(0);
+    if (m.IsValid()) return m;
+  }
+  return lldb::SBModule();
+}
+
+std::string module_path_of(lldb::SBModule m) {
+  if (!m.IsValid()) return {};
+  auto fs = m.GetFileSpec();
+  if (!fs.IsValid()) return {};
+  char buf[4096];
+  if (fs.GetPath(buf, sizeof(buf)) > 0) return buf;
+  return {};
+}
+
+// Build a SymbolMatch from an SBSymbol unconditionally (no kind filter).
+// Used by iterate_symbols where the bucket is the kind filter. Mirrors
+// the decoration in find_symbols's `decorate_symbol`; intentionally
+// duplicated rather than refactored because find_symbols's version
+// applies a query-time kind filter we don't want here.
+std::optional<SymbolMatch>
+decorate_symbol_for_iterate(lldb::SBSymbol sym, lldb::SBTarget target,
+                             const std::string& mod_path) {
+  if (!sym.IsValid()) return std::nullopt;
+  const char* name = sym.GetName();
+  if (!name) return std::nullopt;
+
+  SymbolMatch m;
+  m.name = name;
+  if (const char* mn = sym.GetMangledName()) {
+    if (m.name != mn) m.mangled = mn;
+  }
+  m.kind = classify_symbol(sym.GetType());
+
+  auto start_addr = sym.GetStartAddress();
+  if (start_addr.IsValid()) {
+    m.address = start_addr.GetFileAddress();
+    lldb::addr_t la = start_addr.GetLoadAddress(target);
+    if (la != LLDB_INVALID_ADDRESS) {
+      m.load_address = static_cast<std::uint64_t>(la);
+    }
+  }
+  auto end_addr = sym.GetEndAddress();
+  if (end_addr.IsValid() && start_addr.IsValid()) {
+    auto e = end_addr.GetFileAddress();
+    auto s = start_addr.GetFileAddress();
+    if (e > s) m.byte_size = e - s;
+  }
+  m.module_path = mod_path;
+  return m;
+}
+
+}  // namespace
+
+DebuggerBackend::ModuleSymbols
+LldbBackend::iterate_symbols(TargetId tid, std::string_view build_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  ModuleSymbols out;
+  auto mod = resolve_module_for_build_id(target, build_id);
+  if (!mod.IsValid()) return out;
+  std::string mod_path = module_path_of(mod);
+
+  std::size_t nsym = mod.GetNumSymbols();
+  std::size_t cap  = DebuggerBackend::kIterateBucketCap;
+  // Reserve roughly half for functions, half for data — saves a couple
+  // of reallocs on big modules without locking in a precise split.
+  out.functions.reserve(nsym / 2);
+  out.data.reserve(nsym / 4);
+
+  // Dedupe by (schema PK, address) so the cache PK never rejects an
+  // insert. The SymbolIndex PK is (build_id, name, address) where
+  // `name` is whatever ends up in row.name — which is `m.mangled` when
+  // non-empty else `m.name` (see symbol_match_to_row in dispatcher.cpp).
+  // Keying the dedupe on the same expression guarantees we never drop
+  // a row whose schema key would actually have been unique.
+  // LLDB exposes PLT trampolines, weak aliases, and IFUNC resolvers
+  // as separate SBSymbols at the same name+address; this dedupe drops
+  // the duplicates the same way find_symbols's SymbolDedupeKey does.
+  std::set<std::pair<std::string, std::uint64_t>> seen;
+
+  bool truncated = false;
+  for (std::size_t i = 0; i < nsym; ++i) {
+    auto sym = mod.GetSymbolAtIndex(i);
+    auto decorated = decorate_symbol_for_iterate(sym, target, mod_path);
+    if (!decorated.has_value()) continue;
+    const std::string& schema_name =
+        decorated->mangled.empty() ? decorated->name : decorated->mangled;
+    auto key = std::make_pair(schema_name, decorated->address);
+    if (!seen.insert(std::move(key)).second) continue;
+    switch (decorated->kind) {
+      case SymbolKind::kFunction:
+        if (out.functions.size() < cap) out.functions.push_back(std::move(*decorated));
+        else truncated = true;
+        break;
+      case SymbolKind::kVariable:
+        if (out.data.size() < cap) out.data.push_back(std::move(*decorated));
+        else truncated = true;
+        break;
+      default:
+        if (out.other.size() < cap) out.other.push_back(std::move(*decorated));
+        else truncated = true;
+        break;
+    }
+  }
+  if (truncated) {
+    ::ldb::log::warn(
+        std::string("iterate_symbols: module ") + mod_path +
+        " has >" + std::to_string(cap) + " symbols per bucket; truncated. "
+        "correlate.* per-name queries beyond the cap fall through to backend.");
+  }
+  out.truncated = truncated;
+  return out;
+}
+
+DebuggerBackend::ModuleTypes
+LldbBackend::iterate_types(TargetId tid, std::string_view build_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  ModuleTypes out;
+  auto mod = resolve_module_for_build_id(target, build_id);
+  if (!mod.IsValid()) return out;
+
+  // SBModule::GetTypes(eTypeClassStruct | eTypeClassClass | eTypeClassUnion)
+  // gives us every aggregate the debug info knows about. We skip typedefs
+  // and enums — find_type_layout only emits aggregate layouts.
+  const std::uint32_t type_classes =
+      static_cast<std::uint32_t>(lldb::eTypeClassStruct) |
+      static_cast<std::uint32_t>(lldb::eTypeClassClass)  |
+      static_cast<std::uint32_t>(lldb::eTypeClassUnion);
+  auto tlist = mod.GetTypes(type_classes);
+  std::uint32_t n = tlist.GetSize();
+  out.types.reserve(n);
+
+  std::size_t cap = DebuggerBackend::kIterateBucketCap;
+  bool truncated = false;
+  // Dedupe by canonical name — DWARF can produce multiple SBType
+  // entries for the same struct across compilation units. find_type_
+  // layout uses FindFirstType which returns one; we mirror by keeping
+  // the first occurrence.
+  std::set<std::string> seen;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    if (out.types.size() >= cap) { truncated = true; break; }
+    auto t = tlist.GetTypeAtIndex(i);
+    if (!t.IsValid()) continue;
+    const char* nm = t.GetName();
+    if (!nm || *nm == '\0') continue;
+    std::string canonical = nm;
+    if (!seen.insert(canonical).second) continue;
+    out.types.push_back(extract_type_layout(t, canonical));
+  }
+  if (truncated) {
+    ::ldb::log::warn(
+        std::string("iterate_types: module ") + module_path_of(mod) +
+        " has >" + std::to_string(cap) + " aggregate types; truncated. "
+        "correlate.types beyond the cap falls through to backend.");
+  }
+  out.truncated = truncated;
+  return out;
+}
+
+DebuggerBackend::ModuleStrings
+LldbBackend::iterate_strings(TargetId tid, std::string_view build_id) {
+  lldb::SBTarget target;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->targets.find(tid);
+    if (it == impl_->targets.end()) {
+      throw Error("unknown target_id");
+    }
+    target = it->second;
+  }
+
+  ModuleStrings out;
+  auto mod = resolve_module_for_build_id(target, build_id);
+  if (!mod.IsValid()) return out;
+
+  // Match find_strings's default-scope behaviour: scan only the main
+  // executable's data sections at min_length=4. The cache stores the
+  // raw strings; the dispatcher's correlate.strings query path applies
+  // any caller-supplied filter post-hoc.
+  StringQuery q;
+  q.module_path = "";   // default = main exec only
+  q.min_length  = 4;
+  q.max_length  = 0;
+  scan_module_for_strings(mod, target, q, out.strings);
+
+  if (out.strings.size() > DebuggerBackend::kIterateBucketCap) {
+    ::ldb::log::warn(
+        std::string("iterate_strings: module ") + module_path_of(mod) +
+        " yielded " + std::to_string(out.strings.size()) +
+        " strings; truncating to " +
+        std::to_string(DebuggerBackend::kIterateBucketCap));
+    out.strings.resize(DebuggerBackend::kIterateBucketCap);
+    out.truncated = true;
+  }
   return out;
 }
 

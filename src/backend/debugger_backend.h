@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Abstract backend interface. M0 has only the LLDB implementation, but
@@ -461,6 +462,74 @@ class DebuggerBackend {
   // for invalid target_id.
   virtual std::vector<StringMatch>
       find_strings(TargetId tid, const StringQuery& query) = 0;
+
+  // --- Bulk module iteration (post-V1 #18, docs/23-symbol-index.md) ----
+  //
+  // The dispatcher's correlate.* path needs to enumerate every symbol /
+  // type / string in a module so the SymbolIndex can populate once and
+  // serve subsequent calls from sqlite. Three buckets keyed by build_id:
+  //
+  //   ModuleSymbols  — every named symbol the backend can see in the
+  //                    main executable, bucketed by classification
+  //                    (function / data / other). The same SymbolMatch
+  //                    shape find_symbols emits, so the index→wire
+  //                    converter is the existing symbol_match_to_json.
+  //   ModuleTypes    — every fully-resolved struct/class/union layout
+  //                    in the target's debug info, shaped exactly like
+  //                    find_type_layout returns. Type-strip / canonical-
+  //                    name handling matches find_type_layout's contract
+  //                    so query_type(build_id, name) returns what
+  //                    find_type_layout(tid, name) would.
+  //   ModuleStrings  — printable ASCII runs in the default scope of
+  //                    find_strings (main executable's data sections,
+  //                    min_length=4).
+  //
+  // Why bulk and not "find with empty query": find_symbols / find_strings
+  // are query-shaped (per-target SymbolQuery / StringQuery). The cache
+  // is build_id-keyed and doesn't know the caller's specific query at
+  // populate time. Bulk + post-filter (in sqlite) is the inversion that
+  // turns O(targets) backend walks into O(unique build_ids).
+  //
+  // build_id is purely a populator-side label (the caller writes it
+  // into the BinaryEntry); the backend isn't expected to validate the
+  // claim against the actual module UUID. Throws backend::Error for
+  // invalid target_id; empty buckets are not an error.
+  //
+  // Hard cap on bucket size (per-bucket): kIterateBucketCap. Modules
+  // that exceed it are truncated and a stderr warning logged; the
+  // dispatcher's correlate.* still falls through to backend find_*
+  // for specific-name queries beyond the cap. Today's biggest real-
+  // world module (kernel debuginfo) hits ~1M symbols and would blow
+  // sqlite WAL otherwise.
+  static constexpr std::size_t kIterateBucketCap = 100000;
+
+  // `truncated` fires when any bucket hit kIterateBucketCap. The
+  // dispatcher uses this to decide whether to fall through to find_*
+  // when an indexed query returns empty results — without the flag,
+  // a truncated index would silently turn "this symbol was capped out"
+  // into "this symbol does not exist."
+  struct ModuleSymbols {
+    std::vector<SymbolMatch>  functions;  // SymbolKind::kFunction
+    std::vector<SymbolMatch>  data;       // SymbolKind::kVariable
+    std::vector<SymbolMatch>  other;      // everything else
+    bool                      truncated = false;
+  };
+  virtual ModuleSymbols
+      iterate_symbols(TargetId tid, std::string_view build_id) = 0;
+
+  struct ModuleTypes {
+    std::vector<TypeLayout>   types;
+    bool                      truncated = false;
+  };
+  virtual ModuleTypes
+      iterate_types(TargetId tid, std::string_view build_id) = 0;
+
+  struct ModuleStrings {
+    std::vector<StringMatch>  strings;
+    bool                      truncated = false;
+  };
+  virtual ModuleStrings
+      iterate_strings(TargetId tid, std::string_view build_id) = 0;
 
   // Disassemble file-address range [start, end). Empty result for
   // empty/inverted ranges or unmapped addresses; not an error.

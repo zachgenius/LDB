@@ -79,6 +79,12 @@ class DisasmStub : public DebuggerBackend {
       find_globals_of_type(TID, std::string_view, bool&) override { return {}; }
   std::vector<ldb::backend::StringMatch>
       find_strings(TID, const ldb::backend::StringQuery&) override { return {}; }
+  ldb::backend::DebuggerBackend::ModuleSymbols
+      iterate_symbols(TID, std::string_view) override { return {}; }
+  ldb::backend::DebuggerBackend::ModuleTypes
+      iterate_types(TID, std::string_view) override { return {}; }
+  ldb::backend::DebuggerBackend::ModuleStrings
+      iterate_strings(TID, std::string_view) override { return {}; }
   std::vector<ldb::backend::XrefMatch>
       xref_address(TID, std::uint64_t) override { return {}; }
   std::vector<ldb::backend::StringXrefResult>

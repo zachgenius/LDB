@@ -4,6 +4,244 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.5 #18 phase-1 integration (bulk iterate + dispatcher rewire + smoke)
+
+**Goal:** Land the integration layer for the own symbol index that
+shipped as `aab4bf9`'s SymbolIndex class. Phase-1 deliverable per
+`docs/23-symbol-index.md` §8: bulk iteration on `DebuggerBackend`,
+dispatcher `correlate.*` routed through SymbolIndex, end-to-end smoke.
+
+**Done:**
+- `664cf34 feat(backend): bulk iterate_symbols/types/strings for #18 phase-1`
+  - Three new pure virtuals on `DebuggerBackend`: `iterate_symbols`,
+    `iterate_types`, `iterate_strings`. Bucketed by symbol kind
+    (function/data/other). `kIterateBucketCap = 100k` per bucket to
+    bound sqlite WAL on monster modules; truncated with a stderr
+    warn, dispatcher's per-name fall-through still answers beyond
+    the cap.
+  - `LldbBackend` walks `SBModule` directly: GetSymbolAtIndex,
+    GetTypes(struct|class|union), scan_module_for_strings reused.
+    Refactored `find_type_layout`'s field-extraction into
+    `extract_type_layout(SBType, fallback_name)` so the bulk path
+    produces byte-identical layouts — load-bearing invariant.
+  - `GdbMiBackend` returns empty buckets with a comment pointing
+    at the v1.5 contract (gdb-MI lacks efficient module-wide
+    enumeration; re-visit when --backend=gdb gains its own indexer).
+  - 5 test-only Stub backends got the same empty stubs.
+  - `tests/unit/test_backend_iterate.cpp` (3 cases) — `main` in
+    functions, `dxp_login_frame` in types, "DXP/1.0" or
+    "btp_schema.xml" in strings.
+- `e965fe6 feat(dispatcher): route correlate.* through SymbolIndex for #18 phase-1`
+  - Dispatcher owns `unique_ptr<SymbolIndex>`, lazily opened from
+    `LDB_STORE_ROOT` env var in the constructor. nullptr/!available
+    leaves every callsite gated → fall-through preserved when the
+    store isn't configured.
+  - Three handler rewrites:
+    - `correlate.types`: index→query_type→row_to_type_layout→existing
+      type_layout_to_json. Wire-identical to cold path.
+    - `correlate.symbols`: index→query_symbols→row_to_symbol_match.
+      Indexes both demangled and mangled so either spelling matches.
+    - `correlate.strings`: opportunistic short-circuit only. xrefs
+      aren't cached (phase-2 `symbol.xref`). When cache is hot AND
+      no strings match, skip the disasm-walking `find_string_xrefs`.
+      Populate path still runs to prime downstream consumers.
+  - Helper `ensure_indexed()` wraps the stat/cache_status/populate
+    cycle; any failure (no build_id, fingerprint fail, sqlite throw)
+    → `handled=false` → original backend path runs.
+  - Bonus fix in iterate_symbols: dedupe by (name, address). LLDB
+    exposes PLT trampolines/weak aliases/IFUNC resolvers as multiple
+    SBSymbols at the same (name, address); SymbolIndex's PK is
+    (build_id, name, address) so duplicates crash populate. Mirrors
+    the SymbolDedupeKey shape `find_symbols` uses on the read path.
+  - `tests/unit/test_dispatcher_correlate_indexed.cpp` (2 cases)
+    — stats.binary_count 0→1 and populated_at_ns stable across
+    the warm call; fall-through with `LDB_STORE_ROOT` unset.
+- `d9c231a test(smoke): end-to-end cold→warm for SymbolIndex (#18 phase-1)`
+  - `tests/smoke/test_index_cold_warm.py`: target.open → cold
+    correlate.types → target.close → target.open → warm
+    correlate.types. Asserts warm not slower than 1.5x cold (hard);
+    warn-only on the 2x speedup threshold. Local: cold≈0.9ms,
+    warm≈0.09ms, ratio≈10x.
+
+**Decisions:**
+
+- **Re-used backend struct types in the bulk API rather than new
+  wire types.** `iterate_symbols` returns `vector<SymbolMatch>` per
+  bucket, `iterate_types` returns `vector<TypeLayout>` — the same
+  types `find_symbols` / `find_type_layout` emit. This keeps the
+  row→wire converters trivial (the existing
+  `symbol_match_to_json` / `type_layout_to_json` work unchanged
+  on rows pulled out of the index) and pins "lossless w.r.t.
+  find_*" at the type-system level.
+
+- **No new `module_build_id` / `module_path` methods on
+  DebuggerBackend.** The prompt suggested flagging if I added
+  them — I didn't. `list_modules(tid)` already returns
+  `Module{path, uuid}` per module; uuid is the build-id on ELF
+  (verified via `convert_module` comment in lldb_backend.cpp:121).
+  `resolve_main_module` in the dispatcher picks the first module
+  with both a non-empty uuid and non-empty path — a v1.5
+  simplification documented in the helper's comment. Multi-binary
+  index coverage (every loaded `.so` separately indexed) is a
+  phase-2 follow-up per docs/23 §10.
+
+- **correlate.strings only opportunistically uses the index.** The
+  endpoint returns disasm-derived callsites (xrefs), not the
+  strings themselves. The index caches strings but not xrefs (that
+  needs a future `symbol.xref` phase-2 endpoint). Short-circuit
+  when the cache is hot AND no strings match — skip the expensive
+  disasm walk entirely. When strings DO match, we still call
+  `find_string_xrefs`. The populate path still runs to prime the
+  cache for `symbol.xref` later. Documented in a long comment
+  above the handler.
+
+- **iterate_symbols dedupes by (name, address).** The schema PK is
+  (build_id, name, address). LLDB's symbol table can have PLT
+  trampolines / weak aliases / IFUNC entries at the same address
+  with the same name — SymbolIndex would reject the duplicate
+  insert with UNIQUE-constraint. The dedup happens at iterate
+  time so populate stays simple.
+
+**Surprises / blockers:**
+
+- First implementation run failed with `UNIQUE constraint failed:
+  symbols.build_id, symbols.name, symbols.address` on real
+  binaries. Caught by `[correlate]` tests against LldbBackend
+  (the StubBackend cases passed because their iterate_* returns
+  empty). Fix landed in the same commit as the dispatcher rewire
+  via the (name, address) dedupe set in iterate_symbols.
+
+- `LDB_STORE_ROOT` is wired into unit_tests' environment via
+  `tests/CMakeLists.txt` line 726. Every existing `[correlate]`
+  test in `test_correlate.cpp` now constructs a Dispatcher that
+  opens a SymbolIndex — the StubBackend cases hit fall-through
+  via empty `list_modules`, the LldbBackend cases warm and serve
+  from the index. All 19 existing tests still pass — the wire
+  shape is byte-identical.
+
+- File-fingerprint mtime conversion warning (`file_mtime_ns
+  defined but not used`) in `src/index/symbol_index.cpp` is
+  pre-existing in `aab4bf9`. Confirmed via `git stash` baseline
+  test. Not my fault to fix here; left for a `phase-2 cleanup`
+  pass that wires `file_mtime_ns` into a callsite or removes it.
+
+**Next:**
+
+- v1.5 plan-item #18 phase-2: `symbol.find` / `symbol.xref` /
+  `index.warm` / `index.invalidate` / `index.stats` endpoints
+  (separate commits per docs/23 §8). `symbol.xref` is the
+  blocking deliverable for letting correlate.strings short-
+  circuit unconditionally — today it still falls through on a
+  cache-hot string-match.
+- Multi-binary index coverage. Today's dispatcher picks "the
+  first module with a build_id" as the indexed binary; agents
+  fanning across a process with dynamic libs only get the main
+  exec cached. Phase-2 ranges across every loaded module per
+  target.
+- Re-evaluate the bucket cap (`kIterateBucketCap = 100k`)
+  against kernel-debuginfo measurements once a kernel-target
+  smoke exists.
+
+---
+
+## 2026-05-12 — v1.5 kickoff: #18/#19 design note (own symbol index)
+
+**Goal:** Start v1.5's critical chain (#18 → #15 → #16 per
+`docs/17-version-plan.md`). The first deliverable is the design note
+that re-evaluates whether `#19` (own DWARF reader) is actually
+needed before we commit any code to it — `docs/15-post-v1-plan.md`
+already flagged #19 ROI as questionable on the watchlist.
+
+**Done:**
+- `docs/23-symbol-index.md` (~430 lines). Covers:
+  - Today's pain: `correlate.{types,symbols,strings}` re-walks
+    LLDB's symbol/type/strings tables on every call, even when
+    multiple `target_id`s share a build_id. Cited dispatcher.cpp
+    + lldb_backend.cpp line numbers so future readers can audit.
+  - **No own DWARF reader for v1.5.** Decoupling goal is achieved
+    by the cache boundary, not by replacing libDebugInfoDWARF.
+    Maintenance burden of forking LLDB's reader vs. the marginal
+    cold-path speedup doesn't justify the swap. Recorded the
+    re-evaluation triggers for v1.6+.
+  - Schema for `${LDB_STORE_ROOT}/symbol_index.db` — separate
+    sqlite file (not a new table family on the artifact-store
+    DB) so PRAGMAs stay independently tunable. Four tables:
+    `binaries`, `symbols`, `types`, `strings`. Index keys
+    matching the existing correlate query shapes.
+  - Lazy-on-first-query population; no background thread (matches
+    single-threaded dispatcher; reconsider after #21 non-stop
+    runtime). Bulk `index.warm` endpoint for replay setup +
+    deliberate wide-sweep agents.
+  - Three invalidation triggers: file mtime/size mismatch, schema
+    version bump, explicit `index.invalidate`. Drop-and-rebuild on
+    schema bumps (no in-place migrations; cache is recoverable).
+  - Phase-1 = transparent integration into existing correlate.*;
+    phase-2 = `symbol.find` / `symbol.xref` / `index.stats` /
+    `index.warm` / `index.invalidate` endpoints; phase-3 (v1.6)
+    = cross-process index sharing + signed index packs.
+  - Failure matrix: every failure mode falls back to the backend
+    path. Index is a cache — it can fail safe.
+
+**Decisions:**
+
+- **Separate sqlite DB, not a new table family on the artifact-
+  store DB.** Index queries are read-heavy and concurrent-friendly;
+  artifact writes are infrequent. Sharing a file would force
+  `journal_mode` / `synchronous` to be the conservative of the
+  two; separate files let `symbol_index.db` run `WAL` +
+  `synchronous=NORMAL` without compromising artifact durability,
+  and means index corruption never threatens artifacts.
+- **`synchronous=NORMAL` on the index DB.** The cache is
+  recoverable from LLDB at worst-case cost. Trade-off vs `FULL` is
+  ~100x faster inserts during population; we'll re-walk one
+  binary on a power loss instead of fsyncing every row.
+- **Lazy population, not eager-at-target-open.** We don't know
+  which build_ids the agent will care about; pre-walking every
+  loaded module would burn 100s of MB of debug info on `target.open`.
+- **No background thread.** Single-threaded dispatcher means
+  populate-during-RPC. Backgrounding only buys parallelism when
+  the dispatcher learns async — v1.6's non-stop runtime
+  territory.
+- **No DWARF section hashing for cache invalidation.** mtime +
+  size catches every real-world change short of timestamp-
+  preserving in-place patches. Operators who care call
+  `index.invalidate` explicitly.
+
+**Surprises / blockers:**
+
+- None at design-note stage. The interesting tension was whether
+  to share the artifact-store DB; the analysis above is the only
+  non-obvious call.
+
+**Verification:**
+
+- Design note only — no code, no test impact. `ctest` baseline
+  preserved trivially.
+
+**Next:**
+
+Phase-1 implementation per §8:
+
+1. `src/index/symbol_index.{h,cpp}` — schema + read/write APIs +
+   cache-invalidation logic. Unit tests pin the schema round-trip
+   and invalidation behaviour without needing LLDB live targets.
+2. Dispatcher's `handle_correlate_*` routes through the index;
+   falls back to backend on miss; writes the result back.
+3. `smoke_index_cold_warm` exercises first-cold-then-warm and
+   pins the wire-shape stability.
+4. Documentation update in `docs/14-pack-signing.md` (or a new
+   `docs/24-storage-layout.md`) covering
+   `${LDB_STORE_ROOT}/symbol_index.db` alongside the existing
+   artifact / pack / session / recipe directory layout.
+
+After phase-1 lands, the critical-chain ordering is **#18 → #15
+(live-process provenance audit, easier with our own timestamps) →
+#16 (session.fork/replay, the prize)**. The non-stop chain (#17
+own RSP, #21 non-stop runtime, #25/#26 tracepoints) can
+parallelise once #18 phase-1 is in.
+
+---
+
 ## 2026-05-12 — v1.4 close-out: #12 phase-3 + #14 phase-2 + README deps
 
 **Goal:** User installed `libbpf-dev` (no more `/tmp/libbpf-extracted`

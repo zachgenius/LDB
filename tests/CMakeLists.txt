@@ -317,6 +317,19 @@ set_tests_properties(smoke_correlate PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 #18 phase-1: SymbolIndex cold→warm path. Asserts the second
+# correlate.types call hits the cache (faster + wire-identical) after
+# the first walks LLDB and writes the index. docs/23-symbol-index.md.
+add_test(
+  NAME smoke_index_cold_warm
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_index_cold_warm.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_index_cold_warm PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_recipe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe.py"

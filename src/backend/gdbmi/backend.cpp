@@ -1144,6 +1144,32 @@ GdbMiBackend::find_strings(TargetId tid, const StringQuery&) {
   return {};
 }
 
+// Bulk iteration APIs for the SymbolIndex (post-V1 #18). gdb-MI has no
+// efficient module-wide enumeration primitives; replicating LldbBackend's
+// SBModule walk via -interpreter-exec console "info functions" / "info
+// types" would be slow and forced us to parse free-form gdb output that
+// varies between versions. v1.5 contract: gdbmi backend returns empty
+// iteration buckets, the dispatcher's correlate.* falls through to
+// find_* per target (today's behaviour). Re-visit when --backend=gdb
+// gains its own indexer.
+DebuggerBackend::ModuleSymbols
+GdbMiBackend::iterate_symbols(TargetId tid, std::string_view) {
+  (void)must_get_target(*impl_, tid);
+  return {};
+}
+
+DebuggerBackend::ModuleTypes
+GdbMiBackend::iterate_types(TargetId tid, std::string_view) {
+  (void)must_get_target(*impl_, tid);
+  return {};
+}
+
+DebuggerBackend::ModuleStrings
+GdbMiBackend::iterate_strings(TargetId tid, std::string_view) {
+  (void)must_get_target(*impl_, tid);
+  return {};
+}
+
 std::vector<DisasmInsn>
 GdbMiBackend::disassemble_range(TargetId tid, std::uint64_t lo,
                                   std::uint64_t hi) {

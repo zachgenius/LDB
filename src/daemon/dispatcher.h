@@ -19,6 +19,7 @@ namespace ldb::store   { class ArtifactStore; }
 namespace ldb::probes  { class ProbeOrchestrator; }
 namespace ldb::observers { class ExecAllowlist; }
 namespace ldb::python  { class Callable; }
+namespace ldb::index   { class SymbolIndex; }
 
 namespace ldb::daemon {
 
@@ -53,6 +54,19 @@ class Dispatcher {
   std::shared_ptr<store::SessionStore>         sessions_;
   std::shared_ptr<probes::ProbeOrchestrator>   probes_;
   std::shared_ptr<observers::ExecAllowlist>    exec_allowlist_;
+  // Own symbol index (post-V1 #18, docs/23-symbol-index.md). Constructed
+  // when LDB_STORE_ROOT resolves; nullptr when the env var is unset.
+  // correlate.* checks index_ && index_->available() and falls through
+  // to the backend find_* path otherwise.
+  std::unique_ptr<index::SymbolIndex>          index_;
+  // (target_id → main-module key) cache populated on target.open. The
+  // executable's {build_id, path} is the right index cache key, but
+  // list_modules() sorts by path ascending — so the "first module with
+  // non-empty uuid + path" heuristic picks libc / ld-linux on any
+  // executable installed under /opt or /usr. Storing the value at
+  // target.open time is the only reliable way; cleared on target.close.
+  std::unordered_map<std::uint64_t, std::pair<std::string, std::string>>
+                                               target_main_module_;
   // Active backend label echoed via hello.data.capabilities.backend.
   // Set by the constructor from main.cpp's --backend resolution.
   std::string                                  backend_name_;
