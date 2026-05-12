@@ -2747,6 +2747,16 @@ Response Dispatcher::handle_target_open(const Request& req) {
   }
 
   auto res = backend_->open_executable(*path);
+  // Remember the executable's {build_id, path} for resolve_main_module.
+  // OpenResult docs say modules[0] is "typically the executable itself"
+  // — explicitly relied on here. If that ever changes, the picker
+  // should match against the path argument instead.
+  if (!res.modules.empty()
+      && !res.modules.front().uuid.empty()
+      && !res.modules.front().path.empty()) {
+    target_main_module_[res.target_id] =
+        {res.modules.front().uuid, res.modules.front().path};
+  }
   json data;
   data["target_id"] = res.target_id;
   data["triple"] = res.triple;
@@ -2959,6 +2969,7 @@ Response Dispatcher::handle_target_close(const Request& req) {
                               "missing uint param 'target_id'");
   }
   backend_->close_target(static_cast<backend::TargetId>(tid));
+  target_main_module_.erase(tid);
   return protocol::make_ok(req.id, json{{"closed", true}});
 }
 
@@ -4060,25 +4071,32 @@ struct MainModuleKey {
 };
 
 std::optional<MainModuleKey>
-resolve_main_module(backend::DebuggerBackend& be, backend::TargetId tid) {
+resolve_main_module(
+    backend::DebuggerBackend& be,
+    backend::TargetId tid,
+    const std::unordered_map<std::uint64_t,
+                              std::pair<std::string, std::string>>&
+        target_main_module) {
+  // Prefer the cached executable {build_id, path} stamped by
+  // handle_target_open. list_modules() sorts by path ascending; for
+  // executables installed under /opt or /usr, libc / ld-linux sort
+  // before the executable and the "first module with uuid+path"
+  // heuristic picks the wrong module. The OpenResult.modules[0] the
+  // backend handed back at target.open IS the executable; the
+  // dispatcher caches it. Fall back to the list-modules heuristic
+  // for targets opened by load_core / create_empty_target (cores +
+  // attach paths bypass the executable-known-up-front contract).
+  if (auto it = target_main_module.find(static_cast<std::uint64_t>(tid));
+      it != target_main_module.end()) {
+    return MainModuleKey{it->second.first, it->second.second};
+  }
+
   std::vector<backend::Module> mods;
   try {
     mods = be.list_modules(tid);
   } catch (const backend::Error&) {
     return std::nullopt;
   }
-  // The structs/sleeper fixtures (and every other target.open'd
-  // binary) reach the dispatcher with the executable as the first
-  // module before any process is launched. After process.launch +
-  // dlopen, additional modules appear; list_modules sorts by path
-  // ascending, so "first" isn't reliable. Prefer the module whose
-  // path looks like a regular executable file — but the simplest
-  // sufficient rule is: pick the first module with a non-empty
-  // uuid and a non-empty path. On a typical Linux build that's the
-  // main executable; libc/ld-linux have UUIDs but their paths sort
-  // alphabetically ahead/behind the executable's path so they can
-  // collide. Punt to the first valid one as a v1.5 phase-1 simplification;
-  // multi-binary index coverage is a phase-2 follow-up (see §10).
   for (const auto& m : mods) {
     if (!m.uuid.empty() && !m.path.empty()) {
       return MainModuleKey{m.uuid, m.path};
@@ -4215,14 +4233,24 @@ index::StringRow string_match_to_row(const backend::StringMatch& m) {
 // Ensure `build_id` is indexed and hot. Walks backend.iterate_* and
 // writes the index when the cache is cold/stale. Returns true when
 // the cache is now hot and queries are safe; false when the population
-// path failed (no fingerprint, sqlite error) — caller falls through
-// to backend.
+// path failed (no fingerprint, sqlite error, backend returned nothing
+// to index) — caller falls through to backend.
+//
+// Empty-result detection: a backend that doesn't support bulk iteration
+// (GdbMiBackend today, future stubs) returns all-empty buckets from
+// iterate_*. populating with empty rows would mark the binary as kHot
+// permanently and silently bypass the backend's find_* fall-through
+// for every subsequent correlate.* call. Treating "iterate produced
+// nothing" as "skip cache and fall through" preserves correctness for
+// every backend regardless of bulk-iteration support.
 bool ensure_indexed(index::SymbolIndex& idx,
                      backend::DebuggerBackend& be,
                      backend::TargetId tid,
                      const std::string& build_id,
                      const std::string& path,
-                     const std::string& arch) {
+                     const std::string& arch,
+                     std::string& cap_note) {
+  cap_note.clear();
   auto fp = fingerprint_for(path);
   if (!fp.has_value()) return false;
   auto status = idx.cache_status(build_id, *fp);
@@ -4232,6 +4260,26 @@ bool ensure_indexed(index::SymbolIndex& idx,
     auto ms = be.iterate_symbols(tid, build_id);
     auto mt = be.iterate_types(tid, build_id);
     auto mstr = be.iterate_strings(tid, build_id);
+
+    // Detect a backend that has no bulk-iteration support (every
+    // bucket empty). Don't populate — the dispatcher falls through to
+    // find_* / find_type_layout / find_strings on the cold path
+    // instead. Logging at debug level so a real binary with genuinely
+    // no symbols (rare; would still have at least `_start`) isn't
+    // mistaken for a backend limitation.
+    if (ms.functions.empty() && ms.data.empty() && ms.other.empty()
+        && mt.types.empty() && mstr.strings.empty()) {
+      return false;
+    }
+
+    // Truncation note: if any iterate_* bucket was capped by
+    // kIterateBucketCap (encoded by the backend as truncated=true on
+    // ModuleSymbols/etc.), propagate so the handler can decide to
+    // also consult the backend's find_* as a safety net for the
+    // names that were truncated out of the index.
+    if (ms.truncated || mt.truncated || mstr.truncated) {
+      cap_note = "iterate_bucket_cap";
+    }
 
     std::vector<index::SymbolRow> srows;
     srows.reserve(ms.functions.size() + ms.data.size() + ms.other.size());
@@ -4394,21 +4442,31 @@ Response Dispatcher::handle_correlate_types(const Request& req) {
     // handled=false and we fall through to the original backend path
     // below — the wire shape is unchanged in both cases.
     if (index_ && index_->available()) {
-      if (auto key = resolve_main_module(*backend_, tid); key.has_value()) {
+      if (auto key = resolve_main_module(*backend_, tid, target_main_module_); key.has_value()) {
+        std::string cap_note;
         if (ensure_indexed(*index_, *backend_,
                            static_cast<backend::TargetId>(tid),
-                           key->build_id, key->path, /*arch=*/"")) {
+                           key->build_id, key->path, /*arch=*/"",
+                           cap_note)) {
           if (auto tr = index_->query_type(key->build_id, *name);
               tr.has_value()) {
             backend::TypeLayout layout = row_to_type_layout(*tr);
             row["status"] = "found";
             row["layout"] = type_layout_to_json(layout);
             found_set.push_back(std::move(layout));
-          } else {
+            handled = true;
+          } else if (cap_note.empty()) {
+            // Genuine "missing" — index covers this build_id fully,
+            // the type really isn't there. Don't double-bill the
+            // backend.
             row["status"] = "missing";
             row["layout"] = nullptr;
+            handled = true;
           }
-          handled = true;
+          // else: index was truncated by kIterateBucketCap. The name
+          // might have been capped out. Fall through to backend's
+          // find_type_layout so a truncated cache can't silently turn
+          // "this type was capped" into "this type does not exist."
         }
       }
     }
@@ -4487,18 +4545,28 @@ Response Dispatcher::handle_correlate_symbols(const Request& req) {
     // correlate.types: index hot + populate path; backend find_symbols
     // on any failure.
     if (index_ && index_->available()) {
-      if (auto key = resolve_main_module(*backend_, tid); key.has_value()) {
+      if (auto key = resolve_main_module(*backend_, tid, target_main_module_); key.has_value()) {
+        std::string cap_note;
         if (ensure_indexed(*index_, *backend_,
                            static_cast<backend::TargetId>(tid),
-                           key->build_id, key->path, /*arch=*/"")) {
+                           key->build_id, key->path, /*arch=*/"",
+                           cap_note)) {
           index::SymbolQuery iq;
           iq.name = *name;
           // kind stays empty → "any" filter; mirrors q.kind=kAny above.
           auto rows = index_->query_symbols(key->build_id, iq);
-          for (const auto& r : rows) {
-            arr.push_back(symbol_match_to_json(row_to_symbol_match(r)));
+          if (!rows.empty()) {
+            for (const auto& r : rows) {
+              arr.push_back(symbol_match_to_json(row_to_symbol_match(r)));
+            }
+            handled = true;
+          } else if (cap_note.empty()) {
+            // Genuine "no match" — index is the full set for this
+            // build_id. Return zero matches without re-walking LLDB.
+            handled = true;
           }
-          handled = true;
+          // else: index was truncated. Fall through to backend
+          // find_symbols so capped-out names still get answered.
         }
       }
     }
@@ -4565,15 +4633,21 @@ Response Dispatcher::handle_correlate_strings(const Request& req) {
     // and the eventual smoke_index_cold_warm warm-path numbers.
     bool short_circuited = false;
     if (index_ && index_->available()) {
-      if (auto key = resolve_main_module(*backend_, tid); key.has_value()) {
+      if (auto key = resolve_main_module(*backend_, tid, target_main_module_); key.has_value()) {
+        std::string cap_note;
         if (ensure_indexed(*index_, *backend_,
                            static_cast<backend::TargetId>(tid),
-                           key->build_id, key->path, /*arch=*/"")) {
+                           key->build_id, key->path, /*arch=*/"",
+                           cap_note)) {
           index::StringQuery sq;
           sq.text     = *text;
           sq.contains = false;   // mirror find_string_xrefs's exact-text rule
           auto strings = index_->query_strings(key->build_id, sq);
-          if (strings.empty()) {
+          // Short-circuit ONLY when the cache covers the build_id fully.
+          // A truncated cache (kIterateBucketCap fired in iterate_strings)
+          // can return empty for a string that was capped out — falling
+          // through to find_string_xrefs is the safety net.
+          if (strings.empty() && cap_note.empty()) {
             short_circuited = true;
             // callsites remains [], total stays 0 for this row
           }

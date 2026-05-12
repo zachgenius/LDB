@@ -1265,12 +1265,15 @@ LldbBackend::iterate_symbols(TargetId tid, std::string_view build_id) {
   out.functions.reserve(nsym / 2);
   out.data.reserve(nsym / 4);
 
-  // Dedupe by (name, address). LLDB exposes PLT trampolines, weak
-  // aliases, and IFUNC resolvers as separate SBSymbols at the same
-  // address with the same name — the SymbolIndex primary key
-  // (build_id, name, address) would reject the duplicate insert. The
-  // existing find_symbols path dedupes by SymbolDedupeKey for the
-  // same reason; mirror it here so the cached set matches.
+  // Dedupe by (schema PK, address) so the cache PK never rejects an
+  // insert. The SymbolIndex PK is (build_id, name, address) where
+  // `name` is whatever ends up in row.name — which is `m.mangled` when
+  // non-empty else `m.name` (see symbol_match_to_row in dispatcher.cpp).
+  // Keying the dedupe on the same expression guarantees we never drop
+  // a row whose schema key would actually have been unique.
+  // LLDB exposes PLT trampolines, weak aliases, and IFUNC resolvers
+  // as separate SBSymbols at the same name+address; this dedupe drops
+  // the duplicates the same way find_symbols's SymbolDedupeKey does.
   std::set<std::pair<std::string, std::uint64_t>> seen;
 
   bool truncated = false;
@@ -1278,7 +1281,9 @@ LldbBackend::iterate_symbols(TargetId tid, std::string_view build_id) {
     auto sym = mod.GetSymbolAtIndex(i);
     auto decorated = decorate_symbol_for_iterate(sym, target, mod_path);
     if (!decorated.has_value()) continue;
-    auto key = std::make_pair(decorated->name, decorated->address);
+    const std::string& schema_name =
+        decorated->mangled.empty() ? decorated->name : decorated->mangled;
+    auto key = std::make_pair(schema_name, decorated->address);
     if (!seen.insert(std::move(key)).second) continue;
     switch (decorated->kind) {
       case SymbolKind::kFunction:
@@ -1301,6 +1306,7 @@ LldbBackend::iterate_symbols(TargetId tid, std::string_view build_id) {
         " has >" + std::to_string(cap) + " symbols per bucket; truncated. "
         "correlate.* per-name queries beyond the cap fall through to backend.");
   }
+  out.truncated = truncated;
   return out;
 }
 
@@ -1354,6 +1360,7 @@ LldbBackend::iterate_types(TargetId tid, std::string_view build_id) {
         " has >" + std::to_string(cap) + " aggregate types; truncated. "
         "correlate.types beyond the cap falls through to backend.");
   }
+  out.truncated = truncated;
   return out;
 }
 
@@ -1390,6 +1397,7 @@ LldbBackend::iterate_strings(TargetId tid, std::string_view build_id) {
         " strings; truncating to " +
         std::to_string(DebuggerBackend::kIterateBucketCap));
     out.strings.resize(DebuggerBackend::kIterateBucketCap);
+    out.truncated = true;
   }
   return out;
 }
