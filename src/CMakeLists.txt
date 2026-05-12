@@ -7,6 +7,7 @@ set(LDBD_SOURCES
   protocol/jsonrpc.cpp
   protocol/version.cpp
   protocol/cost.cpp
+  protocol/notifications.cpp
   protocol/provenance.cpp
   protocol/transport.cpp
   protocol/view.cpp
