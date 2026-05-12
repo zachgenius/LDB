@@ -20,6 +20,7 @@ namespace ldb::probes  { class ProbeOrchestrator; }
 namespace ldb::observers { class ExecAllowlist; }
 namespace ldb::python  { class Callable; }
 namespace ldb::index   { class SymbolIndex; }
+namespace ldb::transport::rsp { class RspChannel; }
 
 namespace ldb::daemon {
 
@@ -129,6 +130,16 @@ class Dispatcher {
   std::unordered_map<backend::TargetId,
                      std::unique_ptr<python::Callable>> python_unwinders_;
 
+  // Post-V1 #17 phase-1 (docs/25-own-rsp-client.md §3): targets opened
+  // via target.connect_remote_rsp keep their RspChannel here, keyed by
+  // target_id. The unique_ptr's destructor (called from the dispatcher
+  // destructor or target.close) joins the channel's reader thread +
+  // closes the socket. Targets opened via the legacy
+  // target.connect_remote path do NOT appear here — they stay on
+  // LLDB's gdb-remote plugin per the dual-stack design.
+  std::unordered_map<backend::TargetId,
+                     std::unique_ptr<transport::rsp::RspChannel>> rsp_channels_;
+
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
   protocol::Response handle_describe_endpoints(const protocol::Request& req);
@@ -137,6 +148,7 @@ class Dispatcher {
   protocol::Response handle_target_attach(const protocol::Request& req);
   protocol::Response handle_target_connect_remote(const protocol::Request& req);
   protocol::Response handle_target_connect_remote_ssh(const protocol::Request& req);
+  protocol::Response handle_target_connect_remote_rsp(const protocol::Request& req);
   protocol::Response handle_target_load_core(const protocol::Request& req);
   protocol::Response handle_module_list(const protocol::Request& req);
   protocol::Response handle_target_close(const protocol::Request& req);

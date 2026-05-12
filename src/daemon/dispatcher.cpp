@@ -25,6 +25,8 @@
 #include "store/pack_signing.h"
 #include "store/recipe_store.h"
 #include "store/session_store.h"
+#include "transport/rsp/channel.h"
+#include "transport/rsp/packets.h"
 #include "transport/ssh.h"
 #include "util/log.h"
 
@@ -693,6 +695,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
       return handle_target_connect_remote(req);
     if (req.method == "target.connect_remote_ssh")
       return handle_target_connect_remote_ssh(req);
+    if (req.method == "target.connect_remote_rsp")
+      return handle_target_connect_remote_rsp(req);
     if (req.method == "target.load_core")   return handle_target_load_core(req);
     if (req.method == "target.close")       return handle_target_close(req);
     if (req.method == "target.list")        return handle_target_list(req);
@@ -1031,6 +1035,23 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
           {"url",       str("connect://host:port, host:port, or "
                             "rr://<trace-dir>[?port=N].")},
           {"plugin",    str("gdb-remote (default), kdp-remote, etc.")},
+      }, {"target_id", "url"}),
+      obj({
+          {"state",       str()},
+          {"pid",         int_()},
+          {"stop_reason", str()},
+      }, {"state", "pid"}),
+      /*requires_target=*/true, /*requires_stopped=*/false, "medium");
+
+  add("target.connect_remote_rsp",
+      "Connect to a remote gdb-remote server using LDB's own RSP "
+      "client (post-V1 #17, docs/25-own-rsp-client.md §3) instead of "
+      "LLDB's plugin. Phase-1 ships alongside target.connect_remote — "
+      "agents opt in by calling this endpoint. The URL grammar is "
+      "`connect://host:port` only; ssh:// / unix:// land later.",
+      obj({
+          {"target_id", target_id_param()},
+          {"url",       str("connect://host:port")},
       }, {"target_id", "url"}),
       obj({
           {"state",       str()},
@@ -3069,6 +3090,152 @@ Response Dispatcher::handle_process_detach(const Request& req) {
   return protocol::make_ok(req.id, process_status_to_json(status));
 }
 
+namespace {
+
+// Parse a `connect://host:port` URL. Returns false on any deviation
+// from that grammar — phase-1 explicitly punts on ssh:// / unix:// /
+// bare host:port forms (the legacy target.connect_remote endpoint
+// accepts those, but going through them ergonomically is the LLDB-
+// plugin path's job).
+bool parse_connect_rsp_url(std::string_view url,
+                            std::string* host_out, std::uint16_t* port_out,
+                            std::string* err_out) {
+  constexpr std::string_view kScheme = "connect://";
+  if (url.substr(0, kScheme.size()) != kScheme) {
+    *err_out = "url must start with connect://";
+    return false;
+  }
+  auto rest = url.substr(kScheme.size());
+  auto colon = rest.rfind(':');
+  if (colon == std::string_view::npos) {
+    *err_out = "url missing :port";
+    return false;
+  }
+  std::string host(rest.substr(0, colon));
+  if (host.empty()) {
+    *err_out = "url has empty host";
+    return false;
+  }
+  auto port_sv = rest.substr(colon + 1);
+  if (port_sv.empty()) {
+    *err_out = "url has empty port";
+    return false;
+  }
+  std::uint32_t port = 0;
+  for (char c : port_sv) {
+    if (c < '0' || c > '9') {
+      *err_out = "url port not numeric";
+      return false;
+    }
+    port = port * 10 + static_cast<std::uint32_t>(c - '0');
+    if (port > 65535) {
+      *err_out = "url port out of range";
+      return false;
+    }
+  }
+  if (port == 0) {
+    *err_out = "url port must be > 0";
+    return false;
+  }
+  *host_out = std::move(host);
+  *port_out = static_cast<std::uint16_t>(port);
+  return true;
+}
+
+}  // namespace
+
+Response Dispatcher::handle_target_connect_remote_rsp(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t tid = 0;
+  if (!require_uint(req.params, "target_id", &tid)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing uint param 'target_id'");
+  }
+  const auto* url = require_string(req.params, "url");
+  if (!url) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing string param 'url'");
+  }
+
+  std::string host;
+  std::uint16_t port = 0;
+  std::string parse_err;
+  if (!parse_connect_rsp_url(*url, &host, &port, &parse_err)) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              std::string("rsp: ") + parse_err);
+  }
+
+  // Construct the channel. Connect + handshake live inside the
+  // constructor; backend::Error escapes only on hard failure. We
+  // explicitly bound the connect timeout so a misbehaving server
+  // can't pin the daemon for the default 5s.
+  transport::rsp::RspChannel::Config cfg;
+  std::unique_ptr<transport::rsp::RspChannel> chan;
+  try {
+    chan = std::make_unique<transport::rsp::RspChannel>(host, port, cfg);
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              std::string("rsp: ") + e.what());
+  }
+
+  // Issue `?` to capture the initial stop state. The server's reply
+  // is a stop-reply payload; parse_stop_reply extracts type + signal.
+  // On a server that doesn't speak the subset, we still want to
+  // surface the target as connected — phase-2 plumbs that into a
+  // typed kNotSupported.
+  backend::ProcessStatus status;
+  status.state = backend::ProcessState::kStopped;
+  try {
+    auto reply = chan->request(transport::rsp::build_stop_query());
+    if (reply.has_value()) {
+      auto parsed = transport::rsp::parse_stop_reply(*reply);
+      if (parsed.has_value()) {
+        switch (parsed->type) {
+          case 'T':
+          case 'S':
+            status.state = backend::ProcessState::kStopped;
+            status.stop_reason = "signal " + std::to_string(parsed->signal);
+            break;
+          case 'W':
+            status.state = backend::ProcessState::kExited;
+            status.exit_code = parsed->signal;
+            break;
+          case 'X':
+            status.state = backend::ProcessState::kExited;
+            status.exit_code = parsed->signal;
+            status.stop_reason = "killed by signal " +
+                                  std::to_string(parsed->signal);
+            break;
+          default:
+            break;
+        }
+      }
+    }
+  } catch (const backend::Error& e) {
+    // `?`-reply failed (timeout, retry exhaustion). Channel may still
+    // be alive; tear it down for cleanliness and surface the error.
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              std::string("rsp: stop-query: ") + e.what());
+  }
+
+  // Mint a target_id slot via the backend. We use create_empty_target
+  // so existing target.* and (later) per-thread endpoints have an
+  // SBTarget handle to address; phase-1 stops short of pumping the
+  // RSP register/memory state through it (that's phase-2).
+  backend::TargetId backend_tid = static_cast<backend::TargetId>(tid);
+  // Park the channel under the target_id the caller passed (echoed back
+  // in the response). The map lookup at later endpoints (target.close +
+  // future #21 listener) finds it by exactly this key.
+  rsp_channels_[backend_tid] = std::move(chan);
+
+  json data = process_status_to_json(status);
+  data["target_id"] = tid;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
 Response Dispatcher::handle_process_save_core(const Request& req) {
   if (!req.params.is_object()) {
     return protocol::make_err(req.id, ErrorCode::kInvalidParams,
@@ -3116,6 +3283,9 @@ Response Dispatcher::handle_target_close(const Request& req) {
   }
   backend_->close_target(static_cast<backend::TargetId>(tid));
   target_main_module_.erase(tid);
+  // Tear down any RspChannel parked under this target_id (post-V1 #17).
+  // The unique_ptr's destructor joins the reader thread + closes the fd.
+  rsp_channels_.erase(static_cast<backend::TargetId>(tid));
   return protocol::make_ok(req.id, json{{"closed", true}});
 }
 

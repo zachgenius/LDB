@@ -78,6 +78,7 @@ set(LDB_UNIT_SOURCES
   test_rsp_framing.cpp
   test_rsp_packets.cpp
   test_rsp_channel.cpp
+  test_dispatcher_connect_remote_rsp.cpp
   test_bpftrace_parser.cpp
   test_bpftrace_program.cpp
   test_bpftrace_live.cpp
