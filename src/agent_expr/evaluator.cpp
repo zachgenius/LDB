@@ -246,6 +246,12 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
       // — surface kBadImmediate so callers learn to validate jump
       // targets before installing the predicate. Anti-loop sanity
       // for backward jumps comes from kMaxInsnCount above.
+      // Invariant: always validate immediates regardless of whether
+      // the transfer is taken. An out-of-range target is malformed
+      // bytecode at decode time — if we only check on the taken path,
+      // a predicate with a broken jump silently passes when cond
+      // happens to be zero and crashes the next time cond is truthy.
+      // Six-months-later production bug pattern. Don't reintroduce.
       case Op::kGoto: {
         std::uint16_t target = 0;
         if (!read_u16_be(prog.code, &pc, &target)) {
@@ -262,12 +268,12 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
         if (!read_u16_be(prog.code, &pc, &target)) {
           step = EvalError::kBadImmediate; break;
         }
+        if (target > prog.code.size()) {
+          step = EvalError::kBadImmediate; break;
+        }
         std::int64_t cond = 0;
         if (!vm.pop(&cond, &step)) break;
         if (cond != 0) {
-          if (target > prog.code.size()) {
-            step = EvalError::kBadImmediate; break;
-          }
           pc = target;
         }
         break;

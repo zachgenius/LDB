@@ -502,6 +502,30 @@ TEST_CASE("evaluator: kIfGoto target past end-of-code → kBadImmediate (if-take
   CHECK(r.error == EvalError::kBadImmediate);
 }
 
+TEST_CASE("evaluator: kIfGoto with bad target AND zero cond still surfaces kBadImmediate",
+          "[agent_expr][eval][ctrl][error][regression]") {
+  // Regression for the bounds-check asymmetry: pre-fix the kIfGoto
+  // handler only validated the target inside the "cond != 0" branch.
+  // A predicate with a broken jump target would silently fall through
+  // when cond happened to be zero — and crash on the next call when
+  // cond was truthy. The target is malformed bytecode regardless of
+  // whether the branch is taken, so validation must run first.
+  //
+  // Program: push 0, kIfGoto 0x00ff (way past end of code).
+  // Pre-fix: cond pops as 0, branch not taken, kBadImmediate never
+  //          surfaces; the kConst8 7 below runs and we get value=7,
+  //          error=kOk. That's the silent-failure mode the fix kills.
+  // Post-fix: target validated unconditionally → kBadImmediate.
+  EvalContext ctx;
+  auto r = eval(prog({
+      0x10, 0,              // push 0 (falsy)
+      0x90, 0x00, 0xff,     // kIfGoto 0x00ff — target way out of range
+      0x10, 7,              // would execute pre-fix (proves silent skip)
+      0x00,                 // kEnd
+  }), ctx);
+  CHECK(r.error == EvalError::kBadImmediate);
+}
+
 TEST_CASE("evaluator: kIfGoto with empty stack → kStackUnderflow",
           "[agent_expr][eval][ctrl][error]") {
   EvalContext ctx;
