@@ -98,6 +98,111 @@ arrives.
   current trajectory. Next session picks up whatever's next on
   the active plan (likely #26 phase-2 or non-stop runtime
   follow-ups per the recent worklog entries).
+---
+
+## 2026-05-12 — v1.6 #26 phase-2 (vocab): QTDP tracepoint wire
+
+**Goal:** Ship the gdb-remote tracepoint packet vocabulary so a
+later phase-2.5 PR can route RspChannel-backed tracepoints through
+the inferior's agent (lldb-server / gdbserver) instead of running
+the predicate daemon-side. Scoped to vocabulary + tests + design
+note — dispatcher integration deferred to phase-2.5.
+
+**Done:**
+
+- **`src/transport/rsp/packets.{h,cpp}`** — six builders + one parser
+  + one carrier struct.
+    * `build_QTinit()` — wipe all tracepoints.
+    * `build_QTDP_define(id, addr, enabled, pass_count)` — primary
+      define. step pinned to 0; pass_count==0 ≡ unlimited (the
+      orchestrator's rate-limit covers that case daemon-side).
+    * `build_QTDP_condition(id, addr, bytecode)` — continuation
+      `-T<id>:<addr>:X<len>,<bytes>` form for agent-expression
+      predicates.
+    * `build_QTStart()` / `build_QTStop()` — collection control.
+    * `build_qTStatus()` — collection-state query.
+    * `build_qTBuffer(off, len)` — drain trace buffer.
+    * `build_QTFrame(n)` — select trace frame (`-1` deselects).
+    * `parse_tstatus_reply(payload)` → `{running, kv}`. Parses the
+      `T0`/`T1` flag plus the trailing `tnotrun`/`tstop`/`tframes`/
+      `tcreated`/`tsize`/`tfree`/`circular` kv pairs.
+    * `struct TracepointWire {tracepoint_id, addr, enabled,
+      pass_count, predicate_bytecode}` — phase-2.5 carrier so the
+      dispatcher can hand the transport layer everything it needs
+      without dragging in `src/probes/`.
+
+- **`tests/unit/test_rsp_packets.cpp`** — 7 new TEST_CASEs, 39
+  assertions. Builders get exact-wire-bytes goldens; parser covers
+  T1/T0 active+inactive, kv-pair tails, and shape-error rejection
+  (`T`, `T2`, `OK`, `""`). `TracepointWire` defaults pinned.
+
+- **`docs/34-tracepoints-in-target.md`** — design note. Documents
+  the wire shape for each packet, capability-negotiation strategy
+  (qSupported flags + empty-reply fallback), phase-2.5 orchestrator
+  integration plan (where in the dispatcher QTDP emission goes,
+  enable/disable redefinition semantics, delete-via-disable since
+  the spec lacks per-tracepoint delete), failure-mode matrix, and
+  the live smoke-test outline that phase-2.5 will ship.
+
+  ctest 70/70 still green.
+
+**Decisions:**
+
+- **Vocabulary-only PR; integration is phase-2.5.** The prompt
+  explicitly allowed this split. Reasoning: the dispatcher
+  integration adds capability detection + fallback paths + a new
+  per-channel state ("did we negotiate tracepoints+? what's the
+  next-id counter?") and is heavy enough that landing it on top of
+  the vocabulary fights TDD. Vocabulary is also reusable on its
+  own — a future bpf/perf path could speak QTDP-like packets to a
+  custom agent.
+
+- **`step` pinned to 0 in `QTDP_define`.** No single-step
+  collection; the tracepoint fires on the normal hit. Phase-3's
+  `tracepoint.collect_spec` will revisit this when in-target capture
+  lands; daemon-side phase-1/2.5 has no use for stepping.
+
+- **`pass_count` is wire-only, not exposed to the user surface.**
+  The orchestrator's `rate_limit_text` already covers the "fire at
+  most N times" case daemon-side; pass_count is here so future
+  phase-3 in-target-only collection can use it without a wire
+  break.
+
+- **`build_QTFrame` lands now but isn't used by phase-2.5.** The
+  vocabulary stays cohesive; phase-3 picks it up. Keeping it out
+  would mean another PR to land one builder.
+
+- **Disable-only delete.** The spec has no per-tracepoint delete;
+  phase-2.5 emits `QTDP:T<id>:<addr>:D:0:0` rather than `QTinit`-
+  and-redefine-all. Documented in §3.3 of the design note;
+  reserves `QTinit` for session shutdown.
+
+**Surprises / blockers:**
+
+- The pre-existing `append_hex_bytes` helper has a -Wsign-conversion
+  warning on master (char → unsigned char in a range-for). My new
+  builders use it transitively, so the warning surfaces in the
+  packets.cpp build; *not* a regression — present before this PR.
+  Not fixed here (out of scope for the vocab PR; a one-line cast
+  inside the helper is the right fix for a follow-up).
+
+- The `master` branch in the *main* checkout (not this worktree)
+  has unrelated in-progress work that fails to link
+  (`GdbMiBackend::suspend_thread` undefined). Verified this is
+  not caused by phase-2 changes; the worktree builds clean.
+
+**Next:**
+
+- **Phase-2.5 PR** — wire `tracepoint.create` against RspChannel
+  targets: emit `QTinit` + `QTDP:T...` + `QTDP:-T...` + `QTStart`
+  in order, fall back to daemon-side on `E NN` or `""`. Needs
+  per-channel `next_id` counter + `has_feature("tracepoints+")`
+  helper on `RspChannel`. Live smoke test against `lldb-server
+  gdbserver` per §5 of the design note.
+
+- **Capability cache.** Phase-2.5 should cache the "no-QTDP" verdict
+  per channel so we don't retry `QTinit` on every tracepoint.create
+  after the first failed negotiation.
 
 ---
 
