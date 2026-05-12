@@ -3168,6 +3168,36 @@ Response Dispatcher::handle_target_connect_remote_rsp(const Request& req) {
                               std::string("rsp: ") + parse_err);
   }
 
+  // Validate that the caller's target_id refers to an actual open
+  // target. The legacy connect_remote path piggybacked on backend
+  // validation; phase-1 of the own client doesn't (yet) touch the
+  // backend, so we have to check here. Without this the handler
+  // happily parks a channel under a phantom id; every subsequent
+  // target.* call then errors with "no such target" from LLDB which
+  // is confusing because the connect "succeeded".
+  backend::TargetId backend_tid = static_cast<backend::TargetId>(tid);
+  {
+    auto infos = backend_->list_targets();
+    bool exists = false;
+    for (const auto& info : infos) {
+      if (info.target_id == backend_tid) { exists = true; break; }
+    }
+    if (!exists) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "unknown target_id: " + std::to_string(tid)
+            + " (call target.create_empty or target.open first)");
+    }
+  }
+
+  // Reject a second connect against a target that already owns a
+  // channel. Silent unique_ptr-assignment replacement would tear
+  // down the prior channel mid-flight — debugging nightmare.
+  if (rsp_channels_.find(backend_tid) != rsp_channels_.end()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "target_id " + std::to_string(tid)
+          + " already has an RSP channel; call target.close first");
+  }
+
   // Construct the channel. Connect + handshake live inside the
   // constructor; backend::Error escapes only on hard failure. We
   // explicitly bound the connect timeout so a misbehaving server
@@ -3183,52 +3213,58 @@ Response Dispatcher::handle_target_connect_remote_rsp(const Request& req) {
 
   // Issue `?` to capture the initial stop state. The server's reply
   // is a stop-reply payload; parse_stop_reply extracts type + signal.
-  // On a server that doesn't speak the subset, we still want to
-  // surface the target as connected — phase-2 plumbs that into a
-  // typed kNotSupported.
+  // A nullopt reply (recv timed out despite a successful send) means
+  // the wire is desynchronised — the server's eventual response to
+  // `?` would arrive after our next request and get misattributed.
+  // Tear down and fail rather than park a poisoned channel.
   backend::ProcessStatus status;
   status.state = backend::ProcessState::kStopped;
   try {
     auto reply = chan->request(transport::rsp::build_stop_query());
-    if (reply.has_value()) {
-      auto parsed = transport::rsp::parse_stop_reply(*reply);
-      if (parsed.has_value()) {
-        switch (parsed->type) {
-          case 'T':
-          case 'S':
-            status.state = backend::ProcessState::kStopped;
-            status.stop_reason = "signal " + std::to_string(parsed->signal);
-            break;
-          case 'W':
-            status.state = backend::ProcessState::kExited;
-            status.exit_code = parsed->signal;
-            break;
-          case 'X':
-            status.state = backend::ProcessState::kExited;
-            status.exit_code = parsed->signal;
-            status.stop_reason = "killed by signal " +
-                                  std::to_string(parsed->signal);
-            break;
-          default:
-            break;
-        }
+    if (!reply.has_value()) {
+      chan.reset();  // joins reader, closes fd, drains queue
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+          "rsp: stop-query: no reply within packet_timeout — "
+          "channel discarded to avoid wire desync");
+    }
+    auto parsed = transport::rsp::parse_stop_reply(*reply);
+    if (parsed.has_value()) {
+      switch (parsed->type) {
+        case 'T':
+        case 'S':
+          status.state = backend::ProcessState::kStopped;
+          status.stop_reason = "signal " + std::to_string(parsed->signal);
+          break;
+        case 'W':
+          status.state = backend::ProcessState::kExited;
+          status.exit_code = parsed->signal;
+          break;
+        case 'X':
+          status.state = backend::ProcessState::kExited;
+          status.exit_code = parsed->signal;
+          status.stop_reason = "killed by signal " +
+                                std::to_string(parsed->signal);
+          break;
+        default:
+          break;
       }
     }
   } catch (const backend::Error& e) {
-    // `?`-reply failed (timeout, retry exhaustion). Channel may still
-    // be alive; tear it down for cleanliness and surface the error.
+    // `?`-reply failed (write error, retry exhaustion). Channel may
+    // still be alive; tear it down for cleanliness and surface the
+    // error.
+    chan.reset();
     return protocol::make_err(req.id, ErrorCode::kBackendError,
                               std::string("rsp: stop-query: ") + e.what());
   }
 
-  // Mint a target_id slot via the backend. We use create_empty_target
-  // so existing target.* and (later) per-thread endpoints have an
-  // SBTarget handle to address; phase-1 stops short of pumping the
-  // RSP register/memory state through it (that's phase-2).
-  backend::TargetId backend_tid = static_cast<backend::TargetId>(tid);
-  // Park the channel under the target_id the caller passed (echoed back
-  // in the response). The map lookup at later endpoints (target.close +
-  // future #21 listener) finds it by exactly this key.
+  // Park the channel under the target_id the caller passed (echoed
+  // back in the response). The existing target.* endpoints address
+  // the SBTarget via target_id; phase-1 stops short of pumping the
+  // RSP register/memory state through the backend (that's phase-2),
+  // so no backend mutation here — the caller already created the
+  // target via target.create_empty or target.open, and we validated
+  // that above.
   rsp_channels_[backend_tid] = std::move(chan);
 
   json data = process_status_to_json(status);

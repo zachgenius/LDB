@@ -268,33 +268,54 @@ void RspChannel::reader_thread_main() {
         // Malformed wire. Best we can do is send a nack and drop one
         // byte to resync. Real gdb-remote clients shouldn't hit this.
         if (ack_mode_.load(std::memory_order_acquire)) {
-          (void)write_all("-");
+          send_raw_locked("-");
         }
         buf.erase(0, 1);
         continue;
       }
-      // Successful decode. In ack-mode, send `+` so the server knows
-      // we got it cleanly.
-      if (ack_mode_.load(std::memory_order_acquire)) {
-        (void)write_all("+");
-      }
-      buf.erase(0, r.consumed);
+      // Decode succeeded. Try to push first; only ack the server once
+      // we've actually committed the payload to the queue. Acking
+      // before push and then dropping on overflow would lie to the
+      // server (it believes we got it; it won't retransmit) and
+      // break the stop-event delivery guarantee #21 depends on.
+      bool pushed = false;
       {
         std::lock_guard<std::mutex> g(recv_mu_);
         if (recv_q_.size() < kMaxQueueDepth) {
           recv_q_.push(std::move(r.payload));
           recv_cv_.notify_all();
+          pushed = true;
         }
-        // Overflow path: drop the packet on the floor. The server's
-        // already committed bytes; back-pressure is for a later
-        // hardening pass.
       }
+      if (ack_mode_.load(std::memory_order_acquire)) {
+        // pushed → `+`; overflow → `-` so the server knows to retry.
+        send_raw_locked(pushed ? "+" : "-");
+      }
+      buf.erase(0, r.consumed);
     }
   }
   alive_.store(false, std::memory_order_release);
 }
 
+// Reader-thread ack/nack send. write_all is already write_mu_-
+// guarded internally; the reader and writer are mutually exclusive
+// only for the duration of one byte-stream (1 byte for an ack vs.
+// the full $..#cs frame for a packet). The writer's ack-wait does
+// NOT hold write_mu_ — that's why the reader can grab it here
+// while the writer is parked in ack_cv_.wait_for.
+void RspChannel::send_raw_locked(std::string_view bytes) {
+  (void)write_all(bytes);
+}
+
 bool RspChannel::write_all(std::string_view framed) {
+  // byte_mu_ (not write_mu_) — the byte-level serialisation. The
+  // reader's send_raw_locked uses the same gate to ack incoming
+  // packets without byte-interleaving the writer's $..#cs frame.
+  // write_mu_ is what send() holds across ack-wait; that doesn't
+  // help against the reader (who isn't a send() caller), so we
+  // need this finer-grained mutex too. Brief hold; never crosses
+  // a wait.
+  std::lock_guard<std::mutex> g(byte_mu_);
   std::size_t off = 0;
   while (off < framed.size()) {
     ssize_t w = ::send(fd_, framed.data() + off,
@@ -326,6 +347,15 @@ bool RspChannel::send_once(std::string_view payload) {
     g.unlock();
 
     if (!write_all(framed)) {
+      // Reset the ack state so a future caller doesn't see a stale
+      // kWaiting and synthesise an unrelated ack. Reader thread is
+      // about to exit (write_all set alive=false on EPIPE/etc.) and
+      // would have notified anyway — but explicit is cheaper than
+      // a future "where did this race come from" debugging session.
+      {
+        std::lock_guard<std::mutex> gg(ack_mu_);
+        ack_state_ = WriterAckState::kIdle;
+      }
       throw backend::Error("rsp: write failed");
     }
 
@@ -358,6 +388,12 @@ bool RspChannel::send_once(std::string_view payload) {
 }
 
 bool RspChannel::send(std::string_view payload) {
+  // write_mu_ serialises send() callers — exactly one packet is in
+  // flight on the ack-state machine at any moment. NOT held during
+  // ack_cv_.wait_for (that's the deadlock the reviewer caught:
+  // reader needs byte_mu_ to ack incoming packets, and would wait
+  // forever if the writer also held its byte-level gate). The
+  // byte-level write is gated by byte_mu_ inside write_all.
   std::lock_guard<std::mutex> g(write_mu_);
   for (int attempt = 0; attempt < cfg_.retry_budget + 1; ++attempt) {
     bool ok = send_once(payload);

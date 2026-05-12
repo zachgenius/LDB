@@ -137,6 +137,16 @@ class Dispatcher {
   // closes the socket. Targets opened via the legacy
   // target.connect_remote path do NOT appear here — they stay on
   // LLDB's gdb-remote plugin per the dual-stack design.
+  //
+  // **Thread-safety**: the map itself is NOT thread-safe. Today's
+  // single-threaded dispatcher serialises every access, so this is
+  // safe. **#21 PRE-REQ**: before the non-stop runtime adds a
+  // listener thread that reads `rsp_channels_.at(tid)->recv(...)`
+  // concurrently with the RPC thread's insert / erase, this needs
+  // either a `shared_mutex` guard, a thread-safe container, or a
+  // structural pin (allocate slots eagerly, never resize the map
+  // mid-flight). The channel itself is internally synchronised; the
+  // *map* is what needs the lock.
   std::unordered_map<backend::TargetId,
                      std::unique_ptr<transport::rsp::RspChannel>> rsp_channels_;
 

@@ -129,8 +129,17 @@ class RspChannel {
 
   // Write `framed` (a full $..#cs envelope) to the socket. Loops past
   // EINTR and short writes. Returns false on a non-recoverable error;
-  // sets alive_ false in that case.
+  // sets alive_ false in that case. Caller MUST hold write_mu_ —
+  // concurrent writes from reader (acks) and writer (packets) over a
+  // single fd produce byte-level interleaving on real TCP.
   bool write_all(std::string_view framed);
+
+  // Reader-thread helper: serialise an ack/nack byte against the
+  // writer's packet bytes via write_mu_. The 1-byte send is cheap
+  // and the lock-hold is bounded; without this gate, #21's listener-
+  // thread model (which sends vCont frames asynchronously while the
+  // reader acks incoming stop-events) corrupts the wire.
+  void send_raw_locked(std::string_view bytes);
 
   // Issue one send + ack-wait pass. Returns true on accepted, false on
   // a nack we should retry. Throws on stream error or timeout (caller
@@ -161,10 +170,16 @@ class RspChannel {
   std::condition_variable    ack_cv_;
   WriterAckState             ack_state_ = WriterAckState::kIdle;
 
-  // Serializes concurrent send() calls (only one packet at a time on
-  // the wire). The dispatcher is currently single-threaded but the
-  // future #21 listener may race against it.
+  // Two-level mutex split — the reviewer-flagged race made this
+  // necessary. write_mu_ serialises send() callers (one packet in
+  // flight against the ack-state machine). It is NOT held during
+  // the ack-wait — that would deadlock the reader's ack-send.
+  // byte_mu_ serialises raw byte writes to the fd (reader's 1-byte
+  // acks vs. writer's $..#cs frames) so the two never byte-
+  // interleave. Lock ordering when both are needed:
+  // write_mu_ → byte_mu_.
   std::mutex                 write_mu_;
+  std::mutex                 byte_mu_;
 
   std::string                server_features_;
 };
