@@ -548,8 +548,38 @@ TEST_CASE("evaluator: kGoto with truncated immediate → kBadImmediate",
 TEST_CASE("evaluator: infinite loop via backward kGoto → kInsnLimitExceeded",
           "[agent_expr][eval][ctrl][cap]") {
   EvalContext ctx;
-  // kGoto 0x0000 — jumps to itself forever. The instruction-count cap
-  // (kMaxInsnCount) must fire.
-  auto r = eval(prog({0x91, 0x00, 0x00}), ctx);
+  // Three-op loop body so we can assert that the cap fired at the
+  // expected iteration count — not on iteration 1 due to an
+  // off-by-one in the counter. Each cycle dispatches exactly three
+  // ops: kConst8 (push), kDrop (pop), kGoto (jump back).
+  //
+  //   pc=0  kConst8 1   (push 1)
+  //   pc=2  kDrop       (pop it back off)
+  //   pc=3  kGoto 0     (jump to pc=0, loop forever)
+  //
+  // The cap is kMaxInsnCount = 10000 ops. We expect to execute
+  // exactly that many ops before the 10001-th increment trips the
+  // check — so insn_count must equal kMaxInsnCount and the loop
+  // body ran ~3333 full cycles. Asserting the exact value locks
+  // both halves down: the cap didn't fire early AND the loop did
+  // run for the full quota.
+  auto r = eval(prog({
+      0x10, 1,             // kConst8 1
+      0x81,                // kDrop
+      0x91, 0x00, 0x00,    // kGoto 0
+  }), ctx);
   CHECK(r.error == EvalError::kInsnLimitExceeded);
+  CHECK(r.insn_count == ldb::agent_expr::kMaxInsnCount);
+}
+
+TEST_CASE("evaluator: insn_count surfaces actual ops executed on success",
+          "[agent_expr][eval][ctrl][cap]") {
+  // Sanity check on insn_count for a normal (non-cap) run, so the
+  // infinite-loop test above isn't the only thing exercising it.
+  // kConst8 + kEnd = 2 ops dispatched.
+  EvalContext ctx;
+  auto r = eval(prog({0x10, 42, 0x00}), ctx);
+  CHECK(r.error == EvalError::kOk);
+  CHECK(r.value == 42);
+  CHECK(r.insn_count == 2);
 }

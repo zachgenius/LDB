@@ -158,6 +158,9 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     if (++vm.insn > kMaxInsnCount) {
       out.error = EvalError::kInsnLimitExceeded;
       out.value = vm.result();
+      out.insn_count = vm.insn - 1;   // count of ops actually executed
+                                       // (the increment that tripped the
+                                       // cap didn't dispatch an op)
       return out;
     }
     auto op = static_cast<Op>(prog.code[pc++]);
@@ -165,6 +168,7 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     switch (op) {
       case Op::kEnd:
         out.value = vm.result();
+        out.insn_count = vm.insn;
         return out;
 
       case Op::kConst8: {
@@ -286,6 +290,7 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     if (step != EvalError::kOk) {
       out.error = step;
       out.value = vm.result();
+      out.insn_count = vm.insn;
       return out;
     }
   }
@@ -295,6 +300,7 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
   // callers know to validate their bytecode.
   out.error = EvalError::kMissingEnd;
   out.value = vm.result();
+  out.insn_count = vm.insn;
   return out;
 }
 

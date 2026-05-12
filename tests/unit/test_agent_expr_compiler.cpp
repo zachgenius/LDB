@@ -241,17 +241,21 @@ TEST_CASE("compiler: (reg ...) emits via reg_table — round-trip against null c
 //   (if cond then else)  — branch on truthy result of cond
 //   (when cond body)     — sugar for (if cond body 0)
 //
-// Code layout for (if c t e):
-//   <c bytes>
-//   kIfGoto <addr-of-then>
-//   <e bytes>
-//   kGoto   <addr-after-then>
-//   <t bytes>            ; addr-of-then targets here
-//                        ; addr-after-then targets just past <t bytes>
+// Code layout for (if c t e) — "if-not-cond, jump to else":
+//   <c bytes>            ; evaluate cond
+//   kLogNot              ; flip so kIfGoto fires when cond was false
+//   kIfGoto Telse        ; jump over the then-branch if cond was false
+//   <t bytes>            ; then-branch (runs when cond was true)
+//   kGoto   Tend         ; skip the else-branch
+//   Telse: <e bytes>     ; else-branch (runs when cond was false)
+//   Tend:                ; control rejoins here
 //
-// We pick this layout so the single-pass emitter can patch the two
-// forward-jump immediates as soon as it knows their targets. See
-// docs/29 §1 for the DSL spec update.
+// Inverting the predicate lets the single-pass emitter walk source
+// order (then before else) and still patch both forward-jump
+// immediates as soon as it knows their targets. See compiler.cpp's
+// "if" handler comment and docs/29 §1 for the DSL spec update. The
+// byte-shape test at the bottom of this file verifies the real
+// layout — keep this comment in sync with that test.
 
 TEST_CASE("compiler: (if 1 42 99) evaluates to 42",
           "[agent_expr][compiler][if]") {

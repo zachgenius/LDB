@@ -124,6 +124,10 @@ enum class EvalError {
 struct EvalResult {
   EvalError    error = EvalError::kOk;
   std::int64_t value = 0;     // top-of-stack at end (or at error point)
+  std::size_t  insn_count = 0;  // ops executed; surfaced so cap-fire
+                                // tests can assert the cap fired at
+                                // the expected iteration (not on the
+                                // first cycle from an off-by-one).
 };
 
 // Caps — anti-DoS. Phase-1 ships fixed values; phase-2 may make
