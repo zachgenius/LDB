@@ -193,6 +193,41 @@ class SessionStore {
   };
   std::vector<TargetBucket> extract_target_ids(std::string_view id);
 
+  // Post-V1 plan #16 (docs/24-session-fork-replay.md §2.1).
+  //
+  // Allocate a fresh session id and copy [source_id]'s rpc_log row
+  // payloads (ts_ns/method/request/response/ok/duration_us) up to and
+  // including `until_seq` into it. `until_seq == 0` means "every row"
+  // (head-of-source). `until_seq > source.max_seq` copies everything;
+  // the reported `forked_at_seq` reflects the actual cut.
+  //
+  // The child re-numbers seq from 1 — sqlite AUTOINCREMENT is per-
+  // table; what's semantically preserved is the per-row payload, not
+  // the strict-monotonic seq id. See docs/24 §4 for the rationale.
+  //
+  // Target_id and the source's name (suffixed with " (fork)" when
+  // `name` is empty) are copied into the child's meta. The parent
+  // session is not mutated; concurrent appends to the parent during
+  // the fork are not visible to the child (single sqlite transaction
+  // on the child's db over a snapshot-read of the parent's rpc_log).
+  //
+  // Throws backend::Error if [source_id] doesn't exist or sqlite
+  // fails mid-copy (the partially-written child db is removed in
+  // that case so the index never references half-state).
+  struct ForkResult {
+    std::string  source_session_id;
+    std::string  id;             // new 32-hex session id
+    std::string  name;
+    std::int64_t created_at   = 0;
+    std::string  path;
+    std::int64_t forked_at_seq= 0; // last source seq actually copied
+    std::int64_t rows_copied  = 0;
+  };
+  ForkResult fork_session(std::string_view source_id,
+                          std::string_view name,
+                          std::optional<std::string> description,
+                          std::int64_t until_seq);
+
   // Open a per-session writer. The Writer holds its own sqlite handle
   // to the <uuid>.db; multiple Writers on the same id are allowed and
   // both can append (WAL handles it), but the dispatcher only ever

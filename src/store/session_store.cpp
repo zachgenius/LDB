@@ -710,6 +710,226 @@ SessionStore::extract_target_ids(std::string_view id) {
 }
 
 // ---------------------------------------------------------------------------
+// Post-V1 plan #16 phase-1 — fork_session
+//
+// Implementation outline (docs/24-session-fork-replay.md §8 step 2):
+//   1. Resolve the source's index row under the index mutex; capture
+//      path / name / target_id. Release the mutex before any per-session
+//      sqlite work so other queries (info/list) don't block on the copy.
+//   2. Allocate a new id + per-session db path.
+//   3. Open the source db read-only and the new db read-write.
+//   4. Migrate the new db (same canonical schema as create()), populate
+//      meta with the inherited target_id and the resolved child name.
+//   5. BEGIN IMMEDIATE on the new db. Prepare a SELECT on the source's
+//      rpc_log (filtered by until_seq if non-zero); prepare an INSERT
+//      against the new rpc_log. Step the SELECT, bind every column to
+//      the INSERT, step it. Track the highest source seq seen.
+//   6. COMMIT on the new db.
+//   7. Insert the index row.
+//
+// If anything fails between steps 3 and 7, the partially-written child
+// db is unlinked so the index never references half-state — same
+// approach as create() and import_session().
+
+SessionStore::ForkResult
+SessionStore::fork_session(std::string_view source_id,
+                           std::string_view name,
+                           std::optional<std::string> description,
+                           std::int64_t until_seq) {
+  namespace fs = std::filesystem;
+  (void)description;  // Captured for future meta-row use; not surfaced today.
+
+  // ----- 1. resolve the source under the index mutex ----------------------
+  std::filesystem::path source_path;
+  std::string           source_name;
+  std::optional<std::string> source_target_id;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    std::string sql = std::string("SELECT ") + kSelectIndexCols +
+                      " FROM sessions WHERE id = ?1;";
+    auto stmt = prepare_or_throw(impl_->index_db, sql);
+    sqlite3_bind_text(stmt.get(), 1, source_id.data(),
+                      static_cast<int>(source_id.size()), SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE) {
+      throw backend::Error("session_store.fork_session: no such source id: "
+                           + std::string(source_id));
+    }
+    if (rc != SQLITE_ROW) throw_sqlite(impl_->index_db, "fork_session: lookup");
+    auto row = row_from_index_stmt(stmt.get());
+    source_path      = row.path;
+    source_name      = row.name;
+    source_target_id = row.target_id;
+  }
+
+  // ----- 2. allocate child id + path --------------------------------------
+  std::string id = make_session_id();
+  fs::path session_path = impl_->sessions_dir / (id + ".db");
+
+  // Resolve child name. Per docs/24 §2.3: empty -> "<source.name> (fork)".
+  std::string child_name(name);
+  if (child_name.empty()) {
+    child_name = source_name + " (fork)";
+  }
+
+  // The created_at timestamp is a fresh ns sample — the fork is a new
+  // session, not a clone of the source's birth time. list() sorts by
+  // created_at DESC so the freshly-forked child appears at the top of
+  // the agent's session.list, which matches the "I just made this"
+  // expectation.
+  auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::system_clock::now().time_since_epoch()).count();
+
+  // ----- 3. open the source db read-only ----------------------------------
+  sqlite3* src_db = nullptr;
+  int rc = sqlite3_open_v2(source_path.c_str(), &src_db,
+                           SQLITE_OPEN_READONLY, nullptr);
+  if (rc != SQLITE_OK) {
+    if (src_db) sqlite3_close(src_db);
+    throw backend::Error("session_store.fork_session: open source "
+                         + source_path.string());
+  }
+
+  // RAII: ensure src_db is closed on every exit path. Use a small lambda
+  // wrapper rather than a class because the close is unconditional and
+  // we already have try/catch for the destination side.
+  struct SrcCloser {
+    sqlite3* db;
+    ~SrcCloser() { if (db) sqlite3_close(db); }
+  } src_closer{src_db};
+
+  // ----- 4. open + migrate the child db ----------------------------------
+  sqlite3* dst_db = nullptr;
+  rc = sqlite3_open(session_path.c_str(), &dst_db);
+  if (rc != SQLITE_OK) {
+    std::string m = "sqlite open ";
+    m.append(session_path.string());
+    m.append(": ");
+    m.append(dst_db ? sqlite3_errmsg(dst_db) : sqlite3_errstr(rc));
+    if (dst_db) sqlite3_close(dst_db);
+    throw backend::Error(m);
+  }
+
+  std::int64_t forked_at_seq = 0;
+  std::int64_t rows_copied   = 0;
+  try {
+    migrate_session_db(dst_db, child_name, source_target_id,
+                       static_cast<std::int64_t>(now));
+
+    // ----- 5. SELECT-then-INSERT row copy in one transaction --------------
+    exec_or_throw(dst_db, "BEGIN IMMEDIATE;");
+    try {
+      // SELECT on the source. `?1 = 0` means "no upper bound"; otherwise
+      // seq <= ?1.
+      auto sel = prepare_or_throw(src_db,
+          "SELECT seq, ts_ns, method, request, response, ok, duration_us "
+          "FROM rpc_log "
+          "WHERE (?1 = 0 OR seq <= ?1) "
+          "ORDER BY seq ASC;");
+      sqlite3_bind_int64(sel.get(), 1, until_seq);
+
+      auto ins = prepare_or_throw(dst_db,
+          "INSERT INTO rpc_log(ts_ns, method, request, response, ok, "
+          "                    duration_us) "
+          "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+
+      for (;;) {
+        int s = sqlite3_step(sel.get());
+        if (s == SQLITE_DONE) break;
+        if (s != SQLITE_ROW) {
+          throw_sqlite(src_db, "fork_session: source step");
+        }
+        // SELECT column 0 = seq (informational; used for forked_at_seq).
+        std::int64_t src_seq = sqlite3_column_int64(sel.get(), 0);
+
+        sqlite3_reset(ins.get());
+        sqlite3_clear_bindings(ins.get());
+        sqlite3_bind_int64(ins.get(), 1,
+                           sqlite3_column_int64(sel.get(), 1));  // ts_ns
+        // method/request/response are TEXT; bind_text needs a length —
+        // pull from the source statement to avoid an extra copy.
+        const unsigned char* method = sqlite3_column_text(sel.get(), 2);
+        int method_n = sqlite3_column_bytes(sel.get(), 2);
+        sqlite3_bind_text(ins.get(), 2,
+                          reinterpret_cast<const char*>(method),
+                          method_n, SQLITE_TRANSIENT);
+        const unsigned char* req = sqlite3_column_text(sel.get(), 3);
+        int req_n = sqlite3_column_bytes(sel.get(), 3);
+        sqlite3_bind_text(ins.get(), 3,
+                          reinterpret_cast<const char*>(req),
+                          req_n, SQLITE_TRANSIENT);
+        const unsigned char* rsp = sqlite3_column_text(sel.get(), 4);
+        int rsp_n = sqlite3_column_bytes(sel.get(), 4);
+        sqlite3_bind_text(ins.get(), 4,
+                          reinterpret_cast<const char*>(rsp),
+                          rsp_n, SQLITE_TRANSIENT);
+        sqlite3_bind_int(ins.get(), 5,
+                         sqlite3_column_int(sel.get(), 5));      // ok
+        sqlite3_bind_int64(ins.get(), 6,
+                           sqlite3_column_int64(sel.get(), 6));  // duration_us
+
+        if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+          throw_sqlite(dst_db, "fork_session: insert row");
+        }
+        rows_copied   += 1;
+        forked_at_seq  = src_seq;
+      }
+      exec_or_throw(dst_db, "COMMIT;");
+    } catch (...) {
+      exec_or_throw(dst_db, "ROLLBACK;");
+      throw;
+    }
+  } catch (...) {
+    sqlite3_close(dst_db);
+    std::error_code ec;
+    fs::remove(session_path, ec);
+    throw;
+  }
+  sqlite3_close(dst_db);
+
+  // ----- 7. insert the child's index row ---------------------------------
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto ins = prepare_or_throw(impl_->index_db,
+        "INSERT INTO sessions(id, name, target_id, created_at, path) "
+        "VALUES(?1, ?2, ?3, ?4, ?5);");
+    sqlite3_bind_text(ins.get(), 1, id.c_str(),
+                      static_cast<int>(id.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins.get(), 2, child_name.c_str(),
+                      static_cast<int>(child_name.size()), SQLITE_TRANSIENT);
+    if (source_target_id.has_value()) {
+      sqlite3_bind_text(ins.get(), 3, source_target_id->c_str(),
+                        static_cast<int>(source_target_id->size()),
+                        SQLITE_TRANSIENT);
+    } else {
+      sqlite3_bind_null(ins.get(), 3);
+    }
+    sqlite3_bind_int64(ins.get(), 4, static_cast<sqlite3_int64>(now));
+    std::string ps = session_path.string();
+    sqlite3_bind_text(ins.get(), 5, ps.c_str(),
+                      static_cast<int>(ps.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+      // Unlink the per-session db so the index never references half-
+      // state. Best-effort — if the unlink itself fails, the index row
+      // we never inserted is the worst we can leave behind.
+      std::error_code ec;
+      fs::remove(session_path, ec);
+      throw_sqlite(impl_->index_db, "fork_session: insert index row");
+    }
+  }
+
+  ForkResult out;
+  out.source_session_id = std::string(source_id);
+  out.id                = std::move(id);
+  out.name              = std::move(child_name);
+  out.created_at        = static_cast<std::int64_t>(now);
+  out.path              = session_path.string();
+  out.forked_at_seq     = forked_at_seq;
+  out.rows_copied       = rows_copied;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 
 void SessionStore::import_session(std::string_view id,
                                   std::string_view name,
