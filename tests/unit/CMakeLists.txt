@@ -76,6 +76,7 @@ set(LDB_UNIT_SOURCES
   test_observers_live.cpp
   test_streaming_exec.cpp
   test_rsp_framing.cpp
+  test_rsp_packets.cpp
   test_bpftrace_parser.cpp
   test_bpftrace_program.cpp
   test_bpftrace_live.cpp
@@ -135,6 +136,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/transport/local_exec.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/streaming_exec.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/rsp/framing.cpp
+  ${CMAKE_SOURCE_DIR}/src/transport/rsp/packets.cpp
   ${CMAKE_SOURCE_DIR}/src/transport/rr.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/proc.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
