@@ -4,6 +4,57 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6.0 release
+
+**Goal:** Close the V1 planned arc. v1.6 shipped the non-stop chain
+(own RSP transport, non-stop runtime + listener, agent-expression
+VM + S-expression compiler + probe predicates, tracepoints with
+rate-limit grammar, QTDP wire vocabulary, control-flow opcodes,
+LLDB-backed `thread.suspend`). README simplified to V1 status
+(no per-release narration); skill `skills/re-analyze.md` refreshed
+to cover the new tracepoint + predicate + non-stop surfaces and to
+fix stale endpoint names from earlier iterations.
+
+**Done:**
+
+- `CMakeLists.txt` VERSION 1.5.0 → 1.6.0.
+- README reduced from 488 to ~290 lines: dropped redundant
+  capability-bullet narration, compressed the install / build /
+  requirements sections, replaced the exhaustive endpoint matrix
+  with a surface summary that points at `describe.endpoints`.
+- `skills/re-analyze.md` rewritten to match the V1 endpoint
+  surface — fixes `process.resume`/`process.threads`/`disasm.xref`/
+  `artifact.store`/`uprobe.bpf` stale names; adds tracepoints,
+  predicate.compile, thread.list_state / thread.suspend, session
+  fork/replay/export, `target.connect_remote_rsp`,
+  `process.reverse_continue` / `process.reverse_step`, BPF probe
+  shape, perf record/report. Skill `README.md` repo URL corrected.
+
+**V1 surface delivered (no version-number bullets, just the
+arcs):**
+
+- Static + cross-binary investigation (build-ID-keyed symbol index)
+- Process control + remote targets (LLDB + native GDB-RSP)
+- Async non-stop runtime with push-event notifications
+- Probes + tracepoints with predicate filtering + rate limits
+- Determinism + replay (`session.fork` / `session.replay`,
+  ed25519-signed `.ldbpack` bundles)
+- Multi-backend (LLDB SBAPI + GDB/MI subprocess)
+- Scriptable probes + recipes (embedded Python)
+- Observers + perf + libbpf agent
+
+**Next (post-V1, opt-in / demand-driven):**
+
+- LldbBackend `SetAsync(true)` flip (drops the final sync-mode
+  constraint on per-thread observation).
+- QTDP phase-2.5 — orchestrator integration on top of the wire
+  vocabulary now in place.
+- Items in `docs/31`/`docs/32`/`docs/33` (own ptrace, hardware
+  tracing, criu) — explicitly deferred per the v1.6 plan; revisit
+  on user pull.
+
+---
+
 ## 2026-05-12 — post-V1 deferred design notes (#20 / #22 / #24)
 
 **Goal:** Document the three "specialized / opt-in / defer based on
