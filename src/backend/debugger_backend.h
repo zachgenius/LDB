@@ -387,6 +387,22 @@ struct Error : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// A backend operation that is genuinely not implemented for this
+// backend (as opposed to "implemented but the call failed"). The
+// dispatcher maps this to -32001 kNotImplemented; the generic Error
+// path maps to -32004 kBackendError.
+//
+// Why a typed subclass instead of a "not implemented" substring on
+// Error::what(): any backend that throws a descriptive error
+// containing the words "not implemented" for a legitimate runtime
+// failure (e.g. "feature X is not implemented on this kernel") would
+// otherwise get silently promoted to -32001 and hide a real bug. The
+// type discriminator is the whole point — the dispatcher catches
+// NotImplementedError BEFORE the generic Error catch.
+struct NotImplementedError : Error {
+  using Error::Error;
+};
+
 // Parameters for connect_remote_target_ssh — bundle them in a struct
 // because there are many optional fields and call-site readability
 // matters more than ABI stability for an internal interface.

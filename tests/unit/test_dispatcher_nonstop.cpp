@@ -7,9 +7,11 @@
 //   * thread.continue              records nonstop_.set_running(...) so
 //                                  a subsequent thread.list_state reflects
 //                                  the resumed thread
-//   * thread.suspend               returns -32001 kNotImplemented in
-//                                  phase-1 (needs SetAsync(true), arrives
-//                                  with the listener thread in phase-2)
+//   * thread.suspend               forwards to backend.suspend_thread
+//                                  for non-RSP targets (v1.6 #21 LLDB
+//                                  completion). Errors map: typed
+//                                  NotImplementedError → -32001,
+//                                  generic Error → -32004.
 //   * process.continue all_threads=false  → -32602 with hint
 //   * process.continue all_threads=true   → forwards as before
 //   * describe.endpoints           lists thread.list_state +
@@ -220,6 +222,67 @@ TEST_CASE("thread.suspend: unknown target_id → -32004 kBackendError",
   Dispatcher d(be);
   auto resp = d.dispatch(req("thread.suspend",
       json{{"target_id", 9999}, {"tid", 1}}));
+  REQUIRE_FALSE(resp.ok);
+  CHECK(resp.error_code == ErrorCode::kBackendError);
+}
+
+// v1.6 #21 follow-up: dispatcher discriminates the not-implemented
+// path by EXCEPTION TYPE (backend::NotImplementedError), not by
+// substring-matching what(). These two cases pin that contract.
+
+// A backend that throws NotImplementedError surfaces as -32001
+// kNotImplemented — even when its message doesn't contain the words
+// "not implemented" anywhere.
+namespace {
+class SuspendNotImplementedBackend : public NoOpBackend {
+ public:
+  ProcessStatus suspend_thread(TID, ThrID) override {
+    // Intentionally a message that does NOT contain "not implemented"
+    // — we want to prove the dispatcher uses the exception TYPE, not
+    // the string content.
+    throw ldb::backend::NotImplementedError("backend lacks the primitive");
+  }
+};
+}  // namespace
+
+TEST_CASE("thread.suspend: NotImplementedError → -32001 by exception type",
+          "[dispatcher][thread][suspend][not_implemented]") {
+  auto be = std::make_shared<SuspendNotImplementedBackend>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(req("thread.suspend",
+      json{{"target_id", 1}, {"tid", 1}}));
+  REQUIRE_FALSE(resp.ok);
+  CHECK(resp.error_code == ErrorCode::kNotImplemented);
+  // The pre-fix code matched the message; this message has no such
+  // substring, so a regression would silently downgrade to -32004.
+  CHECK(resp.error_message.find("not implemented") == std::string::npos);
+  CHECK(resp.error_message.find("lacks the primitive") != std::string::npos);
+}
+
+// And the inverse: a generic backend::Error whose message HAPPENS to
+// contain "not implemented" must still surface as -32004, not be
+// promoted to -32001. This is the exact bug the typed subclass fixed.
+namespace {
+class SuspendErrorWithNotImplementedSubstrBackend : public NoOpBackend {
+ public:
+  ProcessStatus suspend_thread(TID, ThrID) override {
+    // Real runtime failure whose human-readable message includes
+    // "not implemented" as descriptive prose (e.g. "feature X is
+    // not implemented on this kernel"). Pre-fix this would have been
+    // promoted to -32001 by the substring match.
+    throw ldb::backend::Error(
+        "kernel feature not implemented on this host (real failure)");
+  }
+};
+}  // namespace
+
+TEST_CASE("thread.suspend: generic Error with 'not implemented' substring "
+          "stays -32004 (no string-match promotion)",
+          "[dispatcher][thread][suspend][regression]") {
+  auto be = std::make_shared<SuspendErrorWithNotImplementedSubstrBackend>();
+  Dispatcher d(be);
+  auto resp = d.dispatch(req("thread.suspend",
+      json{{"target_id", 1}, {"tid", 1}}));
   REQUIRE_FALSE(resp.ok);
   CHECK(resp.error_code == ErrorCode::kBackendError);
 }

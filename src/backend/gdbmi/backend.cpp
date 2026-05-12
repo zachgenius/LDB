@@ -65,13 +65,13 @@ struct GdbMiBackend::Impl {
 namespace {
 
 // `not implemented yet` stub used by virtuals that will land in later
-// commits. Surfaces through the dispatcher as -32000 backend error,
-// which is the right shape for "this backend doesn't do that yet."
-// As of v1.4 final batch, every virtual is implemented — the helper
-// is retained for future use during partial-coverage refactors so we
-// don't have to re-introduce it.
+// commits. Throws NotImplementedError so the dispatcher routes to
+// -32001 kNotImplemented (the correct shape for "this backend doesn't
+// do that yet"). As of v1.4 final batch, every virtual is implemented
+// — the helper is retained for future use during partial-coverage
+// refactors so we don't have to re-introduce it.
 [[maybe_unused, noreturn]] void todo(const char* method) {
-  throw Error(std::string("GdbMiBackend::") + method +
+  throw NotImplementedError(std::string("GdbMiBackend::") + method +
               ": not implemented yet (post-V1 #8 staged work)");
 }
 
@@ -437,13 +437,15 @@ ProcessStatus GdbMiBackend::continue_thread(TargetId target_id,
 // v1.6 #21: GDB/MI doesn't have a one-shot "park this thread" primitive
 // matching SBThread::Suspend. The closest equivalent requires
 // `-exec-continue --thread X` against an MI server in non-stop mode,
-// which we don't enable. Leave the endpoint as NotImplemented for now;
-// callers needing non-stop semantics use the LLDB backend.
+// which we don't enable. Throw NotImplementedError (not generic Error)
+// so the dispatcher routes to -32001 kNotImplemented via type
+// discrimination rather than string-matching the message.
 ProcessStatus GdbMiBackend::suspend_thread(TargetId target_id,
                                             ThreadId thread_id) {
   (void)target_id;
   (void)thread_id;
-  throw Error("suspend_thread: not implemented for GDB/MI backend");
+  throw NotImplementedError(
+      "suspend_thread: not implemented for GDB/MI backend");
 }
 
 ProcessStatus GdbMiBackend::kill_process(TargetId tid) {

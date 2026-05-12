@@ -204,7 +204,7 @@ TEST_CASE("vCont-RSP: thread.suspend emits vCont;t:<tid> + drops the -32001 stub
 // backend throws "no process", surfaced as -32004 kBackendError.
 // RSP-backed targets still flow through vCont;t (covered above).
 TEST_CASE("vCont-RSP: thread.suspend on a non-RSP target hits LldbBackend",
-          "[dispatcher][rsp][vcont][thread][suspend][legacy]") {
+          "[dispatcher][rsp][vcont][thread][suspend][non-rsp]") {
   auto be = std::make_shared<LldbBackend>();
   Dispatcher disp(be);
 

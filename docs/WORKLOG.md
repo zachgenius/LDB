@@ -205,6 +205,87 @@ note — dispatcher integration deferred to phase-2.5.
   after the first failed negotiation.
 ---
 
+## 2026-05-12 — v1.6 #21 reviewer-pass: typed NotImplementedError + stale comments
+
+**Goal:** Apply linus-code-reviewer findings on PR #17 (the v1.6 #21 LLDB
+suspend_thread landing). Three findings: (1) stale describe.endpoints
+text claiming thread.suspend "still returns -32001" for LLDB-backed
+targets, (2) the dispatcher's string-match on `e.what()` to decide
+between -32001 and -32004 (fragile — any backend error whose message
+happens to contain "not implemented" gets silently promoted), and (3)
+a stale `[legacy]` Catch2 tag on a test that no longer exercises the
+legacy path.
+
+**Done:**
+
+- `backend::NotImplementedError` subclass of `backend::Error` added in
+  `src/backend/debugger_backend.h`. Inherits the ctor; no new state —
+  pure type discriminator.
+- `GdbMiBackend::suspend_thread` now throws `NotImplementedError`
+  instead of generic `Error("not implemented…")`. Also updated the
+  unused `todo()` helper (gdbmi internal stub) so the contract is
+  uniform.
+- `Dispatcher::handle_thread_suspend` rewired: catches
+  `NotImplementedError` first (→ -32001 kNotImplemented), then generic
+  `backend::Error` (→ -32004 kBackendError). String match on
+  `what()` deleted. Catch order matters because NotImplementedError
+  derives from Error.
+- Both stale comment blocks replaced: the describe.endpoints text
+  (lines around 1610) and the function-level comment (lines 4157+).
+  Function comment now enumerates the three branches in dispatch
+  order (RSP, LLDB-backed, NotImplemented-throwing backend).
+- `tests/unit/test_dispatcher_vcont_rsp.cpp` — `[legacy]` Catch2 tag
+  renamed to `[non-rsp]` (the test asserts the non-RSP forwarding
+  path, not anything legacy).
+- `tests/unit/test_dispatcher_nonstop.cpp` — two new cases lock in
+  the typed-error contract:
+  - `NotImplementedError → -32001 by exception type` — backend throws
+    a NotImplementedError whose message intentionally does NOT contain
+    the words "not implemented", to prove the dispatcher uses the
+    type, not the string.
+  - `generic Error with 'not implemented' substring stays -32004` —
+    the inverse: a generic Error whose message DOES contain "not
+    implemented" (descriptive prose) must not be silently promoted.
+    This is the exact regression the pre-fix code was vulnerable to.
+
+70/70 ctest green; +2 new test cases (74 cases now in unit_tests
+binary, up from 72 on the parent commit).
+
+**Decisions:**
+
+- **Typed subclass instead of an error-code enum on Error.** Considered
+  adding an enum `Error::Kind { Generic, NotImplemented }`. Subclass
+  wins on three axes: (a) zero-cost when the discriminator isn't
+  needed (no new field on every Error), (b) `catch` ordering is the
+  idiomatic C++ pattern for "specific case first, fall through to
+  general", (c) it composes — future BadParamError / TimeoutError
+  slot in without an enum migration.
+- **Updated GdbMi `todo()` helper preemptively.** Currently unused
+  (`[[maybe_unused]]`), but the next backend stub that uses it
+  would have silently kept the old -32004-with-substring-match
+  behaviour. Cheaper to fix once.
+- **Catch order in the dispatcher.** `NotImplementedError` first.
+  Reversing the order is a silent regression — the base catch would
+  swallow the subclass — and the compiler does not warn. Pinned in
+  the comment.
+
+**Surprises / blockers:**
+
+- None. The reviewer's two-line description was precise; the only
+  question was whether to add new test cases or just update the
+  comment block. Did both — the typed-error contract is exactly
+  the kind of invariant that needs a regression test, not just
+  documentation.
+
+**Next:**
+
+- The "GDB/MI suspend_thread" follow-up from yesterday's entry is
+  still open (wire to `-exec-interrupt --thread X` against an MI
+  server in non-stop mode). The dispatcher mapping is now correct
+  regardless, so that follow-up is purely a GdbMi-side task.
+
+---
+
 ## 2026-05-12 — v1.6 #21 LLDB completion: thread.suspend for LLDB-backed targets
 
 **Goal:** Close the LLDB half of the non-stop write path. Today
