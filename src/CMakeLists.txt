@@ -17,6 +17,7 @@ set(LDBD_SOURCES
   probe_agent/protocol.cpp
   perf/perf_parser.cpp
   perf/perf_runner.cpp
+  index/symbol_index.cpp
   backend/gdbmi/backend.cpp
   backend/gdbmi/parser.cpp
   backend/gdbmi/session.cpp
