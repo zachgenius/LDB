@@ -4,6 +4,133 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #26 phase-1: tracepoints (no-stop collection)
+
+**Goal:** Land the final agent-facing piece in v1.6's non-stop chain.
+Builds on #21 (non-stop runtime — no-stop semantics) and #25
+(predicates — cheap per-hit filtering). Phase-1 ships the
+daemon-side `tracepoint.*` surface + the rate-limit grammar +
+enforcement. Phase-2 will wire `QTDP` / `QTStart` / `QTFrame` over
+RspChannel for in-target collection.
+
+**Done:**
+
+- **`docs/30-tracepoints.md`** (`dfd62eb`, `6469490`) — design note.
+  Defines tracepoints as no-stop probes with rate limits, on a
+  distinct wire surface from `probe.*` so the no-stop contract is
+  visible at the endpoint name. Spells out the rate-limit grammar
+  (`<int>/<unit>` with `s`/`ms`/`us`/`total`), failure matrix, and
+  phase scoping. Reviewer-pass refinements: honest "fixed-pivot
+  window" semantics (not true sliding) + "us" reliability caveat.
+
+- **`src/probes/rate_limit.{h,cpp}`** (`4a6c961`, `6469490`) — grammar
+  parser + windowed enforcer. `RateLimit::allow_event(now)` returns
+  true/false; false bumps `rate_limited()`. Fixed-pivot window
+  resets when `now - pivot >= window`; `total` is lifetime cap.
+  Pre-V1 token-bucket sliding window is post-phase-1 if real
+  workloads trip on the 2×cap burstiness.
+
+- **`ProbeOrchestrator` integration** (`4a6c961`) — `ProbeState`
+  gains `rate_limit` (`optional<RateLimit>`) + `rate_limited`
+  counter. `on_breakpoint_hit` calls `allow_event` AFTER predicate
+  (predicate is cheaper, 10K-insn bounded), BEFORE capture (which
+  touches registers + memory). Drop → auto-continue + bump
+  counter + return false. `create()` accepts `kind == "tracepoint"`
+  routing through the same lldb_breakpoint machinery. `list()` /
+  `info()` surface `rate_limited`.
+
+- **`tracepoint.*` dispatcher endpoints** (`36dd271`, `6469490`) —
+  six new handlers: create, list, enable, disable, delete, frames.
+  Contract enforced at the dispatcher layer:
+    * `action` field rejected ("tracepoint action is always
+      log-and-continue").
+    * `kind` field rejected ("'kind' is output-only on
+      tracepoint.create") per reviewer #5.
+    * `rate_limit` pre-validated via `parse_rate_limit`;
+      malformed input surfaces -32602 with grammar reproduced.
+    * Predicate parsing reuses the probe.create code path
+      (`{source}` xor `{bytecode_b64}`). Phase-2 will refactor
+      out the duplication.
+  `require_tracepoint_kind` helper refuses to operate on
+  non-tracepoint probe_ids with a directed hint ("use probe.* for
+  kind='X'"). All four `tid`-taking handlers got one-line TOCTOU
+  comments documenting the single-threaded-dispatcher assumption.
+
+- **Tests** — 14 cases total:
+    * `tests/unit/test_rate_limit.cpp` (7 cases) — grammar (N/s,
+      N/ms, N/us, N/total, malformed inputs, empty input,
+      negative/zero) and enforcement (kPerWindow allows up to cap,
+      rejects cap+1, window resets, drop counter accumulates;
+      kTotal is hard cap).
+    * `tests/unit/test_dispatcher_tracepoint.cpp` (7 cases) —
+      missing target_id, missing where, action field rejected,
+      malformed rate_limit, zero rate_limit, predicate source
+      compile error with anchor, describe.endpoints lists all
+      six tracepoint.* endpoints.
+
+  ctest 70/70 still green. Building block tally so far in v1.6:
+  PRs #7 / #8 / #9 / #10 / #11 / #12 / pending #13.
+
+**Decisions:**
+
+- **`tracepoint.*` as a distinct surface, not folded into
+  `probe.create(kind="tracepoint")`** (docs/30 §3). Three reasons:
+  semantic guarantee (probe.create can take action=stop;
+  tracepoint.create is a no-stop contract visible at the
+  endpoint name), phase-2 divergence (collect_spec will only
+  apply to tracepoints), and agent ergonomics
+  (`tracepoint.create({where, predicate, rate_limit})` reads
+  more honestly than the probe.create equivalent). Internally
+  the orchestrator is shared — `kind="tracepoint"` probes go
+  through the same machinery as `kind="lldb_breakpoint"`.
+
+- **Fixed-pivot window, not true sliding** (post-reviewer
+  documentation fix). Reviewer offered both options
+  (implement token bucket OR fix the docs); chose docs because
+  the burst behaviour is bounded at 2×cap and the implementation
+  delta isn't worth it for phase-1. If real workloads hit the
+  burst issue, token-bucket lands as its own follow-up commit.
+
+- **"us" stays in the grammar but warned-against in docs**. A
+  1-µs window is bounded by mutex lock overhead in the orchestrator
+  callback, so the effective floor is closer to 10 µs. Keeping
+  the unit for grammar completeness; agents that need tight rates
+  should use `ms` or `s`.
+
+- **TOCTOU comments rather than refactoring orch.info+enable
+  into one call** (post-reviewer #2). Single-threaded dispatcher
+  is a class-level invariant; the comments make the assumption
+  visible at the four lifecycle handlers so a future multi-
+  threaded refactor finds them.
+
+**Surprises / blockers:**
+
+- The describe.endpoints schema helper `obj(...)` takes
+  `std::initializer_list<std::string_view>` for the required
+  list, not `json::array()`. My first pass passed
+  `json::array()` for empty-required, triggering a wall of
+  template error messages. Fixed by using `{}` consistently.
+
+- `FakeClock::advance(std::chrono::milliseconds)` couldn't
+  accept microsecond values via implicit narrowing; converted
+  the method to a template that `duration_cast`s to
+  steady_clock::duration internally.
+
+**Next:**
+
+- **#26 phase-2** — wire `QTDP` / `QTStart` / `QTStop` /
+  `QTFrame` packets over RspChannel for in-target tracepoint
+  collection. Same bytecode flows through the RSP transport;
+  events stream back as async stop replies + drain via QTFrame.
+- **Refactor predicate/capture parsing** out of the duplicated
+  dispatch handlers (reviewer #6 — deferred to phase-2 when
+  both paths get the QTDP work).
+- **v1.6 release tag** — the non-stop chain (#17, #21, #25, #26)
+  is now agent-feature-complete daemon-side. A v1.6.0 release
+  commit + tag is the natural close-out.
+
+---
+
 ## 2026-05-12 — v1.6 #25 phase-2: predicate compiler + probe wiring
 
 **Goal:** Make phase-1's bytecode VM useful. Phase-1 shipped the
