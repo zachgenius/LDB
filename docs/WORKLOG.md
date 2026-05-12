@@ -4,6 +4,150 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 #25 phase-2: predicate compiler + probe wiring
+
+**Goal:** Make phase-1's bytecode VM useful. Phase-1 shipped the
+VM + codec with no callers; phase-2 adds three pieces that turn it
+into an agent-facing feature:
+
+  1. S-expression compiler — `(eq (reg "rax") 42)` → bytecode.
+  2. `predicate.compile` endpoint — pre-flight a predicate; returns
+     base64 bytecode + mnemonic listing + reg name table.
+  3. `probe.create` predicate field + `ProbeOrchestrator` integration
+     — orchestrator stores the Program in `ProbeState`, evaluates on
+     each hit, drops zero-result events (and counts them).
+
+**Done:**
+
+- **`docs/29-predicate-compiler.md`** (`ccd680f`, `5bfa034`) — design
+  note for the compiler architecture, endpoint shape, probe wiring,
+  failure matrix, and phase scoping. Updated in the reviewer pass
+  to spell out the signed-int64 semantics + the silent-zero
+  contract on unknown register names.
+
+- **`src/agent_expr/compiler.{h,cpp}`** (`f4d6cef`, `5bfa034`) —
+  recursive-descent parser + codegen in one pass. Token kinds:
+  Lparen, Rparen, Integer, Symbol, String, Eof. Const sizing
+  picks the narrowest kConst opcode (kConst8 for -128..127,
+  widening to kConst64 at the int64 boundary). Reg names are
+  interned into `Program.reg_table`; repeated `(reg "rax")` reuses
+  the same index. `(begin a b c)` drops between forms. Errors
+  carry 1-based line:column anchors. Reviewer fix: `strtoll`
+  overflow now checks `errno == ERANGE` (the wrapping try/catch
+  caught an exception strtoll never throws — silent truncation
+  fixed).
+
+- **`src/util/base64.{h,cpp}`** (`c53dc97`) — extracted from
+  `pack_signing.cpp`. The `predicate.compile` path + the existing
+  ssh key path now share one impl. pack_signing keeps its existing
+  call shape via `using` aliases; 304 signing assertions still
+  green.
+
+- **`predicate.compile` endpoint** (`c53dc97`) — takes `{source}`,
+  returns `{bytecode_b64, bytes, mnemonics, reg_table}`.
+  Compile errors map to -32602 with the anchored "compile error
+  at L:C: <msg>" form. Empty source compiles to kEnd-only (always-
+  false predicate). 16 KiB source cap enforced ahead of tokenise.
+
+- **`ProbeSpec.predicate`** (`b6161a8`) — `optional<Program>` field.
+  Honoured only for kind="lldb_breakpoint"; BPF/agent paths reject
+  with -32602 ("predicate is only supported for kind=
+  'lldb_breakpoint'"). Null tolerated for forward-compat in both
+  paths after the reviewer pass.
+
+- **`ProbeOrchestrator::on_breakpoint_hit`** (`b6161a8`, `5bfa034`)
+  — evaluates the predicate FIRST, before capture work. Two
+  counters split (post-reviewer):
+    * `predicate_dropped` — eval returned `value == 0`. Predicate
+      worked as designed; agent asked us to skip.
+    * `predicate_errored` — eval returned a non-`kOk` error
+      (broken bytecode / mem-read failure / div-by-zero / runaway
+      insn count). Lets an agent debug a faulty predicate.
+  Both surface via `probe.list` / `probe.info` when `has_predicate`
+  is true.
+
+- **`probe.create` dispatcher integration** (`b6161a8`) — parses
+  optional `predicate.{source}` xor `predicate.{bytecode_b64}`.
+  source path runs through `agent_expr::compile`; bytecode_b64 path
+  runs through `util::base64_decode` + `agent_expr::decode`. Every
+  error surfaces -32602 with a typed hint ("must set source or
+  bytecode_b64", "exactly one", "invalid base64", "malformed
+  bytecode", line:column anchor for compile errors).
+
+- **Tests**:
+    * `test_agent_expr_compiler.cpp` — 19 cases / parser+codegen
+      coverage including the new overflow-on-int-literal case.
+    * `test_dispatcher_predicate_compile.cpp` — 7 cases for the
+      predicate.compile endpoint (happy path, empty source,
+      compile error with anchor, missing source, non-string
+      source, oversize source, describe.endpoints listing).
+    * `test_probe_predicate.cpp` — 7 cases for probe.create
+      predicate validation (empty object, both set, on
+      uprobe_bpf, source compile error, bad base64, malformed
+      bytecode, struct-level field storage).
+
+  agent_expr suite is now 43 cases / 186 assertions (was 23 / 72
+  at end of phase-1). ctest 70/70 still green.
+
+**Decisions:**
+
+- **Signed-int64 VM throughout, no unsigned-compare opcodes**.
+  Documented explicitly post-reviewer; agents needing unsigned
+  semantics on byte / word values must mask. Phase-3 / #26 might
+  add unsigned ops alongside the in-target VM.
+
+- **Predicate eval BEFORE capture**. The capture path (register
+  reads + memory deref + artifact write) can be expensive; running
+  it for events the predicate would drop wastes time. Eval is
+  cheap (bounded at 10K insns) and reads the same registers /
+  memory the capture would touch anyway, so cold-cache cost is
+  amortised.
+
+- **Split predicate_dropped vs predicate_errored** (post-reviewer).
+  The reviewer caught that conflating them lies to an agent
+  debugging a broken predicate. Cheap fix at design time —
+  splitting them after the fact would have been a wire-shape
+  break.
+
+- **`predicate` rejected on BPF / agent paths**. The BPF engine
+  (bpftrace) has its own filtering surface; the agent engine
+  (`ldb-probe-agent`) ships its own bytecode in a separate path.
+  Pushing a daemon-side predicate after the event has already
+  been published would fire late + double-count. The wire path
+  is the natural enforcement point.
+
+- **Refactor `util::base64` instead of inlining**. The existing
+  pack_signing.cpp had a private copy; predicate.compile needs the
+  same alphabet. Refactor was four files, no behavior change.
+
+**Surprises / blockers:**
+
+- The first stab at the test for `0xdead` widening had a wrong
+  comment claiming "const16 needed" — 57005 doesn't fit in signed
+  int16 either (max 32767), so kConst32 IS correct. Reviewer
+  caught the misleading comment; fixed.
+
+- Reviewer noted that `(reg "rax")` typos silently evaluate to 0
+  (backend's existing captured-as-zero contract). Not a new bug,
+  but worth documenting — predicate semantics make the silent-
+  zero more dangerous than capture-time silent-zero. Added a
+  note to docs/29.
+
+**Next:**
+
+- **#26 (tracepoints / no-stop collection)** — the natural
+  follow-up. Tracepoints are no-stop probes; conditions ride the
+  same bytecode through `QTDP` / `QTStart` in-target. Phase-3 of
+  the agent_expr stack lands the in-target VM.
+
+- **Live integration smoke** for the predicate path — a probe
+  with a real predicate firing against `ldb_fix_sleeper` or
+  similar. Out of scope for phase-2 but worth tracking; the
+  existing live-probe smoke harness covers most of the
+  scaffolding.
+
+---
+
 ## 2026-05-12 — v1.6 #25 phase-1: agent-expression bytecode VM
 
 **Goal:** The third item in v1.6's non-stop chain (per

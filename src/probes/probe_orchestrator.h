@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "agent_expr/bytecode.h"   // agent_expr::Program (probe predicate)
 #include "backend/debugger_backend.h"
 #include "transport/ssh.h"  // SshHost — for uprobe_bpf remote routing
 
@@ -142,6 +143,14 @@ struct ProbeSpec {
   std::vector<std::string>          bpftrace_args;     // arg0,arg1,...
   std::optional<std::int64_t>       bpftrace_filter_pid;
   std::optional<transport::SshHost> bpftrace_host;
+
+  // --- predicate (post-V1 #25 phase-2) ------------------------------------
+  // Optional agent-expression program. When set, the orchestrator's
+  // on_breakpoint_hit callback evaluates it against (target, tid,
+  // frame=0) and drops the event when the result is zero. Only
+  // honoured for kind=="lldb_breakpoint"; the BPF / agent paths have
+  // their own filtering surface.
+  std::optional<agent_expr::Program> predicate;
 };
 
 struct ProbeEvent {
@@ -199,8 +208,23 @@ class ProbeOrchestrator {
     std::string   probe_id;
     std::string   kind;
     std::string   where_expr;
-    bool          enabled    = false;
-    std::uint64_t hit_count  = 0;
+    bool          enabled            = false;
+    std::uint64_t hit_count          = 0;
+    // Post-V1 #25 phase-2: predicate metadata.
+    //   has_predicate     — true when the probe was created with a
+    //                        predicate.
+    //   predicate_dropped — running count of events the predicate
+    //                        filtered out by *evaluating to zero*.
+    //   predicate_errored — running count of events the predicate
+    //                        filtered out because eval() returned a
+    //                        non-kOk error (broken bytecode, mem
+    //                        read failed, etc.). Separate counter so
+    //                        an agent debugging a broken predicate
+    //                        can distinguish "filtered as designed"
+    //                        from "predicate is faulty."
+    bool          has_predicate      = false;
+    std::uint64_t predicate_dropped  = 0;
+    std::uint64_t predicate_errored  = 0;
   };
   std::vector<ListEntry> list();
 
