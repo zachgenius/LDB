@@ -141,6 +141,28 @@ TEST_CASE("perf parser: handles missing event header gracefully",
   REQUIRE_FALSE(r.parse_errors.empty());
 }
 
+TEST_CASE("perf parser: tolerates samples without [CPU] token",
+          "[perf][parser]") {
+  // Defensive case for traces recorded without --sample-cpu (older perf
+  // versions / external sources). The parser falls back to cpu=-1 and
+  // continues parsing the rest of the sample shape. This pairs with
+  // perf_runner.cpp passing --sample-cpu to perf record so this path
+  // is rarely needed in our own traces — but a perf.data ingested from
+  // a perf record run elsewhere may not have CPU info.
+  std::string text =
+      "foo  12345/12345  1700000000.123456: cycles: 100000: "
+      "                                412af0 main (/foo)\n"
+      "\n";
+  PerfParser::Result r = PerfParser::parse(text);
+  REQUIRE(r.parse_errors.empty());
+  REQUIRE(r.samples.size() == 1);
+  CHECK(r.samples[0].cpu == -1);
+  CHECK(r.samples[0].tid == 12345ULL);
+  CHECK(r.samples[0].event == "cycles");
+  REQUIRE(r.samples[0].stack.size() == 1);
+  CHECK(r.samples[0].stack[0].sym == "main");
+}
+
 TEST_CASE("perf parser: to_json shape", "[perf][parser]") {
   Sample s;
   s.ts_ns = 1700000000123456000LL;

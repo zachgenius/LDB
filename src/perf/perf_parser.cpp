@@ -157,43 +157,57 @@ bool parse_event_header(std::string_view line,
     if (!std::isdigit(static_cast<unsigned char>(c))) return false;
   }
 
-  // tok[2] = "[CPU]"
-  if (toks[2].size() < 3 || toks[2].front() != '[' || toks[2].back() != ']')
-    return false;
-  std::string cpu_s(toks[2].substr(1, toks[2].size() - 2));
-  for (char c : cpu_s) {
-    if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+  // tok[2] = "[CPU]" — defensively optional. We pass `--sample-cpu` to
+  // perf record so every sample carries CPU info, but if the trace was
+  // recorded without it (older perf, perf.data from an external tool)
+  // tok[2] will be the timestamp instead and we fall back to cpu=-1.
+  std::string cpu_s;
+  std::size_t consumed = 3;  // tokens consumed by header so far (comm pid/tid cpu)
+  if (toks[2].size() >= 3 && toks[2].front() == '[' && toks[2].back() == ']') {
+    cpu_s.assign(toks[2].substr(1, toks[2].size() - 2));
+    for (char c : cpu_s) {
+      if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    }
+  } else {
+    // No [CPU] token — slide subsequent token indices back by one.
+    consumed = 2;
   }
 
-  // tok[3] = "SEC.USEC:" (trailing colon).
-  std::string_view t3 = toks[3];
+  // tok[consumed] = "SEC.USEC:" (trailing colon).
+  if (consumed >= toks.size()) return false;
+  std::string_view t3 = toks[consumed];
   if (t3.empty() || t3.back() != ':') return false;
   std::string_view ts_text = t3.substr(0, t3.size() - 1);
   std::int64_t ts_ns = 0;
   if (!parse_timestamp_ns(ts_text, &ts_ns)) return false;
 
-  // tok[4] = "EVENT:" (trailing colon; event name itself may carry
-  // additional colons, but the perf script default trims to a single
-  // event-name colon — accept tok[4] verbatim minus the trailing ':').
-  std::string_view t4 = toks[4];
+  // EVENT (trailing colon; event name itself may carry additional
+  // colons, but the perf script default trims to a single event-name
+  // colon — accept verbatim minus the trailing ':').
+  std::size_t event_idx = consumed + 1;
+  if (event_idx >= toks.size()) return false;
+  std::string_view t4 = toks[event_idx];
   if (t4.empty() || t4.back() != ':') return false;
   std::string event(t4.substr(0, t4.size() - 1));
 
-  // tok[5] = "<period>:" — the sample period. We don't preserve it
-  // (callers care about counts, not weights). Sanity-check the trailing
-  // colon since some older perf builds drop it.
-  std::size_t frame_tok_idx = 6;
-  if (!toks[5].empty() && toks[5].back() == ':') {
+  // <period>: — the sample period. We don't preserve it (callers care
+  // about counts, not weights). Sanity-check the trailing colon since
+  // some older perf builds drop it.
+  std::size_t period_idx = consumed + 2;
+  std::size_t frame_tok_idx = consumed + 3;
+  if (period_idx < toks.size()
+      && !toks[period_idx].empty()
+      && toks[period_idx].back() == ':') {
     // OK — period is present and consumed.
   } else {
-    // Older format: period missing. Frame starts at tok[5].
-    frame_tok_idx = 5;
+    // Older format: period missing. Frame starts where period would be.
+    frame_tok_idx = period_idx;
   }
 
   sample->comm  = std::string(toks[0]);
   sample->pid   = std::strtoull(pid_s.c_str(), nullptr, 10);
   sample->tid   = std::strtoull(tid_s.c_str(), nullptr, 10);
-  sample->cpu   = std::atoi(cpu_s.c_str());
+  sample->cpu   = cpu_s.empty() ? -1 : std::atoi(cpu_s.c_str());
   sample->ts_ns = ts_ns;
   sample->event = std::move(event);
 

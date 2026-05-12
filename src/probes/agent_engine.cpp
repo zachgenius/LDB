@@ -9,14 +9,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <ext/stdio_filebuf.h>
 #include <filesystem>
 #include <iostream>
 #include <istream>
 #include <ostream>
+#include <streambuf>
 #include <thread>
 #include <vector>
 
@@ -26,15 +27,103 @@ namespace ldb::probes {
 
 namespace pa = ldb::probe_agent;
 
+namespace {
+
+// Minimal fd-backed streambuf. The probe_agent protocol helpers take
+// std::istream / std::ostream by reference, so we need *some* stream
+// wrapping around our raw pipe fds. libstdc++'s __gnu_cxx::stdio_filebuf
+// is exactly this but is libstdc++-only — Apple's libc++ doesn't ship
+// it, breaking the macOS CI leg. Implementing the four overrides
+// std::streambuf needs is ~30 lines and works across both stdlibs.
+//
+// Buffer sizes intentionally small: the protocol's read_frame /
+// write_frame call sgetn / sputn in length-prefixed chunks (header,
+// then body), so we don't get much from a fat buffer; we'd rather
+// keep memory pressure minimal and force the kernel's pipe buffer
+// (typically 64 KiB) to do its job. The class is non-owning of the
+// fd — AgentEngine::Impl handles close() on the underlying.
+class FdStreamBuf : public std::streambuf {
+ public:
+  explicit FdStreamBuf(int fd) : fd_(fd) {
+    setg(in_buf_, in_buf_, in_buf_);  // empty get area; underflow fills.
+    setp(out_buf_, out_buf_ + kOutBuf);
+  }
+
+  ~FdStreamBuf() override {
+    // Best-effort flush; ignore errors at destruction.
+    sync();
+  }
+
+ protected:
+  // Reads more bytes from fd into the get area. Returns the next char,
+  // or EOF on stream close / read failure (read returning 0 = EOF;
+  // EINTR retries).
+  int_type underflow() override {
+    if (fd_ < 0) return traits_type::eof();
+    for (;;) {
+      ssize_t n = ::read(fd_, in_buf_, kInBuf);
+      if (n > 0) {
+        setg(in_buf_, in_buf_, in_buf_ + n);
+        return traits_type::to_int_type(in_buf_[0]);
+      }
+      if (n == 0) return traits_type::eof();
+      if (errno == EINTR) continue;
+      return traits_type::eof();
+    }
+  }
+
+  // Flush the put area when full, then write the overflow char.
+  int_type overflow(int_type ch) override {
+    if (sync() != 0) return traits_type::eof();
+    if (ch != traits_type::eof()) {
+      char c = static_cast<char>(ch);
+      *pptr() = c;
+      pbump(1);
+    }
+    return ch;
+  }
+
+  // Flush put area to fd in a single short loop. Returns 0 on success,
+  // -1 on partial / failed write (caller treats as stream-fail; mirrors
+  // stdio_filebuf semantics).
+  int sync() override {
+    if (fd_ < 0) return -1;
+    char* base = pbase();
+    std::ptrdiff_t pending = pptr() - base;
+    while (pending > 0) {
+      ssize_t n = ::write(fd_, base, static_cast<std::size_t>(pending));
+      if (n > 0) {
+        base    += n;
+        pending -= n;
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      return -1;
+    }
+    setp(out_buf_, out_buf_ + kOutBuf);
+    return 0;
+  }
+
+ private:
+  static constexpr std::size_t kInBuf  = 4096;
+  static constexpr std::size_t kOutBuf = 4096;
+  int  fd_;
+  char in_buf_[kInBuf];
+  char out_buf_[kOutBuf];
+};
+
+}  // namespace
+
 struct AgentEngine::Impl {
   pid_t pid       = -1;
   int   stdin_fd  = -1;
   int   stdout_fd = -1;
 
-  // stdio_filebuf so we can wrap the fds in std::iostream and reuse the
-  // probe_agent::read_frame / write_frame helpers without copying.
-  std::unique_ptr<__gnu_cxx::stdio_filebuf<char>> in_buf;
-  std::unique_ptr<__gnu_cxx::stdio_filebuf<char>> out_buf;
+  // Portable fd-backed streambufs (avoid libstdc++'s stdio_filebuf so
+  // the daemon builds on macOS / libc++). The streams hold the bufs by
+  // raw pointer; we own the bufs and the fds independently.
+  std::unique_ptr<FdStreamBuf>  in_buf;
+  std::unique_ptr<FdStreamBuf>  out_buf;
   std::unique_ptr<std::ostream> stdin_stream;
   std::unique_ptr<std::istream> stdout_stream;
 };
@@ -144,11 +233,8 @@ AgentEngine::AgentEngine(std::string agent_path)
   impl_->stdin_fd  = in_pipe[1];
   impl_->stdout_fd = out_pipe[0];
 
-  using filebuf = __gnu_cxx::stdio_filebuf<char>;
-  impl_->in_buf  = std::make_unique<filebuf>(impl_->stdin_fd,
-                                              std::ios::out | std::ios::binary);
-  impl_->out_buf = std::make_unique<filebuf>(impl_->stdout_fd,
-                                              std::ios::in | std::ios::binary);
+  impl_->in_buf  = std::make_unique<FdStreamBuf>(impl_->stdin_fd);
+  impl_->out_buf = std::make_unique<FdStreamBuf>(impl_->stdout_fd);
   impl_->stdin_stream  = std::make_unique<std::ostream>(impl_->in_buf.get());
   impl_->stdout_stream = std::make_unique<std::istream>(impl_->out_buf.get());
 }

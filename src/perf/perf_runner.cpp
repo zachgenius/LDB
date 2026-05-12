@@ -142,6 +142,14 @@ RecordResult PerfRunner::record(const RecordSpec& spec) {
   argv.emplace_back(std::to_string(spec.frequency_hz));
   argv.emplace_back("-e");
   argv.emplace_back(join_events(spec.events));
+  // --sample-cpu: force every sample to carry the CPU it was taken on,
+  // even for software events (task-clock) that don't include it by
+  // default. Without this, `perf script -F cpu` later rejects with rc=255
+  // ("Samples for 'task-clock' event do not have CPU attribute set").
+  // Reproduces on GitHub's Ubuntu runners where perf_event_paranoid
+  // forces hardware `cycles` to fall back to software `task-clock` —
+  // local dev boxes with paranoid=0 wouldn't see this.
+  argv.emplace_back("--sample-cpu");
   argv.emplace_back("--call-graph");
   argv.emplace_back(spec.call_graph.empty() ? "fp" : spec.call_graph);
   argv.emplace_back("-o");
