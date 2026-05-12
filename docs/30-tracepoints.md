@@ -86,10 +86,27 @@ rate_limit := <int> "/" <unit>
 unit       := "s"   | "ms"  | "us" | "total"
 ```
 
-- `"1000/s"` — at most 1000 events per second (sliding window).
-- `"10/ms"` — at most 10 events per millisecond.
+- `"1000/s"` — at most 1000 events per fixed-pivot 1-second
+  window. **Not true sliding** — see the semantics note below.
+- `"10/ms"` — at most 10 events per 1-ms window.
 - `"500/total"` — at most 500 events lifetime; after that, every
   hit is dropped.
+
+**Fixed-pivot vs sliding-window semantics.** Phase-1 uses a
+fixed-pivot window: the pivot resets to `now` whenever a hit
+arrives more than `window` past the previous pivot. The worst
+case is `2 × cap` events in a span of `window + ε` (cap events
+in the last ε of window W, then cap more in the first ε of
+W+1). A true sliding window (token bucket) is post-phase-1; if
+your workload requires a hard sliding bound today, either
+over-budget the limit by 2× or use a tighter window.
+
+**Note on `us` granularity.** A 1-µs window is unreliable in
+practice — one mutex lock cycle in the orchestrator's hit
+callback is already tens-to-hundreds of nanoseconds even
+uncontended, so the effective enforced window floor is closer
+to 10 µs. Use "ms" or "s" for tight caps; "us" is here for
+completeness, not production use.
 
 When the limit is exceeded, the orchestrator drops the event
 silently and increments `rate_limited`. This counter is exposed

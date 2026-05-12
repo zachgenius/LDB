@@ -6,9 +6,25 @@
 //
 // Grammar: "<int>/<unit>" where unit ∈ {s, ms, us, total}.
 //
-//   "1000/s"      — at most 1000 events per second (sliding window)
-//   "10/ms"       — at most 10 events per millisecond
+//   "1000/s"      — at most 1000 events per fixed-pivot window of
+//                    one second (see semantics note below)
+//   "10/ms"       — at most 10 events per fixed-pivot 1ms window
 //   "500/total"   — at most 500 events lifetime
+//
+// **Fixed-pivot window semantics, not true sliding.** The pivot
+// resets to `now` whenever a hit arrives more than `window` past
+// the previous pivot. That means a worst-case burst can fit up to
+// 2 × cap events into a span of `window + ε` (cap events in the
+// last ε of window W, then cap more in the first ε of window W+1).
+// True sliding (token bucket) is post-phase-1 if real workloads
+// trip on the burstiness; agents that need a hard bound today
+// should over-budget by 2× or use a smaller window.
+//
+// **"us" granularity caveat.** A 1-µs window is unreliable in
+// practice: one mutex lock/unlock cycle in the orchestrator's hit
+// callback is typically tens to hundreds of nanoseconds even
+// uncontended, so the effective enforced window floor is closer
+// to 10 µs. Use "ms" or "s" for tight rate caps.
 //
 // The enforcer is a single-thread state machine: one mutex on the
 // orchestrator already serialises hit-callback access, so the

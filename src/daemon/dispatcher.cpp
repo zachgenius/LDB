@@ -8929,6 +8929,14 @@ Response Dispatcher::handle_tracepoint_create(const Request& req) {
         "tracepoint action is always log-and-continue; do not "
         "set the action field");
   }
+  // `kind` is output-only — locked to "tracepoint" internally. An
+  // agent echoing the response field back into a create request
+  // would have it silently dropped today; better to reject so the
+  // contract is unambiguous.
+  if (req.params.contains("kind")) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "'kind' is output-only on tracepoint.create");
+  }
 
   std::uint64_t target_id = 0;
   if (!require_uint(req.params, "target_id", &target_id)) {
@@ -9172,6 +9180,12 @@ Response Dispatcher::handle_tracepoint_enable(const Request& req) {
                               "missing non-empty string param 'tracepoint_id'");
   }
   if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+  // TOCTOU between require_tracepoint_kind (info()) and enable():
+  // safe today because the dispatcher is single-threaded
+  // (Dispatcher class comment). If the dispatcher ever becomes
+  // multi-threaded, refactor info+enable into one orchestrator
+  // call that takes mu_ once. Same caveat for the disable / delete
+  // / frames handlers below.
   probes_->enable(*tid);
   return protocol::make_ok(req.id,
       json{{"tracepoint_id", *tid}, {"enabled", true}});
@@ -9189,6 +9203,7 @@ Response Dispatcher::handle_tracepoint_disable(const Request& req) {
                               "missing non-empty string param 'tracepoint_id'");
   }
   if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+  // TOCTOU safe while dispatcher is single-threaded (see enable).
   probes_->disable(*tid);
   return protocol::make_ok(req.id,
       json{{"tracepoint_id", *tid}, {"enabled", false}});
@@ -9206,6 +9221,7 @@ Response Dispatcher::handle_tracepoint_delete(const Request& req) {
                               "missing non-empty string param 'tracepoint_id'");
   }
   if (auto err = require_tracepoint_kind(req, *probes_, *tid)) return *err;
+  // TOCTOU safe while dispatcher is single-threaded (see enable).
   probes_->remove(*tid);
   return protocol::make_ok(req.id,
       json{{"tracepoint_id", *tid}, {"deleted", true}});
@@ -9237,6 +9253,7 @@ Response Dispatcher::handle_tracepoint_frames(const Request& req) {
                               "'max' must be a non-negative integer");
   }
 
+  // TOCTOU safe while dispatcher is single-threaded (see enable).
   auto evs = probes_->events(*tid, since, max);
   json arr = json::array();
   std::uint64_t next_since = since;
