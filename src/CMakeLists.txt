@@ -7,6 +7,7 @@ set(LDBD_SOURCES
   protocol/jsonrpc.cpp
   protocol/version.cpp
   protocol/cost.cpp
+  protocol/notifications.cpp
   protocol/provenance.cpp
   protocol/transport.cpp
   protocol/view.cpp
@@ -18,6 +19,7 @@ set(LDBD_SOURCES
   perf/perf_parser.cpp
   perf/perf_runner.cpp
   index/symbol_index.cpp
+  runtime/nonstop_runtime.cpp
   backend/gdbmi/backend.cpp
   backend/gdbmi/parser.cpp
   backend/gdbmi/session.cpp

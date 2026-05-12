@@ -3,6 +3,7 @@
 
 #include "backend/debugger_backend.h"  // backend::TargetId
 #include "protocol/jsonrpc.h"
+#include "runtime/nonstop_runtime.h"
 #include "store/session_store.h"
 
 #include <nlohmann/json.hpp>
@@ -150,6 +151,15 @@ class Dispatcher {
   std::unordered_map<backend::TargetId,
                      std::unique_ptr<transport::rsp::RspChannel>> rsp_channels_;
 
+  // Post-V1 #21 phase-1 (docs/26-nonstop-runtime.md). The runtime
+  // owns the per-thread state machine + stop_event_seq + the
+  // notification sink wiring. Phase-1 populates state from the
+  // dispatcher RPC thread (thread.continue → set_running); phase-2
+  // adds a listener thread that calls set_stopped from outside the
+  // dispatcher's RPC path. The runtime is internally synchronised so
+  // both writers compose without a dispatcher-side lock.
+  runtime::NonStopRuntime                                  nonstop_;
+
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
   protocol::Response handle_describe_endpoints(const protocol::Request& req);
@@ -194,6 +204,9 @@ class Dispatcher {
   protocol::Response handle_thread_frames(const protocol::Request& req);
   protocol::Response handle_thread_continue(const protocol::Request& req);
   protocol::Response handle_thread_reverse_step(const protocol::Request& req);
+  // Post-V1 #21 phase-1 (docs/26-nonstop-runtime.md).
+  protocol::Response handle_thread_suspend(const protocol::Request& req);
+  protocol::Response handle_thread_list_state(const protocol::Request& req);
 
   protocol::Response handle_frame_locals(const protocol::Request& req);
   protocol::Response handle_frame_args(const protocol::Request& req);

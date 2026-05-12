@@ -56,7 +56,8 @@ venv/
 *.ldbsession
 
 # Sessions/artifacts captured during dev
-runtime/
+# (scoped to top-level — src/runtime/ holds checked-in code)
+/runtime/
 artifacts/
 
 # Editors / IDEs
