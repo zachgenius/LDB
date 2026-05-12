@@ -9,6 +9,7 @@ set(LDB_UNIT_SOURCES
   test_sqlite_connectivity.cpp
   test_protocol_jsonrpc.cpp
   test_protocol_notifications.cpp
+  test_output_channel.cpp
   test_protocol_version.cpp
   test_dispatcher_hello.cpp
   test_protocol_cost.cpp
@@ -119,6 +120,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/version.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/cost.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/notifications.cpp
+  ${CMAKE_SOURCE_DIR}/src/protocol/output_channel.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/provenance.cpp
   ${CMAKE_SOURCE_DIR}/src/util/sha256.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/transport.cpp

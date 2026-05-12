@@ -75,7 +75,9 @@ protocol::json response_to_json(const protocol::Response& r) {
 
 }  // namespace
 
-int run_stdio_loop(Dispatcher& dispatcher, protocol::WireFormat fmt) {
+int run_stdio_loop(Dispatcher& dispatcher,
+                   protocol::OutputChannel& out,
+                   protocol::WireFormat fmt) {
   // Disable stdio sync — keep things flowing.
   std::ios_base::sync_with_stdio(false);
   std::cin.tie(nullptr);
@@ -92,14 +94,14 @@ int run_stdio_loop(Dispatcher& dispatcher, protocol::WireFormat fmt) {
       // error to the peer if we can. With JSON we can recover (sender
       // sees one bad-frame error and continues); with CBOR a torn frame
       // means the prefix/body desync is unrecoverable, so emit a final
-      // error and exit. Stdout discipline still applies — we use
-      // write_message so the response is in the negotiated format.
+      // error and exit. OutputChannel serialises us against the
+      // listener thread's notification writes (#21 phase-2).
       log::error(std::string("framing error: ") + e.what());
       auto err = protocol::make_err(std::nullopt,
                                     protocol::ErrorCode::kParseError,
                                     std::string("framing error: ") + e.what());
       try {
-        protocol::write_message(std::cout, response_to_json(err), fmt);
+        out.write_response(response_to_json(err));
       } catch (const protocol::Error& we) {
         log::error(std::string("failed to send framing-error response: ") +
                    we.what());
@@ -126,7 +128,7 @@ int run_stdio_loop(Dispatcher& dispatcher, protocol::WireFormat fmt) {
     if (is_notification) continue;
 
     try {
-      protocol::write_message(std::cout, response_to_json(resp), fmt);
+      out.write_response(response_to_json(resp));
     } catch (const protocol::Error& e) {
       log::error(std::string("failed to write response: ") + e.what());
       return 1;

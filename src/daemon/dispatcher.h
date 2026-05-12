@@ -50,6 +50,15 @@ class Dispatcher {
 
   protocol::Response dispatch(const protocol::Request& req);
 
+  // Install the daemon's notification sink. The sink is borrowed —
+  // the caller (main.cpp's StreamNotificationSink over the OutputChannel)
+  // owns the lifetime. Called once at startup before any RPCs arrive,
+  // so the NonStopRuntime's atomic sink_ load is a relaxed read of a
+  // value that was set during single-threaded init. See docs/27.
+  void set_notification_sink(protocol::NotificationSink* sink) {
+    nonstop_.set_notification_sink(sink);
+  }
+
  private:
   std::shared_ptr<backend::DebuggerBackend>    backend_;
   std::shared_ptr<store::ArtifactStore>        artifacts_;

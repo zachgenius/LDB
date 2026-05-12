@@ -8,6 +8,7 @@ set(LDBD_SOURCES
   protocol/version.cpp
   protocol/cost.cpp
   protocol/notifications.cpp
+  protocol/output_channel.cpp
   protocol/provenance.cpp
   protocol/transport.cpp
   protocol/view.cpp
