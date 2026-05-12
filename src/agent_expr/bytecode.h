@@ -99,7 +99,9 @@ enum class EvalError {
   kDivByZero,
   kRegNotFound,
   kMemReadFailed,
-  kProgramTooLong,
+  kProgramTooLong,      // program byte count > kMaxProgramBytes
+  kInsnLimitExceeded,   // execution exceeded kMaxInsnCount
+  kMissingEnd,          // program ran off code[] without an explicit kEnd
 };
 
 struct EvalResult {

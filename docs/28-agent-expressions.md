@@ -157,10 +157,15 @@ The evaluator:
 - Caps the stack at 64 entries (`kMaxStackDepth`). Programs that
   try to push deeper hit `kStackOverflow`. Anti-DoS.
 - Caps program size at 4 KiB (`kMaxProgramBytes`). Larger programs
-  decode to `kProgramTooLong`. Anti-DoS.
+  decode to `kProgramTooLong` (codec-time AND eval-time guards).
 - Caps execution at 10,000 instructions (`kMaxInsnCount`). Runaway
-  programs hit `kProgramTooLong` (reuse — they're effectively too
-  long even if compact-and-loopy).
+  programs hit `kInsnLimitExceeded` — distinct from
+  `kProgramTooLong` so agents can tell a too-big bytecode from a
+  too-many-cycles execution (matters once phase-3 adds loops).
+- A program that runs off the end of `code[]` without an explicit
+  `kEnd` surfaces `kMissingEnd` rather than silently returning the
+  top of stack — a truncated bytecode shouldn't masquerade as a
+  valid predicate result.
 - Returns 0 for the result if the stack is empty at `end` (a
   predicate with no value is false, by convention).
 
@@ -183,7 +188,9 @@ agent wire protocol simultaneously.
 | `read_register` returns 0 for an unknown name | Treated as zero (matches existing backend contract); no error |
 | `read_memory` throws | `EvalError::kMemReadFailed` |
 | Division by zero | `EvalError::kDivByZero` |
-| Program exceeds kMaxInsnCount cycles | `EvalError::kProgramTooLong` |
+| Program byte count > kMaxProgramBytes | `EvalError::kProgramTooLong` |
+| Execution exceeds kMaxInsnCount cycles | `EvalError::kInsnLimitExceeded` |
+| Program runs off code[] without kEnd | `EvalError::kMissingEnd` |
 
 Errors stop execution; `EvalResult::value` carries whatever was on
 the top of stack at the error point (useful for debugging the

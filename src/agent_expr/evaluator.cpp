@@ -15,12 +15,10 @@ struct VmState {
   std::array<std::int64_t, kMaxStackDepth> stack{};
   std::size_t                              sp     = 0;   // points to next free
   std::size_t                              insn   = 0;   // instruction count
-  std::int64_t                             last_top = 0;
 
   bool push(std::int64_t v, EvalError* err) {
     if (sp >= kMaxStackDepth) { *err = EvalError::kStackOverflow; return false; }
     stack[sp++] = v;
-    last_top    = v;
     return true;
   }
 
@@ -29,10 +27,20 @@ struct VmState {
     *out = stack[--sp];
     return true;
   }
+
+  // Result value at end-of-evaluation or error point: top of stack,
+  // or 0 if stack empty. Single source of truth — no last_top
+  // bookkeeping spread across opcode handlers.
+  std::int64_t result() const {
+    return (sp == 0) ? 0 : stack[sp - 1];
+  }
 };
 
 // Read a big-endian integer of `n` bytes from code[pc] and advance pc.
-// Returns false on truncated read.
+// Returns false on truncated read. For n < 8 the result is sign-
+// extended from the `n`-byte-wide value into int64_t; for n == 8
+// the bytes are already a full int64_t and no extension is needed
+// (`sign_bit << 1` would be UB at bit 64 — guard explicitly).
 bool read_be(const std::vector<std::uint8_t>& code, std::size_t* pc,
              std::size_t n, std::int64_t* out) {
   if (*pc + n > code.size()) return false;
@@ -41,11 +49,11 @@ bool read_be(const std::vector<std::uint8_t>& code, std::size_t* pc,
     v = (v << 8) | code[*pc + i];
   }
   *pc += n;
-  // Sign-extend from `n` bytes wide.
-  std::int64_t sign_bit = static_cast<std::int64_t>(1) << (n * 8 - 1);
-  if (v & sign_bit) {
-    std::int64_t mask = ~((sign_bit << 1) - 1);
-    v |= mask;
+  if (n < 8) {
+    std::int64_t sign_bit = static_cast<std::int64_t>(1) << (n * 8 - 1);
+    if (v & sign_bit) {
+      v |= ~((sign_bit << 1) - 1);
+    }
   }
   *out = v;
   return true;
@@ -124,7 +132,10 @@ EvalError do_ref(const Program& prog, std::size_t* pc, std::size_t bytes,
   try {
     data = ctx.backend->read_memory(ctx.target,
         static_cast<std::uint64_t>(addr), bytes);
-  } catch (...) {
+  } catch (const backend::Error&) {
+    // Only swallow documented backend errors (bad address, EAGAIN
+    // on detach, etc.). std::bad_alloc and other system failures
+    // propagate — the evaluator can't recover from those.
     return EvalError::kMemReadFailed;
   }
   if (data.size() < bytes) return EvalError::kMemReadFailed;
@@ -145,15 +156,15 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
   std::size_t pc = 0;
   while (pc < prog.code.size()) {
     if (++vm.insn > kMaxInsnCount) {
-      out.error = EvalError::kProgramTooLong;
-      out.value = vm.last_top;
+      out.error = EvalError::kInsnLimitExceeded;
+      out.value = vm.result();
       return out;
     }
     auto op = static_cast<Op>(prog.code[pc++]);
     EvalError step = EvalError::kOk;
     switch (op) {
       case Op::kEnd:
-        out.value = vm.last_top;
+        out.value = vm.result();
         return out;
 
       case Op::kConst8: {
@@ -222,15 +233,11 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
       case Op::kDrop: {
         std::int64_t tmp;
         if (!vm.pop(&tmp, &step)) break;
-        // pop() doesn't refresh last_top (it only knows about pushes).
-        // Update here so kEnd / error returns surface the new top.
-        vm.last_top = (vm.sp == 0) ? 0 : vm.stack[vm.sp - 1];
         break;
       }
       case Op::kSwap: {
         if (vm.sp < 2) { step = EvalError::kStackUnderflow; break; }
         std::swap(vm.stack[vm.sp - 1], vm.stack[vm.sp - 2]);
-        vm.last_top = vm.stack[vm.sp - 1];
         break;
       }
 
@@ -240,12 +247,16 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     }
     if (step != EvalError::kOk) {
       out.error = step;
-      out.value = vm.last_top;
+      out.value = vm.result();
       return out;
     }
   }
-  // Ran off the end without an explicit kEnd — value is last top.
-  out.value = vm.last_top;
+  // Ran off the end without an explicit kEnd. A program without kEnd
+  // is malformed — silently completing risks firing a probe whose
+  // predicate truncated mid-stream. Surface the distinct error so
+  // callers know to validate their bytecode.
+  out.error = EvalError::kMissingEnd;
+  out.value = vm.result();
   return out;
 }
 

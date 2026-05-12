@@ -370,3 +370,15 @@ TEST_CASE("evaluator: program exceeding kMaxProgramBytes is rejected",
   auto r = eval(Program{code, {}}, ctx);
   CHECK(r.error == EvalError::kProgramTooLong);
 }
+
+TEST_CASE("evaluator: program without kEnd surfaces kMissingEnd",
+          "[agent_expr][eval][error][end]") {
+  // Just two consts, no kEnd. The evaluator runs off the end of
+  // code[] and must surface kMissingEnd rather than silently
+  // returning kOk — a truncated bytecode shouldn't masquerade as
+  // a valid predicate result.
+  EvalContext ctx;
+  auto r = eval(prog({0x10, 5, 0x10, 7}), ctx);
+  CHECK(r.error == EvalError::kMissingEnd);
+  CHECK(r.value == 7);   // last value pushed is still surfaced
+}
