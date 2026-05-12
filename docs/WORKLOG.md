@@ -4,6 +4,163 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.4 close-out: #12 phase-3 + #14 phase-2 + README deps
+
+**Goal:** User installed `libbpf-dev` (no more `/tmp/libbpf-extracted`
+workaround), restored the README dependency table, and asked to keep
+going. Remaining v1.4 design-doc commitments after the morning push:
+
+- #12 phase-3: persistent `AgentEngine` session + ProbeOrchestrator
+  routing of `kind = "agent"` probes through to `ldb-probe-agent`.
+- #14 phase-2: an iterative driver around the registered Python
+  Callable — `process.list_frames_python` — so a caller can walk an
+  arbitrary number of frames in one RPC.
+
+**Done (commits on `feat/v1.4-backend`):**
+
+- **`ff174b4` feat(probe-agent): persistent AgentEngine + kind=agent
+  orchestrator routing (#12 phase-3)** —
+  `AgentEngine` grew `attach_uprobe` / `attach_kprobe` /
+  `attach_tracepoint` / `poll_events` / `detach`. A private
+  `round_trip` helper folds write+read+error-classification so each
+  attach/poll/detach method is ~6 lines. `ProbeOrchestrator` owns
+  one lazy `std::unique_ptr<AgentEngine>` per session; first
+  `kind=agent` probe spawns the subprocess, all subsequent probes in
+  the session reuse it. `ProbeState` carries the agent-assigned
+  attach_id; `remove()` detaches; `events()` polls the agent
+  *outside* the orchestrator lock so probe.events doesn't block other
+  handlers behind a wire round-trip. probe.create dispatcher path:
+  `kind="agent"` reuses the existing uprobe_bpf parse (where,
+  capture.args, filter_pid, host, rate_limit); only `ps.kind`
+  differs. describe.endpoints `kind` enum advertises `agent`.
+  README updates: dependency table + Linux apt install line +
+  macOS note now mention `libbpf-dev`, `python3-embed`,
+  `linux-tools-generic`, `clang` + `bpftool`.
+- **`1ed7a28` feat(unwinder): process.list_frames_python — iterative
+  walk (#14 phase-2)** — iteratively invokes the registered Callable
+  until null / incomplete dict / max_frames / cycle. max_frames
+  defaults to 32, hard-capped at 1024. Cycle detection compares the
+  (next_ip, next_sp) pair the unwinder JUST returned against
+  everything seen — the repeated frame is NOT pushed, so
+  `frames.size()` is the count of distinct pairs the unwinder
+  produced. Incomplete returns surface a diagnostic frame
+  `{ctx, returned}` so the caller can see what the unwinder
+  produced before stopping. stop_reason is one of
+  `null_return | incomplete_return | max_frames | cycle`
+  (schema enum). `docs/20-embedded-python.md` §7a updated.
+
+**Decisions:**
+
+- **`kind="agent"` reuses the bpftrace probe parse, not a separate
+  dispatcher branch.** Both engines have the same where-shape
+  (`{uprobe, kprobe, tracepoint}`), the same capture.args, the same
+  filter_pid + rate_limit. Adding a parallel parse would be 60
+  duplicated lines. The orchestrator does the engine routing on
+  `ps.kind`; the dispatcher just plumbs.
+- **`probe.events` for agent probes drops the orchestrator lock
+  during the wire round-trip.** AgentEngine's `poll_events` blocks
+  on a read frame from the subprocess; holding the lock would stall
+  every other RPC for the duration. The poll happens with a snapshot
+  of the ProbeState shared_ptr; the ring-buffer fill re-acquires
+  the lock once events are in hand.
+- **Embedded program selection via `capture.args[0]`** — phase-1
+  ships exactly one embedded program (`syscall_count`). Empty or
+  absent args defaults to that. A recipe-format extension to ship
+  arbitrary BPF programs is the natural next slice; the wire
+  surface accepts the override today so phase-3.5 doesn't need a
+  schema change.
+- **Lazy AgentEngine creation, not eager.** A daemon that never
+  uses agent probes never spawns the subprocess. The dispatcher's
+  agent.hello uses its own one-shot instance for diagnostics —
+  doesn't share the orchestrator's persistent one. Trade-off:
+  agent.hello spawns + tears down once per call (~ms); the
+  cleaner alternative would be a shared "default agent engine"
+  on the dispatcher, but that adds shutdown-ordering complexity
+  for the diagnostic case.
+- **`process.list_frames_python` cycle check is BEFORE the push.**
+  Including the repeated frame would make "got 3 unique frames
+  then cycled" indistinguishable from "got the same frame twice."
+  TDD-caught: first version pushed-then-checked; smoke expected 1
+  frame, got 2 → fixed.
+- **Cycle key is `(next_ip, next_sp)`, not full `next_*`.** ip
+  alone produces false positives on a function called from
+  multiple callsites; including sp lets a normal "same function,
+  different stack frame" walk through. fp would tighten further
+  but rarely changes when ip+sp do, so two-tuple is the
+  practical choice.
+- **`max_frames` hard cap = 1024.** Bounds dispatcher wall-time
+  against a slow unwinder. 1024 frames is past any sane stack
+  even with deep recursion; user code that legitimately needs
+  more should chunk by paginating with a fresh initial-frame
+  starting from the last-returned next_*.
+
+**Surprises / blockers:**
+
+- **Pre-existing nlohmann `-Wnull-dereference` false positives**
+  still present (22 instances on master). Not new. CLAUDE.md's
+  "warning-clean build" promise is technically violated but
+  consistent with the v1.3 release; bumping the vendored
+  nlohmann is an unrelated chore.
+- **No clang + bpftool on this dev box.** The agent binary builds
+  without the embedded skeleton, so attach_* responses are
+  `not_supported`. The `smoke_probe_agent_route` test was written
+  to accept both flavors — live happy path on a CI box with the
+  full BPF toolchain, typed -32000 on a dev box without. The
+  no-toolchain path verifies the dispatcher → orchestrator →
+  AgentEngine → agent wire is correct; the live path needs
+  privileged CI to fully exercise.
+
+**Verification:**
+
+- `cmake --build build` clean modulo pre-existing nlohmann
+  warnings.
+- `ctest --test-dir build -j4` → 60/67 pass — identical
+  7-failure baseline (ptrace-gated). +2 smokes this session
+  (`smoke_probe_agent_route`, `smoke_python_unwinder_walk`).
+- `smoke_probe_agent_route` exercises every probe.create
+  branch (uprobe, kprobe, malformed where, malformed uprobe
+  target) and accepts both the live happy path and the
+  typed-error no-toolchain path.
+- `smoke_python_unwinder_walk` pins all four `stop_reason`
+  values (null_return, max_frames, cycle, incomplete_return)
+  plus the -32002 unset-target path.
+
+**Next:**
+
+v1.4 is now feature-complete to every design-doc commitment for
+the original eight bullets — #8 GdbMiBackend, #9 embedded Python,
+#10 REPL, #11 ssh, #12 ldb-probe-agent (phases 1+2+3), #13 perf,
+#14 Python frame unwinders (phases 1+2). The branch is ready for
+merge to master.
+
+The deferred follow-ups, all landing-independent and documented in
+their respective entries:
+
+1. **#14 phase-3 — SBUnwinder hookup.** Make LLDB's stack walker
+   actually call into the registered Callable during ordinary
+   `process.list_frames`. Needs an SBLanguageRuntime subclass or
+   a command-interpreter hook; deferred because the SBAPI surface
+   for unwinder interception is in flux. Today
+   `process.list_frames_python` is the user-facing surface for
+   custom unwinding.
+2. **#12 phase-4 — async event delivery / richer BPF programs.**
+   Pull-based polling is fine for the conformance + recipe loops;
+   high-fan-out kprobe streaming would benefit from a streaming
+   path. Recipe-format extension to ship arbitrary BPF programs
+   (rather than the embedded `syscall_count`) is the bigger pull.
+3. **CI matrix.** A privileged Linux runner with libbpf-dev +
+   clang + bpftool + CAP_BPF for the live BPF path; another with
+   `linux-tools-generic` for #13's live perf path. Without these
+   the live-side smokes always go through the SKIP-or-typed-error
+   branches.
+4. **Pre-existing nlohmann `-Wnull-dereference`.** Bump or vendor
+   a newer single-header to clear those 22 warnings.
+5. **libbpf-dev now installed on this dev box** (this session).
+   /tmp/libbpf-extracted workaround removed; README documents the
+   apt-get line going forward.
+
+---
+
 ## 2026-05-12 — v1.4 phase-2: #9/#12/#14 integration layers + libsodium fix
 
 **Goal:** User installed libsodium-dev (removing the
