@@ -21,37 +21,38 @@ graph that survives across sessions.
 ## Status
 
 **V1 released.** `v1.0.0` closed all release gates tracked in
-[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.4.0` is the
-current tag — "Backend abstraction + observability" — eight items
-ranging from a second backend implementation to ldb-scriptable probes
-and a libbpf agent ([docs/17-version-plan.md](docs/17-version-plan.md)):
+[docs/13-v1-readiness.md](docs/13-v1-readiness.md). `v1.5.0` is the
+current tag — "Own the critical path: indexing + replay" — three
+items closing the loop on deterministic, reusable investigation
+state ([docs/17-version-plan.md](docs/17-version-plan.md)):
 
-- **GdbMiBackend** ([docs/18-gdbmi-backend.md](docs/18-gdbmi-backend.md))
-  — second `DebuggerBackend` implementation over `gdb --interpreter=mi3`.
-  Validates the abstraction before v1.5's deeper rewrites; selectable
-  per-session via `target.create_empty backend=gdb`.
-- **Interactive REPL** for `tools/ldb/ldb` — persistent daemon across
-  many calls, `:explain` / `:cost` / `:replay` meta-commands, tab
-  completion via prompt_toolkit or readline.
-- **ssh-remote daemon mode** ([docs/19](docs/19-ssh-remote.md)) —
-  `ldb --ssh user@host` spawns `ldbd --stdio` on the remote; daemon
-  itself is unchanged (ssh is the byte stream).
-- **Embedded Python probe callbacks** ([docs/20](docs/20-embedded-python.md))
-  — `recipe.create format=python-v1 body=<src>`; `recipe.run` invokes
-  `def run(ctx)` and returns the result. `process.set_python_unwinder`
-  + `process.list_frames_python` reuse the embed for custom frame
-  walking.
-- **ldb-probe-agent** ([docs/21](docs/21-probe-agent.md)) — standalone
-  libbpf+CO-RE binary speaking length-prefixed JSON over stdio. Probes
-  with `kind="agent"` route to a persistent AgentEngine; daemon stays
-  unprivileged, agent holds CAP_BPF.
-- **perf integration** ([docs/22](docs/22-perf-integration.md)) —
-  `perf.record` / `perf.report` / `perf.cancel` shell to `perf`,
-  parse `perf script` output, store the trace as a binary artifact.
-  Command-mode allowlist-gated; 256 MiB perf.data cap; 10 kHz freq cap.
+- **Own symbol index** ([docs/23](docs/23-symbol-index.md)) —
+  SQLite-backed cache of LLDB-derived symbols / types / strings,
+  keyed by build_id. The dispatcher routes `correlate.types /
+  symbols / strings` through the cache; cold queries walk LLDB
+  once and write back, warm queries are sub-millisecond. Cross-
+  binary indexing means an agent fanning out across many targets
+  pays O(1) on the shared structure instead of O(N).
+- **Live-process provenance gate extended to correlate.\*** — every
+  index-routed response carries `_provenance.deterministic = true`
+  for fixed inputs, and `tests/smoke/test_provenance_replay.py`
+  pins byte-identity across daemon processes. The audit lives in
+  [docs/04](docs/04-determinism-audit.md) §12.
+- **`session.fork` + `session.replay`** ([docs/24](docs/24-session-fork-replay.md))
+  — the v1.5 prize. `session.fork` clones an existing rpc_log up
+  to a seq into a new session id (transactional, no half-state on
+  crash). `session.replay` re-issues captured calls against a
+  fresh dispatcher and byte-compares deterministic rows; non-
+  deterministic rows surface as honest `replay_error` /
+  `captured_error` entries. A new `rpc_log.snapshot` column carries
+  the captured determinism signal across daemon restarts;
+  `read_log` falls back to the legacy SELECT for pre-v1.5 dbs so
+  upgrades don't brick.
 
-Earlier additive features remain from v1.3 (recipe.reload, hypothesis
-artifact, view.diff_against, reverse-step kinds, measured cost preview,
+Earlier additive features remain from v1.4 (GdbMiBackend, CLI REPL,
+ssh transport, embedded Python probes, libbpf agent, perf
+integration), v1.3 (recipe.reload, hypothesis artifact,
+view.diff_against, reverse-step kinds, measured cost preview,
 token-budget CI gate), v1.2 (`.ldbpack` ed25519 signing
 [docs/14](docs/14-pack-signing.md), reverse-execution endpoints
 [docs/16](docs/16-reverse-exec.md)), and the v1.1 dogfood fixes.
@@ -63,8 +64,8 @@ for the item-level catalog.
 
 | | |
 |---|---|
-| **Validation** | Default `ctest` suite (67 tests, 100% pass on a stock Linux dev box; SKIP-gated live-attach tests run when `kernel.yama.ptrace_scope=0` or with CAP_SYS_PTRACE) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
-| **Endpoints** | 94 across target / process / thread / frame / value / memory / probe / agent / perf / observer / session / artifact / recipe / correlate |
+| **Validation** | Default `ctest` suite (69 tests, 100% pass on a stock Linux dev box; SKIP-gated live-attach tests run when `kernel.yama.ptrace_scope=0` or with CAP_SYS_PTRACE) plus GitHub Actions on Linux x86-64, Linux arm64, macOS arm64, and an opt-in Capstone leg |
+| **Endpoints** | 96 across target / process / thread / frame / value / memory / probe / agent / perf / observer / session / artifact / recipe / correlate |
 | **Wire formats** | Line-delimited JSON (default); length-prefixed CBOR (`--format=cbor`) |
 | **Protocol schema** | JSON Schema draft 2020-12 for every endpoint via `describe.endpoints` |
 | **Determinism** | Core-backed replay gate plus live↔core parity checks for selected static-analysis endpoints |
