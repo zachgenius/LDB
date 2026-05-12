@@ -265,6 +265,31 @@ struct State {
   void emit_op(Op op) {
     prog.code.push_back(static_cast<std::uint8_t>(op));
   }
+
+  // Emit a kGoto / kIfGoto with a placeholder u16 BE target. Returns
+  // the offset of the immediate's first byte so the caller can patch
+  // it once the real target pc is known. Single-pass codegen wants
+  // forward branches to slot in before their destinations exist.
+  std::size_t emit_jump(Op op) {
+    prog.code.push_back(static_cast<std::uint8_t>(op));
+    std::size_t imm_off = prog.code.size();
+    prog.code.push_back(0);
+    prog.code.push_back(0);
+    return imm_off;
+  }
+
+  // Back-patch a u16 BE value at `off`. Returns false if `value`
+  // doesn't fit in 16 bits — caller surfaces the compile error.
+  // We never actually emit a target past code.size() since patching
+  // happens once the destination exists, but the bounds check
+  // catches the pathological >64 KiB-program case before the
+  // evaluator sees a silently-truncated immediate.
+  [[nodiscard]] bool patch_u16_be(std::size_t off, std::size_t value) {
+    if (value > 0xffff) return false;
+    prog.code[off]     = static_cast<std::uint8_t>((value >> 8) & 0xff);
+    prog.code[off + 1] = static_cast<std::uint8_t>( value       & 0xff);
+    return true;
+  }
 };
 
 // --- Parser + codegen --------------------------------------------------
@@ -390,6 +415,102 @@ struct Parser {
         // (begin) with no forms — push 0 so the program still has a
         // value at end.
         st->emit_const(0);
+      }
+      advance();
+      return;
+    }
+    if (op == "if") {
+      // (if cond then else) — three forms required.
+      //
+      // Emission layout (chosen to keep single-pass codegen source-
+      // order-preserving):
+      //   <cond bytes>
+      //   kLogNot                ; flip so we branch on "false"
+      //   kIfGoto Telse          ; if cond was 0, jump over then
+      //   <then bytes>
+      //   kGoto   Tend
+      //   Telse: <else bytes>
+      //   Tend:
+      //
+      // The alternative gdb-style layout (kIfGoto-over-else-then-then)
+      // would require parsing `then` second but emitting it last,
+      // which fights the single-pass invariant. The extra kLogNot is
+      // one byte and one VM cycle — cheap given that #26's in-target
+      // tracepoints are the hot path, not daemon-side compilation.
+      if (cur.kind == Tok::kRparen) {
+        fail(op_line, op_col,
+             "if expects 3 arguments (cond, then, else), got 0");
+      }
+      compile_expr();   // cond
+      st->emit_op(Op::kLogNot);
+      std::size_t ifgoto_imm = st->emit_jump(Op::kIfGoto);
+      if (cur.kind == Tok::kRparen) {
+        fail(op_line, op_col,
+             "if expects 3 arguments (cond, then, else), got 1");
+      }
+      compile_expr();   // then
+      std::size_t goto_imm = st->emit_jump(Op::kGoto);
+      std::size_t else_addr = st->prog.code.size();
+      if (!st->patch_u16_be(ifgoto_imm, else_addr)) {
+        fail(op_line, op_col,
+             "program too large for 16-bit jump target");
+      }
+      if (cur.kind == Tok::kRparen) {
+        fail(op_line, op_col,
+             "if expects 3 arguments (cond, then, else), got 2");
+      }
+      compile_expr();   // else
+      std::size_t end_addr = st->prog.code.size();
+      if (!st->patch_u16_be(goto_imm, end_addr)) {
+        fail(op_line, op_col,
+             "program too large for 16-bit jump target");
+      }
+      if (cur.kind != Tok::kRparen) {
+        fail(op_line, op_col,
+             "if expects exactly 3 arguments");
+      }
+      advance();
+      return;
+    }
+    if (op == "when") {
+      // (when cond body) — sugar for (if cond body 0). We desugar
+      // here rather than at the AST so the emitted bytecode is the
+      // same shape an agent would get from writing (if ...) by hand.
+      // Layout (mirrors (if ...)):
+      //   <cond bytes>
+      //   kLogNot
+      //   kIfGoto Telse
+      //   <body bytes>
+      //   kGoto   Tend
+      //   Telse: kConst8 0
+      //   Tend:
+      if (cur.kind == Tok::kRparen) {
+        fail(op_line, op_col,
+             "when expects 2 arguments (cond, body), got 0");
+      }
+      compile_expr();   // cond
+      st->emit_op(Op::kLogNot);
+      std::size_t ifgoto_imm = st->emit_jump(Op::kIfGoto);
+      if (cur.kind == Tok::kRparen) {
+        fail(op_line, op_col,
+             "when expects 2 arguments (cond, body), got 1");
+      }
+      compile_expr();   // body
+      std::size_t goto_imm = st->emit_jump(Op::kGoto);
+      std::size_t else_addr = st->prog.code.size();
+      if (!st->patch_u16_be(ifgoto_imm, else_addr)) {
+        fail(op_line, op_col,
+             "program too large for 16-bit jump target");
+      }
+      st->emit_const(0);
+      std::size_t end_addr = st->prog.code.size();
+      if (!st->patch_u16_be(goto_imm, end_addr)) {
+        fail(op_line, op_col,
+             "program too large for 16-bit jump target");
+      }
+      if (cur.kind != Tok::kRparen) {
+        fail(op_line, op_col,
+             "when expects exactly 2 arguments");
       }
       advance();
       return;

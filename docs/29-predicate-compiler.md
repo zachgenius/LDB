@@ -58,8 +58,37 @@ Op names mirror the bytecode mnemonics (`docs/28-agent-expressions.md`
 `(begin <e1> <e2> ... <eN>)` evaluates each in order, dropping every
 result except the last — the conventional Lisp-y sequence form, and
 the only way to get drop/swap behaviour without the user emitting
-raw bytecode. Phase-2 doesn't need a higher-level "if" — phase-3's
-control-flow opcodes will land alongside if_goto.
+raw bytecode.
+
+### Control flow (#25 phase-3)
+
+```
+(if <cond> <then> <else>)   → kIfGoto + kGoto with patched targets
+(when <cond> <body>)        → sugar for (if cond body 0)
+```
+
+Both `<then>` and `<else>` are full expressions; the unchosen branch
+is *not* evaluated (short-circuiting). This matters for predicates
+that would otherwise divide by zero or read unmapped memory on the
+"wrong" side:
+
+```
+;; Read errno only when the syscall actually returned -1
+(when (eq (reg "rax") -1)
+  (ref32 (reg "rdi")))
+
+;; Filter for the slow path: stop only if the cache miss flag is set
+;; AND the request-size register is above the threshold.
+(if (eq (ref8 (reg "rbx")) 1)
+    (gt (reg "rsi") 4096)
+    0)
+```
+
+Emission layout for `(if c t e)` is "if-not-cond, jump to else"
+rather than gdb's "if-cond, jump over then" — see
+`src/agent_expr/compiler.cpp`'s `if` handler for the single-pass
+codegen rationale. Agents who care about the exact bytecode shape
+should fetch `mnemonics[]` from the `predicate.compile` response.
 
 ### Single-op convenience
 
@@ -267,13 +296,27 @@ let agents reason about filter rates from `probe.list` alone.
   breakpoint smoke (a probe that fires only when a captured
   register matches a value).
 
-### Phase-3 (#26 territory)
+### Phase-3 — landed in #25 phase-3
+
+Control-flow forms (`(if ...)`, `(when ...)`) compile to the
+`kIfGoto` + `kGoto` opcodes (`docs/28-agent-expressions.md` §2).
+Required by #26 phase-2's in-target VM for efficient predicate
+short-circuiting — the alternative was to round-trip each branch
+through the VM as a separate program.
+
+- `src/agent_expr/compiler.cpp` grows two special-form handlers
+  (`if`, `when`) that emit `kLogNot` + `kIfGoto` + `kGoto` with
+  back-patched u16 BE targets.
+- Tests cover short-circuit behaviour (the unchosen branch's
+  `(div 1 0)` does not execute), nested `(if (if ...) ...)`
+  codegen, and arity-error anchoring.
+
+### Phase-3 / #26 (still ahead)
 
 - gdb-remote tracepoint vocabulary (`QTDP`, `QTStart`, etc.). Same
   bytecode format flows over the wire to an in-target VM.
 - Tracepoints are no-stop probes — they emit data continuously
   without stopping the inferior. Builds on the listener
   notification surface from #21 phase-2.
-- Some opcodes (`if_goto`, `call`) become useful for
-  efficient in-target evaluation. Adds them to the opcode table
-  without breaking phase-1/phase-2 bytecode.
+- `call` opcode (still reserved at 0x92–0x9f) for in-target
+  function dispatch; deferred until an actual use case lands.

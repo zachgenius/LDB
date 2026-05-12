@@ -158,6 +158,9 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     if (++vm.insn > kMaxInsnCount) {
       out.error = EvalError::kInsnLimitExceeded;
       out.value = vm.result();
+      out.insn_count = vm.insn - 1;   // count of ops actually executed
+                                       // (the increment that tripped the
+                                       // cap didn't dispatch an op)
       return out;
     }
     auto op = static_cast<Op>(prog.code[pc++]);
@@ -165,6 +168,7 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     switch (op) {
       case Op::kEnd:
         out.value = vm.result();
+        out.insn_count = vm.insn;
         return out;
 
       case Op::kConst8: {
@@ -241,6 +245,44 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
         break;
       }
 
+      // Control flow (#25 phase-3). Both ops carry a u16 BE absolute
+      // pc immediate. A target past code.size() is malformed bytecode
+      // — surface kBadImmediate so callers learn to validate jump
+      // targets before installing the predicate. Anti-loop sanity
+      // for backward jumps comes from kMaxInsnCount above.
+      // Invariant: always validate immediates regardless of whether
+      // the transfer is taken. An out-of-range target is malformed
+      // bytecode at decode time — if we only check on the taken path,
+      // a predicate with a broken jump silently passes when cond
+      // happens to be zero and crashes the next time cond is truthy.
+      // Six-months-later production bug pattern. Don't reintroduce.
+      case Op::kGoto: {
+        std::uint16_t target = 0;
+        if (!read_u16_be(prog.code, &pc, &target)) {
+          step = EvalError::kBadImmediate; break;
+        }
+        if (target > prog.code.size()) {
+          step = EvalError::kBadImmediate; break;
+        }
+        pc = target;
+        break;
+      }
+      case Op::kIfGoto: {
+        std::uint16_t target = 0;
+        if (!read_u16_be(prog.code, &pc, &target)) {
+          step = EvalError::kBadImmediate; break;
+        }
+        if (target > prog.code.size()) {
+          step = EvalError::kBadImmediate; break;
+        }
+        std::int64_t cond = 0;
+        if (!vm.pop(&cond, &step)) break;
+        if (cond != 0) {
+          pc = target;
+        }
+        break;
+      }
+
       default:
         step = EvalError::kBadOpcode;
         break;
@@ -248,6 +290,7 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
     if (step != EvalError::kOk) {
       out.error = step;
       out.value = vm.result();
+      out.insn_count = vm.insn;
       return out;
     }
   }
@@ -257,6 +300,7 @@ EvalResult eval(const Program& prog, const EvalContext& ctx) {
   // callers know to validate their bytecode.
   out.error = EvalError::kMissingEnd;
   out.value = vm.result();
+  out.insn_count = vm.insn;
   return out;
 }
 

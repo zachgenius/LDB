@@ -112,6 +112,8 @@ std::string_view mnemonic(Op op) {
     case Op::kDup:        return "dup";
     case Op::kDrop:       return "drop";
     case Op::kSwap:       return "swap";
+    case Op::kIfGoto:     return "if_goto";
+    case Op::kGoto:       return "goto";
   }
   return "";
 }
