@@ -12,6 +12,9 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_hello.cpp
   test_protocol_cost.cpp
   test_cost_samples.cpp
+  test_mi_parser.cpp
+  test_mi_session.cpp
+  test_backend_gdbmi.cpp
   test_protocol_cbor.cpp
   test_protocol_view.cpp
   test_view_diff.cpp
@@ -74,6 +77,8 @@ set(LDB_UNIT_SOURCES
   test_bpftrace_program.cpp
   test_bpftrace_live.cpp
   test_dispatcher_uprobe_bpf.cpp
+  test_perf_parser.cpp
+  test_dispatcher_perf.cpp
   test_observer_tcpdump_parser.cpp
   test_observer_tcpdump_live.cpp
   test_dispatcher_tcpdump.cpp
@@ -93,6 +98,8 @@ set(LDB_UNIT_SOURCES
   test_dap_transport.cpp
   test_dap_rpc_channel.cpp
   test_dap_handlers.cpp
+  test_embedded_python.cpp
+  test_bpf_agent_protocol.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -107,6 +114,11 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
   ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
+  ${CMAKE_SOURCE_DIR}/src/probes/agent_engine.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/backend.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/parser.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/gdbmi/session.cpp
+  ${CMAKE_SOURCE_DIR}/src/python/embed.cpp
   ${CMAKE_SOURCE_DIR}/src/store/artifact_store.cpp
   ${CMAKE_SOURCE_DIR}/src/store/hypothesis.cpp
   ${CMAKE_SOURCE_DIR}/src/store/recipe_store.cpp
@@ -121,6 +133,9 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/observers/net_sockets.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/exec_allowlist.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/bpftrace_engine.cpp
+  ${CMAKE_SOURCE_DIR}/src/perf/perf_parser.cpp
+  ${CMAKE_SOURCE_DIR}/src/perf/perf_runner.cpp
+  ${CMAKE_SOURCE_DIR}/src/probe_agent/protocol.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
   ${CMAKE_SOURCE_DIR}/src/dap/transport.cpp
@@ -145,12 +160,14 @@ add_executable(ldb_unit_tests
 target_include_directories(ldb_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(ldb_unit_tests PRIVATE
   ldb_catch2
   ldb_json
   ldb_lldb
   ldb_capstone
+  ldb_python
   ldb_sodium
   ldb_warnings
   SQLite::SQLite3
@@ -167,6 +184,7 @@ target_compile_definitions(ldb_unit_tests PRIVATE
   LDB_FIXTURE_CPPSYMS_PATH="$<TARGET_FILE:ldb_fix_cppsyms>"
   LDB_FIXTURE_TEXT_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/text"
   LDB_FIXTURE_KEYS_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/keys"
+  LDB_FIXTURE_PERF_SCRIPT_SAMPLE="${CMAKE_SOURCE_DIR}/tests/fixtures/perf_script_sample.txt"
   LDBD_PATH="$<TARGET_FILE:ldbd>"
   LDB_VERSION_STRING="${PROJECT_VERSION}"
 )

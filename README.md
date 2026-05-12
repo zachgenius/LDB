@@ -125,8 +125,11 @@ items?, tokens_est}` and `_provenance: {snapshot, deterministic}`.
 | zlib | system | `.ldbpack` gzip compression |
 | libsodium | 1.0.18+ | `.ldbpack` ed25519 signing (hard dep) |
 | Python | 3.11+ | Smoke tests and `tools/ldb/ldb` client |
+| `python3-embed` | 3.11+ | Optional; embedded CPython for `format=python-v1` recipes + `process.set_python_unwinder` (post-V1 #9, #14). Auto-detected via pkg-config; `cmake -DLDB_ENABLE_PYTHON=OFF` opts out |
+| libbpf | 1.0+ | Optional; required to build `ldb-probe-agent` (post-V1 #12). Auto-detected via pkg-config; `cmake -DLDB_ENABLE_BPF_AGENT=OFF` opts out. Live BPF programs additionally need `clang` + `bpftool` |
 | Ninja | 1.10+ | Optional; default build generator |
 | `bpftrace` | 0.18+ | Optional; required for `kind: "uprobe_bpf"` probes |
+| `linux-tools-generic` | match kernel | Optional; provides `perf` for `perf.record` / `perf.report` (post-V1 #13) |
 | `lldb-server` | from LLDB | Optional; required for `target.connect_remote*` live tests |
 | `tcpdump` | system | Optional; required for `observer.net.tcpdump` (needs CAP_NET_RAW) |
 | `rr` | 5.6+ | Optional; required for reverse-execution endpoints. Linux only; needs `kernel.perf_event_paranoid <= 1` to record |
@@ -147,11 +150,12 @@ Linux (Ubuntu 24.04-class host):
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  ninja-build cmake build-essential \
+  ninja-build cmake build-essential pkg-config \
   liblldb-dev lldb \
   libsqlite3-dev zlib1g-dev libsodium-dev \
-  python3 \
-  bpftrace tcpdump \
+  python3 python3-dev \
+  libbpf-dev clang bpftool \
+  bpftrace tcpdump linux-tools-generic \
   openssh-server openssh-client \
   rr
 ```
@@ -159,7 +163,9 @@ sudo apt-get install -y \
 macOS (Apple Silicon / Homebrew):
 
 ```bash
-brew install llvm ninja cmake sqlite libsodium
+brew install llvm ninja cmake sqlite libsodium python@3.12
+# libbpf, bpftool, perf, rr, bpftrace are Linux-only — the libbpf-agent
+# (#12) and perf-integration (#13) build paths are auto-disabled on macOS.
 ```
 
 Optional Capstone backend:
@@ -168,11 +174,16 @@ Optional Capstone backend:
 brew install capstone pkgconf
 ```
 
-`bpftrace`, `tcpdump`, `lldb-server`, `openssh-server`, and `rr` are only
-needed for their respective live probe / observer / remote-connection /
-reverse-execution paths; the static analysis and core-backed paths build
-without them. `libsodium` is a hard build dep (used by `.ldbpack` ed25519
-signing). `rr` is Linux x86-64 / arm64 only — macOS has no equivalent.
+`bpftrace`, `tcpdump`, `lldb-server`, `openssh-server`, `rr`, `perf`,
+`libbpf`, `clang+bpftool`, and `python3-embed` are only needed for
+their respective live probe / observer / remote-connection /
+reverse-execution / sampling / agent / scripted-recipe paths; the
+static analysis and core-backed paths build without them. `libsodium`
+is a hard build dep (used by `.ldbpack` ed25519 signing). `rr` is
+Linux x86-64 / arm64 only — macOS has no equivalent. The `ldb-probe-
+agent` binary (post-V1 #12) is only built when libbpf is present;
+embedded CO-RE BPF programs additionally require `clang` and
+`bpftool` (from `linux-tools-generic` or `bpfcc-tools`).
 
 ---
 

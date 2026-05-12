@@ -141,6 +141,9 @@ nlohmann::json RecipeStore::envelope_from_recipe(const Recipe& r) {
     calls.push_back(std::move(one));
   }
   env["calls"] = std::move(calls);
+  if (r.python_body.has_value()) {
+    env["python_body"] = *r.python_body;
+  }
   return env;
 }
 
@@ -184,6 +187,9 @@ Recipe RecipeStore::recipe_from_envelope(std::int64_t   id,
       r.calls.push_back(std::move(call));
     }
   }
+  if (env.contains("python_body") && env["python_body"].is_string()) {
+    r.python_body = env["python_body"].get<std::string>();
+  }
   return r;
 }
 
@@ -203,6 +209,33 @@ Recipe RecipeStore::create_with_source(
     std::optional<std::string>   description,
     std::vector<RecipeParameter> parameters,
     std::vector<RecipeCall>      calls,
+    std::optional<std::string>   source_path) {
+  return create_internal(std::move(name), std::move(description),
+                         std::move(parameters), std::move(calls),
+                         /*python_body=*/std::nullopt,
+                         std::move(source_path));
+}
+
+Recipe RecipeStore::create_python_recipe(
+    std::string                  name,
+    std::optional<std::string>   description,
+    std::vector<RecipeParameter> parameters,
+    std::string                  python_body) {
+  if (python_body.empty()) {
+    throw_recipe_error("python_body must be non-empty for python-v1 recipes");
+  }
+  return create_internal(std::move(name), std::move(description),
+                         std::move(parameters), /*calls=*/{},
+                         std::optional<std::string>(std::move(python_body)),
+                         /*source_path=*/std::nullopt);
+}
+
+Recipe RecipeStore::create_internal(
+    std::string                  name,
+    std::optional<std::string>   description,
+    std::vector<RecipeParameter> parameters,
+    std::vector<RecipeCall>      calls,
+    std::optional<std::string>   python_body,
     std::optional<std::string>   source_path) {
   if (name.empty()) throw_recipe_error("recipe name must be non-empty");
 
@@ -225,6 +258,7 @@ Recipe RecipeStore::create_with_source(
   r.description = std::move(description);
   r.parameters = std::move(parameters);
   r.calls = std::move(calls);
+  r.python_body = std::move(python_body);
   r.source_path = source_path;
 
   auto env = envelope_from_recipe(r);
@@ -242,6 +276,7 @@ Recipe RecipeStore::create_with_source(
   meta["parameter_count"] =
       static_cast<std::int64_t>(r.parameters.size());
   if (r.source_path.has_value()) meta["source_path"] = *r.source_path;
+  if (r.python_body.has_value()) meta["python_v1"] = true;
 
   auto row = store_->put(kRecipeBuildId,
                          std::string(kRecipeNamePrefix) + r.name,

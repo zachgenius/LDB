@@ -15,6 +15,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ptrace_probe import maybe_skip_ptrace
+
 
 def usage():
     sys.stderr.write("usage: test_mem_dump.py <ldbd> <sleeper>\n")
@@ -29,6 +32,7 @@ def main():
         sys.stderr.write(f"ldbd not executable: {ldbd}\n"); sys.exit(1)
     if not os.path.isfile(sleeper):
         sys.stderr.write(f"sleeper missing: {sleeper}\n"); sys.exit(1)
+    maybe_skip_ptrace(ldbd, "smoke_mem_dump")
 
     store_root = tempfile.mkdtemp(prefix="ldb_smoke_memdump_")
 

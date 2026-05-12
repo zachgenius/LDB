@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "backend/gdbmi/backend.h"
 #include "backend/lldb_backend.h"
 #include "daemon/dispatcher.h"
 #include "daemon/stdio_loop.h"
@@ -42,6 +43,13 @@ void print_usage() {
     "                        index + on-disk blobs). Overridden by the\n"
     "                        LDB_STORE_ROOT environment variable.\n"
     "                        Default: $HOME/.ldb\n"
+    "\n"
+    "Backend:\n"
+    "  --backend <lldb|gdb>  Which DebuggerBackend implementation to use.\n"
+    "                        Default `lldb` (LLDB SBAPI). `gdb` selects\n"
+    "                        the v1.4 GdbMiBackend (gdb --interpreter=mi3\n"
+    "                        subprocess; see docs/18-gdbmi-backend.md).\n"
+    "                        LDB_BACKEND env takes precedence over flag.\n"
     "\n"
     "Observer policy:\n"
     "  --observer-exec-allowlist <path>\n"
@@ -97,12 +105,30 @@ std::string resolve_observer_exec_allowlist(const std::string& cli_arg) {
   return cli_arg;
 }
 
+// Post-V1 #8: backend selection. Env LDB_BACKEND wins over the
+// --backend flag; default `lldb`. Returns the canonical lowercase
+// name ("lldb" or "gdb"), or empty string if the input was invalid.
+std::string resolve_backend(const std::string& cli_arg) {
+  std::string raw;
+  if (const char* env = std::getenv("LDB_BACKEND"); env && *env) {
+    raw = env;
+  } else if (!cli_arg.empty()) {
+    raw = cli_arg;
+  } else {
+    return "lldb";
+  }
+  for (auto& c : raw) c = static_cast<char>(std::tolower(c));
+  if (raw == "lldb" || raw == "gdb") return raw;
+  return "";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
   std::string store_root_arg;
   std::string observer_exec_allowlist_arg;
+  std::string backend_arg;
   ldb::protocol::WireFormat wire_format = ldb::protocol::WireFormat::kJson;
 
   for (int i = 1; i < argc; ++i) {
@@ -132,6 +158,8 @@ int main(int argc, char** argv) {
       store_root_arg = argv[++i];
     } else if (a == "--observer-exec-allowlist" && i + 1 < argc) {
       observer_exec_allowlist_arg = argv[++i];
+    } else if (a == "--backend" && i + 1 < argc) {
+      backend_arg = argv[++i];
     } else {
       std::cerr << "unknown argument: " << a << "\n\n";
       print_usage();
@@ -141,9 +169,19 @@ int main(int argc, char** argv) {
 
   ldb::log::info(std::string("ldbd ") + ldb::kVersionString + " starting");
 
+  std::string backend_name = resolve_backend(backend_arg);
+  if (backend_name.empty()) {
+    std::cerr << "invalid backend (expected lldb|gdb)\n";
+    return 2;
+  }
   std::shared_ptr<ldb::backend::DebuggerBackend> backend;
   try {
-    backend = std::make_shared<ldb::backend::LldbBackend>();
+    if (backend_name == "gdb") {
+      backend = std::make_shared<ldb::backend::gdbmi::GdbMiBackend>();
+    } else {
+      backend = std::make_shared<ldb::backend::LldbBackend>();
+    }
+    ldb::log::info(std::string("backend: ") + backend_name);
   } catch (const std::exception& e) {
     ldb::log::error(std::string("backend init failed: ") + e.what());
     return 1;
@@ -237,7 +275,7 @@ int main(int argc, char** argv) {
   }
 
   ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes,
-                                     exec_allowlist);
+                                     exec_allowlist, backend_name);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher, wire_format);

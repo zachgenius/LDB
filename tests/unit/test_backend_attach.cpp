@@ -15,6 +15,7 @@
 #include <catch_amalgamated.hpp>
 
 #include "backend/lldb_backend.h"
+#include "ptrace_probe.h"
 
 #include <atomic>
 #include <chrono>
@@ -99,6 +100,7 @@ TEST_CASE("target.create_empty: returns a usable target_id",
 
 TEST_CASE("target.attach: attaches by PID and reports kStopped",
           "[backend][attach][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   auto sleeper = spawn_sleeper();
   REQUIRE(sleeper->pid > 0);
 

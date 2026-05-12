@@ -13,6 +13,14 @@ set(LDBD_SOURCES
   backend/lldb_backend.cpp
   probes/probe_orchestrator.cpp
   probes/bpftrace_engine.cpp
+  probes/agent_engine.cpp
+  probe_agent/protocol.cpp
+  perf/perf_parser.cpp
+  perf/perf_runner.cpp
+  backend/gdbmi/backend.cpp
+  backend/gdbmi/parser.cpp
+  backend/gdbmi/session.cpp
+  python/embed.cpp
   store/artifact_store.cpp
   store/hypothesis.cpp
   store/recipe_store.cpp
@@ -42,6 +50,7 @@ target_include_directories(ldbd PRIVATE
 target_link_libraries(ldbd PRIVATE
   ldb_lldb
   ldb_capstone
+  ldb_python
   ldb_json
   ldb_sodium
   ldb_warnings
@@ -90,3 +99,9 @@ target_compile_definitions(ldb-dap PRIVATE
   LDB_VERSION_PATCH=${PROJECT_VERSION_PATCH}
   LDB_VERSION_STRING="${PROJECT_VERSION}"
 )
+
+# ----- ldb-probe-agent (post-V1 #12) --------------------------------------
+#
+# Built only when libbpf was found at top-level configure time. The
+# subdirectory's CMakeLists short-circuits otherwise.
+add_subdirectory(probe_agent)

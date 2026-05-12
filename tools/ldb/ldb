@@ -5,7 +5,8 @@ Spawns `ldbd --stdio` as a child process per invocation, sends one
 JSON-RPC request, and prints the response.
 
 Usage:
-    ldb [--ldbd PATH] [--format json|cbor] [--verbose] [--raw]
+    ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]
+        [--verbose] [--raw]
         <subcommand> [key=value ...] [--view k=v ...]
 
 Subcommands are discovered dynamically from `describe.endpoints` on
@@ -14,22 +15,28 @@ parameters in human-readable form.
 
 Design notes:
 
-  • One-shot per invocation. The daemon is spawned, called once, and torn
-    down. For multi-call scripts, run multiple `ldb` commands or write
-    your own JSON-RPC driver. Interactive REPL is deferred post-MVP.
+  • One-shot per invocation OR persistent --repl. By default the daemon
+    is spawned, called once, and torn down. With --repl the daemon
+    survives across many commands inside one interactive session —
+    target_id and other daemon-side state persist.
   • Schema-driven param parsing. Type coercion (string/integer/number/
     boolean/array) is derived from the endpoint's `params_schema`, which
     means new endpoints work without CLI updates.
   • View descriptors. `--view k=v` (repeatable) collapses into
-    `params.view = {k: v, ...}` with type coercion (`limit`/`offset` →
-    int, `summary` → bool, `fields` → array).
+    `params.view = {k: v, ...}` with type coercion (`limit`/`offset` ->
+    int, `summary` -> bool, `fields` -> array).
   • Stdout discipline. The daemon's stdout is the JSON-RPC channel — we
     pipe it through, capture stderr separately, and print our own output
     on the CLI's stdout.
+  • Transport. By default the daemon runs locally as a child process.
+    With --ssh user@host the same `ldbd --stdio` is spawned on the remote
+    via `ssh user@host -- ldbd --stdio`; the agent's wire bytes flow
+    through ssh's stdin/stdout exec channel unchanged. No daemon-side
+    code changes — ssh is just a transport. See post-V1 plan #11.
 
-The CLI is intentionally small (~400 lines) and depends only on Python's
-stdlib. CBOR support is hand-rolled for the wire-format subset ldbd
-emits.
+The CLI depends only on Python's stdlib. Optional: prompt_toolkit for
+nicer REPL completion; readline is the fallback. CBOR support is
+hand-rolled for the wire-format subset ldbd emits.
 """
 from __future__ import annotations
 
@@ -226,6 +233,27 @@ class CborTransport:
 # Daemon discovery + lifecycle.
 # ----------------------------------------------------------------------
 
+class DaemonSpec:
+    """How to spawn the daemon. Either local (a path to ldbd) or ssh.
+
+    The rest of the CLI treats both the same — `spawn_daemon(spec, ...)`
+    returns a Popen whose stdin/stdout speak the JSON-RPC channel.
+    """
+    __slots__ = ("local_ldbd", "ssh_target", "ssh_key", "ssh_options",
+                 "remote_ldbd")
+
+    def __init__(self):
+        self.local_ldbd: str | None = None
+        self.ssh_target: str | None = None
+        self.ssh_key: str | None = None
+        self.ssh_options: str | None = None  # extra raw "-o ..." string
+        self.remote_ldbd: str = "ldbd"
+
+    @property
+    def is_ssh(self) -> bool:
+        return self.ssh_target is not None
+
+
 def find_ldbd(explicit: str | None) -> str:
     if explicit:
         if not os.access(explicit, os.X_OK):
@@ -245,8 +273,56 @@ def find_ldbd(explicit: str | None) -> str:
     sys.exit(2)
 
 
-def spawn_daemon(ldbd: str, fmt: str, verbose: bool):
-    cmd = [ldbd, "--stdio", "--format", fmt, "--log-level", "error"]
+def _split_ssh_target(target: str) -> tuple[str, str | None]:
+    """Parse `[user@]host[:port]` into (user@host, port-or-None).
+
+    ssh accepts `-p PORT` as a separate arg; we strip a trailing `:NNN`
+    here so the user can write the natural `user@host:2222` form.
+    """
+    if ":" in target:
+        host, _, port = target.rpartition(":")
+        if port.isdigit():
+            return host, port
+    return target, None
+
+
+def _build_ssh_argv(spec: DaemonSpec, fmt: str) -> list[str]:
+    """Compose the full `ssh ...` command line for spawning ldbd remote."""
+    assert spec.ssh_target is not None
+    host, port = _split_ssh_target(spec.ssh_target)
+    argv = ["ssh"]
+    if port:
+        argv += ["-p", port]
+    if spec.ssh_key:
+        # IdentitiesOnly avoids ssh-agent surprises picking the wrong key.
+        argv += ["-i", spec.ssh_key, "-o", "IdentitiesOnly=yes"]
+    if spec.ssh_options:
+        # User passed a raw chunk; shlex-split so they can use `-o A=B -o C=D`.
+        import shlex
+        argv += shlex.split(spec.ssh_options)
+    argv += [host, "--", spec.remote_ldbd,
+             "--stdio", "--format", fmt, "--log-level", "error"]
+    return argv
+
+
+def spawn_daemon(spec_or_path, fmt: str, verbose: bool):
+    """Spawn a daemon by spec (local or ssh).
+
+    Accepts either a DaemonSpec or, for backward-compat with older
+    call-sites that already had a resolved ldbd path string, the bare
+    path string (which it wraps into a local spec).
+    """
+    if isinstance(spec_or_path, DaemonSpec):
+        spec = spec_or_path
+    else:
+        spec = DaemonSpec()
+        spec.local_ldbd = spec_or_path
+
+    if spec.is_ssh:
+        cmd = _build_ssh_argv(spec, fmt)
+    else:
+        cmd = [spec.local_ldbd, "--stdio", "--format", fmt,
+               "--log-level", "error"]
     if verbose:
         sys.stderr.write(f"ldb: spawning {' '.join(cmd)}\n")
     return subprocess.Popen(
@@ -440,16 +516,26 @@ def render_top_help(catalog: list[dict]) -> str:
         "ldb — thin CLI for ldbd (LDB daemon)\n"
         "\n"
         "Usage:\n"
-        "  ldb [--ldbd PATH] [--format json|cbor] [--verbose] [--raw]\n"
+        "  ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]\n"
+        "      [--verbose] [--raw]\n"
         "      <subcommand> [key=value ...] [--view k=v ...]\n"
+        "  ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]\n"
+        "      [--verbose] --repl\n"
         "  ldb <subcommand> --help\n"
         "  ldb --help | --version\n"
         "\n"
         "Top-level options:\n"
-        "  --ldbd PATH          ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
+        "  --ldbd PATH          local ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
+        "  --ssh TARGET         spawn ldbd on TARGET ([user@]host[:port]) via ssh\n"
+        "                       (mutually exclusive with --ldbd)\n"
+        "                       env LDB_SSH_TARGET overrides this flag\n"
+        "  --ssh-key PATH       ssh identity file (forwarded as `ssh -i`)\n"
+        "  --ssh-options STR    extra raw ssh options, e.g. \"-o ProxyJump=bastion\"\n"
+        "  --ldbd-path PATH     where ldbd lives on the remote (default: ldbd on $PATH)\n"
         "  --format json|cbor   wire format on the daemon channel (default: json)\n"
         "  --verbose            log JSON-RPC traffic to stderr\n"
         "  --raw                print the full JSON-RPC envelope, not just data\n"
+        "  --repl               drop into an interactive REPL (persistent daemon)\n"
         "  --help               this help\n"
         "  --version            print client version and exit\n"
         "\n"
@@ -476,12 +562,13 @@ def render_top_help(catalog: list[dict]) -> str:
 # Catalog fetch (one daemon roundtrip).
 # ----------------------------------------------------------------------
 
-def fetch_catalog(ldbd: str, fmt: str, verbose: bool) -> list[dict]:
+def fetch_catalog(spec, fmt: str, verbose: bool) -> list[dict]:
     """Spawn ldbd, ask describe.endpoints, return the catalog list.
 
     Errors here are fatal (CLI can't function without the catalog).
+    Accepts either a DaemonSpec or a bare ldbd path string.
     """
-    proc = spawn_daemon(ldbd, fmt, verbose)
+    proc = spawn_daemon(spec, fmt, verbose)
     try:
         if fmt == "cbor":
             tr = CborTransport(proc)
@@ -527,9 +614,9 @@ def fetch_catalog(ldbd: str, fmt: str, verbose: bool) -> list[dict]:
 # RPC call.
 # ----------------------------------------------------------------------
 
-def do_rpc(ldbd: str, fmt: str, verbose: bool, method: str,
+def do_rpc(spec, fmt: str, verbose: bool, method: str,
            params: dict) -> dict:
-    proc = spawn_daemon(ldbd, fmt, verbose)
+    proc = spawn_daemon(spec, fmt, verbose)
     try:
         tr = CborTransport(proc) if fmt == "cbor" else JsonTransport(proc)
         req = {"jsonrpc": "2.0", "id": "1", "method": method,
@@ -567,8 +654,9 @@ def do_rpc(ldbd: str, fmt: str, verbose: bool, method: str,
 #   1. Strip top-level options (anything starting with `--` recognized).
 #   2. Whatever's left: first token = method; the rest = params + --view.
 
-TOP_OPTIONS_WITH_ARG = {"--ldbd", "--format"}
-TOP_OPTIONS_NOARG    = {"--verbose", "--raw"}
+TOP_OPTIONS_WITH_ARG = {"--ldbd", "--format", "--ssh", "--ssh-key",
+                        "--ssh-options", "--ldbd-path"}
+TOP_OPTIONS_NOARG    = {"--verbose", "--raw", "--repl"}
 HELP_FLAGS           = {"--help", "-h"}
 
 CLIENT_VERSION = "0.1.0"
@@ -581,13 +669,37 @@ def parse_argv(argv: list[str]) -> dict:
         "format": "json",
         "verbose": False,
         "raw": False,
+        "repl": False,
         "help_top": False,
         "version": False,
         "method": None,
         "method_help": False,
         "params": [],     # list[str] — key=value
         "view": [],       # list[(key, value)]
+        "ssh": None,
+        "ssh_key": None,
+        "ssh_options": None,
+        "ldbd_path": None,
     }
+
+    def _set_long_arg(key: str, val: str):
+        if key == "--format":
+            if val not in ("json", "cbor"):
+                raise ValueError(
+                    f"--format must be json|cbor, got {val!r}")
+            out["format"] = val
+        elif key == "--ldbd":
+            out["ldbd"] = val
+        elif key == "--ssh":
+            out["ssh"] = val
+        elif key == "--ssh-key":
+            out["ssh_key"] = val
+        elif key == "--ssh-options":
+            out["ssh_options"] = val
+        elif key == "--ldbd-path":
+            out["ldbd_path"] = val
+        else:
+            raise ValueError(f"unknown option: {key}")
 
     i = 0
     n = len(argv)
@@ -596,14 +708,7 @@ def parse_argv(argv: list[str]) -> dict:
         if a in TOP_OPTIONS_WITH_ARG:
             if i + 1 >= n:
                 raise ValueError(f"{a} requires an argument")
-            if a == "--ldbd":
-                out["ldbd"] = argv[i + 1]
-            elif a == "--format":
-                fmt = argv[i + 1]
-                if fmt not in ("json", "cbor"):
-                    raise ValueError(
-                        f"--format must be json|cbor, got {fmt!r}")
-                out["format"] = fmt
+            _set_long_arg(a, argv[i + 1])
             i += 2
         elif a == "--verbose":
             out["verbose"] = True
@@ -611,22 +716,19 @@ def parse_argv(argv: list[str]) -> dict:
         elif a == "--raw":
             out["raw"] = True
             i += 1
+        elif a == "--repl":
+            out["repl"] = True
+            i += 1
         elif a in HELP_FLAGS and out["method"] is None:
             out["help_top"] = True
             i += 1
         elif a == "--version" and out["method"] is None:
             out["version"] = True
             i += 1
-        elif a.startswith("--format=") or a.startswith("--ldbd="):
+        elif "=" in a and a.startswith("--") and a.split("=", 1)[0] in TOP_OPTIONS_WITH_ARG:
             # Accept --foo=bar form too.
             key, _, val = a.partition("=")
-            if key == "--format":
-                if val not in ("json", "cbor"):
-                    raise ValueError(
-                        f"--format must be json|cbor, got {val!r}")
-                out["format"] = val
-            else:
-                out["ldbd"] = val
+            _set_long_arg(key, val)
             i += 1
         elif out["method"] is None:
             if a.startswith("--"):
@@ -666,6 +768,457 @@ def parse_argv(argv: list[str]) -> dict:
 
 
 # ----------------------------------------------------------------------
+# Interactive REPL (post-V1 plan #10).
+#
+# Keeps ONE `ldbd --stdio` subprocess alive for the whole session. The
+# win vs the one-shot CLI is daemon-side state persistence: `target_id`
+# from `target.open` is usable in later `module.list` / `disasm.*` calls
+# without re-opening the binary.
+#
+# Tab completion uses prompt_toolkit if importable, else readline.
+# Meta-commands (prefix `:`) are routed locally; everything else is
+# parsed by the same schema-driven path as the one-shot CLI.
+# ----------------------------------------------------------------------
+
+REPL_META_HELP = (
+    "Meta-commands:\n"
+    "  :help              show this help and list endpoints\n"
+    "  :explain METHOD    print an endpoint's schema and summary\n"
+    "  :cost              show per-endpoint p50 token-cost stats\n"
+    "  :replay            re-run the most recent non-meta command\n"
+    "  :quit, :q          exit (Ctrl-D / EOF also exits)\n"
+    "\n"
+    "Endpoint syntax (same as the CLI):\n"
+    "  > target.open path=/bin/true\n"
+    "  > module.list target_id=1 --view limit=5\n"
+)
+
+
+class _ReplSession:
+    """Owns the persistent daemon and routes one line of input.
+
+    Construction spawns the daemon and fetches the catalog once. Each
+    `dispatch(line)` either runs a meta-command, runs an endpoint, or
+    returns a sentinel meaning "exit".
+    """
+
+    EXIT = object()
+
+    def __init__(self, spec, fmt: str, verbose: bool, raw: bool):
+        self.spec = spec
+        self.fmt = fmt
+        self.verbose = verbose
+        self.raw = raw
+        self.proc = spawn_daemon(spec, fmt, verbose)
+        self.tr = CborTransport(self.proc) if fmt == "cbor" else JsonTransport(self.proc)
+        self.next_id = 0
+        self.catalog = self._fetch_catalog()
+        self.by_method = {e.get("method"): e for e in self.catalog
+                          if isinstance(e, dict)}
+        self.last_method: str | None = None
+        self.last_params: dict | None = None
+
+    # -- catalog / rpc --------------------------------------------------
+
+    def _rpc(self, method: str, params: dict | None = None) -> dict:
+        self.next_id += 1
+        req = {"jsonrpc": "2.0", "id": f"r{self.next_id}", "method": method}
+        if params is not None:
+            req["params"] = params
+        if self.verbose:
+            sys.stderr.write(f"ldb: -> {json.dumps(req)}\n")
+        self.tr.send(req)
+        resp = self.tr.recv()
+        if resp is None:
+            stderr = self.proc.stderr.read().decode("utf-8", errors="replace")
+            raise IOError(
+                f"daemon closed stdout (stderr was: {stderr})")
+        if self.verbose:
+            sys.stderr.write(f"ldb: <- {json.dumps(resp)[:512]}\n")
+        return resp
+
+    def _fetch_catalog(self) -> list[dict]:
+        resp = self._rpc("describe.endpoints")
+        if not resp.get("ok"):
+            err = resp.get("error", {})
+            raise RuntimeError(
+                f"describe.endpoints failed: {err.get('code')} "
+                f"{err.get('message')}")
+        eps = resp.get("data", {}).get("endpoints", [])
+        if not isinstance(eps, list):
+            raise RuntimeError("describe.endpoints: malformed catalog")
+        return eps
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    # -- input parsing --------------------------------------------------
+
+    @staticmethod
+    def _tokenize(line: str) -> list[str]:
+        """Shell-like splitting that respects single/double quotes.
+
+        Falls back to a naive split on bare whitespace. We don't use
+        shlex.split because we want to surface its errors as user-
+        visible parse failures, not raise.
+        """
+        import shlex
+        try:
+            return shlex.split(line, posix=True)
+        except ValueError as e:
+            raise ValueError(f"parse error: {e}") from None
+
+    def _parse_command(self, tokens: list[str]) -> tuple[str, list[str], list[tuple[str, str]]]:
+        """Split tokens into (method, [k=v, ...], [(view_k, view_v), ...]).
+
+        Same shape as the one-shot CLI's argparse pass, minus top-level
+        options (already consumed at startup).
+        """
+        if not tokens:
+            raise ValueError("empty command")
+        method = tokens[0]
+        params: list[str] = []
+        view: list[tuple[str, str]] = []
+        i = 1
+        n = len(tokens)
+        while i < n:
+            a = tokens[i]
+            if a == "--view":
+                if i + 1 >= n:
+                    raise ValueError("--view requires k=v")
+                kv = tokens[i + 1]
+                if "=" not in kv:
+                    raise ValueError(f"--view expects k=v, got {kv!r}")
+                k, _, v = kv.partition("=")
+                view.append((k, v))
+                i += 2
+            elif a.startswith("--view="):
+                kv = a[len("--view="):]
+                if "=" not in kv:
+                    raise ValueError(f"--view= expects k=v, got {kv!r}")
+                k, _, v = kv.partition("=")
+                view.append((k, v))
+                i += 1
+            elif a.startswith("--"):
+                raise ValueError(f"unknown option in repl: {a}")
+            else:
+                params.append(a)
+                i += 1
+        return method, params, view
+
+    # -- dispatch -------------------------------------------------------
+
+    def dispatch(self, line: str):
+        s = line.strip()
+        if not s:
+            return None
+        if s.startswith(":"):
+            return self._dispatch_meta(s)
+        try:
+            tokens = self._tokenize(s)
+            method, params, view = self._parse_command(tokens)
+        except ValueError as e:
+            sys.stderr.write(f"ldb: {e}\n")
+            return None
+        return self._run_method(method, params, view, remember=True)
+
+    def _dispatch_meta(self, s: str):
+        if s in (":q", ":quit", ":exit"):
+            return self.EXIT
+        if s in (":help", ":h"):
+            self._print_help()
+            return None
+        if s == ":cost":
+            self._print_cost()
+            return None
+        if s == ":replay":
+            if self.last_method is None:
+                sys.stderr.write("ldb: nothing to replay yet\n")
+                return None
+            # Replay re-runs the SAME method+params; don't re-stamp
+            # last_* so :replay :replay :replay all redo the same call.
+            method = self.last_method
+            params = self.last_params or {}
+            resp = self._rpc(method, params)
+            self._print_response(method, resp)
+            return None
+        if s.startswith(":explain"):
+            parts = s.split(None, 1)
+            if len(parts) != 2:
+                sys.stderr.write("usage: :explain <method>\n")
+                return None
+            self._print_explain(parts[1].strip())
+            return None
+        sys.stderr.write(f"ldb: unknown meta-command: {s}\n")
+        sys.stderr.write("     try :help\n")
+        return None
+
+    def _run_method(self, method, params, view, remember):
+        entry = self.by_method.get(method)
+        params_schema = (entry.get("params_schema", {}) or {}) if entry else {}
+        required = list(params_schema.get("required", []) or [])
+        try:
+            kv_pairs = parse_kv_pairs(params)
+            built = build_params(kv_pairs, view, params_schema)
+        except ValueError as e:
+            sys.stderr.write(f"ldb: {e}\n")
+            return None
+        missing = [r for r in required if r not in built]
+        if missing:
+            sys.stderr.write(
+                f"ldb: {method}: required param(s) missing: "
+                f"{', '.join(missing)}\n"
+                f"     try `:explain {method}` for the parameter list.\n")
+            return None
+        try:
+            resp = self._rpc(method, built)
+        except IOError as e:
+            sys.stderr.write(f"ldb: {e}\n")
+            return self.EXIT
+        if remember:
+            self.last_method = method
+            self.last_params = built
+        self._print_response(method, resp)
+        return None
+
+    # -- printing -------------------------------------------------------
+
+    def _print_response(self, method: str, resp: dict):
+        # REPL always pretty-prints the FULL envelope (same as --raw on
+        # the one-shot CLI). Agents/humans use the REPL to inspect
+        # everything including _cost; the one-shot CLI's default of
+        # data-only is for shell pipelines.
+        sys.stdout.write(json.dumps(resp, indent=2) + "\n")
+        sys.stdout.flush()
+        if not resp.get("ok"):
+            err = resp.get("error", {})
+            sys.stderr.write(
+                f"ldb: {method}: error {err.get('code')}: "
+                f"{err.get('message', '')}\n")
+
+    def _print_help(self):
+        sys.stdout.write(REPL_META_HELP)
+        sys.stdout.write("\nEndpoints (from describe.endpoints):\n")
+        rows = []
+        for e in self.catalog:
+            m = e.get("method", "?")
+            s = e.get("summary", "")
+            if len(s) > 70:
+                s = s[:67] + "..."
+            rows.append((m, s))
+        rows.sort(key=lambda r: r[0])
+        width = max((len(m) for m, _ in rows), default=20)
+        for m, s in rows:
+            sys.stdout.write(f"  {m:<{width}}  {s}\n")
+        sys.stdout.flush()
+
+    def _print_explain(self, method: str):
+        entry = self.by_method.get(method)
+        if entry is None:
+            sys.stderr.write(f"ldb: unknown method: {method}\n")
+            return
+        # Re-use render_method_help and ALSO dump the raw schema JSON so
+        # `:explain` is the agent's canonical "how do I call this" view.
+        sys.stdout.write(render_method_help(entry))
+        sys.stdout.write("\nFull schema entry:\n")
+        sys.stdout.write(json.dumps(entry, indent=2) + "\n")
+        sys.stdout.flush()
+
+    def _print_cost(self):
+        try:
+            resp = self._rpc(
+                "describe.endpoints",
+                {"view": {"include_cost_stats": True}})
+        except IOError as e:
+            sys.stderr.write(f"ldb: {e}\n")
+            return
+        if not resp.get("ok"):
+            err = resp.get("error", {})
+            sys.stderr.write(
+                f"ldb: :cost: error {err.get('code')}: "
+                f"{err.get('message', '')}\n")
+            return
+        eps = resp.get("data", {}).get("endpoints", []) or []
+        rows = []
+        for e in eps:
+            if not isinstance(e, dict):
+                continue
+            n = e.get("cost_n_samples")
+            if not isinstance(n, int) or n == 0:
+                continue
+            rows.append((
+                e.get("method", "?"),
+                n,
+                e.get("cost_p50_tokens", "-"),
+            ))
+        if not rows:
+            sys.stdout.write(
+                "(no measured costs yet — issue some calls first)\n")
+            sys.stdout.flush()
+            return
+        rows.sort(key=lambda r: r[0])
+        width = max(len(m) for m, _, _ in rows)
+        sys.stdout.write(
+            f"  {'method':<{width}}  cost_n_samples  cost_p50_tokens\n")
+        for m, n, p50 in rows:
+            sys.stdout.write(f"  {m:<{width}}  {n:>14}  {p50!s:>15}\n")
+        sys.stdout.flush()
+
+    # -- completion -----------------------------------------------------
+
+    def complete_first_token(self, prefix: str) -> list[str]:
+        out = [m for m in self.by_method.keys()
+               if m and m.startswith(prefix)]
+        out += [c for c in (":help", ":explain", ":cost", ":replay",
+                            ":quit", ":q")
+                if c.startswith(prefix)]
+        out.sort()
+        return out
+
+    def complete_param_key(self, method: str, prefix: str) -> list[str]:
+        entry = self.by_method.get(method)
+        if entry is None:
+            return []
+        props = (entry.get("params_schema", {}) or {}).get("properties", {}) or {}
+        return sorted(f"{k}=" for k in props.keys()
+                      if isinstance(k, str) and k.startswith(prefix))
+
+
+def _make_completer_prompt_toolkit(session: _ReplSession):
+    """Build a prompt_toolkit Completer; None if prompt_toolkit absent."""
+    try:
+        from prompt_toolkit.completion import Completer, Completion
+    except ImportError:
+        return None
+
+    class LdbCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text_before = document.text_before_cursor
+            words = text_before.split()
+            # If text_before ends in whitespace, we're starting a new word.
+            starting_new = (not text_before) or text_before[-1].isspace()
+            if not words or (len(words) == 1 and not starting_new):
+                # First token completion.
+                prefix = words[0] if words else ""
+                for c in session.complete_first_token(prefix):
+                    yield Completion(c, start_position=-len(prefix))
+                return
+            method = words[0]
+            current = "" if starting_new else words[-1]
+            # Only complete on a fresh `--foo` or `key=...` slot; leave
+            # the right-hand side of `key=` alone.
+            if "=" in current:
+                return
+            for c in session.complete_param_key(method, current):
+                yield Completion(c, start_position=-len(current))
+
+    return LdbCompleter()
+
+
+def _install_readline_completion(session: _ReplSession):
+    """Install a readline completer. No-op if readline isn't importable."""
+    try:
+        import readline
+    except ImportError:
+        return
+
+    # readline tokenization: we drop most word breaks so "target.open"
+    # and "target_id=1" complete as single words.
+    readline.set_completer_delims(" \t\n")
+
+    state_cache: list[str] = []
+
+    def completer(text, state):
+        if state == 0:
+            state_cache.clear()
+            line = readline.get_line_buffer()
+            begidx = readline.get_begidx()
+            head = line[:begidx]
+            words_before = head.split()
+            if not words_before:
+                state_cache.extend(session.complete_first_token(text))
+            else:
+                state_cache.extend(
+                    session.complete_param_key(words_before[0], text))
+        if state < len(state_cache):
+            return state_cache[state]
+        return None
+
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
+
+
+def run_repl(spec, fmt: str, verbose: bool, raw: bool) -> int:
+    """Drive an interactive ldb session against ONE persistent daemon.
+
+    Returns the exit code. EOF, :quit, :q, :exit all exit cleanly with
+    code 0. Daemon-spawn / catalog-fetch errors exit nonzero.
+    """
+    try:
+        session = _ReplSession(spec, fmt, verbose, raw)
+    except (IOError, RuntimeError) as e:
+        sys.stderr.write(f"ldb: repl startup failed: {e}\n")
+        return 1
+
+    interactive = sys.stdin.isatty()
+
+    # Choose input strategy. prompt_toolkit if available AND stdin is a
+    # tty; readline as fallback (still has emacs-style line editing on
+    # tty); plain stdin.readline() when piped (smoke tests).
+    pt_session = None
+    if interactive:
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.history import InMemoryHistory
+            completer = _make_completer_prompt_toolkit(session)
+            pt_session = PromptSession(
+                completer=completer, history=InMemoryHistory())
+        except ImportError:
+            pt_session = None
+            _install_readline_completion(session)
+
+    try:
+        while True:
+            try:
+                if pt_session is not None:
+                    line = pt_session.prompt("ldb> ")
+                elif interactive:
+                    line = input("ldb> ")
+                else:
+                    line = sys.stdin.readline()
+                    if line == "":
+                        break  # EOF on piped stdin
+                    line = line.rstrip("\n")
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                # Match shell-like UX: clear current line, keep looping.
+                if interactive:
+                    sys.stdout.write("\n")
+                    continue
+                break
+            result = session.dispatch(line)
+            if result is session.EXIT:
+                break
+    finally:
+        session.close()
+    if interactive:
+        sys.stdout.write("\n")
+    return 0
+
+
+# ----------------------------------------------------------------------
 # Entry point.
 # ----------------------------------------------------------------------
 
@@ -680,9 +1233,34 @@ def main(argv: list[str]) -> int:
         print(f"ldb {CLIENT_VERSION}")
         return 0
 
-    ldbd = find_ldbd(opts["ldbd"])
+    # LDB_SSH_TARGET (if set) overrides --ssh, matching the convention
+    # used elsewhere (env beats flag — same precedence as LDB_STORE_ROOT
+    # for the daemon). Empty env value is treated as unset.
+    env_ssh = os.environ.get("LDB_SSH_TARGET") or None
+    if env_ssh:
+        opts["ssh"] = env_ssh
+
+    if opts["ssh"] and opts["ldbd"]:
+        sys.stderr.write(
+            "ldb: --ssh and --ldbd are mutually exclusive\n")
+        return 2
+
+    spec = DaemonSpec()
+    if opts["ssh"]:
+        spec.ssh_target = opts["ssh"]
+        spec.ssh_key = opts["ssh_key"]
+        spec.ssh_options = opts["ssh_options"]
+        if opts["ldbd_path"]:
+            spec.remote_ldbd = opts["ldbd_path"]
+    else:
+        spec.local_ldbd = find_ldbd(opts["ldbd"])
     fmt = opts["format"]
     verbose = opts["verbose"]
+
+    if opts["repl"]:
+        # --repl ignores any positional method; the user drives the
+        # session interactively. We still respect --raw/--verbose/--format.
+        return run_repl(spec, fmt, verbose, opts["raw"])
 
     # Fetch catalog only when we need it.
     needs_catalog = (
@@ -690,7 +1268,7 @@ def main(argv: list[str]) -> int:
     )
     catalog: list[dict] = []
     if needs_catalog:
-        catalog = fetch_catalog(ldbd, fmt, verbose)
+        catalog = fetch_catalog(spec, fmt, verbose)
 
     if opts["help_top"]:
         sys.stdout.write(render_top_help(catalog))
@@ -737,7 +1315,7 @@ def main(argv: list[str]) -> int:
             f"     run `ldb {method} --help` for the parameter list.\n")
         return 2
 
-    resp = do_rpc(ldbd, fmt, verbose, method, params)
+    resp = do_rpc(spec, fmt, verbose, method, params)
 
     if opts["raw"]:
         sys.stdout.write(json.dumps(resp, indent=2) + "\n")

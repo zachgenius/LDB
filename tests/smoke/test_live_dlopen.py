@@ -44,6 +44,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ptrace_probe import maybe_skip_ptrace
+
 
 LIVE_RE = re.compile(r"^live:([0-9]+):([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{64})$")
 
@@ -122,6 +125,7 @@ def main():
         sys.stderr.write(f"ldbd not executable: {ldbd}\n"); sys.exit(1)
     if not os.path.isfile(dlopener):
         sys.stderr.write(f"dlopener missing: {dlopener}\n"); sys.exit(1)
+    maybe_skip_ptrace(ldbd, "smoke_live_dlopen")
 
     inferior = subprocess.Popen(
         [dlopener], stdout=subprocess.PIPE, stderr=subprocess.PIPE,

@@ -33,6 +33,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ptrace_probe import maybe_skip_ptrace
+
 
 LIVE_RE = re.compile(r"^live:[0-9]+:[0-9a-f]{64}:[0-9a-f]{64}:[0-9a-f]{64}$")
 
@@ -92,6 +95,7 @@ def main():
         sys.stderr.write(f"ldbd not executable: {ldbd}\n"); sys.exit(1)
     if not os.path.isfile(sleeper):
         sys.stderr.write(f"sleeper missing: {sleeper}\n"); sys.exit(1)
+    maybe_skip_ptrace(ldbd, "smoke_live_provenance")
 
     inferior = subprocess.Popen(
         [sleeper], stdout=subprocess.PIPE, stderr=subprocess.PIPE,

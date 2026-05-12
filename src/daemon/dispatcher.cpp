@@ -10,7 +10,11 @@
 #include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
+#include "perf/perf_parser.h"
+#include "perf/perf_runner.h"
+#include "probes/agent_engine.h"
 #include "probes/probe_orchestrator.h"
+#include "python/embed.h"
 #include "protocol/view.h"
 #include "store/artifact_store.h"
 #include "store/hypothesis.h"
@@ -21,7 +25,10 @@
 #include "transport/ssh.h"
 #include "util/log.h"
 
+#include <unistd.h>
+
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -417,12 +424,14 @@ Dispatcher::Dispatcher(std::shared_ptr<backend::DebuggerBackend> backend,
                        std::shared_ptr<store::ArtifactStore> artifacts,
                        std::shared_ptr<store::SessionStore> sessions,
                        std::shared_ptr<probes::ProbeOrchestrator> probes,
-                       std::shared_ptr<observers::ExecAllowlist> exec_allowlist)
+                       std::shared_ptr<observers::ExecAllowlist> exec_allowlist,
+                       std::string backend_name)
     : backend_(std::move(backend)),
       artifacts_(std::move(artifacts)),
       sessions_(std::move(sessions)),
       probes_(std::move(probes)),
-      exec_allowlist_(std::move(exec_allowlist)) {}
+      exec_allowlist_(std::move(exec_allowlist)),
+      backend_name_(std::move(backend_name)) {}
 
 Dispatcher::~Dispatcher() = default;
 
@@ -696,6 +705,18 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "probe.enable")       return handle_probe_enable(req);
     if (req.method == "probe.delete")       return handle_probe_delete(req);
 
+    if (req.method == "perf.record")        return handle_perf_record(req);
+    if (req.method == "perf.report")        return handle_perf_report(req);
+    if (req.method == "perf.cancel")        return handle_perf_cancel(req);
+
+    if (req.method == "agent.hello")        return handle_agent_hello(req);
+
+    if (req.method == "process.set_python_unwinder")
+                                              return handle_process_set_python_unwinder(req);
+    if (req.method == "process.unwind_one") return handle_process_unwind_one(req);
+    if (req.method == "process.list_frames_python")
+                                              return handle_process_list_frames_python(req);
+
     if (req.method == "observer.proc.fds")    return handle_observer_proc_fds(req);
     if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
     if (req.method == "observer.proc.status") return handle_observer_proc_status(req);
@@ -763,6 +784,9 @@ Response Dispatcher::handle_hello(const Request& req) {
 #else
       {"disasm_backend", "lldb"},
 #endif
+      // v1.4 #8: echo the active DebuggerBackend so agents can
+      // branch behavior. "lldb" (default) or "gdb" (GdbMiBackend).
+      {"backend", backend_name_.empty() ? "lldb" : backend_name_},
   };
   data["formats"] = json::array({"json", "cbor"});
   return protocol::make_ok(req.id, std::move(data));
@@ -2064,21 +2088,28 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
 
     add("recipe.create",
         "Create a named, parameterized recipe — a reusable RPC sequence "
-        "the agent can replay against fresh inputs. Storage is a "
-        "`recipe-v1` artifact under build_id \"_recipes\"; the recipe_id "
-        "IS the artifact id, so artifact.delete is a valid GC path. "
-        "Parameter substitution is whole-string-match: a STRING value "
-        "in calls[].params equal to \"{slot}\" is replaced with the "
-        "caller's parameter value at recipe.run time.",
+        "(format=\"recipe-v1\", default) OR an embedded Python module "
+        "with `def run(ctx): ...` (format=\"python-v1\", post-V1 #9). "
+        "Storage is a `recipe-v1` artifact under build_id \"_recipes\"; "
+        "the recipe_id IS the artifact id, so artifact.delete is a "
+        "valid GC path. For recipe-v1, parameter substitution is "
+        "whole-string-match: a STRING value in calls[].params equal to "
+        "\"{slot}\" is replaced with the caller's parameter value at "
+        "recipe.run time. For python-v1, the recipe.run `args` dict is "
+        "passed verbatim as the `ctx` parameter to `run(ctx)`; see "
+        "docs/20-embedded-python.md.",
         obj({
             {"name",        str()},
             {"description", str()},
+            {"format",      enum_str({"recipe-v1", "python-v1"})},
             {"calls",       arr_of(recipe_call_schema)},
+            {"body",        str("Python module source (python-v1 only)")},
             {"parameters",  arr_of(recipe_param_schema)},
-        }, {"name", "calls"}),
+        }, {"name"}),
         obj({
             {"recipe_id",  int_()},
             {"name",       str()},
+            {"format",     enum_str({"recipe-v1", "python-v1"})},
             {"call_count", int_()},
         }, {"recipe_id", "name", "call_count"}),
         /*requires_target=*/false, /*requires_stopped=*/false, "low");
@@ -2229,7 +2260,7 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
       "only). rate_limit is parsed but UNENFORCED.",
       obj({
           {"target_id",     optional_target_id_param()},
-          {"kind",          enum_str({"lldb_breakpoint", "uprobe_bpf"})},
+          {"kind",          enum_str({"lldb_breakpoint", "uprobe_bpf", "agent"})},
           {"where",         obj({
               {"function",   str()},
               {"address",    uint_()},
@@ -2332,6 +2363,180 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"deleted",  bool_()},
       }, {"probe_id", "deleted"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== perf.* (post-V1 plan #13) ==============
+  //
+  // Sibling to probe.*; shells out to the system `perf` binary. Samples
+  // are shaped to align with the BPF agent event schema #12 is landing
+  // (ts_ns, tid, pid, cpu, stack: [{addr, sym, mod}]). See
+  // docs/22-perf-integration.md.
+
+  add("perf.record",
+      "Spawn `perf record` against a pid or a fresh command and "
+      "synchronously return the resulting perf.data artifact id plus "
+      "parsed samples. Synchronous in phase 1 — duration_ms is capped "
+      "at 300000 (5 min). Errors: perf missing, kernel.perf_event_paranoid "
+      "too strict, target pid vanished, ArtifactStore not configured.",
+      obj({
+          {"pid",          int_("OS pid to sample; mutually exclusive "
+                                "with `command`.")},
+          {"command",      arr_of(str(), "argv to spawn + sample; "
+                                          "mutually exclusive with `pid`.")},
+          {"duration_ms",  uint_("Wall-clock duration. Required for pid "
+                                  "mode; capped at 300000.")},
+          {"frequency_hz", uint_("perf -F; default 99.")},
+          {"events",       arr_of(str(), "perf -e; default [\"cycles\"].")},
+          {"call_graph",   enum_str({"fp", "dwarf", "lbr"},
+                                     "perf --call-graph; default \"fp\".")},
+          {"build_id",     str("ArtifactStore key prefix for the perf.data "
+                                "blob. Default \"_perf\".")},
+      }),
+      obj({
+          {"artifact_id",   int_()},
+          {"artifact_name", str()},
+          {"sample_count",  uint_()},
+          {"duration_ms",   uint_()},
+          {"perf_argv",     arr_of(str())},
+          {"stderr_tail",   str()},
+          {"parse_errors",  arr_of(str(), "Non-fatal parse errors from "
+                                           "the perf script ingestion. "
+                                           "Empty on a clean trace.")},
+      }, {"artifact_id", "artifact_name", "sample_count"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+  add("perf.report",
+      "Re-parse an existing perf.data artifact and return its samples. "
+      "Lets the agent ask for a different stack depth or sample cap "
+      "without re-recording.",
+      obj({
+          {"artifact_id",    int_()},
+          {"max_samples",    uint_("Default 0 = no cap.")},
+          {"max_stack_depth",uint_("Default 0 = no cap.")},
+      }, {"artifact_id"}),
+      obj({
+          {"samples", arr_of(obj({
+              {"ts_ns", int_()},
+              {"tid",   uint_()},
+              {"pid",   uint_()},
+              {"cpu",   int_()},
+              {"comm",  str()},
+              {"event", str()},
+              {"stack", arr_of(obj({
+                  {"addr", str("Hex IP, e.g. \"0x412af0\".")},
+                  {"sym",  str()},
+                  {"mod",  str()},
+              }))},
+          }))},
+          {"total",          uint_()},
+          {"truncated",      bool_()},
+          {"perf_data_size", uint_()},
+          {"parse_errors",   arr_of(str())},
+      }, {"samples", "total"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "high");
+
+  add("perf.cancel",
+      "Send SIGTERM to an in-flight perf.record subprocess. Phase 1: "
+      "perf.record is synchronous so there is never an in-flight call; "
+      "this endpoint exists for catalog completeness and returns "
+      "-32002 kBadState until the async variant lands.",
+      obj({{"record_id", str()}}, {"record_id"}),
+      obj({
+          {"record_id", str()},
+          {"cancelled", bool_()},
+      }, {"record_id", "cancelled"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  // ============== agent.* (post-V1 #12 phase-2) ==============
+  // The `ldb-probe-agent` binary is the privileged half of the probe
+  // stack: it links libbpf and (optionally) carries embedded CO-RE
+  // skeletons. The daemon spawns it on demand and speaks length-
+  // prefixed JSON over the agent's stdio. agent.hello is phase-2's
+  // ground-truth wire test — full attach_* / poll_events routing is
+  // wired through the ProbeOrchestrator in a follow-up commit.
+  add("agent.hello",
+      "Spawn ldb-probe-agent, perform a hello round-trip, return the "
+      "agent's version + libbpf version + BTF availability + embedded "
+      "program list. The agent exits after the round-trip (the daemon "
+      "sends shutdown). Errors:\n"
+      "  • -32002 kBadState: agent binary not found (set "
+      "$LDB_PROBE_AGENT, install on $PATH, or build alongside ldbd).\n"
+      "  • -32000 kBackendError: spawn / pipe / protocol failure.\n"
+      "See docs/21-probe-agent.md for the wire protocol.",
+      obj({}),
+      obj({
+          {"agent_path",        str()},
+          {"agent_version",     str()},
+          {"libbpf_version",    str()},
+          {"btf_present",       bool_()},
+          {"embedded_programs", arr_of(str())},
+      }, {"agent_path", "agent_version", "libbpf_version",
+          "btf_present", "embedded_programs"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  // ============== process.set_python_unwinder / unwind_one (post-V1 #14) ==
+  add("process.set_python_unwinder",
+      "Register a Python frame-unwinder callable against a target. The "
+      "module must define `def run(ctx): ...`; ctx carries "
+      "{ip, sp, fp, registers?} and the callable returns either null "
+      "(fall through to LLDB's default unwind) or a dict with "
+      "{next_ip, next_sp, next_fp}. Compile errors at registration are "
+      "surfaced as -32602 kInvalidParams. Phase-1 stores the callable; "
+      "real SBUnwinder hookup so LLDB's stack walker calls into it "
+      "during ordinary frame enumeration is phase-2.",
+      obj({
+          {"target_id", int_()},
+          {"body",      str()},
+      }, {"target_id", "body"}),
+      obj({
+          {"target_id",  int_()},
+          {"registered", bool_()},
+      }, {"target_id", "registered"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("process.unwind_one",
+      "Invoke the registered Python unwinder against a synthetic frame "
+      "{ip, sp, fp} and return the result verbatim. This is a phase-1 "
+      "observability endpoint — it lets agents and tests exercise the "
+      "unwinder without a real stopped process. Returns -32002 "
+      "kBadState when no unwinder is registered for the target.",
+      obj({
+          {"target_id", int_()},
+          {"ip",        int_()},
+          {"sp",        int_()},
+          {"fp",        int_()},
+          {"registers", obj({})},
+      }, {"target_id", "ip", "sp", "fp"}),
+      obj({
+          {"target_id", int_()},
+          {"result",    obj({})},
+      }, {"target_id", "result"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  add("process.list_frames_python",
+      "Iteratively invoke the registered Python unwinder starting from "
+      "the caller-supplied {ip, sp, fp}, collecting frames until the "
+      "unwinder returns null (LLDB-fallback signal), an incomplete dict "
+      "(missing next_ip / next_sp / next_fp), max_frames is reached, "
+      "or a cycle is detected on (next_ip, next_sp). max_frames "
+      "defaults to 32 and is clamped to 1024 to bound dispatcher "
+      "wall-time. Independent of LLDB's SBUnwinder — useful today for "
+      "offline analysis and validating a custom unwinder against a "
+      "known trace. Returns -32002 if no unwinder is registered.",
+      obj({
+          {"target_id",  int_()},
+          {"ip",         int_()},
+          {"sp",         int_()},
+          {"fp",         int_()},
+          {"registers",  obj({})},
+          {"max_frames", int_()},
+      }, {"target_id", "ip", "sp", "fp"}),
+      obj({
+          {"target_id",   int_()},
+          {"frames",      arr_of(obj({}))},
+          {"stop_reason", enum_str({"null_return", "incomplete_return",
+                                     "max_frames", "cycle"})},
+      }, {"target_id", "frames", "stop_reason"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   // ============== observer.* ==============
 
@@ -2579,9 +2784,20 @@ Response Dispatcher::handle_target_connect_remote(const Request& req) {
     plugin = it->get<std::string>();
   }
 
-  auto status = backend_->connect_remote_target(
-      static_cast<backend::TargetId>(tid), *url, plugin);
-  return protocol::make_ok(req.id, process_status_to_json(status));
+  try {
+    auto status = backend_->connect_remote_target(
+        static_cast<backend::TargetId>(tid), *url, plugin);
+    return protocol::make_ok(req.id, process_status_to_json(status));
+  } catch (const backend::Error& e) {
+    // "does not support" → -32003 forbidden so agents can branch
+    // backends cleanly (e.g. fall back to --backend=lldb on rr://
+    // URLs the gdb backend rejects).
+    const std::string what = e.what();
+    if (what.find("does not support") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden, what);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+  }
 }
 
 Response Dispatcher::handle_target_connect_remote_ssh(const Request& req) {
@@ -2647,12 +2863,20 @@ Response Dispatcher::handle_target_connect_remote_ssh(const Request& req) {
     opts.setup_timeout = std::chrono::milliseconds(timeout_ms);
   }
 
-  auto result = backend_->connect_remote_target_ssh(
-      static_cast<backend::TargetId>(tid), opts);
-  json data = process_status_to_json(result.status);
-  data["target_id"]         = tid;
-  data["local_tunnel_port"] = result.local_tunnel_port;
-  return protocol::make_ok(req.id, std::move(data));
+  try {
+    auto result = backend_->connect_remote_target_ssh(
+        static_cast<backend::TargetId>(tid), opts);
+    json data = process_status_to_json(result.status);
+    data["target_id"]         = tid;
+    data["local_tunnel_port"] = result.local_tunnel_port;
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const backend::Error& e) {
+    const std::string what = e.what();
+    if (what.find("does not support") != std::string::npos) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden, what);
+    }
+    return protocol::make_err(req.id, ErrorCode::kBackendError, what);
+  }
 }
 
 Response Dispatcher::handle_process_detach(const Request& req) {
@@ -5378,21 +5602,24 @@ Response Dispatcher::handle_recipe_create(const Request& req) {
     }
     description = it->get<std::string>();
   }
-  auto cit = req.params.find("calls");
-  if (cit == req.params.end() || !cit->is_array() || cit->empty()) {
-    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
-                              "missing non-empty array param 'calls'");
-  }
-  std::vector<ldb::store::RecipeCall> calls;
-  calls.reserve(cit->size());
-  for (const auto& c : *cit) {
-    std::string err;
-    auto call = parse_recipe_call(c, &err);
-    if (!err.empty()) {
-      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+
+  // Format dispatch. Absent / "recipe-v1" → call-sequence recipe (the
+  // long-standing shape). "python-v1" → embed.h Callable; requires
+  // `body`, ignores `calls`. The two formats share `parameters`.
+  std::string format = "recipe-v1";
+  if (auto it = req.params.find("format");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_string()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'format' must be a string");
     }
-    calls.push_back(std::move(call));
+    format = it->get<std::string>();
+    if (format != "recipe-v1" && format != "python-v1") {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'format' must be one of {\"recipe-v1\", \"python-v1\"}");
+    }
   }
+
   std::vector<ldb::store::RecipeParameter> parameters;
   if (auto pit = req.params.find("parameters");
       pit != req.params.end() && !pit->is_null()) {
@@ -5411,12 +5638,53 @@ Response Dispatcher::handle_recipe_create(const Request& req) {
     }
   }
 
+  if (format == "python-v1") {
+    if (!ldb::python::Interpreter::available()) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "python-v1 recipes require ldbd built with LDB_ENABLE_PYTHON "
+          "(pkg-config python3-embed >= 3.11)");
+    }
+    auto bit = req.params.find("body");
+    if (bit == req.params.end() || !bit->is_string()
+        || bit->get<std::string>().empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "python-v1 recipes require non-empty string param 'body'");
+    }
+    ldb::store::RecipeStore rs(*artifacts_);
+    auto r = rs.create_python_recipe(*name, std::move(description),
+                                     std::move(parameters),
+                                     bit->get<std::string>());
+    json data;
+    data["recipe_id"]  = r.id;
+    data["name"]       = r.name;
+    data["format"]     = "python-v1";
+    data["call_count"] = 0;
+    return protocol::make_ok(req.id, std::move(data));
+  }
+
+  auto cit = req.params.find("calls");
+  if (cit == req.params.end() || !cit->is_array() || cit->empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "missing non-empty array param 'calls'");
+  }
+  std::vector<ldb::store::RecipeCall> calls;
+  calls.reserve(cit->size());
+  for (const auto& c : *cit) {
+    std::string err;
+    auto call = parse_recipe_call(c, &err);
+    if (!err.empty()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams, err);
+    }
+    calls.push_back(std::move(call));
+  }
+
   ldb::store::RecipeStore rs(*artifacts_);
   auto r = rs.create(*name, std::move(description),
                      std::move(parameters), std::move(calls));
   json data;
   data["recipe_id"]  = r.id;
   data["name"]       = r.name;
+  data["format"]     = "recipe-v1";
   data["call_count"] = static_cast<std::int64_t>(r.calls.size());
   return protocol::make_ok(req.id, std::move(data));
 }
@@ -5656,7 +5924,25 @@ Response Dispatcher::handle_recipe_lint(const Request& req) {
                               "recipe not found: " + std::to_string(id));
   }
 
-  auto warnings = ldb::store::lint_recipe(*r);
+  std::vector<ldb::store::LintWarning> warnings;
+  if (r->python_body.has_value()) {
+    // python-v1 recipes have no `calls` to lint; the meaningful check
+    // is "does the body compile?". Attempt construction; SyntaxError
+    // becomes a single LintWarning at step_index=0. Other Python
+    // errors at construction time (e.g. missing run() callable) also
+    // land here so the agent can fix them before a recipe.run.
+    try {
+      ldb::python::Callable c(*r->python_body, "<recipe:" + r->name + ">");
+      (void)c;  // construction-only lint; don't invoke.
+    } catch (const ldb::backend::Error& e) {
+      ldb::store::LintWarning w;
+      w.step_index = 0;
+      w.message    = e.what();
+      warnings.push_back(std::move(w));
+    }
+  } else {
+    warnings = ldb::store::lint_recipe(*r);
+  }
   json warn_arr = json::array();
   for (const auto& w : warnings) {
     warn_arr.push_back(json{{"step_index", w.step_index},
@@ -5768,12 +6054,68 @@ Response Dispatcher::handle_recipe_run(const Request& req) {
     }
     caller_args = *it;
   }
+  // python-v1 recipes use `args` instead of `parameters` since there is
+  // no placeholder substitution — the dict is the literal `ctx` passed
+  // into the recipe's `run(ctx)`. Accept both shapes; `args` wins when
+  // both are present so callers can keep typed-shape predictability.
+  json py_args = caller_args;
+  if (auto it = req.params.find("args");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_object()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "'args' must be an object");
+    }
+    py_args = *it;
+  }
 
   ldb::store::RecipeStore rs(*artifacts_);
   auto r = rs.get(id);
   if (!r.has_value()) {
     return protocol::make_err(req.id, ErrorCode::kBackendError,
                               "recipe not found: " + std::to_string(id));
+  }
+
+  if (r->python_body.has_value()) {
+    if (!ldb::python::Interpreter::available()) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "python-v1 recipes require ldbd built with LDB_ENABLE_PYTHON");
+    }
+    try {
+      ldb::python::Callable c(*r->python_body,
+                              "<recipe:" + r->name + ">");
+      json result = c.invoke(py_args);
+      json data;
+      data["recipe_id"] = id;
+      data["format"]    = "python-v1";
+      data["result"]    = std::move(result);
+      // Surface captured stdout/stderr so an agent can keep prints
+      // useful for debugging without violating the JSON-RPC stdout
+      // discipline. Empty strings stay in the response so the shape
+      // is stable across runs.
+      data["stdout"]    = c.last_stdout();
+      data["stderr"]    = c.last_stderr();
+      return protocol::make_ok(req.id, std::move(data));
+    } catch (const ldb::backend::Error& e) {
+      // The embed wrapper sets last_exception_* on the Callable but
+      // we've destructed it by now — extract from the message. The
+      // wrapper formats as "python: <type>: <msg>"; split on the
+      // first ": " after "python:" to recover the structured shape.
+      std::string what = e.what();
+      json err_data = json::object();
+      const std::string prefix = "python: ";
+      if (what.rfind(prefix, 0) == 0) {
+        std::string rest = what.substr(prefix.size());
+        auto colon = rest.find(": ");
+        if (colon != std::string::npos) {
+          err_data["exception_type"] = rest.substr(0, colon);
+          err_data["message"]        = rest.substr(colon + 2);
+        } else {
+          err_data["exception_type"] = rest;
+        }
+      }
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+                                what, std::move(err_data));
+    }
   }
 
   // Stop-on-first-error policy. The brief asks for either stop or
@@ -5968,8 +6310,13 @@ Response Dispatcher::handle_probe_create(const Request& req) {
                               "missing non-empty string param 'kind'");
   }
 
-  // ---- uprobe_bpf path ---------------------------------------------------
-  if (*kind == "uprobe_bpf") {
+  // ---- uprobe_bpf / agent path -------------------------------------------
+  // Both engines share the BPF-style where-shape ({uprobe, kprobe,
+  // tracepoint}) and probe-event surface. uprobe_bpf shells bpftrace;
+  // agent talks length-prefixed JSON to ldb-probe-agent via libbpf
+  // (post-V1 plan #12). The dispatcher parses identically and the
+  // orchestrator routes on ps.kind.
+  if (*kind == "uprobe_bpf" || *kind == "agent") {
     auto wit = req.params.find("where");
     if (wit == req.params.end() || !wit->is_object()) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams,
@@ -6066,7 +6413,7 @@ Response Dispatcher::handle_probe_create(const Request& req) {
 
     probes::ProbeSpec ps;
     ps.target_id           = static_cast<backend::TargetId>(target_id);
-    ps.kind                = "uprobe_bpf";
+    ps.kind                = *kind;  // "uprobe_bpf" or "agent"
     ps.bpftrace_where      = std::move(bw);
     ps.bpftrace_args       = std::move(bpf_args);
     ps.bpftrace_filter_pid = filter_pid;
@@ -6080,11 +6427,12 @@ Response Dispatcher::handle_probe_create(const Request& req) {
       return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
     }
     // backend::Error from start() (bpftrace missing, attach failed, etc.)
+    // or from AgentEngine (no agent binary, agent-side error)
     // propagates through dispatch_inner's catch → -32000.
 
     json data;
     data["probe_id"] = probe_id;
-    data["kind"]     = "uprobe_bpf";
+    data["kind"]     = ps.kind;
     return protocol::make_ok(req.id, std::move(data));
   }
 
@@ -6392,6 +6740,519 @@ Response Dispatcher::handle_probe_delete(const Request& req) {
   data["probe_id"] = *probe_id;
   data["deleted"]  = true;
   return protocol::make_ok(req.id, std::move(data));
+}
+
+// ---- perf.* handlers (post-V1 plan #13) --------------------------------
+//
+// See docs/22-perf-integration.md. The runner is synchronous in phase 1
+// (perf.record blocks for `duration_ms`); perf.cancel is wired in
+// `describe.endpoints` for catalog completeness and returns
+// kBadState until the async variant lands.
+
+namespace {
+
+json perf_sample_to_view_json(const ldb::perf::Sample& s) {
+  return ldb::perf::PerfParser::sample_to_json(s);
+}
+
+}  // namespace
+
+Response Dispatcher::handle_perf_record(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+
+  ldb::perf::RecordSpec spec;
+
+  // pid xor command
+  bool have_pid = false;
+  std::int64_t pid_v = 0;
+  if (auto it = req.params.find("pid");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_number_integer() && !it->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "pid must be integer");
+    }
+    pid_v = it->get<std::int64_t>();
+    if (pid_v <= 0) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "pid must be positive");
+    }
+    have_pid = true;
+  }
+  bool have_cmd = false;
+  if (auto it = req.params.find("command");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_array()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "command must be array of string");
+    }
+    for (const auto& a : *it) {
+      if (!a.is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "command entries must be strings");
+      }
+      spec.command.push_back(a.get<std::string>());
+    }
+    have_cmd = !spec.command.empty();
+  }
+  if (have_pid == have_cmd) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "exactly one of pid|command must be set");
+  }
+  if (have_pid) spec.pid = pid_v;
+
+  // perf record -- <cmd> execs <cmd> directly after the trace interval;
+  // a JSON-RPC client supplying `command` is requesting arbitrary process
+  // spawn. Route it through the same operator-policy allowlist as
+  // observer.exec instead of trusting the wire. pid mode is fine —
+  // observer-side decision about which pids the agent can sample is
+  // outside this surface (it's kernel + perf_event_paranoid territory).
+  if (have_cmd) {
+    if (!exec_allowlist_) {
+      return protocol::make_err(req.id, ErrorCode::kBadState,
+          "perf.record command mode disabled — no allowlist configured. "
+          "Set --observer-exec-allowlist or LDB_OBSERVER_EXEC_ALLOWLIST, "
+          "or use pid mode against an already-running process.");
+    }
+    if (!exec_allowlist_->allows(spec.command)) {
+      return protocol::make_err(req.id, ErrorCode::kForbidden,
+          "perf.record: command not allowed by operator policy");
+    }
+  }
+
+  // duration_ms (uint). Required for pid mode; optional for command mode
+  // (the command's lifetime is the trace duration), but if supplied we
+  // still cap-check.
+  std::uint64_t duration_ms = 0;
+  if (auto it = req.params.find("duration_ms");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "duration_ms", &duration_ms)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "duration_ms must be non-negative integer");
+    }
+    spec.duration = std::chrono::milliseconds(static_cast<long long>(duration_ms));
+  } else if (have_pid) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "duration_ms required when pid is set");
+  }
+
+  // 10 kHz upper bound. Above this, sampling pressure starts producing
+  // multi-GB perf.data files in a 5-minute trace and the kernel itself
+  // typically throttles unprivileged perf at 1 kHz anyway. Daemon-side
+  // cap is the cheap guard before disk/RAM exhaustion (see also the
+  // perf.data size cap below).
+  constexpr std::uint64_t kMaxFrequencyHz = 10000;
+  std::uint64_t freq = 0;
+  if (auto it = req.params.find("frequency_hz");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "frequency_hz", &freq) || freq == 0) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "frequency_hz must be positive integer");
+    }
+    if (freq > kMaxFrequencyHz) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "frequency_hz exceeds " + std::to_string(kMaxFrequencyHz)
+            + " Hz daemon cap");
+    }
+    spec.frequency_hz = static_cast<std::uint32_t>(freq);
+  }
+
+  if (auto it = req.params.find("events");
+      it != req.params.end() && !it->is_null()) {
+    if (!it->is_array()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "events must be array of string");
+    }
+    for (const auto& a : *it) {
+      if (!a.is_string()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                  "events entries must be strings");
+      }
+      std::string ev = a.get<std::string>();
+      if (ev.empty()) {
+        return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+            "events entries must be non-empty strings");
+      }
+      spec.events.push_back(std::move(ev));
+    }
+  }
+
+  if (const auto* cg = require_string(req.params, "call_graph")) {
+    if (!cg->empty() && *cg != "fp" && *cg != "dwarf" && *cg != "lbr") {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "call_graph must be one of {fp, dwarf, lbr}");
+    }
+    spec.call_graph = *cg;
+  }
+
+  std::string build_id = "_perf";
+  if (const auto* bi = require_string(req.params, "build_id"); bi && !bi->empty()) {
+    build_id = *bi;
+  }
+
+  // Execute. perf::PerfRunner throws backend::Error on subprocess
+  // failure; the dispatcher's outer catch maps that to -32000.
+  ldb::perf::RecordResult result = ldb::perf::PerfRunner::record(spec);
+
+  // Slurp the perf.data file into the ArtifactStore. The cap exists
+  // because perf record at high frequency with --call-graph dwarf can
+  // emit multi-GB traces; blindly resize()-ing into RAM and copying to
+  // the artifact store would put 2x that on disk plus 1x in memory.
+  // 256 MiB is comfortable for typical 5-minute traces at 99 Hz fp
+  // call-graph; agents who genuinely need more can chunk by time.
+  constexpr std::streamsize kMaxPerfDataBytes =
+      static_cast<std::streamsize>(256) * 1024 * 1024;
+  std::vector<std::uint8_t> blob;
+  {
+    std::ifstream f(result.perf_data_path, std::ios::binary);
+    if (!f) {
+      ::unlink(result.perf_data_path.c_str());
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+                                "perf record succeeded but the perf.data "
+                                "temp file is unreadable");
+    }
+    f.seekg(0, std::ios::end);
+    std::streamsize sz = f.tellg();
+    if (sz < 0) sz = 0;
+    if (sz > kMaxPerfDataBytes) {
+      ::unlink(result.perf_data_path.c_str());
+      return protocol::make_err(req.id, ErrorCode::kBackendError,
+          "perf.data exceeds daemon cap (" + std::to_string(sz)
+            + " > " + std::to_string(kMaxPerfDataBytes)
+            + " bytes); shorten duration_ms, lower frequency_hz, or "
+              "drop --call-graph dwarf");
+    }
+    f.seekg(0, std::ios::beg);
+    blob.resize(static_cast<std::size_t>(sz));
+    if (sz > 0) f.read(reinterpret_cast<char*>(blob.data()), sz);
+  }
+  ::unlink(result.perf_data_path.c_str());
+
+  // Name with a UTC timestamp suffix so multiple records on the same
+  // build_id don't collide.
+  std::string artifact_name;
+  {
+    auto t = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    struct tm tm_buf{};
+    gmtime_r(&t, &tm_buf);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "perf-%Y%m%dT%H%M%SZ.data", &tm_buf);
+    artifact_name = buf;
+  }
+
+  json meta = json::object();
+  meta["perf_argv"]      = result.perf_argv;
+  meta["sample_count"]   = result.parsed.samples.size();
+  meta["parse_errors"]   = result.parsed.parse_errors;
+  if (!result.parsed.hostname.empty())   meta["hostname"]   = result.parsed.hostname;
+  if (!result.parsed.os_release.empty()) meta["os_release"] = result.parsed.os_release;
+  if (!result.parsed.arch.empty())       meta["arch"]       = result.parsed.arch;
+
+  ldb::store::ArtifactRow row;
+  try {
+    row = artifacts_->put(build_id, artifact_name, blob,
+                          std::string("perf.data"), meta);
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError,
+                              std::string("artifact store put failed: ")
+                                  + e.what());
+  }
+
+  json data;
+  data["artifact_id"]   = row.id;
+  data["artifact_name"] = row.name;
+  data["sample_count"]  = result.parsed.samples.size();
+  data["duration_ms"]   = result.wall_duration.count();
+  data["perf_argv"]     = result.perf_argv;
+  data["stderr_tail"]   = result.stderr_tail;
+  data["parse_errors"]  = result.parsed.parse_errors;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_perf_report(const Request& req) {
+  if (auto e = require_artifact_store(req, artifacts_)) return *e;
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t artifact_id = 0;
+  if (!require_uint(req.params, "artifact_id", &artifact_id) || artifact_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "artifact_id must be positive integer");
+  }
+  std::uint64_t max_samples = 0;
+  if (auto it = req.params.find("max_samples");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "max_samples", &max_samples)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "max_samples must be non-negative integer");
+    }
+  }
+  std::uint64_t max_stack = 0;
+  if (auto it = req.params.find("max_stack_depth");
+      it != req.params.end() && !it->is_null()) {
+    if (!require_uint(req.params, "max_stack_depth", &max_stack)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                                "max_stack_depth must be non-negative integer");
+    }
+  }
+
+  auto row_opt = artifacts_->get_by_id(static_cast<std::int64_t>(artifact_id));
+  if (!row_opt) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "artifact_id not found");
+  }
+
+  ldb::perf::ReportSpec rs;
+  rs.perf_data_path  = row_opt->stored_path;
+  rs.max_samples     = static_cast<std::int64_t>(max_samples);
+  rs.max_stack_depth = static_cast<std::int64_t>(max_stack);
+
+  ldb::perf::ReportResult result = ldb::perf::PerfRunner::report(rs);
+
+  json arr = json::array();
+  for (const auto& s : result.parsed.samples) {
+    arr.push_back(perf_sample_to_view_json(s));
+  }
+  json data;
+  data["samples"]        = std::move(arr);
+  // `total` is the pre-truncation count so an agent capping with
+  // max_samples can tell whether to widen the cap. Mirrors what
+  // view::apply_to_array does for paginated read-path endpoints.
+  data["total"]          = result.total_samples;
+  data["truncated"]      = result.truncated;
+  data["perf_data_size"] = row_opt->byte_size;
+  data["parse_errors"]   = result.parsed.parse_errors;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_process_set_python_unwinder(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) || target_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "target_id must be positive integer");
+  }
+  auto bit = req.params.find("body");
+  if (bit == req.params.end() || !bit->is_string()
+      || bit->get<std::string>().empty()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+        "missing non-empty string param 'body'");
+  }
+  if (!ldb::python::Interpreter::available()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "process.set_python_unwinder requires ldbd built with "
+        "LDB_ENABLE_PYTHON");
+  }
+  try {
+    auto callable = std::make_unique<ldb::python::Callable>(
+        bit->get<std::string>(),
+        "<unwinder:target=" + std::to_string(target_id) + ">");
+    python_unwinders_[target_id] = std::move(callable);
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams, e.what());
+  }
+  json data;
+  data["target_id"] = target_id;
+  data["registered"] = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_process_unwind_one(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) || target_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "target_id must be positive integer");
+  }
+  auto it = python_unwinders_.find(target_id);
+  if (it == python_unwinders_.end()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "no python unwinder registered for target_id=" +
+        std::to_string(target_id));
+  }
+  // ctx is the frame state the unwinder operates on. The four required
+  // keys mirror the canonical "stack walker" interface; the unwinder
+  // returns either null (fall through to LLDB's default) or a dict with
+  // the next frame's {next_ip, next_sp, next_fp}.
+  json ctx = json::object();
+  for (const char* key : {"ip", "sp", "fp"}) {
+    auto pit = req.params.find(key);
+    if (pit == req.params.end() || pit->is_null()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("missing integer param '") + key + "'");
+    }
+    if (!pit->is_number_integer() && !pit->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("'") + key + "' must be an integer");
+    }
+    ctx[key] = *pit;
+  }
+  if (auto reg = req.params.find("registers");
+      reg != req.params.end() && reg->is_object()) {
+    ctx["registers"] = *reg;
+  }
+  try {
+    json result = it->second->invoke(ctx);
+    json data;
+    data["target_id"] = target_id;
+    data["result"]    = std::move(result);
+    data["stdout"]    = it->second->last_stdout();
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  }
+}
+
+Response Dispatcher::handle_process_list_frames_python(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) || target_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "target_id must be positive integer");
+  }
+  auto it = python_unwinders_.find(target_id);
+  if (it == python_unwinders_.end()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "no python unwinder registered for target_id=" +
+        std::to_string(target_id));
+  }
+  json ctx = json::object();
+  for (const char* key : {"ip", "sp", "fp"}) {
+    auto pit = req.params.find(key);
+    if (pit == req.params.end() || pit->is_null()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("missing integer param '") + key + "'");
+    }
+    if (!pit->is_number_integer() && !pit->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("'") + key + "' must be an integer");
+    }
+    ctx[key] = *pit;
+  }
+  if (auto reg = req.params.find("registers");
+      reg != req.params.end() && reg->is_object()) {
+    ctx["registers"] = *reg;
+  }
+
+  // Caller-supplied cap on iterations. 32 is a sane default for typical
+  // user-mode stacks; the daemon-side hard cap of 1024 prevents a
+  // pathological unwinder (returning a slow chain) from blocking the
+  // dispatcher arbitrarily.
+  std::uint64_t max_frames = 32;
+  if (auto mit = req.params.find("max_frames");
+      mit != req.params.end() && !mit->is_null()) {
+    if (!require_uint(req.params, "max_frames", &max_frames)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'max_frames' must be non-negative integer");
+    }
+  }
+  constexpr std::uint64_t kHardCap = 1024;
+  if (max_frames == 0 || max_frames > kHardCap) max_frames = kHardCap;
+
+  json frames = json::array();
+  std::string stop_reason = "max_frames";
+  // (ip, sp) pairs we've already seen → cycle guard. Misbehaving
+  // unwinders that always return the same frame would loop forever.
+  std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+
+  try {
+    for (std::uint64_t i = 0; i < max_frames; ++i) {
+      json result = it->second->invoke(ctx);
+      if (result.is_null()) { stop_reason = "null_return"; break; }
+      if (!result.is_object()
+          || !result.contains("next_ip")
+          || !result.contains("next_sp")
+          || !result.contains("next_fp")) {
+        // A non-null, non-frame return is treated as a stop signal —
+        // the unwinder declined to advance. Surface what was returned
+        // for diagnosis.
+        json entry;
+        entry["ctx"]      = ctx;
+        entry["returned"] = std::move(result);
+        frames.push_back(std::move(entry));
+        stop_reason = "incomplete_return";
+        break;
+      }
+      auto next_ip = result["next_ip"].get<std::uint64_t>();
+      auto next_sp = result["next_sp"].get<std::uint64_t>();
+      auto next_fp = result["next_fp"].get<std::uint64_t>();
+      // Cycle check BEFORE pushing — if (next_ip, next_sp) is one we've
+      // already seen, the walk has looped. Including the repeated frame
+      // would make "got N distinct frames before cycling" indistinguish-
+      // able from "got the same frame twice and stopped"; this way
+      // frames.size() is the count of distinct (ip, sp) pairs the
+      // unwinder produced.
+      if (!seen.insert({next_ip, next_sp}).second) {
+        stop_reason = "cycle";
+        break;
+      }
+      frames.push_back(result);
+      ctx["ip"] = next_ip;
+      ctx["sp"] = next_sp;
+      ctx["fp"] = next_fp;
+    }
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  }
+
+  json data;
+  data["target_id"]   = target_id;
+  data["frames"]      = std::move(frames);
+  data["stop_reason"] = stop_reason;
+  data["stdout"]      = it->second->last_stdout();
+  return protocol::make_ok(req.id, std::move(data));
+}
+
+Response Dispatcher::handle_agent_hello(const Request& req) {
+  std::string path = ldb::probes::AgentEngine::discover_agent();
+  if (path.empty()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "ldb-probe-agent not found — set $LDB_PROBE_AGENT, install on "
+        "$PATH, or build ldb-probe-agent alongside ldbd (requires "
+        "libbpf via pkg-config at cmake time)");
+  }
+  try {
+    ldb::probes::AgentEngine eng(path);
+    auto ok = eng.hello();
+    json data;
+    data["agent_path"]        = path;
+    data["agent_version"]     = ok.version;
+    data["libbpf_version"]    = ok.libbpf_version;
+    data["btf_present"]       = ok.btf_present;
+    data["embedded_programs"] = ok.embedded_programs;
+    return protocol::make_ok(req.id, std::move(data));
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  }
+}
+
+Response Dispatcher::handle_perf_cancel(const Request& req) {
+  // Phase 1: perf.record is synchronous, so there's never anything to
+  // cancel. We return -32002 kBadState with a deterministic message so
+  // an agent can detect "this build does not support async record".
+  // Even param-malformed cases get this error preferentially — the
+  // surface is intentionally trivial.
+  if (!req.params.is_object() || !req.params.contains("record_id")) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "record_id required");
+  }
+  return protocol::make_err(req.id, ErrorCode::kBadState,
+                            "perf.record is synchronous in this build; "
+                            "no in-flight record to cancel");
 }
 
 // ---- observer.* handlers ------------------------------------------------

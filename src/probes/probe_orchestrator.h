@@ -225,11 +225,19 @@ class ProbeOrchestrator {
   std::map<std::string, std::shared_ptr<ProbeState>> probes_;
   std::uint64_t                                 next_probe_seq_ = 1;
 
+  // Lazily-spawned ldb-probe-agent shared by every kind=="agent" probe
+  // for the session lifetime. One subprocess per orchestrator. nullptr
+  // until the first kind=="agent" probe.create.
+  std::unique_ptr<class AgentEngine>            agent_engine_;
+
   static bool on_breakpoint_hit(void* baton,
                                 const backend::BreakpointCallbackArgs& args);
 
   // kind=="uprobe_bpf" path.
   std::string create_uprobe_bpf(const ProbeSpec& spec_in);
+
+  // kind=="agent" path (post-V1 plan #12 phase-3).
+  std::string create_agent(const ProbeSpec& spec_in);
 };
 
 }  // namespace ldb::probes

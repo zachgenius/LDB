@@ -26,6 +26,7 @@
 #include "daemon/dispatcher.h"
 #include "protocol/jsonrpc.h"
 #include "store/artifact_store.h"
+#include "ptrace_probe.h"
 
 #include <algorithm>
 #include <chrono>
@@ -130,6 +131,7 @@ std::unique_ptr<Sleeper> spawn_sleeper() {
 
 TEST_CASE("dispatcher: mem.dump_artifact happy path on the sleeper",
           "[dispatcher][mem][dump][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   TmpStoreRoot t;
   auto be       = std::make_shared<LldbBackend>();
   auto store    = std::make_shared<ArtifactStore>(t.root);
@@ -211,6 +213,7 @@ TEST_CASE("dispatcher: mem.dump_artifact happy path on the sleeper",
 
 TEST_CASE("dispatcher: mem.dump_artifact replaces on duplicate (build_id, name)",
           "[dispatcher][mem][dump][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   TmpStoreRoot t;
   auto be       = std::make_shared<LldbBackend>();
   auto store    = std::make_shared<ArtifactStore>(t.root);
@@ -347,6 +350,7 @@ TEST_CASE("dispatcher: mem.dump_artifact backend read failure → -32000",
 
 TEST_CASE("dispatcher: mem.dump_artifact len > 1 MiB → -32000",
           "[dispatcher][mem][dump][error]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   TmpStoreRoot t;
   auto be    = std::make_shared<LldbBackend>();
   auto store = std::make_shared<ArtifactStore>(t.root);

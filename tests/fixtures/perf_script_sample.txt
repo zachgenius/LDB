@@ -1,0 +1,25 @@
+# ========
+# captured on    : Mon May 11 12:00:00 2026
+# hostname       : devbox
+# os release     : 6.18.7-76061807-generic
+# perf version   : 6.8.12
+# arch           : x86_64
+# cpudesc        : AMD Ryzen
+# cmdline        : perf record -F 99 -p 12345 -g -o /tmp/perf.data -- sleep 0.5
+# event          : name = cycles, , size = 136, { sample_period, sample_freq }
+# ========
+#
+foo 12345/12345 [003] 1700000000.123456:    cycles:        1234567:            412af0 main+0x10 (/home/zach/foo)
+                                                                       7ffe12340000 __libc_start_main+0x80 (/lib/x86_64-linux-gnu/libc.so.6)
+                                                                       7ffe12340100 _start+0x20 (/home/zach/foo)
+
+foo 12345/12345 [003] 1700000000.224000:    cycles:        2345678:            412b00 do_work+0x30 (/home/zach/foo)
+                                                                            412af8 main+0x18 (/home/zach/foo)
+                                                                       7ffe12340000 __libc_start_main+0x80 (/lib/x86_64-linux-gnu/libc.so.6)
+
+foo 12345/12346 [001] 1700000000.300000:    cycles:        3456789:            412c00 [unknown] (/home/zach/foo)
+
+foo 12345/12345 [003] 1700000000.401234:    cycles:        4567890:            412b08 do_work+0x38 (/home/zach/foo)
+                                                                            412af8 main+0x18 (/home/zach/foo)
+
+worker 12345/12347 [002] 1700000000.500000:    cycles:        5000000:        0 [unknown]

@@ -10,6 +10,7 @@
 #include <catch_amalgamated.hpp>
 
 #include "backend/lldb_backend.h"
+#include "ptrace_probe.h"
 
 #include <algorithm>
 #include <chrono>
@@ -136,6 +137,7 @@ TEST_CASE("mem.read: invalid target_id throws backend::Error",
 
 TEST_CASE("mem.read: returns 8 bytes from a relocated global on the sleeper",
           "[backend][memory][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   auto a = attach_to_sleeper();
 
   auto syms = a->backend->find_symbols(
@@ -153,6 +155,7 @@ TEST_CASE("mem.read: returns 8 bytes from a relocated global on the sleeper",
 
 TEST_CASE("mem.read_cstr: reads the sleeper's k_marker via pointer indirection",
           "[backend][memory][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   auto a = attach_to_sleeper();
 
   // k_marker is a const char* const pointing to "LDB_SLEEPER_MARKER_v1".
@@ -176,6 +179,7 @@ TEST_CASE("mem.read_cstr: reads the sleeper's k_marker via pointer indirection",
 
 TEST_CASE("mem.read_cstr: max_len caps the result",
           "[backend][memory][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   auto a = attach_to_sleeper();
 
   auto syms = a->backend->find_symbols(
@@ -213,6 +217,7 @@ TEST_CASE("mem.regions: returns at least one executable region",
 
 TEST_CASE("mem.search: finds the marker string in the sleeper's memory",
           "[backend][memory][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   auto a = attach_to_sleeper();
   std::string needle_str = "LDB_SLEEPER_MARKER_v1";
   std::vector<std::uint8_t> needle(needle_str.begin(), needle_str.end());
@@ -225,6 +230,7 @@ TEST_CASE("mem.search: finds the marker string in the sleeper's memory",
 
 TEST_CASE("mem.search: respects max_hits cap",
           "[backend][memory][live]") {
+  LDB_SKIP_WITHOUT_PTRACE();
   auto a = attach_to_sleeper();
   // A single byte will match many places — useful to test the cap.
   std::vector<std::uint8_t> needle = {0x00};

@@ -326,6 +326,68 @@ set_tests_properties(smoke_recipe PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #9 phase-2: python-v1 recipe format end-to-end.
+# SKIPs when ldbd was built without LDB_ENABLE_PYTHON.
+add_test(
+  NAME smoke_recipe_python
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_recipe_python.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_recipe_python PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #12 phase-2: agent.hello round-trip through ldbd.
+# SKIPs when ldb-probe-agent wasn't built (no libbpf on the host).
+if(LDB_BPF_AGENT_BUILD)
+  add_test(
+    NAME smoke_probe_agent
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe_agent.py"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb-probe-agent>"
+  )
+  set_tests_properties(smoke_probe_agent PROPERTIES
+    TIMEOUT 30
+  )
+
+  # Post-V1 plan #12 phase-3: orchestrator routing of kind=agent probes.
+  # Accepts both the live happy path and the no-BPF-toolchain "agent
+  # returns not_supported" path so it passes on dev boxes without
+  # clang+bpftool+CAP_BPF.
+  add_test(
+    NAME smoke_probe_agent_route
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe_agent_route.py"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb-probe-agent>"
+  )
+  set_tests_properties(smoke_probe_agent_route PROPERTIES
+    TIMEOUT 30
+  )
+endif()
+
+# Post-V1 plan #14 phase-1: Python frame unwinders.
+# SKIPs cleanly when ldbd was built without LDB_ENABLE_PYTHON
+# (test self-detects via describe.endpoints).
+add_test(
+  NAME smoke_python_unwinder
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_python_unwinder.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_python_unwinder PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #14 phase-2: multi-step process.list_frames_python walk.
+# Same skip-gate as the single-step phase-1 smoke.
+add_test(
+  NAME smoke_python_unwinder_walk
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_python_unwinder_walk.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_python_unwinder_walk PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_probe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe.py"
@@ -371,6 +433,19 @@ add_test(
 )
 set_tests_properties(smoke_uprobe_bpf PROPERTIES
   TIMEOUT 60
+)
+
+# Post-V1 plan #13: perf record/report integration. SKIPs cleanly on
+# hosts without `perf` (no linux-tools) or with kernel.perf_event_paranoid
+# too strict for unprivileged use.
+add_test(
+  NAME smoke_perf_record
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_perf_record.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_sleeper>"
+)
+set_tests_properties(smoke_perf_record PROPERTIES
+  TIMEOUT 30
 )
 
 add_test(
@@ -513,6 +588,44 @@ add_test(
           "$<TARGET_FILE:ldbd>"
 )
 set_tests_properties(smoke_cost_p50 PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #10: interactive REPL with persistent daemon, meta-
+# commands (:explain / :cost / :replay / :quit), tab completion via
+# prompt_toolkit-or-readline fallback.
+add_test(
+  NAME smoke_cli_repl
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_cli_repl.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_cli_repl PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #11: --ssh transport on the `ldb` CLI. A shell shim on
+# PATH stands in for `ssh`, so this test runs without a real remote.
+add_test(
+  NAME smoke_cli_ssh
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_ldb_cli_ssh.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+)
+set_tests_properties(smoke_cli_ssh PROPERTIES
+  TIMEOUT 30
+)
+
+# Post-V1 plan #8: cross-backend smoke under ldbd --backend=gdb.
+# SKIPs cleanly when gdb is not on PATH.
+add_test(
+  NAME smoke_gdbmi_backend
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_gdbmi_backend.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_gdbmi_backend PROPERTIES
   TIMEOUT 30
 )
 
