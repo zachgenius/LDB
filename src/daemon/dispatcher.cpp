@@ -9,6 +9,7 @@
 #include "index/symbol_index.h"
 #include "ldb/version.h"
 #include "protocol/cost.h"
+#include "protocol/provenance.h"
 #include "protocol/version.h"
 #include "observers/exec_allowlist.h"
 #include "observers/observers.h"
@@ -5668,12 +5669,12 @@ bool is_meta_method_for_replay(const std::string& method) {
          std::string_view(method).substr(0, 8) == "session.";
 }
 
-// Best-effort sanity check on a string snapshot value: is it
-// deterministic-flavored per docs/04 §1 (== starts with "core:")?
+// Best-effort sanity check on a string snapshot value: defer to the
+// existing protocol::provenance::is_deterministic to avoid duplicate
+// definitions of the "what counts as deterministic" predicate
+// (docs/04 §1).
 bool snapshot_is_deterministic(const std::string& s) {
-  static constexpr std::string_view kCorePrefix = "core:";
-  return s.size() > kCorePrefix.size() &&
-         std::string_view(s).substr(0, kCorePrefix.size()) == kCorePrefix;
+  return ldb::protocol::provenance::is_deterministic(s);
 }
 
 // Parse `request_json` (compact JSON written by Writer::append) back
