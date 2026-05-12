@@ -2002,8 +2002,10 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
       obj({
           {"session_id", str("32-hex session id to replay.")},
           {"against",    str("Reserved for phase-2 (target pre-open / "
-                             "path remap). Phase-1 accepts but doesn't "
-                             "act on it.")},
+                             "path remap). Phase-1 validates shape "
+                             "(non-empty string OR positive integer) "
+                             "but doesn't act on it. Future phase-2 "
+                             "uses string=path, integer=target_id.")},
           {"strict",     bool_("If true, stop on the first deterministic "
                                "byte-mismatch. Default false.")},
           {"view",       view_param()},
@@ -5659,12 +5661,13 @@ namespace {
 
 // Is this a meta-call we should skip during replay?
 //   session.* methods are skipped — they recurse or no-op against a
-//   fresh dispatcher, per docs/24 §2.2 step 1.
+//   fresh dispatcher, per docs/24 §2.2 step 1. recipe.run is
+//   intentionally NOT skipped in phase-1; it fan-outs into multiple
+//   dispatches and any non-determinism inside will surface as a
+//   replay_error or deterministic_mismatch entry, which is honest
+//   per-step accounting. Phase-2 may add an explicit recipe.run skip
+//   if the noise outweighs the signal.
 bool is_meta_method_for_replay(const std::string& method) {
-  // Note: also skip recipe.run; it can fan out into hundreds of
-  // sub-dispatches and isn't deterministic across daemons today.
-  // Phase-2 may revisit. Keep the list narrow to session.* for now —
-  // that's what the design doc commits to.
   return method.size() >= 8 &&
          std::string_view(method).substr(0, 8) == "session.";
 }
@@ -5718,11 +5721,29 @@ Response Dispatcher::handle_session_replay(const Request& req) {
     strict = it->get<bool>();
   }
   // `against` is reserved for phase-2 (cross-host / explicit target
-  // pre-open). Phase-1 accepts it for forward-compat but doesn't act
-  // on it — the replay walks rows as captured and any target.open
-  // rows re-issue against the recorded path. Documented in docs/24
-  // §2.2 step 2 and §7.
-  (void)req.params.find("against");
+  // pre-open). Phase-1 doesn't act on it, but we DO validate shape so
+  // phase-2 can trust that any value reaching it has already cleared
+  // the gate. Accepts null/absent (no-op), a non-empty string (target
+  // path), or a positive integer (target_id). Anything else is
+  // rejected now to prevent garbage from accumulating in stored
+  // rpc_logs that phase-2 would then have to defend against.
+  if (auto it = req.params.find("against");
+      it != req.params.end() && !it->is_null()) {
+    bool ok = false;
+    if (it->is_string()) {
+      ok = !it->get<std::string>().empty();
+    } else if (it->is_number_unsigned()) {
+      ok = it->get<std::uint64_t>() > 0;
+    } else if (it->is_number_integer()) {
+      ok = it->get<std::int64_t>() > 0;
+    }
+    if (!ok) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'against' must be a non-empty string (path) or positive "
+          "integer (target_id); reserved for phase-2 cross-host "
+          "replay (see docs/24 §2.2 step 2)");
+    }
+  }
 
   auto rows = sessions_->read_log(*sid);
 

@@ -435,19 +435,47 @@ SessionStore::read_log(std::string_view id,
     throw backend::Error("session_store.read_log: open " +
                          session_path.string());
   }
-  std::string sql =
-      "SELECT seq, ts_ns, method, request, response, ok, duration_us, "
-      "       snapshot "
-      "FROM rpc_log";
+  // Per-session dbs created before commit d7f5137 lack the `snapshot`
+  // column on rpc_log. migrate_session_db only runs on writer-side
+  // paths (create / fork / import); reads against a pre-#16 db would
+  // otherwise throw "no such column: snapshot" — bricking every
+  // session.diff / session.targets / session.replay against legacy
+  // stores. Mirror pack.cpp's two-attempt fallback: try the new SELECT
+  // first, fall back to the legacy SELECT with snapshot="" on prepare
+  // failure. Empty snapshot maps to non-deterministic at the replay
+  // gate (docs/24 §3.1), which is the conservative semantics for any
+  // log row written before the column existed.
+  std::string sql_tail;
   bool has_since = (since_seq > 0);
   bool has_until = (until_seq > 0);
-  if (has_since || has_until) sql += " WHERE";
-  if (has_since)               sql += " seq >= ?1";
-  if (has_since && has_until)  sql += " AND";
-  if (has_until)               sql += has_since ? " seq < ?2" : " seq < ?1";
-  sql += " ORDER BY seq ASC;";
+  if (has_since || has_until) sql_tail += " WHERE";
+  if (has_since)               sql_tail += " seq >= ?1";
+  if (has_since && has_until)  sql_tail += " AND";
+  if (has_until)               sql_tail += has_since ? " seq < ?2" : " seq < ?1";
+  sql_tail += " ORDER BY seq ASC;";
 
-  auto stmt = prepare_or_throw(db, sql);
+  std::string sql_new =
+      "SELECT seq, ts_ns, method, request, response, ok, duration_us, "
+      "       snapshot "
+      "FROM rpc_log" + sql_tail;
+  std::string sql_old =
+      "SELECT seq, ts_ns, method, request, response, ok, duration_us "
+      "FROM rpc_log" + sql_tail;
+
+  sqlite3_stmt* raw_stmt = nullptr;
+  bool has_snapshot = true;
+  if (sqlite3_prepare_v2(db, sql_new.c_str(), -1, &raw_stmt, nullptr)
+      != SQLITE_OK) {
+    has_snapshot = false;
+    if (sqlite3_prepare_v2(db, sql_old.c_str(), -1, &raw_stmt, nullptr)
+        != SQLITE_OK) {
+      std::string msg = std::string("sqlite: read_log prepare: ")
+                      + sqlite3_errmsg(db);
+      sqlite3_close(db);
+      throw backend::Error(msg);
+    }
+  }
+  StmtGuard stmt(raw_stmt);
   int bind_idx = 1;
   if (has_since) sqlite3_bind_int64(stmt.get(), bind_idx++, since_seq);
   if (has_until) sqlite3_bind_int64(stmt.get(), bind_idx++, until_seq);
@@ -457,8 +485,12 @@ SessionStore::read_log(std::string_view id,
     int step = sqlite3_step(stmt.get());
     if (step == SQLITE_DONE) break;
     if (step != SQLITE_ROW) {
+      // Capture the error message BEFORE closing the handle —
+      // sqlite3_errmsg(db) on a freed handle is UB.
+      std::string msg = std::string("sqlite: read_log step: ")
+                      + sqlite3_errmsg(db);
       sqlite3_close(db);
-      throw_sqlite(db, "read_log step");
+      throw backend::Error(msg);
     }
     LogRow r;
     r.seq         = sqlite3_column_int64(stmt.get(), 0);
@@ -474,9 +506,11 @@ SessionStore::read_log(std::string_view id,
     r.response_json= rsp ? rsp : "{}";
     r.ok           = sqlite3_column_int(stmt.get(), 5) != 0;
     r.duration_us  = sqlite3_column_int64(stmt.get(), 6);
-    auto snap      = reinterpret_cast<const char*>(
-        sqlite3_column_text(stmt.get(), 7));
-    r.snapshot     = snap ? snap : "";
+    if (has_snapshot) {
+      auto snap    = reinterpret_cast<const char*>(
+          sqlite3_column_text(stmt.get(), 7));
+      r.snapshot   = snap ? snap : "";
+    }
     out.push_back(std::move(r));
   }
   sqlite3_close(db);

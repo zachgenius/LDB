@@ -114,7 +114,7 @@ Semantics:
     {
       "seq":              17,
       "method":           "string.list",
-      "reason":           "deterministic_mismatch" | "live_response_drift" | "replay_error" | "captured_error",
+      "reason":           "deterministic_mismatch" | "replay_error" | "captured_error",
       "expected_snapshot": "core:7a8b...",
       "observed_snapshot": "core:7a8b...",
       "expected_ok":       true,
@@ -166,14 +166,21 @@ Semantics, row-by-row:
    - If the captured row was `deterministic == false` or
      `_provenance` was absent (live state, wall-clock,
      `hello`/`describe.endpoints` against a no-target dispatcher):
-     - Don't compare bytes. Just record that the replay produced a
-       response; tag as `reason: "live_response_drift"` ONLY when
-       `ok` flipped (true → false or false → true), otherwise leave
-       the row out of the divergence list. The aggregate counter
-       for live drift is `errors` only when the replay errored on
-       a row that had succeeded originally; ok-flipped-the-other-
-       way (replay succeeds on a row that had failed originally) is
-       reported but doesn't increment `errors`.
+     - Don't compare bytes. The replay's response is honest data but
+       not a regression signal. Phase-1 emits no divergence entry for
+       non-deterministic rows that succeed both times. If the replay
+       errored on a row that succeeded originally — that IS a
+       regression signal — emit `reason: "replay_error"` and increment
+       `errors`. ok-flipped-the-other-way (replay succeeds on a row
+       that had failed originally) is reported via `divergences` with
+       `reason: "captured_error"` and DOES NOT increment `errors`.
+     - The phase-2 reservation for a distinct `"live_response_drift"`
+       reason (non-deterministic row, both ok=true, payload differs)
+       was considered and dropped: the replay handler can't
+       distinguish "expected drift" from "regression" without a
+       per-endpoint policy, which is what `_provenance.deterministic`
+       already encodes. Conflating it back into `replay_error` /
+       `captured_error` is the honest cut for phase-1.
    - If the captured row was `ok == false` (the original RPC
      itself errored): we still dispatch it. If replay also errors
      with the same `error.code`, that's a match (no divergence
@@ -360,6 +367,7 @@ payload is preserved, and `seq` re-numbering is deterministic
 | `strict=true` and a deterministic row mismatches | Stop the loop, return summary with `divergences` containing only that one row. `replayed` reflects rows processed up to and including the failed row. |
 | Replay dispatch throws a non-`backend::Error` exception | Caught by the outer `dispatch_inner` try/catch and surfaced as `-32603 kInternalError` for that row's observed response; recorded as `reason: "replay_error"`. The replay loop continues unless `strict`. |
 | Source session was imported from a `.ldbpack` (no rebuild artifacts) | If the original target binaries aren't materialised on this host, `target.open` rows error. Replay reports those errors and continues — agents importing for replay should bundle the binaries via `.ldbpack`'s artifact-store side. Documented in phase-2 scope (cross-host replay). |
+| **Replay on a fresh daemon process where captured `target.open` re-opens to a *different* backend target_id, and subsequent captured rows still reference the OLD id** | Phase-1 dispatches the captured rows verbatim. Re-opening yields a fresh backend id (e.g. `1` on a clean process, `2` if some other target was opened first this run). The captured row's `target_id` is unchanged, so subsequent `module.list / type.layout / process.*` rows error with "unknown target_id" and are recorded as `reason: "replay_error"`. The smoke test passes today because it replays on the *same* dispatcher where the originals still resolve. Phase-2 wires the `against` param to provide the target_id remap (`old_id → new_id`) maintained across the loop. |
 
 ## 7. Phase-2 scope (not in this commit)
 
