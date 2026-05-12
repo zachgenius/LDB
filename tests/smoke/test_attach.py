@@ -11,6 +11,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ptrace_probe import maybe_skip_ptrace
+
 
 def usage():
     sys.stderr.write("usage: test_attach.py <ldbd> <sleeper>\n")
@@ -25,6 +28,7 @@ def main():
         sys.stderr.write(f"ldbd not executable: {ldbd}\n"); sys.exit(1)
     if not os.path.isfile(sleeper):
         sys.stderr.write(f"sleeper missing: {sleeper}\n"); sys.exit(1)
+    maybe_skip_ptrace(ldbd, "smoke_attach")
 
     inferior = subprocess.Popen(
         [sleeper], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

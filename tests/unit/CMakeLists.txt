@@ -160,6 +160,7 @@ add_executable(ldb_unit_tests
 target_include_directories(ldb_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(ldb_unit_tests PRIVATE
   ldb_catch2
