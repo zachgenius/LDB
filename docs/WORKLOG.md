@@ -4,6 +4,83 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-12 — v1.6 kickoff: #17 design note (own RSP client)
+
+**Goal:** Start v1.6's non-stop chain (#17 → #21 → #25 → #26 per
+`docs/17-version-plan.md`). First deliverable, mirroring the v1.5
+#18 cadence: a design note that re-evaluates scope before any
+code lands.
+
+**Done:**
+- `docs/25-own-rsp-client.md` (~450 lines). Covers:
+  - Today's pain: reverse-exec uses `process plugin packet send`
+    as a CLI shim. rr replay scrapes subprocess stderr for the
+    gdb-remote port. Custom vendor q-packets blocked behind
+    LLDB's plugin assumptions. The async pump #21 needs isn't
+    surface-accessible via SBAPI.
+  - **Verdict: yes, own RSP client.** The argument is different
+    from #19 (DWARF): unlike DWARF where LLDB tracks LLVM and our
+    job is caching, RSP is the *transport contract* for every
+    remote / replay / probe-agent path. Owning it pays for itself
+    via reverse-exec cleanup, #21's async pump, and vendor-server
+    talk without LLDB-plugin churn. ~1500-2500 lines of focused
+    code, not a libDebugInfoDWARF-class fork.
+  - Module layout: `src/transport/rsp/` with framing + packets +
+    channel + async reader. Reader thread feeds bounded
+    `std::queue<Packet>`; `recv(timeout_ms)` blocks on it. This
+    is the seed of #21's per-thread event pump.
+  - Phase-1 packet vocabulary: `qSupported`, `?`, `g`/`G`,
+    `p`/`P`, `m`, `c`/`s`, `vCont`, `qfThreadInfo`,
+    `Hg`/`Hc`, `qXfer:features:read`, `bc`/`bs`. Out of scope:
+    `vRun`, `Z0/z0`, `vFile:*`, full thread-state vectors.
+  - Migration: dual stack. New endpoint
+    `target.connect_remote_rsp` ships alongside `connect_remote`
+    (LLDB plugin). Smoke compares both against the same
+    lldb-server. v1.7 flips the default; v1.6 is opt-in.
+  - Failure matrix and phase-1/2/3 scope split.
+
+**Decisions:**
+- **Parallel endpoint, not a behind-the-curtain flip.** Standard
+  side-by-side comparison via smoke is the easiest way to debug
+  vendor-server quirks (QEMU's qXfer differs from gdbserver's).
+  v1.0's "no breaking wire changes" promise holds.
+- **Async reader thread from day one.** The single-threaded
+  dispatcher can still consume synchronously via
+  `recv(blocking)`, but the architecture leaves room for #21
+  without a structural rewrite.
+- **No `Z0/z0` over RSP in phase-1.** Breakpoint placement stays
+  with LLDB's plugin (`SBBreakpoint` lowers it through LLDB's
+  RSP). Owning bps over RSP is phase-2.
+- **No own server.** We are the client; we never run the
+  gdbserver side. ~10k lines of LLDB's RSP plugin handle
+  server-detection / extended-remote handshakes / vRun launch —
+  none of that is on our path.
+
+**Surprises / blockers:**
+- None at design-note stage. The non-obvious call was deciding
+  whether to own the bp side too; documented as phase-2.
+
+**Verification:**
+- Design note only — no code, no test impact. ctest 69/69
+  baseline preserved trivially.
+
+**Next:**
+Phase-1 implementation per §6:
+1. `src/transport/rsp/framing.{h,cpp}` — packet codec (escape,
+   RLE, checksum). Unit tests pin every spec corner.
+2. `src/transport/rsp/packets.{h,cpp}` — typed builders/parsers
+   for the v1.6 subset. Golden-byte tests.
+3. `src/transport/rsp/channel.{h,cpp}` — bidirectional stream +
+   async reader + retry. Pipe-backed unit test (no real
+   gdbserver needed).
+4. `target.connect_remote_rsp` endpoint + handler.
+5. `smoke_rsp_connect.py` — live lldb-server round-trip.
+
+After phase-1 lands, the rest of v1.6's non-stop chain (#21, #25,
+#26) can build on the async pump.
+
+---
+
 ## 2026-05-12 — v1.5 #15 phase-1 (correlate.* determinism gate)
 
 **Goal:** Extend the cross-daemon byte-identity gate
