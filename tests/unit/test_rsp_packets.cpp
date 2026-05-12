@@ -230,3 +230,106 @@ TEST_CASE("rsp/packets: parse_qXfer_reply m/l carries the data byte-for-byte",
   CHECK_FALSE(parse_qXfer_reply("").has_value());      // empty
   CHECK_FALSE(parse_qXfer_reply("x...").has_value());  // bad leading char
 }
+
+// ----------- Tracepoint vocabulary (#26 phase-2) -------------------
+
+TEST_CASE("rsp/packets: QTinit / QTStart / QTStop / qTStatus literals",
+          "[rsp][packets][qtdp]") {
+  CHECK(build_QTinit()    == "QTinit");
+  CHECK(build_QTStart()   == "QTStart");
+  CHECK(build_QTStop()    == "QTStop");
+  CHECK(build_qTStatus()  == "qTStatus");
+}
+
+TEST_CASE("rsp/packets: QTDP define emits T<id>:<addr>:E|D:0:<pass>",
+          "[rsp][packets][qtdp]") {
+  // Enabled tracepoint, no pass limit.
+  CHECK(build_QTDP_define(1, 0x401000, true, 0)
+        == "QTDP:T1:401000:E:0:0");
+  // Disabled tracepoint with pass-count cap.
+  CHECK(build_QTDP_define(2, 0x500, false, 0x10)
+        == "QTDP:T2:500:D:0:10");
+  // High tracepoint id + 64-bit address render as lower-hex.
+  CHECK(build_QTDP_define(0xab, 0xffff0000aabbccdd, true, 0)
+        == "QTDP:Tab:ffff0000aabbccdd:E:0:0");
+}
+
+TEST_CASE("rsp/packets: QTDP condition emits -T<id>:<addr>:X<len>,<bytes>",
+          "[rsp][packets][qtdp]") {
+  // Tiny synthetic predicate: a single `end` opcode (0x27 in the
+  // GDB agent-expression spec). The byte count is hex; bytecode is
+  // hex-encoded just like other m/M payloads.
+  std::string bc;
+  bc.push_back(static_cast<char>(0x27));
+  CHECK(build_QTDP_condition(1, 0x401000, bc)
+        == "QTDP:-T1:401000:X1,27");
+
+  // Multi-byte predicate.
+  std::string bc2;
+  bc2.push_back(static_cast<char>(0x08));  // push_const8
+  bc2.push_back(static_cast<char>(0x01));
+  bc2.push_back(static_cast<char>(0x27));  // end
+  CHECK(build_QTDP_condition(2, 0x500, bc2)
+        == "QTDP:-T2:500:X3,080127");
+
+  // Empty bytecode — degenerate but spec-permissible (length=0).
+  CHECK(build_QTDP_condition(1, 0x401000, "")
+        == "QTDP:-T1:401000:X0,");
+}
+
+TEST_CASE("rsp/packets: qTBuffer offset+length", "[rsp][packets][qtdp]") {
+  CHECK(build_qTBuffer(0, 0x100)     == "qTBuffer:0,100");
+  CHECK(build_qTBuffer(0x1000, 0x80) == "qTBuffer:1000,80");
+}
+
+TEST_CASE("rsp/packets: QTFrame select + deselect", "[rsp][packets][qtdp]") {
+  CHECK(build_QTFrame(0)    == "QTFrame:0");
+  CHECK(build_QTFrame(0x42) == "QTFrame:42");
+  // -1 is the spec-defined "deselect" sentinel.
+  CHECK(build_QTFrame(-1)   == "QTFrame:-1");
+}
+
+TEST_CASE("rsp/packets: parse_tstatus_reply T1 / T0 + kv pairs",
+          "[rsp][packets][parse][qtdp]") {
+  // Real-world-ish: T1 with frame/buffer stats.
+  auto a = parse_tstatus_reply("T1;tframes:5;tcreated:5;tsize:8000;tfree:7f80");
+  REQUIRE(a.has_value());
+  CHECK(a->running);
+  REQUIRE(a->kv.size() == 4);
+  CHECK(a->kv[0].first  == "tframes");
+  CHECK(a->kv[0].second == "5");
+  CHECK(a->kv[3].first  == "tfree");
+  CHECK(a->kv[3].second == "7f80");
+
+  // T0 — collection inactive, no extra fields.
+  auto b = parse_tstatus_reply("T0");
+  REQUIRE(b.has_value());
+  CHECK_FALSE(b->running);
+  CHECK(b->kv.empty());
+
+  // T0;tnotrun:0;... — also a valid inactive reply.
+  auto c = parse_tstatus_reply("T0;tnotrun:0");
+  REQUIRE(c.has_value());
+  CHECK_FALSE(c->running);
+  REQUIRE(c->kv.size() == 1);
+  CHECK(c->kv[0].first  == "tnotrun");
+  CHECK(c->kv[0].second == "0");
+
+  // Reject malformed payloads.
+  CHECK_FALSE(parse_tstatus_reply("").has_value());
+  CHECK_FALSE(parse_tstatus_reply("T").has_value());     // missing flag
+  CHECK_FALSE(parse_tstatus_reply("T2").has_value());    // flag not 0/1
+  CHECK_FALSE(parse_tstatus_reply("OK").has_value());    // not a T-reply
+}
+
+TEST_CASE("rsp/packets: TracepointWire defaults are sane",
+          "[rsp][packets][qtdp]") {
+  // The wire struct exists primarily as a phase-2.5 carrier; pin the
+  // defaults so an accidental change in the header is caught.
+  TracepointWire w;
+  CHECK(w.tracepoint_id == 0);
+  CHECK(w.addr == 0);
+  CHECK(w.enabled);
+  CHECK(w.pass_count == 0);
+  CHECK(w.predicate_bytecode.empty());
+}

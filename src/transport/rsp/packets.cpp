@@ -198,6 +198,86 @@ std::string build_qXfer_features_read(std::string_view annex,
   return out;
 }
 
+// ----------- Tracepoint vocabulary (v1.6 #26 phase-2) -------------
+
+std::string build_QTinit()    { return "QTinit"; }
+std::string build_QTStart()   { return "QTStart"; }
+std::string build_QTStop()    { return "QTStop"; }
+std::string build_qTStatus()  { return "qTStatus"; }
+
+std::string build_QTDP_define(std::uint32_t tracepoint_id,
+                               std::uint64_t addr,
+                               bool          enabled,
+                               std::uint32_t pass_count) {
+  // Wire shape per the gdb-remote spec:
+  //   QTDP:T<id-hex>:<addr-hex>:<E|D>:<step-hex>:<pass-hex>
+  // step is pinned to 0 (no single-step collection) for phase-2.
+  // The dispatcher's rate-limit covers the pass-count case
+  // daemon-side; pass_count==0 here is "no pass-limit" which the
+  // server reads as unlimited firing.
+  std::string out = "QTDP:T";
+  out += to_hex(tracepoint_id);
+  out.push_back(':');
+  out += to_hex(addr);
+  out.push_back(':');
+  out.push_back(enabled ? 'E' : 'D');
+  out += ":0:";  // step
+  out += to_hex(pass_count);
+  return out;
+}
+
+std::string build_QTDP_condition(std::uint32_t tracepoint_id,
+                                  std::uint64_t addr,
+                                  std::string_view bytecode) {
+  // Continuation packet — note the leading `-T` after `QTDP:` per
+  // the spec's "additional packet" form. The condition is an
+  // agent-expression bytecode blob carried as `X<len-hex>,<bytes-hex>`.
+  std::string out = "QTDP:-T";
+  out += to_hex(tracepoint_id);
+  out.push_back(':');
+  out += to_hex(addr);
+  out += ":X";
+  out += to_hex(bytecode.size());
+  out.push_back(',');
+  append_hex_bytes(&out, bytecode);
+  return out;
+}
+
+std::string build_qTBuffer(std::uint64_t offset, std::uint32_t length) {
+  std::string out = "qTBuffer:";
+  out += to_hex(offset);
+  out.push_back(',');
+  out += to_hex(length);
+  return out;
+}
+
+std::string build_QTFrame(std::int64_t frame) {
+  std::string out = "QTFrame:";
+  out += to_hex_signed(frame);
+  return out;
+}
+
+std::optional<TStatus> parse_tstatus_reply(std::string_view payload) {
+  // Wire shape: `T<flag>[;k:v]*` where flag is the ASCII digit '0'
+  // (inactive) or '1' (active). Per the gdb spec extra `tnotrun`,
+  // `tstop`, `tframes`, `tcreated`, `tsize`, `tfree`, `circular`
+  // pairs may follow.
+  if (payload.size() < 2 || payload[0] != 'T') return std::nullopt;
+  char flag = payload[1];
+  if (flag != '0' && flag != '1') return std::nullopt;
+  TStatus out;
+  out.running = (flag == '1');
+  if (payload.size() == 2) return out;
+  if (payload[2] != ';') return std::nullopt;  // require kv-separator
+  for (auto kv : split_view(payload.substr(3), ';')) {
+    auto colon = kv.find(':');
+    if (colon == std::string_view::npos) continue;  // malformed; skip
+    out.kv.emplace_back(std::string(kv.substr(0, colon)),
+                        std::string(kv.substr(colon + 1)));
+  }
+  return out;
+}
+
 // ----------- Response parsers --------------------------------------
 
 ResponseKind classify_response(std::string_view payload) {

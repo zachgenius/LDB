@@ -106,6 +106,98 @@ std::string build_reverse_step();
 // ack bytes. Issued only when qSupported advertised the feature.
 std::string build_QStartNoAckMode();
 
+// ----------- Tracepoint vocabulary (v1.6 #26 phase-2) -------------
+//
+// gdb-remote's in-target tracepoint family. The high-level dance:
+//
+//   QTinit                  — wipe all tracepoints from the server
+//   QTDP:T<id>:<addr>:...   — define a tracepoint (one packet per
+//                              tracepoint; condition / action come in
+//                              follow-up `QTDP:-T...` packets)
+//   QTStart                 — begin collection
+//   QTStop                  — halt collection (buffer is preserved)
+//   qTStatus                — query collection state
+//   qTBuffer:<off>,<len>    — drain the trace buffer
+//
+// See https://sourceware.org/gdb/current/onlinedocs/gdb.html/Tracepoint-Packets.html
+// and docs/34-tracepoints-in-target.md for the orchestrator wiring.
+//
+// Phase-2 ships builders + struct vocabulary only. The dispatcher
+// integration (emit-QTDP-on-tracepoint.create against an RspChannel
+// target) is phase-2.5.
+
+// `QTinit` — reset all tracepoints. Always the first packet of a
+// new tracepoint session; the server replies OK or "" (unsupported).
+std::string build_QTinit();
+
+// `QTDP:T<id>:<addr>:{E|D}:<step>:<pass>` — primary define. We pin
+// step=0 (no single-step collection) for phase-2; the predicate gates
+// on a normal hit. pass_count==0 means "no pass limit" — the inferior
+// keeps firing every hit. `enabled` toggles between 'E' (enabled) and
+// 'D' (disabled) in the third field. Tracepoint id is hex (1-based
+// per the spec).
+std::string build_QTDP_define(std::uint32_t tracepoint_id,
+                               std::uint64_t addr,
+                               bool          enabled,
+                               std::uint32_t pass_count);
+
+// `QTDP:-T<id>:<addr>:X<len>,<bytes>` — set the condition (predicate)
+// agent-expression bytecode for an already-defined tracepoint. Per the
+// spec this is a *follow-up* QTDP (note the `-T` continuation marker).
+// `len` is the byte count in hex; `bytes` is the bytecode hex-encoded.
+std::string build_QTDP_condition(std::uint32_t tracepoint_id,
+                                  std::uint64_t addr,
+                                  std::string_view bytecode);
+
+// `QTStart` / `QTStop` — collection control. The server replies OK on
+// success or "" if it doesn't support tracepoints.
+std::string build_QTStart();
+std::string build_QTStop();
+
+// `qTStatus` — query whether collection is active. Reply shape:
+//   T0;...   collection inactive
+//   T1;...   collection active
+//   ...kv pairs after the leading T flag carry buffer / frame stats.
+std::string build_qTStatus();
+
+// `qTBuffer:<offset>,<length>` — read raw trace-buffer bytes. The
+// reply is hex-encoded (decode via decode_hex_bytes).
+std::string build_qTBuffer(std::uint64_t offset, std::uint32_t length);
+
+// `QTFrame:<n>` — select a trace frame for inspection (subsequent
+// register / memory reads target the selected frame's snapshot).
+// Special values: `QTFrame:-1` deselects.
+std::string build_QTFrame(std::int64_t frame);
+
+// Compact in-memory description of a tracepoint as it appears on the
+// wire. The dispatcher's RSP-backed-target integration (phase-2.5)
+// composes this from the orchestrator's ProbeSpec when an RspChannel
+// is bound to the target. Keeping it separate from probes::ProbeSpec
+// means the transport layer doesn't have to depend on probes/.
+struct TracepointWire {
+  std::uint32_t          tracepoint_id = 0;  // 1-based per spec
+  std::uint64_t          addr          = 0;
+  bool                   enabled       = true;
+  // 0 ≡ unlimited. We don't expose pass_count to the user surface in
+  // phase-2 — the orchestrator's rate-limit already covers that case
+  // daemon-side; pass_count here is wire-only.
+  std::uint32_t          pass_count    = 0;
+  // Agent-expression bytecode, raw bytes (NOT base64). Empty means
+  // "no predicate; fire on every hit."
+  std::string            predicate_bytecode;
+};
+
+// Parsed qTStatus reply. The wire is `T<flag>[;k:v]*` where flag is
+// '0' (inactive) or '1' (active); extra kv pairs carry buffer stats
+// ('tnotrun', 'tstop', 'tframes', 'tcreated', 'tsize', 'tfree', etc.).
+// We expose the parsed flag + the kv-pair map; callers that need a
+// specific stat look it up by key.
+struct TStatus {
+  bool running = false;
+  std::vector<std::pair<std::string, std::string>> kv;
+};
+std::optional<TStatus> parse_tstatus_reply(std::string_view payload);
+
 // ----------- Response parsers (server → client) ------------------
 
 // Top-level classification of a payload. Most callers can branch on
