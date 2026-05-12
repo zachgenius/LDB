@@ -6,6 +6,7 @@
 #include "ldb/version.h"
 #include "observers/exec_allowlist.h"
 #include "probes/probe_orchestrator.h"
+#include "protocol/output_channel.h"
 #include "protocol/transport.h"
 #include "store/artifact_store.h"
 #include "store/recipe_store.h"
@@ -277,8 +278,17 @@ int main(int argc, char** argv) {
   ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes,
                                      exec_allowlist, backend_name);
 
+  // Post-V1 #21 phase-2 (docs/27): single stdout writer with mutex;
+  // the listener thread's thread.event notifications and the
+  // dispatcher's replies funnel through this so they never byte-
+  // interleave. The sink is borrowed by the dispatcher; both live
+  // for the duration of main(), so the borrow is stable.
+  ldb::protocol::OutputChannel out(std::cout, wire_format);
+  ldb::protocol::StreamNotificationSink notif_sink(out);
+  dispatcher.set_notification_sink(&notif_sink);
+
   if (stdio_mode) {
-    return ldb::daemon::run_stdio_loop(dispatcher, wire_format);
+    return ldb::daemon::run_stdio_loop(dispatcher, out, wire_format);
   }
   return 0;
 }

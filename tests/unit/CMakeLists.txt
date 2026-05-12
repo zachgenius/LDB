@@ -9,6 +9,7 @@ set(LDB_UNIT_SOURCES
   test_sqlite_connectivity.cpp
   test_protocol_jsonrpc.cpp
   test_protocol_notifications.cpp
+  test_output_channel.cpp
   test_protocol_version.cpp
   test_dispatcher_hello.cpp
   test_protocol_cost.cpp
@@ -95,6 +96,7 @@ set(LDB_UNIT_SOURCES
   test_dispatcher_observer_exec.cpp
   test_describe_endpoints_schema.cpp
   test_nonstop_runtime.cpp
+  test_nonstop_listener.cpp
   test_dispatcher_nonstop.cpp
   test_pack.cpp
   test_pack_signing.cpp
@@ -119,6 +121,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/version.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/cost.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/notifications.cpp
+  ${CMAKE_SOURCE_DIR}/src/protocol/output_channel.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/provenance.cpp
   ${CMAKE_SOURCE_DIR}/src/util/sha256.cpp
   ${CMAKE_SOURCE_DIR}/src/protocol/transport.cpp
@@ -153,6 +156,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/perf/perf_runner.cpp
   ${CMAKE_SOURCE_DIR}/src/index/symbol_index.cpp
   ${CMAKE_SOURCE_DIR}/src/runtime/nonstop_runtime.cpp
+  ${CMAKE_SOURCE_DIR}/src/runtime/nonstop_listener.cpp
   ${CMAKE_SOURCE_DIR}/src/probe_agent/protocol.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_tcpdump.cpp
   ${CMAKE_SOURCE_DIR}/src/observers/net_igmp.cpp
