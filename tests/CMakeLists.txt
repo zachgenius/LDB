@@ -377,6 +377,17 @@ set_tests_properties(smoke_python_unwinder PROPERTIES
   TIMEOUT 30
 )
 
+# Post-V1 plan #14 phase-2: multi-step process.list_frames_python walk.
+# Same skip-gate as the single-step phase-1 smoke.
+add_test(
+  NAME smoke_python_unwinder_walk
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_python_unwinder_walk.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_python_unwinder_walk PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_probe
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_probe.py"

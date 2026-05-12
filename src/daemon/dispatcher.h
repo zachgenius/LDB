@@ -229,6 +229,11 @@ class Dispatcher {
   // during ordinary process.list_frames is phase-2.
   protocol::Response handle_process_set_python_unwinder(const protocol::Request& req);
   protocol::Response handle_process_unwind_one(const protocol::Request& req);
+  // Phase-2: iterate the unwinder until it returns null / exhausts
+  // max_frames / detects a cycle. Independent of LLDB's SBUnwinder
+  // (full integration deferred); useful today for offline analysis
+  // and stack-walking validation against known-good traces.
+  protocol::Response handle_process_list_frames_python(const protocol::Request& req);
 
   protocol::Response handle_observer_proc_fds(const protocol::Request& req);
   protocol::Response handle_observer_proc_maps(const protocol::Request& req);

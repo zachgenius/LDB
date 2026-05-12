@@ -246,14 +246,25 @@ next_fp}`.
 
 **Phase-1 stores the callable per target_id and exposes `unwind_one`
 as a synchronous test endpoint** — agents and tests exercise the
-unwinder without needing a real stopped process. The phase-2 hookup
-into LLDB's SBUnwinder so the stack walker calls into the callable
-during ordinary `process.list_frames` is intentionally deferred:
+unwinder without needing a real stopped process. **Phase-2 ships
+`process.list_frames_python`**, an iterative driver that calls the
+Callable until it returns `null`, returns an incomplete dict, hits
+`max_frames` (default 32, hard-capped at 1024), or trips the
+`(next_ip, next_sp)` cycle guard. Response carries the frames array
+plus a `stop_reason` of `null_return | incomplete_return | max_frames
+| cycle`.
+
+The deeper hookup into LLDB's SBUnwinder — so the LLDB stack walker
+itself calls into the Callable during ordinary `process.list_frames`
+— remains deferred:
 
 - It needs `SBUnwindPlan` interception via `SBLanguageRuntime` or a
   custom command-interpreter hook; the SBAPI surface is in flux.
-- Once the wire contract (set / unwind_one) is pinned, the SBUnwinder
-  side can land independently without breaking any client.
+- The contract (set / unwind_one / list_frames_python) is now
+  pinned, so the SBUnwinder side can land independently without
+  breaking any client.
+- Until then, `list_frames_python` is useful for offline analysis
+  and for validating a custom unwinder against a known-good trace.
 
 Failure mapping:
 - Compile error at registration → `-32602 kInvalidParams`.

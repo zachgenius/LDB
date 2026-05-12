@@ -714,6 +714,8 @@ Response Dispatcher::dispatch_inner(const Request& req) {
     if (req.method == "process.set_python_unwinder")
                                               return handle_process_set_python_unwinder(req);
     if (req.method == "process.unwind_one") return handle_process_unwind_one(req);
+    if (req.method == "process.list_frames_python")
+                                              return handle_process_list_frames_python(req);
 
     if (req.method == "observer.proc.fds")    return handle_observer_proc_fds(req);
     if (req.method == "observer.proc.maps")   return handle_observer_proc_maps(req);
@@ -2508,6 +2510,32 @@ with_defs(      obj({{"regions", arr_of(ref("Region"))}}, {"regions"}),
           {"target_id", int_()},
           {"result",    obj({})},
       }, {"target_id", "result"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "medium");
+
+  add("process.list_frames_python",
+      "Iteratively invoke the registered Python unwinder starting from "
+      "the caller-supplied {ip, sp, fp}, collecting frames until the "
+      "unwinder returns null (LLDB-fallback signal), an incomplete dict "
+      "(missing next_ip / next_sp / next_fp), max_frames is reached, "
+      "or a cycle is detected on (next_ip, next_sp). max_frames "
+      "defaults to 32 and is clamped to 1024 to bound dispatcher "
+      "wall-time. Independent of LLDB's SBUnwinder — useful today for "
+      "offline analysis and validating a custom unwinder against a "
+      "known trace. Returns -32002 if no unwinder is registered.",
+      obj({
+          {"target_id",  int_()},
+          {"ip",         int_()},
+          {"sp",         int_()},
+          {"fp",         int_()},
+          {"registers",  obj({})},
+          {"max_frames", int_()},
+      }, {"target_id", "ip", "sp", "fp"}),
+      obj({
+          {"target_id",   int_()},
+          {"frames",      arr_of(obj({}))},
+          {"stop_reason", enum_str({"null_return", "incomplete_return",
+                                     "max_frames", "cycle"})},
+      }, {"target_id", "frames", "stop_reason"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "medium");
 
   // ============== observer.* ==============
@@ -7084,6 +7112,109 @@ Response Dispatcher::handle_process_unwind_one(const Request& req) {
   } catch (const backend::Error& e) {
     return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
   }
+}
+
+Response Dispatcher::handle_process_list_frames_python(const Request& req) {
+  if (!req.params.is_object()) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "params must be object");
+  }
+  std::uint64_t target_id = 0;
+  if (!require_uint(req.params, "target_id", &target_id) || target_id == 0) {
+    return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+                              "target_id must be positive integer");
+  }
+  auto it = python_unwinders_.find(target_id);
+  if (it == python_unwinders_.end()) {
+    return protocol::make_err(req.id, ErrorCode::kBadState,
+        "no python unwinder registered for target_id=" +
+        std::to_string(target_id));
+  }
+  json ctx = json::object();
+  for (const char* key : {"ip", "sp", "fp"}) {
+    auto pit = req.params.find(key);
+    if (pit == req.params.end() || pit->is_null()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("missing integer param '") + key + "'");
+    }
+    if (!pit->is_number_integer() && !pit->is_number_unsigned()) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          std::string("'") + key + "' must be an integer");
+    }
+    ctx[key] = *pit;
+  }
+  if (auto reg = req.params.find("registers");
+      reg != req.params.end() && reg->is_object()) {
+    ctx["registers"] = *reg;
+  }
+
+  // Caller-supplied cap on iterations. 32 is a sane default for typical
+  // user-mode stacks; the daemon-side hard cap of 1024 prevents a
+  // pathological unwinder (returning a slow chain) from blocking the
+  // dispatcher arbitrarily.
+  std::uint64_t max_frames = 32;
+  if (auto mit = req.params.find("max_frames");
+      mit != req.params.end() && !mit->is_null()) {
+    if (!require_uint(req.params, "max_frames", &max_frames)) {
+      return protocol::make_err(req.id, ErrorCode::kInvalidParams,
+          "'max_frames' must be non-negative integer");
+    }
+  }
+  constexpr std::uint64_t kHardCap = 1024;
+  if (max_frames == 0 || max_frames > kHardCap) max_frames = kHardCap;
+
+  json frames = json::array();
+  std::string stop_reason = "max_frames";
+  // (ip, sp) pairs we've already seen → cycle guard. Misbehaving
+  // unwinders that always return the same frame would loop forever.
+  std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
+
+  try {
+    for (std::uint64_t i = 0; i < max_frames; ++i) {
+      json result = it->second->invoke(ctx);
+      if (result.is_null()) { stop_reason = "null_return"; break; }
+      if (!result.is_object()
+          || !result.contains("next_ip")
+          || !result.contains("next_sp")
+          || !result.contains("next_fp")) {
+        // A non-null, non-frame return is treated as a stop signal —
+        // the unwinder declined to advance. Surface what was returned
+        // for diagnosis.
+        json entry;
+        entry["ctx"]      = ctx;
+        entry["returned"] = std::move(result);
+        frames.push_back(std::move(entry));
+        stop_reason = "incomplete_return";
+        break;
+      }
+      auto next_ip = result["next_ip"].get<std::uint64_t>();
+      auto next_sp = result["next_sp"].get<std::uint64_t>();
+      auto next_fp = result["next_fp"].get<std::uint64_t>();
+      // Cycle check BEFORE pushing — if (next_ip, next_sp) is one we've
+      // already seen, the walk has looped. Including the repeated frame
+      // would make "got N distinct frames before cycling" indistinguish-
+      // able from "got the same frame twice and stopped"; this way
+      // frames.size() is the count of distinct (ip, sp) pairs the
+      // unwinder produced.
+      if (!seen.insert({next_ip, next_sp}).second) {
+        stop_reason = "cycle";
+        break;
+      }
+      frames.push_back(result);
+      ctx["ip"] = next_ip;
+      ctx["sp"] = next_sp;
+      ctx["fp"] = next_fp;
+    }
+  } catch (const backend::Error& e) {
+    return protocol::make_err(req.id, ErrorCode::kBackendError, e.what());
+  }
+
+  json data;
+  data["target_id"]   = target_id;
+  data["frames"]      = std::move(frames);
+  data["stop_reason"] = stop_reason;
+  data["stdout"]      = it->second->last_stdout();
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_agent_hello(const Request& req) {
