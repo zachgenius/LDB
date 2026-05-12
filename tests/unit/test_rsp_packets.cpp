@@ -9,6 +9,7 @@
 
 #include <catch_amalgamated.hpp>
 
+#include "backend/debugger_backend.h"  // for ldb::backend::Error
 #include "transport/rsp/packets.h"
 
 #include <cstdint>
@@ -254,15 +255,21 @@ TEST_CASE("rsp/packets: QTDP define emits T<id>:<addr>:E|D:0:<pass>",
         == "QTDP:Tab:ffff0000aabbccdd:E:0:0");
 }
 
-TEST_CASE("rsp/packets: QTDP condition emits -T<id>:<addr>:X<len>,<bytes>",
+TEST_CASE("rsp/packets: QTDP condition emits -<id>:<addr>:X<len>,<bytes>",
           "[rsp][packets][qtdp]") {
+  // Wire shape per the gdb-remote spec (remote.c,
+  // remote_add_target_side_condition): `QTDP:-<id>:<addr>:X<len>,<bytes>`.
+  // The leading `T` only appears on the PRIMARY define packet — the
+  // continuation drops it. A leading `-T` would be NAK'd by a real
+  // lldb-server / gdbserver.
+  //
   // Tiny synthetic predicate: a single `end` opcode (0x27 in the
   // GDB agent-expression spec). The byte count is hex; bytecode is
   // hex-encoded just like other m/M payloads.
   std::string bc;
   bc.push_back(static_cast<char>(0x27));
   CHECK(build_QTDP_condition(1, 0x401000, bc)
-        == "QTDP:-T1:401000:X1,27");
+        == "QTDP:-1:401000:X1,27");
 
   // Multi-byte predicate.
   std::string bc2;
@@ -270,11 +277,17 @@ TEST_CASE("rsp/packets: QTDP condition emits -T<id>:<addr>:X<len>,<bytes>",
   bc2.push_back(static_cast<char>(0x01));
   bc2.push_back(static_cast<char>(0x27));  // end
   CHECK(build_QTDP_condition(2, 0x500, bc2)
-        == "QTDP:-T2:500:X3,080127");
+        == "QTDP:-2:500:X3,080127");
+}
 
-  // Empty bytecode — degenerate but spec-permissible (length=0).
-  CHECK(build_QTDP_condition(1, 0x401000, "")
-        == "QTDP:-T1:401000:X0,");
+TEST_CASE("rsp/packets: QTDP condition rejects empty bytecode",
+          "[rsp][packets][qtdp]") {
+  // The gdb spec does not define a zero-length agent expression and
+  // some servers NAK `X0,`. The builder rejects at the source so the
+  // caller (composing the agent expression) gets a typed error
+  // instead of a confusing transport-level NAK later.
+  CHECK_THROWS_AS(build_QTDP_condition(1, 0x401000, ""),
+                  ldb::backend::Error);
 }
 
 TEST_CASE("rsp/packets: qTBuffer offset+length", "[rsp][packets][qtdp]") {
@@ -320,6 +333,39 @@ TEST_CASE("rsp/packets: parse_tstatus_reply T1 / T0 + kv pairs",
   CHECK_FALSE(parse_tstatus_reply("T").has_value());     // missing flag
   CHECK_FALSE(parse_tstatus_reply("T2").has_value());    // flag not 0/1
   CHECK_FALSE(parse_tstatus_reply("OK").has_value());    // not a T-reply
+}
+
+TEST_CASE("rsp/packets: parse_tstatus_reply caps kv-pair allocation",
+          "[rsp][packets][parse][qtdp]") {
+  // The parser runs against untrusted remote-debug-server data; a
+  // malicious or buggy server emitting thousands of kv-pairs in a
+  // single T-reply would otherwise allocate unboundedly. Cap is 64
+  // pairs; above that we return nullopt and let the caller surface
+  // a transport error.
+
+  // 64 pairs: exactly at the cap — accepted.
+  {
+    std::string payload = "T1";
+    for (int i = 0; i < 64; ++i) {
+      payload += ";k";
+      payload += std::to_string(i);
+      payload += ":v";
+    }
+    auto r = parse_tstatus_reply(payload);
+    REQUIRE(r.has_value());
+    CHECK(r->kv.size() == 64);
+  }
+
+  // 65 pairs: over the cap — rejected.
+  {
+    std::string payload = "T1";
+    for (int i = 0; i < 65; ++i) {
+      payload += ";k";
+      payload += std::to_string(i);
+      payload += ":v";
+    }
+    CHECK_FALSE(parse_tstatus_reply(payload).has_value());
+  }
 }
 
 TEST_CASE("rsp/packets: TracepointWire defaults are sane",

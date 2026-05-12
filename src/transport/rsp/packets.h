@@ -141,10 +141,14 @@ std::string build_QTDP_define(std::uint32_t tracepoint_id,
                                bool          enabled,
                                std::uint32_t pass_count);
 
-// `QTDP:-T<id>:<addr>:X<len>,<bytes>` — set the condition (predicate)
+// `QTDP:-<id>:<addr>:X<len>,<bytes>` — set the condition (predicate)
 // agent-expression bytecode for an already-defined tracepoint. Per the
-// spec this is a *follow-up* QTDP (note the `-T` continuation marker).
+// spec (gdb remote.c, remote_add_target_side_condition) this is a
+// *follow-up* QTDP. The leading `T` is on the PRIMARY define packet
+// only; the continuation uses `QTDP:-<id>:...` with no `T`.
 // `len` is the byte count in hex; `bytes` is the bytecode hex-encoded.
+// Throws `backend::Error` if `bytecode` is empty — the gdb spec does
+// not define a zero-length agent expression and servers may NAK it.
 std::string build_QTDP_condition(std::uint32_t tracepoint_id,
                                   std::uint64_t addr,
                                   std::string_view bytecode);
