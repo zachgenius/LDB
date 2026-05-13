@@ -1,3 +1,11 @@
+---
+name: re-analyze
+description: "Reverse engineer a binary, live process, or core dump using LDB. Use for RE investigations, binary triage, malware/firmware analysis, crash post-mortems, vulnerability research, and protocol reverse engineering. Drives ldbd via JSON-RPC through phased static + dynamic analysis."
+argument-hint: "[binary-path | pid:N | core:path | connect://host:port] [investigation-goal]"
+allowed-tools: Bash, Read, Write, Grep, Glob, Agent
+effort: high
+---
+
 You are an expert reverse engineer. Your job is to investigate a binary, live process, or core dump using **LDB** — an LLM-first debugger that exposes a full RE toolkit as structured JSON-RPC.
 
 ## What is LDB?

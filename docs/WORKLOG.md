@@ -4,6 +4,47 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-13 — v1.6.1 patch: skill packaging
+
+**Goal:** Make the shipped `re-analyze` skill conform to the
+Claude Code Skill format so it auto-discovers from
+`~/.claude/skills/<name>/SKILL.md` instead of needing a manual
+slash-command install. The flat `skills/re-analyze.md` lacked the
+YAML frontmatter (`name`, `description`, `argument-hint`,
+`allowed-tools`) that Claude Code reads to decide when a skill
+applies — so the description shown in the skill list was just the
+first ~100 chars of the prose body.
+
+**Done:**
+
+- `skills/re-analyze.md` → `skills/re-analyze/SKILL.md` (folder
+  layout matching upstream Claude Code Skills).
+- Added YAML frontmatter to `SKILL.md`: `name`, `description`,
+  `argument-hint`, `allowed-tools`, `effort: high`. Body content
+  is unchanged from v1.6.0.
+- `skills/README.md` rewritten: install path moves from
+  `~/.claude/commands/re-analyze.md` to
+  `~/.claude/skills/re-analyze/`; clone+symlink is now the
+  recommended path; project-level instructions point at
+  `.claude/skills/` instead of `.claude/commands/`.
+- `CMakeLists.txt` VERSION 1.6.0 → 1.6.1.
+
+**Decisions:**
+
+- Patch release rather than rolled into v1.7 — the skill is
+  user-installable and the broken description has been live since
+  v1.6.0; want the fix discoverable by tag.
+- Kept the file under `skills/<name>/` (not `.claude/skills/`) so
+  the repo doesn't accidentally activate the skill for anyone who
+  opens LDB in Claude Code without opting in. The README still
+  documents the project-level symlink for contributors who want
+  it auto-active.
+
+**Next:** Post-V1 items (LLDB `SetAsync(true)` flip, QTDP
+phase-2.5, etc.) from the v1.6.0 worklog stand.
+
+---
+
 ## 2026-05-12 — v1.6.0 release
 
 **Goal:** Close the V1 planned arc. v1.6 shipped the non-stop chain
