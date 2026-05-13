@@ -15,7 +15,7 @@ It is not a GDB clone. It is a GDB-class tool with a different primary
 user: an LLM that wants typed, paginated, cost-budgeted answers, and a
 knowledge graph that survives across sessions.
 
-** If you don't know how to configure this project, just simply let your LLM agent to check it and set it up **
+**If you don't know how to configure this project, just simply let your LLM agent to check it and set it up**
 
 ---
 
