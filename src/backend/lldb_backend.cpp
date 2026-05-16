@@ -2388,10 +2388,31 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
 
           // Phase-3 register-state mutations (after match emit so the
           // instruction we just resolved doesn't lose its tracking
-          // mid-emit). Order matters: BL/BLR clobber first because a
+          // mid-emit). Order matters: call clobber first because a
           // call-site has no other state-mutating effect we care about;
-          // ADD/MOV are exclusive of each other and of BL/BLR.
-          if (mnem_lower == "bl" || mnem_lower == "blr") {
+          // ADD/MOV are exclusive of each other and of calls.
+          //
+          // The PAC-authenticated branch family (BLRAA, BLRAB, BLRAAZ,
+          // BLRABZ for calls; BRAA, BRAB, BRAAZ, BRABZ for indirect
+          // branches; RETAA, RETAB for returns) is treated identically
+          // to its plain sibling. AAPCS64 caller-saved semantics are
+          // independent of PAC — a PAC call is still a call and still
+          // overwrites x0..x18 + x30. The original phase-3 patch
+          // matched only bare "bl"/"blr"/"br"/"ret"; the post-review
+          // spec extends each clause to the full family.
+          const bool is_call =
+              mnem_lower == "bl"     || mnem_lower == "blr"    ||
+              mnem_lower == "blraa"  || mnem_lower == "blrab"  ||
+              mnem_lower == "blraaz" || mnem_lower == "blrabz";
+          const bool is_indirect_branch =
+              mnem_lower == "br"     ||
+              mnem_lower == "braa"   || mnem_lower == "brab"   ||
+              mnem_lower == "braaz"  || mnem_lower == "brabz";
+          const bool is_return =
+              mnem_lower == "ret"    ||
+              mnem_lower == "retaa"  || mnem_lower == "retab";
+
+          if (is_call) {
             // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
             // callee may overwrite x0..x18 + x30 — the scanner has
             // no way to know the callee's behaviour.
@@ -2410,8 +2431,7 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                      mnem_lower == "movk" || mnem_lower == "movn") {
             // Gate 4: MOV may propagate or clobber.
             apply_mov_state(mnem_lower, i.operands, adrp_regs);
-          } else if (mnem_lower == "ret" || mnem_lower == "br" ||
-                     mnem_lower == "b") {
+          } else if (is_return || is_indirect_branch || mnem_lower == "b") {
             // Gate 1 follow-up: end-of-basic-block instructions that
             // exit the current function reset the entire map. We don't
             // distinguish "B to within current function" from
@@ -2419,7 +2439,9 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // disasm and the next-iteration function-boundary check
             // will restore tracking when we re-enter the right
             // function via subsequent ADRPs. The conservative reset is
-            // the phase-3 acceptance bar.
+            // the phase-3 acceptance bar. Function-boundary detection
+            // by symbol name would miss the two-adjacent-stripped-
+            // functions case; phase-4 follow-up tracked in the worklog.
             adrp_regs.clear();
             current_function_known = false;
           }

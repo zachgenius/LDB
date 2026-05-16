@@ -126,6 +126,21 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     )
     set_tests_properties(smoke_${_phase3_smoke} PROPERTIES TIMEOUT 30)
   endforeach()
+
+  # Phase-3 post-review PAC-call smoke. Gated on the arm64e toolchain
+  # probe in tests/fixtures/CMakeLists.txt — without it the fixture
+  # target doesn't exist and the test would fail to resolve
+  # $<TARGET_FILE:ldb_fix_xref_pac_callclobber> at generate time.
+  if(LDB_CAN_COMPILE_ARM64E)
+    add_test(
+      NAME smoke_xref_pac_callclobber
+      COMMAND python3
+              "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_pac_callclobber.py"
+              "$<TARGET_FILE:ldbd>"
+              "$<TARGET_FILE:ldb_fix_xref_pac_callclobber>"
+    )
+    set_tests_properties(smoke_xref_pac_callclobber PROPERTIES TIMEOUT 30)
+  endif()
 endif()
 
 add_test(
