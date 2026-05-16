@@ -138,6 +138,91 @@ of inline section data per call.
 
 ---
 
+## 2026-05-16 — ARM64e chained-fixup parser (phase 1)
+
+**Goal:** Land the standalone parser for Mach-O
+`LC_DYLD_CHAINED_FIXUPS` payloads called out in
+`docs/35-field-report-followups.md §3`. Phase 1: parser + unit
+tests only — no indexer wire-up, no on-disk cache, no bind
+resolution. Phase 2 wires this into xref / string-xref /
+correlate so iOS 13+ / macOS 11+ ARM64e binaries stop silently
+producing wrong xref results.
+
+**Done:**
+
+- New public header `include/ldb/backend/chained_fixups.h`
+  exporting `parse_chained_fixups(payload, size, segments) ->
+  ChainedFixupMap`. Map keys are image-base-relative file_addrs;
+  values are the post-dyld 64-bit pointer dyld writes into the
+  slot (0 for binds in phase 1).
+- New impl `src/backend/chained_fixups.cpp`. Decodes each chained
+  pointer slot via masks + shifts off the raw little-endian u64
+  instead of casting to the Apple SDK bitfield structs — the SDK
+  struct bit-ordering is technically implementation-defined and
+  we want a Linux-buildable parser for CI parity.
+- Supports pointer formats 1 (ARM64E), 2 (PTR_64), 6
+  (PTR_64_OFFSET), 9 (ARM64E_USERLAND), 12
+  (ARM64E_USERLAND24). Everything else throws
+  `backend::Error("...unsupported chained pointer format: N —
+  phase 2")`.
+- Unit tests `tests/unit/test_chained_fixups.cpp` cover three
+  vectors: (A) ARM64E single-page two-rebase chain, (B) PTR_64
+  multi-page chain exercising the `page_start[i]`-per-page
+  dispatch, (C) unsupported format → phase-2 error message.
+  Byte vectors are hand-derived inline from the SDK struct
+  layouts; the format-6 path was cross-checked against a real
+  arm64 binary built with `clang -Wl,-fixup_chains` and the
+  output of `dyld_info --fixups`.
+- Sanity-checked the parser against two real binaries built
+  on Darwin-arm64 26.0.0: `clang -arch arm64` (format 6) and
+  `clang -arch arm64e` (format 12 USERLAND24). Every rebase
+  matches `dyld_info --fixups`; binds resolve to 0 as designed.
+
+**Decisions:**
+
+- Extended `SegmentInfo` with `data` + `data_size` pointer-
+  to-segment-bytes. The task spec's listed struct lacked these,
+  but chained pointer slots live in segment data (not in the
+  fixup payload), so the parser needs access to those bytes
+  somehow. Pointer-in-struct keeps the API one call; the
+  alternative — passing the whole Mach-O buffer plus per-segment
+  file_offsets — was more invasive at the call site.
+- image_base derived dynamically as `seg[i].vm_addr -
+  starts_in_segment.segment_offset` for the first segment with
+  chain data. Avoids requiring the caller to identify which
+  segment is __TEXT.
+- Multi-start pages (`page_start[i] & 0x8000`) throw a "phase 2"
+  error rather than silently skipping the page. clang/lld
+  pack chains tightly so the multi-start path is uncommon in
+  userland; deferring keeps the parser surface small.
+- Binds (auth or otherwise) recorded with `resolved = 0`. The
+  membership-in-map signal is what phase-2 callers will need
+  ("this slot is bound, look up the import"); the actual import
+  resolution belongs in phase 2 with the imports table.
+
+**Surprises / blockers:**
+
+- The task spec's deliverable section listed only
+  `{file_offset, vm_addr, vm_size}` for `SegmentInfo`, which
+  isn't sufficient to walk chains (we need the segment data
+  too). Documented in the header comment; flagged in the report
+  so the reviewer can confirm the intent before phase 2.
+- `LDB_WARNINGS_AS_ERRORS=ON` surfaces pre-existing -Wconversion
+  / -Wmismatched-tags issues in `src/transport/rsp/framing.cpp`
+  and `src/transport/rr.cpp` that are unrelated to this change.
+  Default build (warnings-as-errors OFF) is warning-clean for the
+  new files; left existing issues alone.
+
+**Next:** Phase 2 — wire `parse_chained_fixups` into the indexer
+(`src/index/symbol_index.cpp` or wherever the xref scan lives),
+add cache-format `<build_id>/fixups.bin`, and add the imports
+table parser so binds resolve to symbol names. Validate against
+a real ARM64e iOS binary (e.g. an extracted `WeChat` slice) before
+shipping to make sure ARM64E_USERLAND24's 24-bit bind ordinal
+path is exercised end-to-end.
+
+---
+
 ## 2026-05-13 — v1.6.1 patch: skill packaging
 
 **Goal:** Make the shipped `re-analyze` skill conform to the

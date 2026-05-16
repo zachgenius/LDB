@@ -13,6 +13,7 @@ set(LDBD_SOURCES
   protocol/transport.cpp
   protocol/view.cpp
   backend/lldb_backend.cpp
+  backend/chained_fixups.cpp
   probes/probe_orchestrator.cpp
   probes/rate_limit.cpp
   probes/bpftrace_engine.cpp

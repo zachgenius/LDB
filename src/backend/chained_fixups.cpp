@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: Apache-2.0
+// Parser for LC_DYLD_CHAINED_FIXUPS payloads. Phase 1 of
+// docs/35-field-report-followups.md §3 — standalone parser, no
+// indexer wire-up. Phase 2 wires the resolved map into xref /
+// string-xref / correlate, and adds the imports table for binds.
+//
+// We deliberately parse the format byte-by-byte from the payload
+// instead of casting to the Apple SDK structs. Two reasons:
+//   1. We compile on Linux too (the daemon CI runs there); on
+//      non-Apple hosts the SDK header isn't present and the layout
+//      is fixed-width little-endian anyway.
+//   2. The SDK bitfield structs are ABI-fragile (bit order is
+//      implementation-defined in standard C++). Decoding each u64
+//      via masks + shifts is portable and matches dyld source.
+
+#include "ldb/backend/chained_fixups.h"
+#include "backend/debugger_backend.h"  // backend::Error
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace ldb::backend {
+
+namespace {
+
+// Pointer-format enum mirrors <mach-o/fixup-chains.h>. Kept here as
+// named constants so the parser is self-contained.
+constexpr std::uint16_t kArm64e            =  1;
+constexpr std::uint16_t kPtr64             =  2;
+constexpr std::uint16_t kPtr64Offset       =  6;
+constexpr std::uint16_t kArm64eUserland    =  9;
+constexpr std::uint16_t kArm64eUserland24  = 12;
+
+constexpr std::uint16_t kPageStartNone = 0xFFFF;
+constexpr std::uint16_t kChainStartMulti = 0x8000;  // unsupported in phase 1
+
+// Endian-safe little-endian reads. Mach-O is fixed LE on all
+// Apple-supported architectures; we never see big-endian fixups.
+std::uint16_t read_u16(const std::uint8_t* p) {
+  return static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(p[0]) |
+      (static_cast<std::uint16_t>(p[1]) << 8));
+}
+
+std::uint32_t read_u32(const std::uint8_t* p) {
+  return static_cast<std::uint32_t>(p[0]) |
+         (static_cast<std::uint32_t>(p[1]) << 8) |
+         (static_cast<std::uint32_t>(p[2]) << 16) |
+         (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+std::uint64_t read_u64(const std::uint8_t* p) {
+  std::uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) {
+    v |= static_cast<std::uint64_t>(p[i]) << (i * 8);
+  }
+  return v;
+}
+
+void require_range(std::size_t off, std::size_t need,
+                   std::size_t total, const char* what) {
+  if (off > total || need > total - off) {
+    throw Error(std::string("chained_fixups: out-of-bounds read: ") + what);
+  }
+}
+
+bool is_arm64e_family(std::uint16_t fmt) {
+  return fmt == kArm64e || fmt == kArm64eUserland ||
+         fmt == kArm64eUserland24;
+}
+
+bool target_is_runtime_offset(std::uint16_t fmt) {
+  // For unauthenticated rebases:
+  //   format 1 (ARM64E)            : target is vmaddr
+  //   format 2 (PTR_64)            : target is vmaddr
+  //   format 6 (PTR_64_OFFSET)     : target is runtime offset
+  //   format 9 (ARM64E_USERLAND)   : target is runtime offset
+  //   format 12 (ARM64E_USERLAND24): target is runtime offset
+  // Authenticated rebases (ARM64E*) always carry a runtime offset.
+  return fmt == kPtr64Offset || fmt == kArm64eUserland ||
+         fmt == kArm64eUserland24;
+}
+
+std::uint64_t stride_bytes(std::uint16_t fmt) {
+  // All supported formats use 4-byte stride for PTR_64*, 8-byte for
+  // ARM64E userland. (ARM64E_KERNEL is 4-byte, but unsupported here.)
+  if (fmt == kPtr64 || fmt == kPtr64Offset) return 4;
+  return 8;  // arm64e userland / userland24 / arm64e (format 1)
+}
+
+void unsupported_format(std::uint16_t fmt) {
+  throw Error("chained_fixups: unsupported chained pointer format: " +
+              std::to_string(fmt) + " — phase 2");
+}
+
+// Decode one 64-bit chained-pointer slot into:
+//   - resolved logical pointer value (0 for binds — phase 1 doesn't
+//     resolve them)
+//   - next stride count (0 means end of chain)
+//   - whether this entry was a bind
+struct DecodedSlot {
+  std::uint64_t resolved = 0;
+  std::uint32_t next = 0;
+  bool is_bind = false;
+};
+
+DecodedSlot decode_arm64e(std::uint64_t raw, std::uint64_t image_base,
+                          bool target_is_offset) {
+  // dyld_chained_ptr_arm64e_* layout (all variants share top bits):
+  //   bit 63   : auth
+  //   bit 62   : bind
+  //   bits 61:51: next (11)
+  // Rebase  (auth=0,bind=0): target [42:0], high8 [50:43]
+  // AuthRebase (auth=1,bind=0): target [31:0] (always runtime offset),
+  //                             diversity [47:32], addrDiv [48],
+  //                             key [50:49]
+  // Bind / AuthBind: ordinal+addend variants — phase 1 leaves at 0.
+  DecodedSlot d;
+  const bool auth = (raw >> 63) & 0x1;
+  const bool bind = (raw >> 62) & 0x1;
+  d.next = static_cast<std::uint32_t>((raw >> 51) & 0x7FFU);
+  d.is_bind = bind;
+  if (bind) {
+    return d;
+  }
+  if (auth) {
+    std::uint64_t target = raw & 0xFFFFFFFFULL;
+    d.resolved = image_base + target;
+  } else {
+    std::uint64_t target = raw & 0x7FFFFFFFFFFULL;  // 43 bits
+    std::uint64_t high8  = (raw >> 43) & 0xFFULL;
+    std::uint64_t value  = target_is_offset ? (image_base + target) : target;
+    d.resolved = value | (high8 << 56);
+  }
+  return d;
+}
+
+DecodedSlot decode_64(std::uint64_t raw, std::uint64_t image_base,
+                      bool target_is_offset) {
+  // dyld_chained_ptr_64_rebase / _bind layout:
+  //   bit 63    : bind
+  //   bits 62:51: next (12)
+  //   Rebase: target [35:0], high8 [43:36], reserved [50:44]
+  //   Bind  : ordinal [23:0], addend [31:24], reserved [50:32]
+  DecodedSlot d;
+  const bool bind = (raw >> 63) & 0x1;
+  d.next = static_cast<std::uint32_t>((raw >> 51) & 0xFFFU);
+  d.is_bind = bind;
+  if (bind) {
+    return d;
+  }
+  std::uint64_t target = raw & 0xFFFFFFFFFULL;  // 36 bits
+  std::uint64_t high8  = (raw >> 36) & 0xFFULL;
+  std::uint64_t value  = target_is_offset ? (image_base + target) : target;
+  d.resolved = value | (high8 << 56);
+  return d;
+}
+
+DecodedSlot decode_slot(std::uint16_t fmt, std::uint64_t raw,
+                        std::uint64_t image_base) {
+  const bool offset_target = target_is_runtime_offset(fmt);
+  if (is_arm64e_family(fmt)) {
+    return decode_arm64e(raw, image_base, offset_target);
+  }
+  return decode_64(raw, image_base, offset_target);
+}
+
+void walk_chain(const SegmentInfo& seg, std::uint16_t fmt,
+                std::uint64_t seg_offset_in_image,
+                std::uint64_t page_base_in_segment,
+                std::uint16_t start_offset_in_page,
+                std::uint64_t image_base,
+                std::uint64_t stride,
+                ChainedFixupMap& out) {
+  if (seg.data == nullptr) {
+    throw Error("chained_fixups: segment with chain data has no bytes; "
+                "caller must pass segment.data for chained segments");
+  }
+  std::uint64_t cursor_in_seg = page_base_in_segment + start_offset_in_page;
+  for (;;) {
+    if (cursor_in_seg + 8 > seg.data_size) {
+      throw Error("chained_fixups: chain walks past end of segment data");
+    }
+    std::uint64_t raw = read_u64(seg.data + cursor_in_seg);
+    DecodedSlot d = decode_slot(fmt, raw, image_base);
+    std::uint64_t file_addr = seg_offset_in_image + cursor_in_seg;
+    // For binds, resolved stays 0 — but we still record the slot so
+    // callers can detect chained-fixup territory by membership.
+    out.resolved.emplace(file_addr, d.resolved);
+    if (d.next == 0) {
+      break;
+    }
+    std::uint64_t step = static_cast<std::uint64_t>(d.next) * stride;
+    cursor_in_seg += step;
+  }
+}
+
+}  // namespace
+
+ChainedFixupMap parse_chained_fixups(
+    const std::uint8_t* payload, std::size_t payload_size,
+    const std::vector<SegmentInfo>& segments) {
+  if (payload == nullptr) {
+    throw Error("chained_fixups: null payload");
+  }
+  require_range(0, 28, payload_size, "header");
+  // const std::uint32_t fixups_version = read_u32(payload + 0);
+  const std::uint32_t starts_offset  = read_u32(payload +  4);
+  // imports_offset / symbols_offset are phase 2 territory.
+  // const std::uint32_t imports_count  = read_u32(payload + 16);
+  // const std::uint32_t imports_format = read_u32(payload + 20);
+
+  require_range(starts_offset, 4, payload_size, "starts_in_image");
+  const std::uint8_t* starts = payload + starts_offset;
+  const std::uint32_t seg_count = read_u32(starts);
+  require_range(starts_offset + 4,
+                static_cast<std::size_t>(seg_count) * 4,
+                payload_size, "seg_info_offset[]");
+  if (seg_count > segments.size()) {
+    throw Error("chained_fixups: seg_count exceeds caller's segments[]");
+  }
+
+  ChainedFixupMap out;
+  bool image_base_known = false;
+  std::uint64_t image_base = 0;
+
+  for (std::uint32_t i = 0; i < seg_count; ++i) {
+    const std::uint32_t seg_info_offset =
+        read_u32(starts + 4 + i * 4);
+    if (seg_info_offset == 0) {
+      continue;
+    }
+    const std::size_t sis_off =
+        static_cast<std::size_t>(starts_offset) + seg_info_offset;
+    require_range(sis_off, 22, payload_size, "starts_in_segment");
+    const std::uint8_t* sis = payload + sis_off;
+    const std::uint32_t size            = read_u32(sis + 0);
+    const std::uint16_t page_size       = read_u16(sis + 4);
+    const std::uint16_t pointer_format  = read_u16(sis + 6);
+    const std::uint64_t segment_offset  = read_u64(sis + 8);
+    // const std::uint32_t max_valid_ptr = read_u32(sis + 16);
+    const std::uint16_t page_count      = read_u16(sis + 20);
+    require_range(sis_off, size, payload_size, "starts_in_segment body");
+    require_range(sis_off + 22,
+                  static_cast<std::size_t>(page_count) * 2,
+                  payload_size, "page_start[]");
+    if (page_size == 0) {
+      throw Error("chained_fixups: zero page_size");
+    }
+
+    const bool supported =
+        is_arm64e_family(pointer_format) ||
+        pointer_format == kPtr64 ||
+        pointer_format == kPtr64Offset;
+    if (!supported) {
+      unsupported_format(pointer_format);
+    }
+
+    if (!image_base_known) {
+      if (segments[i].vm_addr < segment_offset) {
+        throw Error("chained_fixups: segment vm_addr < segment_offset");
+      }
+      image_base = segments[i].vm_addr - segment_offset;
+      image_base_known = true;
+    }
+
+    const std::uint64_t stride = stride_bytes(pointer_format);
+    const std::uint8_t* page_starts = sis + 22;
+    for (std::uint16_t pi = 0; pi < page_count; ++pi) {
+      const std::uint16_t ps = read_u16(page_starts + pi * 2);
+      if (ps == kPageStartNone) {
+        continue;
+      }
+      if (ps & kChainStartMulti) {
+        // Multi-start pages live in chain_starts[] appended after
+        // page_start[]. Real userland binaries seldom emit them
+        // (clang/lld pack chains so one start per page suffices).
+        // Phase 2 handles this when we encounter it in the wild.
+        throw Error("chained_fixups: multi-start page — phase 2");
+      }
+      const std::uint64_t page_base_in_seg =
+          static_cast<std::uint64_t>(pi) *
+          static_cast<std::uint64_t>(page_size);
+      walk_chain(segments[i], pointer_format, segment_offset,
+                 page_base_in_seg, ps, image_base, stride, out);
+    }
+  }
+
+  return out;
+}
+
+}  // namespace ldb::backend

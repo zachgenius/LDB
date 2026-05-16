@@ -123,6 +123,7 @@ set(LDB_UNIT_SOURCES
   test_symbol_index.cpp
   test_backend_iterate.cpp
   test_dispatcher_correlate_indexed.cpp
+  test_chained_fixups.cpp
 )
 
 set(LDB_LIB_SOURCES
@@ -137,6 +138,7 @@ set(LDB_LIB_SOURCES
   ${CMAKE_SOURCE_DIR}/src/protocol/view.cpp
   ${CMAKE_SOURCE_DIR}/src/util/log.cpp
   ${CMAKE_SOURCE_DIR}/src/backend/lldb_backend.cpp
+  ${CMAKE_SOURCE_DIR}/src/backend/chained_fixups.cpp
   ${CMAKE_SOURCE_DIR}/src/daemon/dispatcher.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/probe_orchestrator.cpp
   ${CMAKE_SOURCE_DIR}/src/probes/rate_limit.cpp
