@@ -4,6 +4,136 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — persistent unix-socket daemon (§2 phase 1)
+
+**Goal:** Implement `docs/35-field-report-followups.md §2` phase 1 — a
+new `ldbd --listen unix:PATH` mode (single-client, persistent) and a
+matching `ldb --socket PATH` client knob, so an agent can invoke
+`ldb target.open ...` followed by `ldb symbol.find target_id=N` from a
+shell script without losing `target_id` between calls.
+
+**Done:**
+
+- Worktree branch `worktree-agent-ae73d824f609b6e86` (rebased onto
+  `fix/target-open-lazy-load` so `docs/35-field-report-followups.md`
+  was actually present in the tree).
+- TDD: three new smoke tests, failing first, then passing:
+  * `tests/smoke/test_socket_lifecycle.py` — start `ldbd --listen
+    unix:$sock`, run `ldb target.open` over one connection, then
+    `ldb module.list target_id=$N` over a fresh connection. Asserts
+    `target_id` survives the disconnect — the load-bearing
+    correctness claim of §2 phase 1.
+  * `tests/smoke/test_socket_collision.py` — second `ldbd --listen
+    unix:$same_path` exits non-zero with stderr naming the holder
+    pid.
+  * `tests/smoke/test_socket_perms.py` — socket inode is mode 0600,
+    auto-created parent dir is mode 0700.
+- `src/daemon/socket_loop.{h,cpp}`: new translation unit owning the
+  `accept()` loop. Acquires `LOCK_EX|LOCK_NB` on `${sock}.lock`,
+  binds with `umask(0077)` (so the inode lands at 0600 atomically),
+  defensive `chmod 0600` afterwards, `listen(backlog=4)`. Per-
+  connection `OutputChannel` is installed as the dispatcher's
+  notification sink, then cleared on disconnect — phase 1 has at
+  most one connection alive, so the re-pointing is race-free.
+  `SIGTERM`/`SIGINT` set an atomic shutdown flag and trip out of the
+  accept loop; the socket and lock file are unlinked on the way out.
+  `SIGPIPE` is `SIG_IGN`'d so a peer closing mid-write becomes an
+  `EPIPE` on `write()` (caught and dropped), not a process death.
+- `src/daemon/stdio_loop.{cpp,h}`: extracted
+  `serve_one_connection(dispatcher, out, in, fmt)` from
+  `run_stdio_loop`. Both modes now share the same dispatch body, so
+  framing-error semantics, request-from-json conversion, and the
+  notification-vs-reply distinction stay identical regardless of
+  transport.
+- `src/daemon/socket_loop.cpp` includes a self-contained
+  `FdStreambuf` (200 lines) wrapping a single fd for both read and
+  write halves. Reused via `FdIstream` / `FdOstream`. Justification
+  recorded inline: we already have `read_message`/`write_message`
+  taking `std::istream&` / `std::ostream&`, and pulling
+  `__gnu_cxx::stdio_filebuf` would be a libstdc++-specific escape
+  hatch.
+- `src/main.cpp`: new `--listen unix:PATH` flag, mutually exclusive
+  with `--stdio`. Help text documents the path policy (XDG / TMPDIR
+  / /tmp + UID-stamped fallback), the file-permission contract, and
+  links to `docs/35-field-report-followups.md §2`.
+- `tools/ldb/ldb`: `DaemonSpec` grew a `socket_path` field; new
+  `--socket PATH` flag with `LDB_SOCKET` env override and a
+  mutual-exclusion check against `--ssh` / `--ldbd`. New
+  `_SocketProc` adapter exposes `stdin`/`stdout`/`stderr`/`wait()`/
+  `kill()`/`poll()` so the existing `JsonTransport`/`CborTransport`
+  + `fetch_catalog` + `do_rpc` plumbing works unchanged. `--help`
+  documents the new flag and the daemon-lifetime tradeoffs.
+- `tests/CMakeLists.txt`: three new `add_test` entries (TIMEOUT 30
+  each). All three pass; the entire 72-test suite passes
+  warning-clean.
+
+**Decisions:**
+
+- **Single-client, serial.** The §2 lifecycle table is explicit
+  about phase 1 being one connection at a time; the dispatcher
+  installs the per-connection notification sink without locking
+  because at most one connection is alive at any moment. Phase 2
+  needs (a) per-connection sinks plumbed through the
+  `NonStopRuntime` and (b) an audit of the dispatcher's per-target
+  mutability assumptions — both deferred per the explicit
+  out-of-scope list in §2.
+- **flock on `${sock}.lock`, not on the socket itself.** Unix
+  sockets can't be `flock()`'d portably; a sidecar lockfile is the
+  conventional pattern. We also stamp the holder's pid into the
+  lockfile so the collision diagnostic can name a process — useful
+  for an operator running two terminals.
+- **umask trick + defensive chmod.** POSIX `bind()` honours
+  `umask`. Setting it to 0077 around the `bind()` makes the inode
+  0600 atomically — no window between `bind()` and a separate
+  `fchmod()` where someone could open the socket. The defensive
+  `chmod 0600` afterwards is for filesystems (tmpfs over NFS, some
+  containerised mounts) that ignore umask; cheap, idempotent.
+- **Parent dir 0700 only when we create it.** Pre-existing parents
+  are the operator's responsibility; chmoding `/tmp` because the
+  user passed `--listen unix:/tmp/x` would be aggressive.
+- **No client-side auto-spawn.** Per the §2 lifecycle table:
+  phase 1 expects the user to run `ldbd --listen` explicitly. The
+  CLI's "could not connect" error is enough — auto-spawn is phase 2.
+- **No idle timeout / `daemon.shutdown` RPC yet.** Daemon runs
+  until `SIGTERM`/`SIGINT`; the operator does the lifecycle.
+- **Per-connection notification sink install/clear inside the
+  accept loop.** The `NonStopRuntime`'s sink is an `atomic<T*>`
+  with relaxed loads in production; re-pointing it between
+  connections (one at a time) is correct as long as no notification
+  is in flight at the moment of repoint. Since the dispatcher is
+  single-threaded and we only repoint after `serve_one_connection`
+  returns (i.e. after the connection has closed and no further
+  RPCs / notifications will fire on this conn), the invariant
+  holds. Phase 2 multi-client breaks this; flag noted in the
+  commit message.
+
+**Surprises / blockers:**
+
+- macOS has no `SOCK_CLOEXEC`; we always create the socket
+  unconditionally with `socket(2)` and `fcntl(F_SETFD, FD_CLOEXEC)`
+  afterwards. The post-fork-before-CLOEXEC race window is empty on
+  this single-threaded startup path.
+- `Dispatcher::set_notification_sink` does not have a documented
+  thread-safety story under live-RPC mutation. Phase-1 calls it
+  only when no RPC is in flight (between accept() and the first
+  read on a fresh connection, and after the connection closes),
+  which is safe. Phase 2 needs (i) per-connection sinks routed
+  through a different API or (ii) an explicit lock + a per-sink
+  liveness flag so a notification arriving after disconnect
+  doesn't fire into a dead `OutputChannel`. Flagged in this commit
+  for the phase-2 author.
+- Test harness uses Python `socket.makefile()` with `buffering=0`
+  so JSON-line and length-prefixed-CBOR framing both read and write
+  without an intermediate buffer that could split a frame.
+
+**Next:** §2 phase 2 — multi-client + auto-spawn + notification-sink
+refactor. Or §1 (CLI sibling lookup, 30-min change). Or §3 (chained
+fixups, ~week of work). The sequencing recommendation in §4 of
+`docs/35-field-report-followups.md` is §1 → §2-phase-1 (just
+shipped) → §3 → §2-phase-2; §1 is the next small one.
+
+---
+
 ## 2026-05-16 — target.open lazy load: preload-symbols off + summary modules
 
 **Goal:** Take a RE-engineer field report (driving LDB against a 503 MB

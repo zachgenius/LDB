@@ -41,9 +41,11 @@ hand-rolled for the wire-format subset ldbd emits.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -234,13 +236,17 @@ class CborTransport:
 # ----------------------------------------------------------------------
 
 class DaemonSpec:
-    """How to spawn the daemon. Either local (a path to ldbd) or ssh.
+    """How to spawn the daemon. Either local (a path to ldbd), ssh, or
+    a unix-socket connection to an already-running `ldbd --listen ...`.
 
-    The rest of the CLI treats both the same — `spawn_daemon(spec, ...)`
-    returns a Popen whose stdin/stdout speak the JSON-RPC channel.
+    The rest of the CLI treats all three the same — `spawn_daemon(spec, ...)`
+    returns an object whose stdin/stdout speak the JSON-RPC channel.
+    For local/ssh that object is a `subprocess.Popen`; for the unix
+    socket path it's a `_SocketProc` shim that exposes the same
+    `stdin` / `stdout` / `stderr` / `wait()` / `kill()` interface.
     """
     __slots__ = ("local_ldbd", "ssh_target", "ssh_key", "ssh_options",
-                 "remote_ldbd")
+                 "remote_ldbd", "socket_path")
 
     def __init__(self):
         self.local_ldbd: str | None = None
@@ -248,10 +254,90 @@ class DaemonSpec:
         self.ssh_key: str | None = None
         self.ssh_options: str | None = None  # extra raw "-o ..." string
         self.remote_ldbd: str = "ldbd"
+        self.socket_path: str | None = None
 
     @property
     def is_ssh(self) -> bool:
         return self.ssh_target is not None
+
+    @property
+    def is_socket(self) -> bool:
+        return self.socket_path is not None
+
+
+def default_socket_path() -> str:
+    """Return the default unix-socket path per §2 phase-1 policy.
+
+    Resolution order (matches `ldbd --help`):
+      $XDG_RUNTIME_DIR/ldbd.sock   if XDG_RUNTIME_DIR is set
+      $TMPDIR/ldbd-$UID.sock       if TMPDIR is set
+      /tmp/ldbd-$UID.sock          fallback
+    """
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return os.path.join(xdg, "ldbd.sock")
+    tmpdir = os.environ.get("TMPDIR") or "/tmp"
+    uid = os.geteuid() if hasattr(os, "geteuid") else 0
+    return os.path.join(tmpdir, f"ldbd-{uid}.sock")
+
+
+class _SocketProc:
+    """Popen-shaped adapter wrapping a connected unix socket.
+
+    `stdin` / `stdout` expose the socket's send/recv halves through
+    Python's `socket.makefile()` so the existing
+    `JsonTransport`/`CborTransport` plumbing works unchanged. `stderr`
+    is a static empty BytesIO — when the daemon talks via a socket,
+    its log lines go to ITS stderr (we never see them), so reading
+    from this shim's stderr in error paths simply returns b"". Code
+    paths that report "daemon stderr was: ..." just print an empty
+    string in socket mode — acceptable for phase 1.
+    """
+
+    def __init__(self, sock_path: str):
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self._sock.connect(sock_path)
+        except OSError as e:
+            self._sock.close()
+            raise IOError(
+                f"could not connect to ldbd socket {sock_path!r}: {e}"
+            ) from None
+        # makefile() on a socket bumps a ref so the file object's close
+        # doesn't tear the underlying socket out from under the other
+        # half. We separately close `self._sock` in `wait()`/`kill()`.
+        self.stdin = self._sock.makefile("wb", buffering=0)
+        self.stdout = self._sock.makefile("rb", buffering=0)
+        self.stderr = io.BytesIO()
+        self.returncode: int | None = None
+
+    def wait(self, timeout: float | None = None):
+        # No subprocess to reap — but signal cleanup intent by closing
+        # the socket so the daemon's accept() loop can move on to the
+        # next caller. shutdown() first to flush the kernel send buffer
+        # and let the daemon see EOF promptly.
+        if self.returncode is None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self.returncode = 0
+        return 0
+
+    def kill(self):
+        if self.returncode is None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self.returncode = -9
+
+    def poll(self):
+        return self.returncode
 
 
 def find_ldbd(explicit: str | None) -> str:
@@ -306,17 +392,27 @@ def _build_ssh_argv(spec: DaemonSpec, fmt: str) -> list[str]:
 
 
 def spawn_daemon(spec_or_path, fmt: str, verbose: bool):
-    """Spawn a daemon by spec (local or ssh).
+    """Spawn a daemon by spec (local, ssh, or unix-socket connection).
 
     Accepts either a DaemonSpec or, for backward-compat with older
     call-sites that already had a resolved ldbd path string, the bare
     path string (which it wraps into a local spec).
+
+    For the socket case nothing is spawned — we connect to an existing
+    `ldbd --listen unix:PATH` and return a Popen-shaped adapter so the
+    rest of the code keeps working unchanged.
     """
     if isinstance(spec_or_path, DaemonSpec):
         spec = spec_or_path
     else:
         spec = DaemonSpec()
         spec.local_ldbd = spec_or_path
+
+    if spec.is_socket:
+        if verbose:
+            sys.stderr.write(
+                f"ldb: connecting to unix:{spec.socket_path}\n")
+        return _SocketProc(spec.socket_path)
 
     if spec.is_ssh:
         cmd = _build_ssh_argv(spec, fmt)
@@ -516,11 +612,11 @@ def render_top_help(catalog: list[dict]) -> str:
         "ldb — thin CLI for ldbd (LDB daemon)\n"
         "\n"
         "Usage:\n"
-        "  ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]\n"
-        "      [--verbose] [--raw]\n"
+        "  ldb [--ldbd PATH | --ssh [user@]host[:port] | --socket PATH]\n"
+        "      [--format json|cbor] [--verbose] [--raw]\n"
         "      <subcommand> [key=value ...] [--view k=v ...]\n"
-        "  ldb [--ldbd PATH | --ssh [user@]host[:port]] [--format json|cbor]\n"
-        "      [--verbose] --repl\n"
+        "  ldb [--ldbd PATH | --ssh [user@]host[:port] | --socket PATH]\n"
+        "      [--format json|cbor] [--verbose] --repl\n"
         "  ldb <subcommand> --help\n"
         "  ldb --help | --version\n"
         "\n"
@@ -536,14 +632,27 @@ def render_top_help(catalog: list[dict]) -> str:
         "  (e.g. `ldb --repl < commands.txt`) and processes every line\n"
         "  before exiting.\n"
         "\n"
+        "  Alternatively, run `ldbd --listen unix:PATH` once out-of-band\n"
+        "  and connect every `ldb` invocation with `--socket PATH`.\n"
+        "  target_id and other daemon-side state survive across CLI\n"
+        "  invocations because the daemon outlives them (§2 phase-1 of\n"
+        "  docs/35-field-report-followups.md). Phase-1 is single-client:\n"
+        "  the daemon serves one connection at a time.\n"
+        "\n"
         "Top-level options:\n"
         "  --ldbd PATH          local ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
         "  --ssh TARGET         spawn ldbd on TARGET ([user@]host[:port]) via ssh\n"
-        "                       (mutually exclusive with --ldbd)\n"
+        "                       (mutually exclusive with --ldbd and --socket)\n"
         "                       env LDB_SSH_TARGET overrides this flag\n"
         "  --ssh-key PATH       ssh identity file (forwarded as `ssh -i`)\n"
         "  --ssh-options STR    extra raw ssh options, e.g. \"-o ProxyJump=bastion\"\n"
         "  --ldbd-path PATH     where ldbd lives on the remote (default: ldbd on $PATH)\n"
+        "  --socket PATH        connect to an already-running\n"
+        "                       `ldbd --listen unix:PATH`. Mutually\n"
+        "                       exclusive with --ssh / --ldbd. env\n"
+        "                       LDB_SOCKET overrides this flag. Access\n"
+        "                       control is filesystem-only (socket mode\n"
+        "                       0600); no token auth in phase 1.\n"
         "  --format json|cbor   wire format on the daemon channel (default: json)\n"
         "  --verbose            log JSON-RPC traffic to stderr\n"
         "  --raw                print the full JSON-RPC envelope, not just data\n"
@@ -667,7 +776,7 @@ def do_rpc(spec, fmt: str, verbose: bool, method: str,
 #   2. Whatever's left: first token = method; the rest = params + --view.
 
 TOP_OPTIONS_WITH_ARG = {"--ldbd", "--format", "--ssh", "--ssh-key",
-                        "--ssh-options", "--ldbd-path"}
+                        "--ssh-options", "--ldbd-path", "--socket"}
 TOP_OPTIONS_NOARG    = {"--verbose", "--raw", "--repl"}
 HELP_FLAGS           = {"--help", "-h"}
 
@@ -692,6 +801,7 @@ def parse_argv(argv: list[str]) -> dict:
         "ssh_key": None,
         "ssh_options": None,
         "ldbd_path": None,
+        "socket": None,
     }
 
     def _set_long_arg(key: str, val: str):
@@ -710,6 +820,8 @@ def parse_argv(argv: list[str]) -> dict:
             out["ssh_options"] = val
         elif key == "--ldbd-path":
             out["ldbd_path"] = val
+        elif key == "--socket":
+            out["socket"] = val
         else:
             raise ValueError(f"unknown option: {key}")
 
@@ -1252,13 +1364,30 @@ def main(argv: list[str]) -> int:
     if env_ssh:
         opts["ssh"] = env_ssh
 
+    # Same env-over-flag precedence: LDB_SOCKET wins over --socket.
+    # Empty env value is treated as unset. §2 phase-1 of
+    # docs/35-field-report-followups.md.
+    env_socket = os.environ.get("LDB_SOCKET") or None
+    if env_socket:
+        opts["socket"] = env_socket
+
+    # All three transport selectors are mutually exclusive. We surface
+    # this client-side so the user gets a fast, locally-rendered error
+    # instead of a confusing "tried to spawn ldbd while a socket was
+    # already configured" later in the pipeline.
+    if opts["socket"] and (opts["ssh"] or opts["ldbd"]):
+        sys.stderr.write(
+            "ldb: --socket is mutually exclusive with --ssh and --ldbd\n")
+        return 2
     if opts["ssh"] and opts["ldbd"]:
         sys.stderr.write(
             "ldb: --ssh and --ldbd are mutually exclusive\n")
         return 2
 
     spec = DaemonSpec()
-    if opts["ssh"]:
+    if opts["socket"]:
+        spec.socket_path = opts["socket"]
+    elif opts["ssh"]:
         spec.ssh_target = opts["ssh"]
         spec.ssh_key = opts["ssh_key"]
         spec.ssh_options = opts["ssh_options"]
@@ -1350,4 +1479,11 @@ if __name__ == "__main__":
         rc = main(sys.argv)
     except KeyboardInterrupt:
         rc = 130
+    except IOError as e:
+        # Surfaces both classic file-IO failures and the unix-socket
+        # `connect()` path's IOError from `_SocketProc.__init__`.
+        # Without this the agent sees an opaque Python traceback for
+        # the common "daemon isn't running" case.
+        sys.stderr.write(f"ldb: {e}\n")
+        rc = 1
     sys.exit(rc)

@@ -755,6 +755,18 @@ set_tests_properties(smoke_dap_shim PROPERTIES
 # Field-report follow-up §2 phase 1 — persistent unix-socket daemon.
 # `--listen unix:PATH` is single-client (one connection at a time);
 # `target_id` and other dispatcher state survive across a disconnect.
+# This test exercises the cross-cutting promise — daemon stays up,
+# client reconnects, target_id remains valid.
+add_test(
+  NAME smoke_socket_lifecycle
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_lifecycle.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_lifecycle PROPERTIES
+  TIMEOUT 30
+)
 
 # Two `ldbd --listen unix:$same_path` daemons must not coexist — flock
 # on `${sock}.lock` makes the second fail fast with a clear message.
