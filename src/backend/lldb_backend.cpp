@@ -2355,8 +2355,20 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
     auto bytes = read_module_file_bytes(mod);
     ChainedFixupMap m;
     if (!bytes.empty()) {
+      // Phase 4 item 2: pass the SBTarget's triple through so the FAT
+      // picker matches the slice LLDB actually loaded. SBTarget::
+      // GetTriple() returns a stable C string ("arm64e-apple-...",
+      // "arm64-apple-ios13.0", "x86_64-apple-...", ...); empty when
+      // LLDB couldn't classify the binary (we fall back to the
+      // phase-3 preference order in that case). The triple is
+      // ignored for thin Mach-Os.
+      const char* triple_cstr = target.GetTriple();
+      std::string_view triple_sv =
+          (triple_cstr != nullptr) ? std::string_view(triple_cstr)
+                                    : std::string_view{};
       try {
-        m = extract_chained_fixups_from_macho(bytes.data(), bytes.size());
+        m = extract_chained_fixups_from_macho(bytes.data(), bytes.size(),
+                                               triple_sv);
       } catch (const Error&) {
         // Malformed payload: publish an empty map so we don't retry on
         // every call. Phase 3 will surface this as a diagnostic.

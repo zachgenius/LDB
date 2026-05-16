@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -84,7 +85,19 @@ ChainedFixupMap parse_chained_fixups(
 //
 // `macho_bytes` must outlive this call but the map's resolved table
 // owns its own storage and survives the byte buffer's destruction.
+//
+// `triple` is the SBTarget triple of the LOADED slice (e.g.
+// "arm64e-apple-macosx14.0.0", "arm64-apple-ios13.0", "x86_64-apple-
+// macosx-"). Phase 4 item 5 (docs/35-field-report-followups.md §3)
+// uses it to pick the right slice from a FAT (universal) Mach-O:
+//   - triple substring "arm64e-" → prefer CPU_SUBTYPE_ARM64E (= 2)
+//   - triple substring "arm64-"  → prefer CPU_SUBTYPE_ARM64_ALL/_V8
+//   - triple substring "x86_64-" → CPU_TYPE_X86_64 (no chained fixups
+//                                   today; we still skip past it)
+// Empty triple falls back to the phase-3 preference order (arm64e
+// then arm64). Non-FAT inputs ignore the triple entirely.
 ChainedFixupMap extract_chained_fixups_from_macho(
-    const std::uint8_t* macho_bytes, std::size_t macho_size);
+    const std::uint8_t* macho_bytes, std::size_t macho_size,
+    std::string_view triple = {});
 
 }  // namespace ldb::backend

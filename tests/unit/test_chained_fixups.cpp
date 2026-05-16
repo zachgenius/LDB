@@ -768,3 +768,157 @@ TEST_CASE("extract_chained_fixups_from_macho: FAT64 (cafebabf) picks arm64 slice
   CHECK(m.resolved.at(0x8008) == 0x100000600ULL);
   CHECK(m.image_base == 0x100000000ULL);
 }
+
+// ---------------------------------------------------------------------------
+// FAT triple-aware slice selection
+// (docs/35-field-report-followups.md §3 phase 4 item 2).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("extract_chained_fixups_from_macho: FAT picks arm64 slice when "
+          "triple says arm64",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // Same FAT layout as "FAT prefers arm64e over arm64" but with an
+  // arm64-targeted triple. Phase 4: the triple should override the
+  // phase-3 arm64e-first default and pick the plain arm64 slice.
+  // image_base proves the right slice was selected.
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSlice1Off = 0x2000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  // Slice 0: arm64e (subtype 2), vmaddr base 0x100000000
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  // Slice 1: arm64-all, vmaddr base 0x200000000
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 0);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho(fat, kSlice1Off, 0x200000000ULL);
+
+  // Triple says arm64 (no 'e') — slice 1's image_base must come back.
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64-apple-macosx14.0.0");
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x200000000ULL);
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: FAT picks arm64e slice when "
+          "triple says arm64e",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // Inverse of the test above — explicit arm64e triple still lands on
+  // slice 0 (which would also be the default).
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSlice1Off = 0x2000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 0);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho(fat, kSlice1Off, 0x200000000ULL);
+
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64e-apple-macosx14.0.0");
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x100000000ULL);
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: empty triple falls back to "
+          "phase-3 preference order",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // No triple — same as phase 3's default: arm64e wins. This pins the
+  // backward-compatible no-op case so existing callers (the ones that
+  // don't yet plumb SBTarget::GetTriple() through) keep behaving
+  // identically.
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSlice1Off = 0x2000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 0);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho(fat, kSlice1Off, 0x200000000ULL);
+
+  // Empty triple — preserves phase-3 default (arm64e first).
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size());
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x100000000ULL);
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: triple-matching slice missing "
+          "falls back to preference order",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // FAT with only an arm64e slice. Triple says arm64. The arm64
+  // slice doesn't exist; fall back to phase-3 preference (arm64e).
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice0Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 1);
+
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);                 // arm64e
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+
+  // The arm64 slice doesn't exist in this FAT. Phase 4: fall through
+  // to the arm64e slice rather than returning empty.
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64-apple-ios13.0");
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x100000000ULL);
+}
