@@ -16,6 +16,12 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+// Peer-credential retrieval is platform-specific. BSDs ship getpeereid;
+// Linux glibc/musl don't, but expose SO_PEERCRED via getsockopt.
+#if defined(__linux__)
+#  include <sys/socket.h>  // for SO_PEERCRED + struct ucred
+#endif
+
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -281,9 +287,13 @@ int acquire_lock(const std::string& lock_path) {
   }
   // Re-stamp the lock with our pid so the next collision can name us.
   // ftruncate+pwrite (rather than fopen) so flock semantics survive.
-  ::ftruncate(fd, 0);
+  // Both calls are best-effort — a failed pid stamp degrades the
+  // collision diagnostic but is not fatal. Explicit ignore via assigning
+  // to (void)-cast lvalue silences gcc's -Wunused-result (which a bare
+  // cast does NOT on __attribute__((warn_unused_result)) declarations).
+  if (::ftruncate(fd, 0) != 0) { /* best-effort */ }
   std::string pid = std::to_string(::getpid()) + "\n";
-  (void) ::pwrite(fd, pid.data(), pid.size(), 0);
+  if (::pwrite(fd, pid.data(), pid.size(), 0) < 0) { /* best-effort */ }
   return fd;
 }
 
@@ -713,16 +723,31 @@ int run_socket_listener(Dispatcher& dispatcher,
 
     // Phase-1 trust model is uid-only: even though the socket inode
     // is 0600, a defense-in-depth peer-cred check rejects any caller
-    // whose uid differs from ours. getpeereid() is portable across
-    // macOS and Linux; on Linux it wraps SO_PEERCRED, on macOS it
-    // wraps LOCAL_PEERCRED.
+    // whose uid differs from ours. The retrieval API is platform-
+    // specific: BSDs ship getpeereid(); glibc/musl don't, but expose
+    // SO_PEERCRED via getsockopt. peer_cred_of() abstracts that.
     uid_t peer_uid = 0;
     gid_t peer_gid = 0;
+#if defined(__linux__)
+    {
+      struct ucred uc{};
+      socklen_t len = sizeof(uc);
+      if (::getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &uc, &len) != 0) {
+        log::error(std::string("SO_PEERCRED: ") + std::strerror(errno));
+        ::close(conn);
+        continue;
+      }
+      peer_uid = uc.uid;
+      peer_gid = uc.gid;
+    }
+#else
     if (::getpeereid(conn, &peer_uid, &peer_gid) != 0) {
       log::error(std::string("getpeereid: ") + std::strerror(errno));
       ::close(conn);
       continue;
     }
+#endif
+    (void)peer_gid;  // gid retrieved for parity with the BSD API but unused
     if (peer_uid != ::geteuid()) {
       log::error("rejecting connection from uid " +
                  std::to_string(peer_uid) +
