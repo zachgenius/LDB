@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
-"""Smoke test for §2 phase-2 multi-client socket daemon.
+"""Validates accept-level concurrency + state persistence across connections.
 
-Phase-1 (`docs/35-field-report-followups.md §2`) is single-client: the
-accept loop serves one connection to completion before the next.
-Phase-2 lifts that limit so an agent can run several `ldb --socket`
-clients in parallel against the same daemon and have them all make
-progress concurrently.
+§2 phase-2 of `docs/35-field-report-followups.md`. Phase-1 was
+single-client: the accept loop served one connection to completion
+before accepting the next. Phase-2 lifts the accept-level serialisation
+so two `ldb --socket` clients can be CONNECTED to the daemon at the
+same time, and each connection can persist target_id state across
+its own RPC sequence.
+
+Honesty note (post-review N6): this test does NOT pin "concurrent
+dispatch." The dispatcher acquires `dispatch_mu_` for the entire
+dispatch() lifetime, so overlapping RPCs are serialised at that
+mutex. What this test DOES pin:
+
+  - Accept-level concurrency: two connections can be open
+    simultaneously. Phase-1 would block worker B's connect() until
+    worker A disconnects; the barrier between target.open and
+    module.list would then deadlock and time out at 10s.
+
+  - State persistence across connections: each worker opens its OWN
+    target_id, both succeed, both find their target still alive on
+    the second RPC.
+
+True per-connection dispatch parallelism is a phase-3 item (see
+`docs/35-field-report-followups.md` "Phase 3 — carried forward").
 
 Test sequence:
   1. Start `ldbd --listen unix:$sock` in the background.
-  2. Open TWO concurrent unix-socket connections. Each runs a serial
-     pair of JSON-RPC calls: `target.open` → `module.list`. The two
-     connections do NOT share target_id state — each opens its own
-     target. Both must succeed concurrently; phase-1 would serialise
-     and the second's accept would block until the first disconnects.
-  3. The two connections do their work in parallel via Python threads.
-     We pin the parallelism by waiting on a barrier between the
-     `target.open` and `module.list` calls — if the daemon serialises,
-     the barrier deadlocks.
-  4. Notification isolation: phase-2 prereq has per-connection sinks
+  2. Two Python threads each open a unix-socket connection. Each
+     runs a serial pair: `target.open` → `module.list`. A barrier
+     between the two RPCs requires BOTH workers to reach it before
+     either proceeds; a single-client accept loop deadlocks here.
+  3. Notification isolation: phase-2 prereq has per-connection sinks
      so a stop notification fired on connection A doesn't show up in
      connection B's stream. The smoke fixture is statically linked
      and we don't actually run it, so this test focuses on the
@@ -116,11 +129,14 @@ def main():
                     f"daemon never bound socket; stderr={err!r}\n")
                 sys.exit(1)
 
-            # Barrier that the two worker threads sync on between
-            # target.open and module.list. If the daemon serialises
-            # dispatch (the phase-1 behaviour), one worker holds the
-            # daemon while the other's accept() blocks — the barrier
-            # times out and we surface the deadlock as a failure.
+            # Barrier the two worker threads sync on between target.open
+            # and module.list. Pins ACCEPT-level concurrency: in phase-1
+            # the second worker's connect() would block on the daemon's
+            # accept() until the first worker disconnects, so its
+            # target.open never returns and the barrier hits its 10s
+            # timeout. NOT pinning dispatch-level parallelism — that's
+            # serialised by dispatch_mu_ in phase-2 and is a phase-3
+            # refinement item.
             barrier = threading.Barrier(2, timeout=10.0)
             results = {}
             lock = threading.Lock()
@@ -219,7 +235,8 @@ def main():
         for f in failures:
             sys.stderr.write(f"  - {f}\n")
         sys.exit(1)
-    print("OK: two concurrent socket clients made progress in parallel")
+    print("OK: two clients held concurrent connections; per-connection "
+          "target state persisted across the RPC pair")
 
 
 if __name__ == "__main__":
