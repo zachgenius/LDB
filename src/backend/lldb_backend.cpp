@@ -1846,14 +1846,21 @@ using xref_arm64::parse_uint_at;
 // Extract the target address an ARM64 memory operand refers to, given a
 // known {adrp_page, register_name} pair. Recognised shapes:
 //
-//   ADD reg, src_reg, #<imm>          → page + imm
-//   LDR reg, [src_reg]                → page + 0
-//   LDR reg, [src_reg, #<imm>]        → page + imm
+//   ADD   reg, src_reg, #<imm>                  → page + imm
+//   LDR   xN,  [src_reg]                        → page + 0,   slot-load
+//   LDR   xN,  [src_reg, #<imm>]                → page + imm, slot-load
+//   LDR   wN,  [src_reg{, #imm}]                → page + imm, NOT slot-load
+//   LDRSW xN,  [src_reg{, #imm}]                → page + imm, NOT slot-load
+//   LDRH/LDRB  reg, [src_reg{, #imm}]           → page + imm, NOT slot-load
 //
 // `mnemonic` is lower-cased by the caller. Returns std::nullopt when
-// the instruction doesn't fit one of the patterns above. Sets
-// `is_slot_load` true for LDR (the load consumes a slot, so its target
-// is a slot address; for ADD the target is the slot's logical *value*).
+// the instruction doesn't fit one of the patterns above. The
+// `is_slot_load` flag is what gates the chained-fixup map lookup: it's
+// only meaningful for 8-byte LDRs into x-registers, because the
+// chained-fixup map keys 64-bit pointer slots. A 32-bit ldr/ldrsw or a
+// halfword/byte load is consuming the same effective address as a real
+// chained pointer would, so its direct ADRP target match is still
+// useful, but it cannot resolve through a slot.
 struct AdrpResolved {
   std::uint64_t target = 0;
   bool is_slot_load = false;
@@ -1883,6 +1890,21 @@ resolve_adrp_consumer(const std::string& mnemonic, const std::string& operands,
   if (mnemonic == "ldr" || mnemonic == "ldrsw" || mnemonic == "ldrh" ||
       mnemonic == "ldrb") {
     // "ldr dst, [src]" or "ldr dst, [src, #imm]"
+    //
+    // We snapshot the destination register's first character *before*
+    // parse_reg_at canonicalises it (w8 → x8). The slot-load gate
+    // below needs the original width to distinguish `ldr xN, ...` (a
+    // 64-bit slot load — what the chained-fixup map indexes) from
+    // `ldr wN, ...` (a 32-bit load — same effective address, but the
+    // value at that address isn't a pointer).
+    std::size_t dst_start = 0;
+    while (dst_start < operands.size() &&
+           (operands[dst_start] == ' ' || operands[dst_start] == '\t' ||
+            operands[dst_start] == ',')) ++dst_start;
+    char dst_width = (dst_start < operands.size())
+                         ? static_cast<char>(std::tolower(operands[dst_start]))
+                         : '\0';
+
     auto [ok_dst, dst, p1] = parse_reg_at(operands, 0);
     if (!ok_dst) return std::nullopt;
     // Skip ", ["
@@ -1910,7 +1932,12 @@ resolve_adrp_consumer(const std::string& mnemonic, const std::string& operands,
     }
     AdrpResolved r;
     r.target = it->second.page + imm;
-    r.is_slot_load = true;
+    // Slot-indirection only applies to 8-byte LDRs into x-registers.
+    // Halfword/byte loads and LDRSW are 32→64-bit sign-extension loads;
+    // their effective address may match a slot but the value at that
+    // address is not a chained pointer. We still emit the direct
+    // ADRP-target match so the caller can resolve string-byte loads.
+    r.is_slot_load = (mnemonic == "ldr" && dst_width == 'x');
     return r;
   }
   return std::nullopt;
@@ -2062,21 +2089,13 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
     }
   }
 
-  // Image base for converting slot RVAs to file addresses. For the
-  // main executable, file_addr == image_base + slot_rva. On Mach-O
-  // the first segment is __PAGEZERO (file_addr 0, vm_size 4 GiB) on
-  // 64-bit; the *next* segment's file address is the real image base.
-  // We pick the lowest non-zero file address across the module's
-  // top-level sections to land at __TEXT regardless of LLDB ordering.
-  std::uint64_t image_base = 0;
-  size_t nsec_top = mod.GetNumSections();
-  for (size_t i = 0; i < nsec_top; ++i) {
-    auto s = mod.GetSectionAtIndex(i);
-    if (!s.IsValid()) continue;
-    std::uint64_t fa = s.GetFileAddress();
-    if (fa == 0) continue;
-    if (image_base == 0 || fa < image_base) image_base = fa;
-  }
+  // Image base for converting slot file-addresses to chained-fixup
+  // RVAs. The parser already computed this from the first chain-
+  // bearing segment's (vm_addr - segment_offset); reuse it rather than
+  // re-deriving from LLDB's section table. Zero when the binary has
+  // no chained fixups, in which case the slot-load path below
+  // short-circuits on the empty `resolved` map anyway.
+  const std::uint64_t image_base = fixup_map.image_base;
 
   // Match an instruction's adrp-resolved target against (a) the
   // caller's needle directly, and (b) the slot-resolves-to-needle
@@ -2190,10 +2209,13 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
   // ADRP-pair path can both match the same instruction (e.g. on x86-64
   // RIP-relative loads where the operand already carries the target
   // and we also walk the trivial ADRP-pair pattern with zero results).
-  std::sort(out.begin(), out.end(),
-            [](const XrefMatch& a, const XrefMatch& b) {
-              return a.address < b.address;
-            });
+  // stable_sort because std::unique below keeps the first survivor of
+  // each address group; an unstable sort would let nondeterministic
+  // ordering pick which of two equal-address entries wins on rebuilds.
+  std::stable_sort(out.begin(), out.end(),
+                   [](const XrefMatch& a, const XrefMatch& b) {
+                     return a.address < b.address;
+                   });
   auto last = std::unique(out.begin(), out.end(),
                           [](const XrefMatch& a, const XrefMatch& b) {
                             return a.address == b.address;

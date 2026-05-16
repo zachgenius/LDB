@@ -45,6 +45,15 @@ struct ChainedFixupMap {
   // formats). For binds, this is 0 — phase 1 does not resolve binds.
   // Phase 2 wires in the imports table.
   std::unordered_map<std::uint64_t, std::uint64_t> resolved;
+
+  // Image base derived from the first chain-bearing segment's
+  // (vm_addr - segment_offset) pair. Zero when no chained fixups are
+  // present (extract_chained_fixups_from_macho on a non-Mach-O / non-
+  // ARM64e binary, or a Mach-O without LC_DYLD_CHAINED_FIXUPS). Callers
+  // that need to translate a slot's file address to an RVA (xref's
+  // ADRP-pair resolver) read this instead of re-deriving it from the
+  // module's section table.
+  std::uint64_t image_base = 0;
 };
 
 // Parse a raw LC_DYLD_CHAINED_FIXUPS payload. `payload` points at the

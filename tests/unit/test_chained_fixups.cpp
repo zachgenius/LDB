@@ -321,6 +321,10 @@ TEST_CASE("parse_chained_fixups: ARM64E single-page two-rebase chain",
   REQUIRE(m.resolved.size() == 2);
   CHECK(m.resolved.at(0x8000) == 0x100000500ULL);
   CHECK(m.resolved.at(0x8008) == 0x100000600ULL);
+  // image_base derived from segment[0]: vm_addr 0x100008000 -
+  // segment_offset 0x8000 = 0x100000000. xref's slot-load resolver
+  // reads this field rather than re-deriving from LLDB's section table.
+  CHECK(m.image_base == 0x100000000ULL);
 }
 
 TEST_CASE("parse_chained_fixups: 64_OFFSET multi-page chain",
@@ -399,9 +403,12 @@ TEST_CASE("extract_chained_fixups_from_macho: empty/non-Mach-O is a no-op",
           "[chained_fixups][macho]") {
   using ldb::backend::extract_chained_fixups_from_macho;
 
-  // Null / empty: empty map, no throw.
+  // Null / empty: empty map, no throw. image_base stays at the
+  // ChainedFixupMap default (0) so the xref slot-load resolver's
+  // (file_addr >= image_base) gate short-circuits to no-match.
   auto m1 = extract_chained_fixups_from_macho(nullptr, 0);
   CHECK(m1.resolved.empty());
+  CHECK(m1.image_base == 0ULL);
 
   // ELF magic — not a Mach-O. Caller treats this as "binary doesn't
   // use chained fixups" rather than an error.
@@ -409,6 +416,7 @@ TEST_CASE("extract_chained_fixups_from_macho: empty/non-Mach-O is a no-op",
   elf[0] = 0x7f; elf[1] = 'E'; elf[2] = 'L'; elf[3] = 'F';
   auto m2 = extract_chained_fixups_from_macho(elf.data(), elf.size());
   CHECK(m2.resolved.empty());
+  CHECK(m2.image_base == 0ULL);
 }
 
 TEST_CASE("extract_chained_fixups_from_macho: minimal arm64 Mach-O round-trip",
@@ -425,7 +433,12 @@ TEST_CASE("extract_chained_fixups_from_macho: minimal arm64 Mach-O round-trip",
   // Layout decisions are encoded in offset constants to keep the
   // hand-built header readable.
   constexpr std::size_t kHeader     = 32;
-  constexpr std::size_t kSegCmdSize = 56;   // segment_command_64 base size
+  // segment_command_64 is 72 bytes:
+  //   cmd/cmdsize/segname(16)/vmaddr/vmsize/fileoff/filesize/maxprot/
+  //   initprot/nsects/flags. Anything shorter would truncate the maxprot
+  //   tail that the parser doesn't currently read but a future check
+  //   might. Keep the test in sync with the parser's structural minimum.
+  constexpr std::size_t kSegCmdSize = 72;
   constexpr std::size_t kFixCmdSize = 16;   // linkedit_data_command
   constexpr std::size_t kCmdEnd     = kHeader + kSegCmdSize + kFixCmdSize;
   constexpr std::size_t kSegOff     = 0x100;

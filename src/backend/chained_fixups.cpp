@@ -276,6 +276,7 @@ ChainedFixupMap parse_chained_fixups(
       }
       image_base = segments[i].vm_addr - segment_offset;
       image_base_known = true;
+      out.image_base = image_base;
     }
 
     const std::uint64_t stride = stride_bytes(pointer_format);
@@ -361,10 +362,15 @@ ChainedFixupMap extract_chained_fixups_from_macho(
     if (cmdsize < 8 || cursor + cmdsize > macho_size) return {};
 
     if (cmd == kLCSegment64) {
-      // segment_command_64:
+      // segment_command_64 (72-byte fixed header):
       //   cmd[0..4] cmdsize[4..8] segname[8..24] vmaddr[24..32]
-      //   vmsize[32..40] fileoff[40..48] filesize[48..56] ...
-      if (cmdsize < 56) return {};
+      //   vmsize[32..40] fileoff[40..48] filesize[48..56]
+      //   maxprot[56..60] initprot[60..64] nsects[64..68] flags[68..72]
+      // We only read up to filesize[48..56] in this branch, so a
+      // cmdsize<72 input wouldn't OOB today; the tighter bound matches
+      // the actual struct minimum and rejects truncated commands that
+      // any later additions (nsects/flags) would dereference past.
+      if (cmdsize < 72) return {};
       const std::uint64_t vmaddr   = read_u64(macho_bytes + cursor + 24);
       const std::uint64_t vmsize   = read_u64(macho_bytes + cursor + 32);
       const std::uint64_t fileoff  = read_u64(macho_bytes + cursor + 40);
