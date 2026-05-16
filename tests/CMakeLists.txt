@@ -90,6 +90,23 @@ set_tests_properties(smoke_string_xref PROPERTIES
   TIMEOUT 30
 )
 
+# docs/35-field-report-followups.md §3 phase 2 — xref.addr must follow
+# chained-fixup slot indirection on Apple silicon arm64 builds with
+# -Wl,-fixup_chains. The fixture only builds on that host; the test
+# is gated identically. Linux + non-arm64 macOS skip it cleanly because
+# the fixture target doesn't exist there.
+if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
+  add_test(
+    NAME smoke_xref_chained_fixup
+    COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_chained_fixup.sh"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb_fix_chain_slot>"
+  )
+  set_tests_properties(smoke_xref_chained_fixup PROPERTIES
+    TIMEOUT 30
+  )
+endif()
+
 add_test(
   NAME smoke_view_module_list
   COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_module_list.sh"

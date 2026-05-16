@@ -4,6 +4,100 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — ARM64 chained-fixup xref wire-up (§3 phase 2)
+
+**Goal:** Land phase 2 of `docs/35-field-report-followups.md §3` —
+wire the existing `parse_chained_fixups()` (phase 1) into the xref
+pipeline so `xref.address` on iOS/macOS arm64 binaries built with
+`-Wl,-fixup_chains` stops silently returning empty.
+
+**Done:**
+
+- Branch `worktree-agent-a108b3b7a3a54148b`, forked off
+  `origin/fix/chained-fixups-phase1`.
+- **TDD red:** built `tests/fixtures/c/chain_slot.c` (string in
+  `__cstring`, pointer slot in `__data` chained-fixup-encoded to it,
+  `reference_string()` loads via ADRP+LDR) and
+  `tests/smoke/test_xref_chained_fixup.sh`. Gated on
+  `APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64"`. First run
+  with the new fixture+test on the phase-1 tip: empty `matches[]`,
+  diagnosing hypothesis #2 from the parent task — LLDB renders ADRP
+  operands as a 21-bit page count (`"x8, 4"`), not as an absolute
+  page address, so the literal-hex scan misses both the slot and the
+  resolved string.
+- **Phase-2 wire-up.** Three landed pieces:
+  - `include/ldb/backend/chained_fixups.h` +
+    `src/backend/chained_fixups.cpp`: new
+    `extract_chained_fixups_from_macho(bytes, size)`. Walks
+    `LC_SEGMENT_64` + `LC_DYLD_CHAINED_FIXUPS` from raw Mach-O bytes
+    and dispatches to `parse_chained_fixups()`. Non-Mach-O / FAT /
+    classic-LC_DYLD_INFO_ONLY inputs return an empty map so xref
+    callers can wire it unconditionally.
+  - `src/backend/lldb_backend.cpp`: `Impl::chained_fixup_maps` +
+    `chained_fixup_loaded` per-target caches (lazy on first xref
+    query; reaped in `close_target`). `xref_address` extended with
+    an ARM64 ADRP-pair resolver — tracks `adrp xN, imm` →
+    absolute target page per destination register, computes
+    `page + imm` on the next `add` / `ldr` consumer, matches against
+    (a) the needle directly and (b) the chained-fixup map's
+    `slot_rva → resolved_value` for LDR-style consumers. Results
+    deduped by instruction address. `find_string_xrefs` inherits
+    the fix unchanged because it calls `xref_address`.
+  - `tests/unit/test_chained_fixups.cpp`: two new cases for the
+    Mach-O extractor (null/ELF → empty; minimal arm64 Mach-O →
+    round-trips Vector A's payload).
+- All 70 ctest tests green. Build warning-clean.
+- `docs/35-field-report-followups.md §3` updated with a "Phase 2 —
+  what shipped" section and an explicit "Out of scope (phase 2)"
+  list, mirroring the drift-reduction §1 went through.
+
+**Decisions:**
+
+- **No on-disk cache in this branch.** Cache the chained-fixup map in
+  memory keyed on TargetId; rebuild on every `target.open`. At
+  fixture scale (33 KB binary → ~1 ms) this is invisible; phase 3
+  will measure on real WeChat-scale targets before picking a cache
+  substrate. Keeps the diff focused on the correctness bug.
+- **No `correlate.symbols`/`correlate.strings` wire-up.** Per the
+  task's explicit out-of-scope list. Phase 3 will plug the fixup
+  map into the symbol-index path.
+- **ADRP-pair resolver instead of a chained-fixup-only path.** The
+  ADRP heuristic is needed regardless of chained fixups (compiler-
+  emitted `adrp + add #imm` for short string loads is also missed
+  by the literal-operand scan on the existing structs fixture if
+  LLDB's operand text doesn't surface the absolute target). The
+  chained-fixup map is consulted only for LDR consumers; ADD
+  consumers fall through to the direct-target match. Single
+  resolver covers both cases.
+- **`__PAGEZERO` skip when picking image_base.** `mod.GetSectionAtIndex(0)`
+  on a 64-bit Mach-O is `__PAGEZERO` (file_addr 0). Switched to
+  "lowest non-zero file address across top-level sections" so we
+  land at `__TEXT`.
+
+**Surprises / blockers:**
+
+- The field-report's specific failure mode is hypothesis #2 from the
+  parent task (LLDB renders ADRP as a page count, not an absolute
+  address), NOT hypothesis #3 (LLDB resolves the slot in operand
+  text). The smoke test pinned this empirically before any wire-up.
+- LLDB's `string.list` returns no strings for `static const char
+  k_target[] = "..."` because that lands in `__TEXT/__const`, not
+  `__TEXT/__cstring`, and `is_data_section()` doesn't include
+  `__const`. Worked around by storing the literal directly:
+  `static const char* g_slot = "ldb_chain_test_marker_string";`,
+  which puts the string in `__cstring` and the pointer slot (the
+  chained-fixup target) in `__data`. This is also the more
+  realistic shape vs the parent task's sketch — `__cstring` is
+  where real selrefs/cfstrings point.
+
+**Next:**
+
+- Phase 3 of §3: on-disk fixup-map cache, bind-table resolution,
+  `correlate.symbols`/`correlate.strings` wire-up, multi-module
+  support, real WeChat-binary validation.
+
+---
+
 ## 2026-05-16 — target.open lazy load: preload-symbols off + summary modules
 
 **Goal:** Take a RE-engineer field report (driving LDB against a 503 MB

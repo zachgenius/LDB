@@ -84,6 +84,34 @@ target_compile_options(ldb_fix_looper PRIVATE
   -fno-eliminate-unused-debug-types
 )
 
+# Chained-fixup fixture for docs/35-field-report-followups.md §3 phase 2.
+# Only built on Apple Silicon hosts: the smoke test that drives this
+# fixture (tests/smoke/test_xref_chained_fixup.sh) inspects an arm64
+# LC_DYLD_CHAINED_FIXUPS payload, which only Apple's linker emits and
+# which is only meaningfully decodable when the host can disassemble
+# arm64. The CMake guard mirrors the add_test() guard in
+# tests/CMakeLists.txt so a fresh `cmake --build` doesn't fail on Linux.
+if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
+  add_executable(ldb_fix_chain_slot c/chain_slot.c)
+  set_target_properties(ldb_fix_chain_slot PROPERTIES
+    OUTPUT_NAME    chain_slot
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+    C_STANDARD     11
+  )
+  target_compile_options(ldb_fix_chain_slot PRIVATE
+    -arch arm64
+    -g -O0
+    -fno-omit-frame-pointer
+  )
+  # -Wl,-fixup_chains forces the linker to emit LC_DYLD_CHAINED_FIXUPS
+  # even when the deployment target wouldn't have demanded it. This is
+  # the flag whose output the parse_chained_fixups() pipeline targets.
+  target_link_options(ldb_fix_chain_slot PRIVATE
+    -arch arm64
+    -Wl,-fixup_chains
+  )
+endif()
+
 # C++ fixture for symbol.find demangled-name lookup (papercut #3).
 # Itanium ABI mangles `ldb_fix::Widget::poke(long)` to a known mangled
 # symbol; we lean on the demangled name from LLDB SBSymbol::GetName()

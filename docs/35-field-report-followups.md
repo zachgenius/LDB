@@ -284,6 +284,78 @@ The map is built once per module (cached under
    can filter).
 5. **Cache invalidation.** Keyed on the module's build-id; immutable.
 
+### Phase 1 — what shipped (commits `1c0c8bb`, `359e738`, `d99cff9`)
+
+- `include/ldb/backend/chained_fixups.h` — public `parse_chained_fixups()`
+  + `ChainedFixupMap` (rva-keyed) + `SegmentInfo` callers populate from
+  Mach-O LC_SEGMENT_64s.
+- `src/backend/chained_fixups.cpp` — header walk, per-segment chain
+  walk, ARM64E (formats 1/9/12) + PTR_64 / PTR_64_OFFSET (formats 2/6)
+  decode. Multi-start pages, 32-bit formats, and bind resolution all
+  throw `phase 2` errors.
+- `tests/unit/test_chained_fixups.cpp` — five hand-built vectors
+  covering single-page, multi-page, auth-rebase, USERLAND, and the
+  unsupported-format error path.
+
+### Phase 2 — what shipped (this branch)
+
+The minimal wire-up needed to stop `xref.address` returning empty on
+chained-fixup binaries. Real iOS app validation deferred to phase 3.
+
+- `include/ldb/backend/chained_fixups.h` — new
+  `extract_chained_fixups_from_macho(bytes, size)` helper. Walks
+  `LC_SEGMENT_64` + `LC_DYLD_CHAINED_FIXUPS` from raw Mach-O bytes;
+  returns empty map on non-Mach-O / no-chained-fixup inputs (Linux
+  ELF, FAT binaries, classic LC_DYLD_INFO_ONLY) so callers can wire
+  it unconditionally without a Mach-O sniff.
+- `src/backend/lldb_backend.cpp` — `LldbBackend::Impl` gets
+  `chained_fixup_maps` / `chained_fixup_loaded` per-target caches
+  (lazy-init on first xref query; reaped in `close_target`). No
+  on-disk cache — phase 3.
+- `xref_address` — keeps the literal-operand + RIP-relative scans
+  intact, then runs an ARM64 ADRP-pair resolver. ADRP records the
+  absolute target page per destination register; the next consumer
+  (`add xN, src, #imm` or `ldr xN, [src, #imm]`) computes
+  `page + imm`. The target is matched against (a) the caller's
+  needle directly, and (b) the chained-fixup map's `slot_rva →
+  resolved_value` table for LDR-style consumers (slot-load
+  indirection). Results from all paths are deduped by instruction
+  address. Logic is sequential, single-pass — no liveness analysis;
+  the "last ADRP wins for this register" heuristic matches what
+  compiler-emitted ADRP+immediate-use code expects.
+- `tests/unit/test_chained_fixups.cpp` — two new cases covering the
+  Mach-O extractor: null / ELF magic → empty map; minimal arm64
+  Mach-O with one segment + one LC_DYLD_CHAINED_FIXUPS round-trips
+  through Vector A's payload.
+- `tests/fixtures/c/chain_slot.c` + `tests/smoke/test_xref_chained_fixup.sh`
+  — Apple-silicon-arm64-gated synthetic fixture. A pointer slot in
+  `__DATA/__data` rebases to a string in `__TEXT/__cstring`;
+  `reference_string()` loads through the slot via ADRP+LDR. Smoke
+  test pins both `xref.addr` and `string.xref` against the string's
+  file address. Without the wire-up the result is empty; with it,
+  the LDR inside `reference_string` is surfaced.
+
+### Out of scope (phase 2)
+
+Carried over to phase 3:
+
+- **On-disk cache** of the fixup map keyed on `build_id`. Today the
+  map is rebuilt on every `target.open`. Cheap enough at fixture
+  scale (33 KB binary → ~1 ms); needs measuring on real WeChat-
+  scale targets before deciding the cache substrate.
+- **`correlate.symbols` / `correlate.strings`** wire-up. The symbol-
+  index path doesn't consult the fixup map yet — it scans raw
+  section bytes and treats them as literal pointers.
+- **Bind resolution.** Phase 1 records `slot_rva → 0` for binds; the
+  imports table parse + lazy load-address resolution lives in
+  phase 3 once the symbol-index has a stable cross-module surface.
+- **Multi-module support.** xref_address only scans the main
+  executable (module index 0), same as before phase 2.
+- **WeChat-scale validation.** Synthetic fixture is sufficient for
+  this branch. Real iOS app smoke is a separate work item; the
+  symptom in the field report is the slot-load case the fixture
+  reproduces.
+
 ### Test plan
 
 Real iOS Mach-O fixtures are licence-sensitive and large; ship a
