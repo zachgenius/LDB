@@ -110,6 +110,27 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     -arch arm64
     -Wl,-fixup_chains
   )
+
+  # Phase-3 adversarial fixtures (docs/35-field-report-followups.md §3
+  # phase 3). Each one reproduces a specific phase-2 false-positive in
+  # the ADRP-pair resolver. Hand-assembled `.s` so the instruction
+  # stream is deterministic and the smoke tests can pin offsets.
+  # enable_language(ASM) is scoped to this CMakeLists — the rest of the
+  # project compiles C/C++ only.
+  enable_language(ASM)
+  foreach(_phase3_fix
+      xref_addclobber
+      xref_fnleak
+      xref_callclobber)
+    add_executable(ldb_fix_${_phase3_fix} asm/${_phase3_fix}.s)
+    set_target_properties(ldb_fix_${_phase3_fix} PROPERTIES
+      OUTPUT_NAME    ${_phase3_fix}
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+      LINKER_LANGUAGE C
+    )
+    target_compile_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
+    target_link_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
+  endforeach()
 endif()
 
 # C++ fixture for symbol.find demangled-name lookup (papercut #3).

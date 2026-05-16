@@ -105,6 +105,26 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
   set_tests_properties(smoke_xref_chained_fixup PROPERTIES
     TIMEOUT 30
   )
+
+  # Phase-3 adversarial smoke tests for the ADRP-pair resolver
+  # (docs/35-field-report-followups.md §3 phase 3). Each one targets
+  # one specific phase-2 false-positive mode: ADD-clobber, cross-
+  # function leak, BL-clobber. All three were silently wrong against
+  # 25f35de; phase 3's deterministic register-state clobber rules
+  # turn them green.
+  foreach(_phase3_smoke
+      xref_addclobber
+      xref_fnleak
+      xref_callclobber)
+    add_test(
+      NAME smoke_${_phase3_smoke}
+      COMMAND python3
+              "${CMAKE_SOURCE_DIR}/tests/smoke/test_${_phase3_smoke}.py"
+              "$<TARGET_FILE:ldbd>"
+              "$<TARGET_FILE:ldb_fix_${_phase3_smoke}>"
+    )
+    set_tests_properties(smoke_${_phase3_smoke} PROPERTIES TIMEOUT 30)
+  endforeach()
 endif()
 
 add_test(
