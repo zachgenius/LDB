@@ -399,7 +399,7 @@ class StubBackend : public ldb::backend::DebuggerBackend {
   }
 
   // Stubs — none of the rest are touched by correlate.types.
-  ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
+  ldb::backend::OpenResult open_executable(const std::string&, const ldb::backend::OpenOptions& = {}) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }
   ldb::backend::OpenResult load_core(const std::string&) override { return {}; }
   std::vector<ldb::backend::Module> list_modules(TID) override { return {}; }

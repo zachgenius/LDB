@@ -100,6 +100,21 @@ set_tests_properties(smoke_view_module_list PROPERTIES
   TIMEOUT 30
 )
 
+# Asserts target.open is summary-by-default and gates the section
+# walk behind view.include_sections=true. Motivated by the 503 MB
+# Mach-O case where the inline section table was 2.2 MB of wire data
+# per call (and the section walk itself was expensive). See worklog
+# 2026-05-16.
+add_test(
+  NAME smoke_target_open_view
+  COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_target_open_view.sh"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_target_open_view PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_process
   COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_process.sh"

@@ -19,7 +19,8 @@ class LldbBackend final : public DebuggerBackend {
   LldbBackend(const LldbBackend&) = delete;
   LldbBackend& operator=(const LldbBackend&) = delete;
 
-  OpenResult open_executable(const std::string& path) override;
+  OpenResult open_executable(const std::string& path,
+                             const OpenOptions& opts = OpenOptions{}) override;
   OpenResult create_empty_target() override;
   OpenResult load_core(const std::string& core_path) override;
   std::vector<Module> list_modules(TargetId tid) override;

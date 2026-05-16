@@ -232,7 +232,13 @@ std::string mi_quote(const std::string& s) {
 
 }  // namespace
 
-OpenResult GdbMiBackend::open_executable(const std::string& path) {
+OpenResult GdbMiBackend::open_executable(const std::string& path,
+                                         const OpenOptions& opts) {
+  // gdb-MI module listing is fetched lazily by list_modules; the opts
+  // bit only affects how target.open's response is shaped, which is
+  // handled by the dispatcher. Nothing to do here yet — keeping the
+  // signature aligned with the interface.
+  (void)opts;
   auto state = std::make_unique<TargetState>();
   state->session = std::make_unique<GdbMiSession>();
   if (!state->session->start()) {

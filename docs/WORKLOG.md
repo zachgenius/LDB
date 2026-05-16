@@ -4,6 +4,140 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — target.open lazy load: preload-symbols off + summary modules
+
+**Goal:** Take a RE-engineer field report (driving LDB against a 503 MB
+iOS arm64 Mach-O / WeChat) and fix the two showstoppers it surfaced:
+`target.open` never returned (RSS grew linearly at ~5 MB/s past 36 GB)
+and its response, when it did complete on smaller binaries, was 2.2 MB
+of inline section data per call.
+
+**Done:**
+
+- Branch `fix/target-open-lazy-load`.
+- TDD: new `tests/smoke/test_target_open_view.sh` asserts default
+  `target.open` carries `section_count` but NO inline `sections`, and
+  that `params.view.include_sections=true` opts back into the full
+  walk. Failing first, then passing.
+- `LldbBackend` ctor: `SBDebugger::SetInternalVariable(
+  "target.preload-symbols", "false", instance_name)`. This is the
+  killer for symptom #1 — LLDB no longer eagerly parses the entire
+  symbol table + DWARF + Obj-C runtime metadata on `CreateTarget`.
+  Symbol queries (`symbol.find`, `disasm.function`, ...) still work;
+  they just trigger the parse lazily, scoped to the module they need.
+- `Module::section_count` (always populated) and `OpenOptions{
+  include_sections=false }`. `convert_module(m, include_sections)`
+  walks sections only when asked; the cheap path just counts.
+- `open_executable(path, opts)` virtual on `DebuggerBackend` with a
+  defaulted `OpenOptions{}` — all 8 unit-test mocks + the GdbMi
+  backend updated.
+- `module_to_json` emits `section_count` always; emits the `sections`
+  array only when non-empty (so the default `target.open` shape is
+  truly absent, distinct from "present but empty").
+- `describe.endpoints` schema for `target.open` documents
+  `view.include_sections` and the default summary shape.
+- `tools/ldb/ldb` top-level `--help` now spells out the one-shot
+  daemon lifecycle and points users at `--repl` for piped batch
+  input — addresses dev-report #3 directly.
+- Token-budget baseline (Darwin-arm64) regenerated:
+  `target.open` 21913 → 1712 tokens (12.8× drop). Total budget for
+  the canonical workflow 51280 → 32627 (−36.4%).
+
+**Decisions:**
+
+- **preload-symbols off as a daemon-wide default** rather than a
+  per-target opt-in. Every static-analysis workflow LDB targets
+  (look up a symbol, disasm a function, follow an xref) hits LLDB
+  lazily anyway — the only consumer that benefited from the eager
+  parse was something like an interactive lookup loop that wanted
+  fast subsequent calls. We don't have that workflow; agents pay the
+  parse cost once on first symbol query and cache the result via
+  the symbol-index path. Net: huge win on open, no measurable loss
+  on the typical multi-call session.
+- **section_count alongside sections, not instead of.** The cheap
+  path needs a discoverable handle for "how big is this module" so
+  agents can budget before asking for the full walk. The recursive
+  count itself is O(top-level sections) with one `GetNumSubSections`
+  per section, not the full subsection walk — orders of magnitude
+  cheaper than the materialised version.
+- **module.list shape unchanged.** Dev report specifically complained
+  about `target.open`; `module.list` already has view descriptors
+  (`view.fields=["path","uuid"]`) to project sections out. Changing
+  its default would break test_view_module_list.sh + every agent
+  that already depends on the inline shape, for negligible additional
+  benefit.
+- **load_core keeps include_sections=true.** The caller has already
+  paid the (much larger) cost of loading a core file and almost
+  certainly wants to navigate the snapshot — the section table is
+  load-bearing for that. Same rationale as module.list.
+- **No --batch CLI mode in this branch.** Dev report #4 ("--repl <
+  cmds.txt only ran the first command") is almost certainly a
+  manifestation of #1 — target.open hung forever, so recv()
+  blocked, so the loop never read line 2. With preload-symbols off
+  the original test case finishes in <1s. If real batch-mode
+  ergonomics complaints survive that fix, add `--batch` then.
+- **add_dependent_modules left at true.** Considered flipping to
+  false for fewer modules on Mach-O, but it's a behavioral change
+  (modules[] would drop dyld + system libs on `target.open`) that
+  needs its own dev-facing migration. Out of scope here.
+
+**Surprises / blockers:**
+
+- **module_to_json was a single function called by both target.open
+  and module.list.** Splitting the JSON shape between "default
+  summary" and "full with sections" had two natural designs: a
+  flag parameter, or check `m.sections.empty()`. The latter is
+  cleaner — the backend's `convert_module(m, include_sections)`
+  already encodes the choice; the serializer just reads what the
+  backend put there. Drop in a comment to lock the convention.
+- **Token-budget gate caught the (intentional) drift exactly.**
+  Worth noting that this test was the only one that flagged the
+  wire-shape change; everything else (smoke + 68 unit-test
+  endpoints) passed unchanged because they don't assert on the
+  presence/absence of inline sections in `target.open`. The gate
+  is doing its job.
+- **GdbMi backend already lazy.** `GdbMiBackend::open_executable`
+  doesn't enumerate modules at open time (gdb-MI module listing is
+  fetched lazily by `list_modules`), so the new `OpenOptions` is
+  a no-op there. Kept the signature aligned with the interface
+  contract; added a one-line `(void)opts` so reviewers don't think
+  it's a TODO.
+
+**Verification:**
+
+- `ctest --output-on-failure` → 68/68 PASS (full suite minus
+  token-budget) in 177s. Token-budget passes after Darwin baseline
+  regen.
+- Manual: `target.open` against the structs fixture returns 1712
+  tokens (was 21913). Default response is
+  `{"path","uuid","triple","load_addr","section_count"}` per module,
+  no inline `sections` key.
+
+**Next:**
+
+- **Linux baseline drift** — `tests/baselines/agent_workflow_tokens.json`
+  Linux-x86_64 entry is now stale. The schema growth (~+1023 tokens
+  on `describe.endpoints`) should be offset by the `target.open`
+  shrink (~−956 tokens). Predicted net total drift on Linux: <1%,
+  comfortably inside the 10% gate. If CI's Linux runner says
+  otherwise, regenerate with `LDB_UPDATE_BASELINE=1` on Linux —
+  one-line follow-up.
+- **Dev report #5 (--ldbd PATH lookup)** — the CLI defaults to
+  `$PATH` then `./build/bin/ldbd`. A sibling-lookup heuristic
+  (`../../build/bin/ldbd` relative to the script's own dirname)
+  would let the in-tree CLI find the in-tree daemon without a flag.
+  Trivial, but unrelated to this branch's perf story.
+- **Dev report #6 (ARM64e tagged pointers / chained fixups in
+  Obj-C selref tables)** — separate roadmap item under post-v1
+  symbol-index work. Needs `LC_DYLD_CHAINED_FIXUPS` parsing before
+  xref indexing can correctly resolve selrefs on iOS 13+ binaries.
+- **Long-running socket-attached daemon** (dev report #3 phase 2):
+  separate from the doc fix landed here. Probably belongs under a
+  `--socket /tmp/ldbd.sock` flag with auto-spawn; design before
+  build.
+
+---
+
 ## 2026-05-13 — v1.6.1 patch: skill packaging
 
 **Goal:** Make the shipped `re-analyze` skill conform to the
