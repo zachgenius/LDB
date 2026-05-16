@@ -1951,38 +1951,15 @@ void clobber_aapcs64_caller_saved(
 // for ORR xN, xzr, xM (reg-reg) or MOVZ/MOVN/MOVK (imm). LLDB
 // canonicalises the alias back to "mov" in its disasm output, which
 // is what we match against here.
-// Tokenise the MOV source operand to one of:
-//   - kImmediate     — `#<n>`
-//   - kZero          — `xzr` / `wzr`
-//   - kStackPointer  — `sp` / `wsp`
-//   - kLinkRegister  — `lr` (alias for x30)
-//   - kWReg          — wN — the upper 32 bits are zeroed, so even if
-//                     the source happened to be tracked, the copy is
-//                     not a page address.
-//   - kXReg          — xN — the only shape that propagates.
-//   - kOther         — unrecognised; conservative clobber.
-enum class MovSrcKind { kOther, kImmediate, kZero, kStackPointer,
-                       kLinkRegister, kWReg, kXReg };
-
-MovSrcKind classify_mov_source(std::string_view tok) {
-  if (tok.empty()) return MovSrcKind::kOther;
-  if (tok[0] == '#') return MovSrcKind::kImmediate;
-  // Strip a trailing comma/space if the caller left it on. parse_reg_at
-  // normalises register tokens for the xN/wN case below; for the
-  // alias-name cases we compare exactly against the canonical
-  // spellings.
-  if (tok == "xzr" || tok == "wzr") return MovSrcKind::kZero;
-  if (tok == "sp"  || tok == "wsp") return MovSrcKind::kStackPointer;
-  if (tok == "lr") return MovSrcKind::kLinkRegister;
-  if (tok.size() >= 2 && (tok[0] == 'x' || tok[0] == 'w')) {
-    // Verify the rest are digits; otherwise treat as kOther.
-    for (std::size_t i = 1; i < tok.size(); ++i) {
-      if (tok[i] < '0' || tok[i] > '9') return MovSrcKind::kOther;
-    }
-    return tok[0] == 'x' ? MovSrcKind::kXReg : MovSrcKind::kWReg;
-  }
-  return MovSrcKind::kOther;
-}
+//
+// MOV-source classification (kZero / kImmediate / kXReg / ...) lives
+// in xref_arm64_parsers.{h,cpp} so unit tests can pin its alias-name-
+// first match order independently of a live LLDB target. Phase 4
+// item 5 (docs/35-field-report-followups.md §3) lifted it here so the
+// `mov xN, xzr` / `mov xN, #0` cases are pinned in unit tests rather
+// than depending on the prefix heuristic by accident.
+using xref_arm64::MovSrcKind;
+using xref_arm64::classify_mov_source;
 
 // Apply a MOV instruction's effect on the ADRP-tracking map. Returns
 // true iff the mnemonic was recognised as a MOV variant — the caller

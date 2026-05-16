@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 namespace ldb::backend::xref_arm64 {
@@ -51,5 +52,30 @@ parse_int_at(const std::string& s, std::size_t pos);
 // underlying register pair (w/x) is the same architectural register.
 std::tuple<bool, std::string, std::size_t>
 parse_reg_at(const std::string& s, std::size_t pos);
+
+// Classify the MOV source operand token (the value being moved INTO the
+// destination register). The classifier exists so the ADRP-pair
+// resolver in xref_address can decide whether a MOV propagates an
+// ADRP-tracked page (only kXReg does) or clobbers the destination's
+// tracking (every other kind).
+//
+// Match order is fixed: explicit alias spellings (xzr / wzr / sp / wsp
+// / lr) are token-compared FIRST, before any prefix heuristic. This
+// matters because `lr` and `xzr` would otherwise be misclassified by
+// a first-character-check that only inspects the leading 'x' / 'w'
+// nibble. See docs/35-field-report-followups.md §3 phase 4 item 5.
+//
+// Recognised inputs:
+//   "#<n>"      → kImmediate  (covers `mov xN, #0` and friends)
+//   "xzr"|"wzr" → kZero       (semantically equivalent to #0)
+//   "sp"|"wsp"  → kStackPointer
+//   "lr"        → kLinkRegister (alias for x30)
+//   "xN"        → kXReg       (the only shape that propagates)
+//   "wN"        → kWReg       (upper bits zeroed; not a page address)
+//   anything else → kOther    (conservative clobber)
+enum class MovSrcKind { kOther, kImmediate, kZero, kStackPointer,
+                       kLinkRegister, kWReg, kXReg };
+
+MovSrcKind classify_mov_source(std::string_view tok);
 
 }  // namespace ldb::backend::xref_arm64
