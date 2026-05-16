@@ -225,10 +225,35 @@ struct XrefProvenance {
   // addition (docs/35-field-report-followups.md §3 improvement 3).
   std::uint32_t adrp_pair_writeback_cleared = 0;
 
+  // Phase 4 item 1 (docs/35-field-report-followups.md §3): conditional
+  // branch (b.cond / cbz / cbnz / tbz / tbnz) whose target sat in a
+  // different function caused the entire adrp_regs map to clear. This
+  // counter increments per such conditional-branch reset. A non-zero
+  // value signals the scanner conservatively dropped tracking; in
+  // stripped binaries (where gate 1's function_name_at can't tell the
+  // boundary) this is the ONLY signal the heuristic isn't authoritative.
+  std::uint32_t adrp_pair_cond_branch_reset = 0;
+
+  // Phase 4 item 3 (docs/35-field-report-followups.md §3): the scanner
+  // crossed an instruction whose address was previously recorded as a
+  // function start (a B / BR / BL target inside __TEXT/__text) and
+  // reset adrp_regs. Catches the stripped-binary case where two
+  // adjacent functions both report function_name_at = "" and gate 1
+  // can't tell them apart.
+  std::uint32_t adrp_pair_function_start_reset = 0;
+
+  // Phase 4 item 4 (docs/35-field-report-followups.md §3): the
+  // scanner saw a load/store it deliberately gave up on resolving
+  // (pre/post-indexed LDR with untracked base, PC-relative literal
+  // load, ...). Distinct from adrp_pair_skipped (which is the
+  // register-offset case); together they cover the universe of
+  // memops the heuristic can't statically resolve.
+  std::uint32_t adrp_pair_unresolvable_load = 0;
+
   // Human-readable warnings — phase 3 starts with a single
   // "register-offset LDR skipped" warning when adrp_pair_skipped > 0.
-  // Phase 4 will extend with more codes as additional patterns
-  // accumulate (auth-rebase semantics, multi-start pages, ...).
+  // Phase 4 extends with codes for conditional-branch resets,
+  // function-start resets, and other unresolvable-load shapes.
   std::vector<std::string> warnings;
 };
 

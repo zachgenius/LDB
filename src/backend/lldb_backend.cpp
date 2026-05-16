@@ -2607,6 +2607,28 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
               mnem_lower == "ret"    ||
               mnem_lower == "retaa"  || mnem_lower == "retab";
 
+          // Phase 4 item 1 (docs/35-field-report-followups.md §3):
+          // conditional branches don't write registers, but a cbz / tbz
+          // / b.cond whose target lands in a different function is a
+          // tail-call-like control-flow handoff. Gate 1's
+          // function_name_at check catches the symbolized case on the
+          // NEXT iteration (when the scanner steps into the target
+          // function); the new code below pre-empts gate 1 by parsing
+          // the conditional's target operand inline. The pre-empt is
+          // necessary for stripped binaries where function_name_at
+          // returns "" for both sides and gate 1 silently misses the
+          // boundary. The bump on adrp_pair_cond_branch_reset signals
+          // when the new path fires.
+          //
+          // Conditional branch mnemonics:
+          //   b.eq / b.ne / b.cs / b.cc / b.mi / b.pl / b.vs / b.vc
+          //   b.hi / b.ls / b.ge / b.lt / b.gt / b.le / b.al / b.nv
+          //   cbz / cbnz / tbz / tbnz
+          const bool is_cond_branch =
+              (mnem_lower.size() >= 4 && mnem_lower.compare(0, 2, "b.") == 0) ||
+              mnem_lower == "cbz"  || mnem_lower == "cbnz" ||
+              mnem_lower == "tbz"  || mnem_lower == "tbnz";
+
           if (is_call) {
             // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
             // callee may overwrite x0..x18 + x30 — the scanner has
@@ -2641,9 +2663,79 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // function via subsequent ADRPs. The conservative reset is
             // the phase-3 acceptance bar. Function-boundary detection
             // by symbol name would miss the two-adjacent-stripped-
-            // functions case; phase-4 follow-up tracked in the worklog.
+            // functions case; phase 4 item 3's function_starts set
+            // closes that.
             adrp_regs.clear();
             current_function_known = false;
+          } else if (is_cond_branch && !adrp_regs.empty()) {
+            // Phase 4 item 1: parse the conditional branch's target
+            // address from the operands (LLDB renders it as
+            // `0xNNNNNNN`), look up the function name at that target,
+            // and reset adrp_regs when it differs from the current
+            // function. The pre-empt is what closes the stripped-
+            // binary case where gate 1 can't see the boundary.
+            //
+            // We only do the lookup when adrp_regs is non-empty —
+            // when there's no tracked state, the reset is a no-op and
+            // function_name_at is the dominant cost. Same optimisation
+            // gate 1 uses.
+            std::uint64_t branch_target = 0;
+            bool have_target = false;
+            const auto& ops = i.operands;
+            // Walk left-to-right looking for the LAST `0x...` token.
+            // LLDB renders cbz / tbz with the conditional register
+            // first and the address last; `b.eq 0x100003f00` puts the
+            // address first. Scanning to end-of-string and keeping
+            // the last hit covers both.
+            for (std::size_t scan = 0; scan + 2 <= ops.size(); ++scan) {
+              if (ops[scan] == '0' &&
+                  (ops[scan + 1] == 'x' || ops[scan + 1] == 'X')) {
+                std::size_t hex_start = scan + 2;
+                std::uint64_t v = 0;
+                std::size_t end = hex_start;
+                while (end < ops.size()) {
+                  char c = ops[end];
+                  unsigned int d;
+                  if (c >= '0' && c <= '9')
+                    d = static_cast<unsigned int>(c - '0');
+                  else if (c >= 'a' && c <= 'f')
+                    d = static_cast<unsigned int>(c - 'a' + 10);
+                  else if (c >= 'A' && c <= 'F')
+                    d = static_cast<unsigned int>(c - 'A' + 10);
+                  else break;
+                  v = (v << 4) | d;
+                  ++end;
+                }
+                if (end > hex_start) {
+                  branch_target = v;
+                  have_target = true;
+                  scan = end - 1;  // outer ++scan will advance past
+                }
+              }
+            }
+            if (have_target) {
+              auto sa_target = target.ResolveFileAddress(branch_target);
+              std::string target_fn = function_name_at(target, sa_target);
+              // current_function was primed by gate 1 above (when
+              // adrp_regs first became non-empty). The reset fires
+              // when target_fn is non-empty AND distinct from
+              // current_function — non-empty matters because stripped
+              // binaries return "" on both sides and we don't want
+              // to false-trigger on same-stripped-fn cbz patterns
+              // (item 3 handles those via function_starts).
+              if (!target_fn.empty() && target_fn != current_function) {
+                adrp_regs.clear();
+                if (provenance != nullptr) {
+                  provenance->adrp_pair_cond_branch_reset++;
+                  std::ostringstream w;
+                  w << "conditional branch " << mnem_lower
+                    << " at 0x" << std::hex << i.address
+                    << " targets a different function ("
+                    << target_fn << ") — adrp_regs cleared";
+                  provenance->warnings.push_back(w.str());
+                }
+              }
+            }
           }
         }
       }

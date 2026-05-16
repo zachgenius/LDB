@@ -4565,12 +4565,20 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
   // cleared. Empty provenance is the common case and would cost ~30
   // bytes per response if always emitted; the explicit field is a
   // clear "this run had ambiguous patterns" signal when present.
+  // Phase 4 adds three new counters; the trigger condition expands to
+  // include them so they're surfaced when non-zero.
   if (prov.adrp_pair_skipped > 0 ||
       prov.adrp_pair_writeback_cleared > 0 ||
+      prov.adrp_pair_cond_branch_reset > 0 ||
+      prov.adrp_pair_function_start_reset > 0 ||
+      prov.adrp_pair_unresolvable_load > 0 ||
       !prov.warnings.empty()) {
     json p = json::object();
     p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
     p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
+    p["adrp_pair_cond_branch_reset"] = prov.adrp_pair_cond_branch_reset;
+    p["adrp_pair_function_start_reset"] = prov.adrp_pair_function_start_reset;
+    p["adrp_pair_unresolvable_load"] = prov.adrp_pair_unresolvable_load;
     json ws = json::array();
     for (const auto& w : prov.warnings) ws.push_back(w);
     p["warnings"] = std::move(ws);
