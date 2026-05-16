@@ -115,7 +115,8 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
   foreach(_phase3_smoke
       xref_addclobber
       xref_fnleak
-      xref_callclobber)
+      xref_callclobber
+      xref_subclobber)
     add_test(
       NAME smoke_${_phase3_smoke}
       COMMAND python3

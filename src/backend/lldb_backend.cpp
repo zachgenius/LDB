@@ -1967,16 +1967,31 @@ bool apply_mov_state(
   return true;
 }
 
-// ARM64 "ADD" writes an arithmetic result, not an ADRP page, into the
-// destination register. The phase-3 rule is the same in every shape:
-// after we've consumed the (possibly-tracked) source for the
-// resolve_adrp_consumer match, clear adrp_regs[dst] so the next
-// instruction can't reach back through dst to an obsolete page.
+// ARM64 ADD / SUB (and the flag-setting ADDS / SUBS variants) all
+// write an arithmetic result, not an ADRP page, into the destination
+// register. The phase-3 rule is the same in every shape: after we've
+// consumed the (possibly-tracked) source for the resolve_adrp_consumer
+// match, clear adrp_regs[dst] so the next instruction can't reach back
+// through dst to an obsolete page.
+//
+// SUB joins the family because its destination-write semantics are
+// identical to ADD's — `sub xN, xN, #imm` overwrites the tracked
+// register exactly as `add xN, xN, #imm` does. The original phase-3
+// patch only clobbered on ADD, leaving SUB as a silent false-positive
+// vector (covered by xref_subclobber post-review fixture).
+//
+// Note on match-emit: ADD currently emits a direct-target match when
+// `page + imm == target_addr` (the legitimate ADRP+ADD pattern).
+// SUB+ADRP doesn't have a corresponding "compute target = page - imm"
+// pattern in real compiler output (compilers emit ADD with a signed
+// immediate or pre-compute via a different scheme). We only model the
+// SUB clobber here, not a SUB match-emit; resolve_adrp_consumer
+// remains ADD-only.
 //
 // Handles:
-//   add  xN, xM, #imm        — phase-2 ADRP+ADD case (xN may equal xM)
-//   add  xN, xM, xL{, shift} — register-register, never tracked
-void clobber_add_destination(
+//   add/sub/adds/subs  xN, xM, #imm        — xN may equal xM
+//   add/sub/adds/subs  xN, xM, xL{, shift} — register-register
+void clobber_arith_destination(
     const std::string& operands,
     std::unordered_map<std::string, AdrpPair>& adrp_regs) {
   auto [ok_dst, dst, _p] = parse_reg_at(operands, 0);
@@ -2381,12 +2396,16 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // callee may overwrite x0..x18 + x30 — the scanner has
             // no way to know the callee's behaviour.
             clobber_aapcs64_caller_saved(adrp_regs);
-          } else if (mnem_lower == "add") {
-            // Gate 3: ADD writes a computed value, not an ADRP page.
-            // Clear adrp_regs[dst] regardless of whether dst==src or
-            // the second operand was tracked. resolve_adrp_consumer
-            // has already run; the match (if any) is already in `out`.
-            clobber_add_destination(i.operands, adrp_regs);
+          } else if (mnem_lower == "add" || mnem_lower == "sub" ||
+                     mnem_lower == "adds" || mnem_lower == "subs") {
+            // Gate 3: ADD / SUB (and the flag-setting siblings) write
+            // a computed value, not an ADRP page. Clear adrp_regs[dst]
+            // regardless of whether dst==src or the second operand was
+            // tracked. resolve_adrp_consumer has already run; the match
+            // (if any — only the ADD shape emits one) is already in
+            // `out`. SUB joins per the post-review spec: same
+            // destination-write semantics, same false-positive class.
+            clobber_arith_destination(i.operands, adrp_regs);
           } else if (mnem_lower == "mov" || mnem_lower == "movz" ||
                      mnem_lower == "movk" || mnem_lower == "movn") {
             // Gate 4: MOV may propagate or clobber.

@@ -121,7 +121,8 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
   foreach(_phase3_fix
       xref_addclobber
       xref_fnleak
-      xref_callclobber)
+      xref_callclobber
+      xref_subclobber)
     add_executable(ldb_fix_${_phase3_fix} asm/${_phase3_fix}.s)
     set_target_properties(ldb_fix_${_phase3_fix} PROPERTIES
       OUTPUT_NAME    ${_phase3_fix}
