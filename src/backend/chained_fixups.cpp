@@ -93,6 +93,7 @@ std::uint64_t stride_bytes(std::uint16_t fmt) {
 }
 
 void unsupported_format(std::uint16_t fmt) {
+  // FIXME(phase 2): docs/35-field-report-followups.md §3
   throw Error("chained_fixups: unsupported chained pointer format: " +
               std::to_string(fmt) + " — phase 2");
 }
@@ -187,10 +188,12 @@ void walk_chain(const SegmentInfo& seg, std::uint16_t fmt,
     }
     std::uint64_t raw = read_u64(seg.data + cursor_in_seg);
     DecodedSlot d = decode_slot(fmt, raw, image_base);
-    std::uint64_t file_addr = seg_offset_in_image + cursor_in_seg;
+    // rva = image-base-relative VM offset of this pointer slot. Not a
+    // file offset; see ChainedFixupMap docstring.
+    std::uint64_t rva = seg_offset_in_image + cursor_in_seg;
     // For binds, resolved stays 0 — but we still record the slot so
     // callers can detect chained-fixup territory by membership.
-    out.resolved.emplace(file_addr, d.resolved);
+    out.resolved.emplace(rva, d.resolved);
     if (d.next == 0) {
       break;
     }
@@ -236,15 +239,22 @@ ChainedFixupMap parse_chained_fixups(
     }
     const std::size_t sis_off =
         static_cast<std::size_t>(starts_offset) + seg_info_offset;
-    require_range(sis_off, 22, payload_size, "starts_in_segment");
+    // Two-phase bounds check: (1) the 22-byte fixed header must be in
+    // range before we can trust the `size` field we read out of it,
+    // (2) `size` itself must cover at least the header, (3) only then
+    // can `size` be used to range-check the variable-length body.
+    require_range(sis_off, 22, payload_size, "starts_in_segment header");
     const std::uint8_t* sis = payload + sis_off;
     const std::uint32_t size            = read_u32(sis + 0);
+    if (size < 22) {
+      throw Error("chained_fixups: starts_in_segment.size < 22");
+    }
+    require_range(sis_off, size, payload_size, "starts_in_segment body");
     const std::uint16_t page_size       = read_u16(sis + 4);
     const std::uint16_t pointer_format  = read_u16(sis + 6);
     const std::uint64_t segment_offset  = read_u64(sis + 8);
     // const std::uint32_t max_valid_ptr = read_u32(sis + 16);
     const std::uint16_t page_count      = read_u16(sis + 20);
-    require_range(sis_off, size, payload_size, "starts_in_segment body");
     require_range(sis_off + 22,
                   static_cast<std::size_t>(page_count) * 2,
                   payload_size, "page_start[]");
@@ -280,6 +290,7 @@ ChainedFixupMap parse_chained_fixups(
         // page_start[]. Real userland binaries seldom emit them
         // (clang/lld pack chains so one start per page suffices).
         // Phase 2 handles this when we encounter it in the wild.
+        // FIXME(phase 2): docs/35-field-report-followups.md §3
         throw Error("chained_fixups: multi-start page — phase 2");
       }
       const std::uint64_t page_base_in_seg =

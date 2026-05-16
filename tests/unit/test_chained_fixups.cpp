@@ -199,7 +199,6 @@ constexpr std::array<std::uint8_t, 60> kVectorC_payload = {
 TEST_CASE("parse_chained_fixups: ARM64E single-page two-rebase chain",
           "[chained_fixups]") {
   std::vector<SegmentInfo> segs(1);
-  segs[0].file_offset = 0x8000;
   segs[0].vm_addr     = 0x100008000;
   segs[0].vm_size     = 0x4000;
   segs[0].data        = kVectorA_segment_bytes.data();
@@ -216,7 +215,6 @@ TEST_CASE("parse_chained_fixups: ARM64E single-page two-rebase chain",
 TEST_CASE("parse_chained_fixups: 64_OFFSET multi-page chain",
           "[chained_fixups]") {
   std::vector<SegmentInfo> segs(1);
-  segs[0].file_offset = 0x4000;
   segs[0].vm_addr     = 0x100004000;
   segs[0].vm_size     = 0x2000;
   segs[0].data        = kVectorB_segment_bytes.data();
@@ -235,7 +233,6 @@ TEST_CASE("parse_chained_fixups: 64_OFFSET multi-page chain",
 TEST_CASE("parse_chained_fixups: unsupported format reports phase 2",
           "[chained_fixups][error]") {
   std::vector<SegmentInfo> segs(1);
-  segs[0].file_offset = 0x8000;
   segs[0].vm_addr     = 0x100008000;
   segs[0].vm_size     = 0x4000;
   segs[0].data        = nullptr;

@@ -23,7 +23,6 @@
 namespace ldb::backend {
 
 struct SegmentInfo {
-  std::uint64_t file_offset = 0;
   std::uint64_t vm_addr = 0;
   std::uint64_t vm_size = 0;
 
@@ -38,11 +37,13 @@ struct SegmentInfo {
 };
 
 struct ChainedFixupMap {
-  // file_addr (image-base-relative, NOT load-time VA) → the 64-bit
-  // pointer value dyld would have written into that slot. For rebases,
-  // this is image_base + rebase_target_offset (or the raw target VA
-  // for vmaddr-style formats). For binds, this is 0 — phase 1 does
-  // not resolve binds. Phase 2 wires in the imports table.
+  // rva: image-base-relative VM offset of the pointer slot. Add this
+  // to the runtime image_base to get the load-time slot address; this
+  // is NOT a file offset. Value is the 64-bit pointer dyld would have
+  // written into that slot. For rebases, this is image_base +
+  // rebase_target_offset (or the raw target VA for vmaddr-style
+  // formats). For binds, this is 0 — phase 1 does not resolve binds.
+  // Phase 2 wires in the imports table.
   std::unordered_map<std::uint64_t, std::uint64_t> resolved;
 };
 
