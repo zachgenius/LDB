@@ -254,6 +254,22 @@ class DaemonSpec:
         return self.ssh_target is not None
 
 
+def _find_ldbd_sibling() -> str | None:
+    # tools/ldb/ldb → tools/ldb → tools → <repo>; the in-tree build
+    # always emits ldbd to <repo>/build/bin/ldbd. Anchoring on
+    # __file__ (not CWD) lets the CLI be invoked from anywhere a user
+    # happens to be, without forcing --ldbd on every call.
+    try:
+        script = os.path.realpath(__file__)
+    except NameError:
+        return None
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(script)))
+    cand = os.path.join(repo_root, "build", "bin", "ldbd")
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    return None
+
+
 def find_ldbd(explicit: str | None) -> str:
     if explicit:
         if not os.access(explicit, os.X_OK):
@@ -263,12 +279,19 @@ def find_ldbd(explicit: str | None) -> str:
     onpath = shutil.which("ldbd")
     if onpath:
         return onpath
-    # In-tree dev fallback: ./build/bin/ldbd from CWD.
+    sibling = _find_ldbd_sibling()
+    if sibling:
+        return sibling
+    # In-tree dev fallback: ./build/bin/ldbd from CWD. Kept for the
+    # case where the user vendors the CLI into a layout that doesn't
+    # match the sibling heuristic but does have a `./build/bin/ldbd`
+    # under their CWD.
     fallback = os.path.join(os.getcwd(), "build", "bin", "ldbd")
     if os.access(fallback, os.X_OK):
         return fallback
     sys.stderr.write(
-        "ldb: ldbd not found on PATH or at ./build/bin/ldbd\n"
+        "ldb: ldbd not found on PATH, alongside the ldb script, "
+        "or at ./build/bin/ldbd\n"
         "     pass --ldbd /path/to/ldbd to override\n")
     sys.exit(2)
 

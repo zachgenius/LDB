@@ -564,6 +564,20 @@ set_tests_properties(smoke_ldb_cli PROPERTIES
   TIMEOUT 30
 )
 
+# docs/35-field-report-followups.md §1: when neither the script nor the
+# daemon is on $PATH, the CLI must still find the in-tree daemon as a
+# sibling of the script. Pins the new precedence layer between $PATH
+# and the CWD-relative fallback.
+add_test(
+  NAME smoke_cli_sibling_lookup
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_cli_sibling_lookup.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+)
+set_tests_properties(smoke_cli_sibling_lookup PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_ldbpack
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_ldbpack.py"
