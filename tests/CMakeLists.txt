@@ -923,6 +923,19 @@ set_tests_properties(smoke_socket_idle_timeout PROPERTIES
   TIMEOUT 30
 )
 
+# §2 phase 2 (post-review I2): an active connection's worker must gate
+# on the shutdown latch — pre-fix it kept dispatching RPCs after
+# daemon.shutdown fired, holding the daemon process alive past the
+# accept-loop exit.
+add_test(
+  NAME smoke_socket_shutdown_active_clients
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_shutdown_active_clients.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_shutdown_active_clients PROPERTIES
+  TIMEOUT 30
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

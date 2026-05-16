@@ -458,7 +458,16 @@ void serve_socket_client(Dispatcher* dispatcher,
   auto sink = std::make_shared<protocol::StreamNotificationSink>(out);
   auto sub = dispatcher->add_notification_sink(sink);
 
-  (void) serve_one_connection(*dispatcher, out, in, fmt);
+  // Post-review I2 — pass the shutdown gate to serve_one_connection
+  // so an already-connected peer can't keep sending RPCs after
+  // daemon.shutdown / SIGTERM and have them serviced. The lambda
+  // closes over the file-scope g_shutdown flag; once that's set,
+  // the worker emits a kBadState response on the NEXT read and
+  // exits, letting the accept loop's join unblock promptly.
+  auto shutdown_gate = []() {
+    return g_shutdown.load(std::memory_order_acquire) != 0;
+  };
+  (void) serve_one_connection(*dispatcher, out, in, fmt, shutdown_gate);
 
   dispatcher->remove_notification_sink(sub);
   // sink (the local shared_ptr) drops its ref here; if any listener
