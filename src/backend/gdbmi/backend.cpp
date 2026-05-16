@@ -1257,14 +1257,16 @@ GdbMiBackend::disassemble_range(TargetId tid, std::uint64_t lo,
 }
 
 std::vector<XrefMatch>
-GdbMiBackend::xref_address(TargetId tid, std::uint64_t) {
+GdbMiBackend::xref_address(TargetId tid, std::uint64_t,
+                           XrefProvenance*) {
   // LldbBackend's xref_address walks every instruction in .text and
   // greps each operand string for the literal address — expensive
   // even there. We could replicate via -data-disassemble across the
   // whole .text range, but the full-text scan is materially worse on
   // gdb (per-call MI tuple overhead, no SBProcess::ReadMemoryFromFileCache
   // equivalent). v1.4 punt: empty result. Agents that need xrefs on
-  // a gdb-backed session switch to --backend=lldb.
+  // a gdb-backed session switch to --backend=lldb. The provenance
+  // out-param is unused — empty result implies empty provenance.
   (void)must_get_target(*impl_, tid);
   return {};
 }

@@ -1305,13 +1305,29 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
 
   add("xref.addr",
       "Find every instruction in the main executable that references "
-      "an address. Detects direct branches reliably; ARM64 ADRP+ADD "
-      "reconstruction is a known gap.",
+      "an address. Detects direct branches reliably; ARM64 ADRP+ADD/LDR "
+      "reconstruction handles the common compiler-emitted shapes (see "
+      "docs/35-field-report-followups.md §3). Skipped patterns surface "
+      "as `provenance.warnings` when present.",
       obj({
           {"target_id", target_id_param()},
           {"addr",      address_param()},
       }, {"target_id", "addr"}),
-with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
+      with_defs(obj({
+          {"matches", arr_of(ref("XrefMatch"))},
+          {"provenance", obj({
+              {"adrp_pair_skipped", uint_(
+                  "Number of register-offset LDR instructions whose "
+                  "base register held a tracked ADRP page but whose "
+                  "offset operand the resolver couldn't statically "
+                  "evaluate (e.g. `[xN, xM]`, `[xN, xM, lsl #imm]`). "
+                  "Each skip is a potential xref the heuristic cannot "
+                  "surface; phase 4 will close the most common cases.")},
+              {"warnings", arr_of(str(), "Human-readable diagnostics "
+                  "from the ADRP-pair resolver; emitted only when at "
+                  "least one ambiguous pattern was encountered.")},
+          })},
+      }, {"matches"}),
           {{"XrefMatch", xref_match_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
@@ -4529,12 +4545,29 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
                               "missing uint param 'addr'");
   }
   auto view_spec = protocol::view::parse_from_params(req.params);
+  // Phase-3 gate 7 (docs/35-field-report-followups.md §3) — populate a
+  // provenance struct so the response can surface ADRP-pair-resolver
+  // skips (register-offset LDR with a tracked base, etc.).
+  backend::XrefProvenance prov;
   auto refs = backend_->xref_address(
-      static_cast<backend::TargetId>(tid), addr);
+      static_cast<backend::TargetId>(tid), addr, &prov);
   json arr = json::array();
   for (const auto& r : refs) arr.push_back(xref_match_to_json(r));
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "matches"));
+  auto data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                              "matches");
+  // Attach provenance only when something was actually skipped. Empty
+  // provenance is the common case and would cost ~30 bytes per
+  // response if always emitted; the explicit field is a clear "this
+  // run had ambiguous patterns" signal when present.
+  if (prov.adrp_pair_skipped > 0 || !prov.warnings.empty()) {
+    json p = json::object();
+    p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
+    json ws = json::array();
+    for (const auto& w : prov.warnings) ws.push_back(w);
+    p["warnings"] = std::move(ws);
+    data["provenance"] = std::move(p);
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_disasm_range(const Request& req) {

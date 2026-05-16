@@ -2131,7 +2131,8 @@ std::string function_name_at(lldb::SBTarget target, lldb::SBAddress addr) {
 }  // namespace
 
 std::vector<XrefMatch>
-LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
+LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
+                          XrefProvenance* provenance) {
   lldb::SBTarget target;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
@@ -2328,6 +2329,33 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
             if (resolved) {
               matched_adrp = target_matches(resolved->target,
                                             resolved->is_slot_load);
+            } else if (provenance != nullptr &&
+                       (mnem_lower == "ldr" || mnem_lower == "ldrsw" ||
+                        mnem_lower == "ldrh" || mnem_lower == "ldrb")) {
+              // Phase-3 gate 7 (docs/35-field-report-followups.md §3).
+              // resolve_adrp_consumer rejected this LDR — most commonly
+              // because the address operand is `[xN, xM]` or
+              // `[xN, xM, lsl #imm]` rather than the immediate form we
+              // model. If xN was nonetheless an ADRP-tracked register,
+              // the load *might* have been the consumer for that ADRP
+              // (the runtime value depends on xM, which we can't
+              // statically resolve). Surface a provenance counter so
+              // the caller can decide to fall back to symbol-index.
+              std::size_t pos = 0;
+              auto [ok_dst, _dst, p1] = parse_reg_at(i.operands, pos);
+              if (ok_dst) {
+                pos = p1;
+                while (pos < i.operands.size() &&
+                       (i.operands[pos] == ' ' || i.operands[pos] == ','))
+                  ++pos;
+                if (pos < i.operands.size() && i.operands[pos] == '[') {
+                  ++pos;
+                  auto [ok_src, src, _p] = parse_reg_at(i.operands, pos);
+                  if (ok_src && adrp_regs.count(src)) {
+                    provenance->adrp_pair_skipped++;
+                  }
+                }
+              }
             }
           }
 
@@ -2405,6 +2433,19 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
                             return a.address == b.address;
                           });
   out.erase(last, out.end());
+
+  // Phase-3 gate 7: emit a human-readable warning when at least one
+  // register-offset LDR was skipped. The agent uses this to decide
+  // whether the ADRP-pair heuristic is authoritative on this binary
+  // or whether it should fall back to symbol-index correlate.
+  if (provenance != nullptr && provenance->adrp_pair_skipped > 0) {
+    provenance->warnings.push_back(
+        "adrp-pair resolver skipped " +
+        std::to_string(provenance->adrp_pair_skipped) +
+        " register-offset LDR(s) with tracked base "
+        "(`[xN, xM]` / `[xN, xM, lsl #imm]`) — these are potential xrefs "
+        "the heuristic cannot statically resolve");
+  }
 
   return out;
 }
