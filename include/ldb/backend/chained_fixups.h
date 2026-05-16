@@ -60,4 +60,22 @@ ChainedFixupMap parse_chained_fixups(
     const std::uint8_t* payload, std::size_t payload_size,
     const std::vector<SegmentInfo>& segments);
 
+// High-level Mach-O wrapper used by the xref pipeline
+// (docs/35-field-report-followups.md §3 phase 2). Walks the load
+// commands at `macho_bytes`, locates LC_DYLD_CHAINED_FIXUPS plus the
+// LC_SEGMENT_64 list, and dispatches to parse_chained_fixups().
+//
+// Behaviour:
+//   - Non-Mach-O / 32-bit Mach-O input: returns empty map (the caller
+//     treats this as "binary doesn't use chained fixups" and falls
+//     back to the literal-operand scan).
+//   - Mach-O without LC_DYLD_CHAINED_FIXUPS: returns empty map.
+//   - Mach-O with LC_DYLD_CHAINED_FIXUPS but malformed payload:
+//     propagates the backend::Error from parse_chained_fixups().
+//
+// `macho_bytes` must outlive this call but the map's resolved table
+// owns its own storage and survives the byte buffer's destruction.
+ChainedFixupMap extract_chained_fixups_from_macho(
+    const std::uint8_t* macho_bytes, std::size_t macho_size);
+
 }  // namespace ldb::backend

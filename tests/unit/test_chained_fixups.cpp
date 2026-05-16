@@ -389,3 +389,106 @@ TEST_CASE("parse_chained_fixups: unsupported format reports phase 2",
     CHECK(msg.find("unsupported") != std::string::npos);
   }
 }
+
+// ---------------------------------------------------------------------------
+// extract_chained_fixups_from_macho — Mach-O wrapper used by the xref
+// wire-up (docs/35-field-report-followups.md §3 phase 2).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("extract_chained_fixups_from_macho: empty/non-Mach-O is a no-op",
+          "[chained_fixups][macho]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // Null / empty: empty map, no throw.
+  auto m1 = extract_chained_fixups_from_macho(nullptr, 0);
+  CHECK(m1.resolved.empty());
+
+  // ELF magic — not a Mach-O. Caller treats this as "binary doesn't
+  // use chained fixups" rather than an error.
+  std::array<std::uint8_t, 64> elf{};
+  elf[0] = 0x7f; elf[1] = 'E'; elf[2] = 'L'; elf[3] = 'F';
+  auto m2 = extract_chained_fixups_from_macho(elf.data(), elf.size());
+  CHECK(m2.resolved.empty());
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: minimal arm64 Mach-O round-trip",
+          "[chained_fixups][macho]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // Build a minimal arm64 Mach-O image in memory:
+  //   - mach_header_64 (32 bytes)
+  //   - one LC_SEGMENT_64 covering the file from offset 0x100..0x110
+  //     (vmaddr 0x100008000, filesize 0x10, vmsize 0x4000) — this is
+  //     where the chained-pointer slot lives.
+  //   - one LC_DYLD_CHAINED_FIXUPS pointing at the same payload bytes
+  //     as Vector A from the parser test (ARM64E, two rebases).
+  // Layout decisions are encoded in offset constants to keep the
+  // hand-built header readable.
+  constexpr std::size_t kHeader     = 32;
+  constexpr std::size_t kSegCmdSize = 56;   // segment_command_64 base size
+  constexpr std::size_t kFixCmdSize = 16;   // linkedit_data_command
+  constexpr std::size_t kCmdEnd     = kHeader + kSegCmdSize + kFixCmdSize;
+  constexpr std::size_t kSegOff     = 0x100;
+  constexpr std::size_t kSegSize    = 0x10;
+  constexpr std::size_t kFixOff     = 0x200;
+  constexpr std::size_t kFileSize   = kFixOff + kVectorA_payload.size();
+
+  std::vector<std::uint8_t> macho(kFileSize, 0);
+
+  auto put_u32 = [&](std::size_t off, std::uint32_t v) {
+    macho[off + 0] = static_cast<std::uint8_t>(v & 0xff);
+    macho[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+    macho[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xff);
+    macho[off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xff);
+  };
+  auto put_u64 = [&](std::size_t off, std::uint64_t v) {
+    for (std::size_t i = 0; i < 8; ++i) {
+      macho[off + i] = static_cast<std::uint8_t>((v >> (i * 8)) & 0xff);
+    }
+  };
+
+  // mach_header_64
+  put_u32(0,  0xFEEDFACF);    // magic = MH_MAGIC_64
+  put_u32(4,  0x0100000C);    // cputype = CPU_TYPE_ARM64 (unused by extractor)
+  put_u32(8,  0);             // cpusubtype
+  put_u32(12, 2);             // filetype = MH_EXECUTE (unused)
+  put_u32(16, 2);             // ncmds = 2 (LC_SEGMENT_64, LC_DYLD_CHAINED_FIXUPS)
+  put_u32(20, kSegCmdSize + kFixCmdSize);  // sizeofcmds
+  put_u32(24, 0);             // flags
+  put_u32(28, 0);             // reserved
+
+  // LC_SEGMENT_64
+  std::size_t off = kHeader;
+  put_u32(off + 0, 0x19);                  // cmd = LC_SEGMENT_64
+  put_u32(off + 4, kSegCmdSize);           // cmdsize
+  // segname[16] is zero-filled which is fine for the extractor.
+  put_u64(off + 24, 0x100008000ULL);       // vmaddr  (matches Vector A)
+  put_u64(off + 32, 0x4000ULL);            // vmsize
+  put_u64(off + 40, kSegOff);              // fileoff
+  put_u64(off + 48, kSegSize);             // filesize
+
+  // LC_DYLD_CHAINED_FIXUPS
+  off += kSegCmdSize;
+  put_u32(off + 0, 0x80000034);            // cmd
+  put_u32(off + 4, kFixCmdSize);           // cmdsize
+  put_u32(off + 8, kFixOff);               // dataoff
+  put_u32(off + 12, kVectorA_payload.size());  // datasize
+
+  static_assert(kCmdEnd <= kSegOff, "load commands must fit before segment");
+
+  // Segment payload — the chained-pointer slots Vector A expects.
+  for (std::size_t i = 0; i < kVectorA_segment_bytes.size() && i < kSegSize; ++i) {
+    macho[kSegOff + i] = kVectorA_segment_bytes[i];
+  }
+
+  // LC_DYLD_CHAINED_FIXUPS payload — same bytes as Vector A.
+  for (std::size_t i = 0; i < kVectorA_payload.size(); ++i) {
+    macho[kFixOff + i] = kVectorA_payload[i];
+  }
+
+  ChainedFixupMap m = extract_chained_fixups_from_macho(macho.data(),
+                                                        macho.size());
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.resolved.at(0x8000) == 0x100000500ULL);
+  CHECK(m.resolved.at(0x8008) == 0x100000600ULL);
+}

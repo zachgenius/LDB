@@ -304,4 +304,104 @@ ChainedFixupMap parse_chained_fixups(
   return out;
 }
 
+namespace {
+
+// Subset of Mach-O constants we need. Kept inline to avoid pulling in
+// the host SDK's <mach-o/*.h> on Linux build legs — the byte layout
+// is fixed and little-endian on every Apple-supported architecture.
+constexpr std::uint32_t kMagic64       = 0xFEEDFACF;
+constexpr std::uint32_t kMagic64Swap   = 0xCFFAEDFE;  // big-endian header
+constexpr std::uint32_t kFatMagic      = 0xCAFEBABE;
+constexpr std::uint32_t kFatMagic64    = 0xCAFEBABF;
+constexpr std::uint32_t kFatMagicSwap  = 0xBEBAFECA;
+constexpr std::uint32_t kFatMagic64Swap= 0xBFBAFECA;
+
+constexpr std::uint32_t kLCSegment64           = 0x19;
+constexpr std::uint32_t kLCDyldChainedFixups   = 0x80000034;  // LC_DYLD_CHAINED_FIXUPS
+
+}  // namespace
+
+ChainedFixupMap extract_chained_fixups_from_macho(
+    const std::uint8_t* macho_bytes, std::size_t macho_size) {
+  if (macho_bytes == nullptr || macho_size < 32) {
+    return {};
+  }
+  // Reject byte-swapped / 32-bit / FAT headers. FAT binaries would need
+  // us to pick the right arch slice; the field report only flagged
+  // single-arch arm64 binaries, so phase 2 just no-ops on FAT and the
+  // caller falls back to literal-operand scanning.
+  const std::uint32_t magic = read_u32(macho_bytes);
+  if (magic != kMagic64) {
+    if (magic == kMagic64Swap || magic == kFatMagic || magic == kFatMagic64 ||
+        magic == kFatMagicSwap || magic == kFatMagic64Swap) {
+      return {};
+    }
+    return {};
+  }
+
+  // mach_header_64 layout (LE):
+  //   magic[0..4] cputype[4..8] cpusubtype[8..12] filetype[12..16]
+  //   ncmds[16..20] sizeofcmds[20..24] flags[24..28] reserved[28..32]
+  const std::uint32_t ncmds      = read_u32(macho_bytes + 16);
+  const std::uint32_t sizeofcmds = read_u32(macho_bytes + 20);
+  if (sizeofcmds > macho_size - 32) {
+    return {};
+  }
+
+  std::vector<SegmentInfo> segments;
+  segments.reserve(8);
+  const std::uint8_t* fixups_payload = nullptr;
+  std::size_t         fixups_size    = 0;
+
+  std::size_t cursor = 32;
+  for (std::uint32_t i = 0; i < ncmds; ++i) {
+    if (cursor + 8 > macho_size) return {};
+    const std::uint32_t cmd     = read_u32(macho_bytes + cursor + 0);
+    const std::uint32_t cmdsize = read_u32(macho_bytes + cursor + 4);
+    if (cmdsize < 8 || cursor + cmdsize > macho_size) return {};
+
+    if (cmd == kLCSegment64) {
+      // segment_command_64:
+      //   cmd[0..4] cmdsize[4..8] segname[8..24] vmaddr[24..32]
+      //   vmsize[32..40] fileoff[40..48] filesize[48..56] ...
+      if (cmdsize < 56) return {};
+      const std::uint64_t vmaddr   = read_u64(macho_bytes + cursor + 24);
+      const std::uint64_t vmsize   = read_u64(macho_bytes + cursor + 32);
+      const std::uint64_t fileoff  = read_u64(macho_bytes + cursor + 40);
+      const std::uint64_t filesize = read_u64(macho_bytes + cursor + 48);
+
+      SegmentInfo seg;
+      seg.vm_addr = vmaddr;
+      seg.vm_size = vmsize;
+      // Bind segment bytes only if the file extent is in-range. dyld
+      // tolerates filesize=0 for __PAGEZERO; parse_chained_fixups()
+      // only dereferences `data` for segments with a non-zero
+      // seg_info_offset, so a null/zero buffer here is safe.
+      if (filesize > 0 && fileoff < macho_size &&
+          filesize <= macho_size - fileoff) {
+        seg.data      = macho_bytes + fileoff;
+        seg.data_size = static_cast<std::size_t>(filesize);
+      }
+      segments.push_back(seg);
+    } else if (cmd == kLCDyldChainedFixups) {
+      // linkedit_data_command: cmd, cmdsize, dataoff[8..12], datasize[12..16].
+      if (cmdsize < 16) return {};
+      const std::uint32_t dataoff  = read_u32(macho_bytes + cursor + 8);
+      const std::uint32_t datasize = read_u32(macho_bytes + cursor + 12);
+      if (dataoff > macho_size || datasize > macho_size - dataoff) {
+        return {};
+      }
+      fixups_payload = macho_bytes + dataoff;
+      fixups_size    = datasize;
+    }
+
+    cursor += cmdsize;
+  }
+
+  if (fixups_payload == nullptr || fixups_size == 0) {
+    return {};
+  }
+  return parse_chained_fixups(fixups_payload, fixups_size, segments);
+}
+
 }  // namespace ldb::backend
