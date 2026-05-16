@@ -35,9 +35,13 @@ namespace {
 // with the SBAPI calls. The signal handler must touch nothing the
 // stdlib doesn't allow from async-signal context — std::atomic<int>
 // stores are conformant.
-std::atomic<int> g_shutdown{0};
+//
+// Explicit `static` (alongside the surrounding anonymous namespace) so
+// the file-scope intent is unambiguous to readers and to any future
+// refactor that flattens the namespace.
+static std::atomic<int> g_shutdown{0};
 
-void on_term_signal(int sig) {
+static void on_term_signal(int sig) {
   g_shutdown.store(sig, std::memory_order_release);
 }
 
@@ -295,7 +299,9 @@ bool ensure_parent_dir(const std::string& sock_path) {
 // Bind a SOCK_STREAM unix socket with the inode landing at mode 0600.
 // POSIX bind() honours umask, so we set umask 0077 transiently to make
 // the inode 0600 atomically — there's no window where someone could
-// open() the socket between bind() and an explicit fchmod().
+// open() the socket between bind() and an explicit fchmod(). The
+// atomicity claim only holds because daemon startup is single-
+// threaded; a sibling thread changing umask mid-call would void it.
 int bind_listener(const std::string& sock_path) {
   // Refuse paths the kernel can't fit. sun_path is typically 104/108
   // bytes; truncating silently produces a socket at the wrong path,

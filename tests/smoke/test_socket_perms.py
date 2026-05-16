@@ -21,6 +21,7 @@ Post-review hardening additions:
     socket in a CWD they don't expect.
 """
 import os
+import select
 import signal
 import socket
 import stat
@@ -28,6 +29,26 @@ import subprocess
 import sys
 import tempfile
 import time
+
+
+def read_stderr_nonblocking(proc, timeout: float = 0.2) -> bytes:
+    """Drain whatever stderr is ready, with a short timeout.
+
+    Bounded wait avoids blocking the test runner when the daemon is
+    alive but hasn't logged anything yet.
+    """
+    if not proc.stderr:
+        return b""
+    try:
+        ready, _, _ = select.select([proc.stderr], [], [], timeout)
+    except (OSError, ValueError):
+        return b""
+    if not ready:
+        return b""
+    try:
+        return proc.stderr.read1(4096) or b""
+    except Exception:
+        return b""
 
 
 def usage():
@@ -77,11 +98,7 @@ def main():
         )
         try:
             if not wait_for_socket(sock, timeout=5.0):
-                err = b""
-                try:
-                    err = daemon.stderr.read1(4096) if daemon.stderr else b""
-                except Exception:
-                    pass
+                err = read_stderr_nonblocking(daemon)
                 sys.stderr.write(
                     f"daemon never bound socket; stderr={err!r}\n")
                 sys.exit(1)
@@ -108,11 +125,7 @@ def main():
         )
         try:
             if not wait_for_socket(sock, timeout=5.0):
-                err = b""
-                try:
-                    err = daemon.stderr.read1(4096) if daemon.stderr else b""
-                except Exception:
-                    pass
+                err = read_stderr_nonblocking(daemon)
                 sys.stderr.write(
                     f"daemon never bound socket (auto-mkdir path); "
                     f"stderr={err!r}\n")

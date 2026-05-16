@@ -240,6 +240,43 @@ If this slips, phase-1 (single-client persistent socket) is the
 useful core; phase-2 (multi-client + auto-spawn) can land as a
 separate branch.
 
+### Phase-2 follow-ups (post-phase-1 review)
+
+These items were flagged by the linus-code-reviewer and security-
+auditor on `worktree-agent-ae73d824f609b6e86` and consciously
+deferred — phase 1 still ships, but the gaps are recorded so they
+don't get re-discovered as surprises.
+
+- **In-flight RPC interruption on SIGTERM.** The accept loop polls
+  `g_shutdown` only between connections; a long-running `target.open`
+  or hung backend call holds the daemon up indefinitely. Three
+  candidate fixes:
+    1. Pump signals into a self-pipe and replace the blocking
+       `accept()` with `pselect`; abort the in-flight RPC by
+       closing the connection fd from the signal handler's side.
+    2. Expose a `daemon.shutdown` RPC that the client can call
+       to drain in-flight work and exit cleanly.
+    3. Add a per-RPC idle timeout (config knob; default off in
+       phase 1, on for phase 2).
+  All three need a thread-safety audit of the dispatcher's mutable
+  state before they're safe to land.
+- **Token auth for shared-uid environments.** Phase-1's trust model
+  (above) explicitly excludes shared-uid hosts; phase 2's token
+  auth covers them. Sketch: daemon writes a one-shot bearer to
+  `${PATH}.token` (mode 0600) at startup; the client reads it and
+  presents it on the first frame; daemon rejects connections that
+  don't present it. The token rotates on restart.
+- **Per-connection notification sinks.** Phase 1 re-points the
+  dispatcher's single `notif_sink` on accept and clears it on
+  disconnect — race-free only because at most one connection is
+  alive at a time. Multi-client phase 2 needs per-connection sinks
+  plumbed through `NonStopRuntime` so async notifications go to
+  the right peer.
+- **Dispatcher mutability audit.** Probes, sessions, breakpoints —
+  audit anything that today assumes single-client serial RPC.
+  Phase-1 mitigation is the "single connection at a time" promise;
+  multi-client phase 2 forces the audit.
+
 ---
 
 ## 3. ARM64e chained fixups for selrefs / xref indexing

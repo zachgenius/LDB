@@ -4,6 +4,161 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — socket-daemon post-review cleanup (§2 phase 1)
+
+**Goal:** Apply the post-review punch list on
+`worktree-agent-ae73d824f609b6e86` (two H-severity findings + six
+medium + four correctness + five nits) so the branch can merge.
+Reviewers: linus-code-reviewer (correctness) and security-auditor
+(socket exposure).
+
+**Done:**
+
+- Commit `497aa7d` — security: closed H1/H2, applied M1/M2/M3/M6 +
+  correctness #2.
+  * **H1** `acquire_lock` opens the lockfile with `O_NOFOLLOW`;
+    ELOOP is fatal. Defends against a same-uid attacker pre-staging
+    `${PATH}.lock` as a symlink to e.g. `~/.ssh/authorized_keys`
+    that our `ftruncate+pwrite(pid)` would otherwise corrupt.
+    `O_EXCL` deliberately NOT added — stale lockfiles from a
+    crashed daemon must still be reusable (flock releases on
+    process death; ftruncate clears the stale pid).
+  * **H2** `ensure_parent_dir` switched to `::lstat()` so symlinked
+    parents don't trick the daemon into bind()ing inside the
+    symlink target. Refuses pre-existing parents that are
+    symlinks, owned by another uid, or group/other-permissive.
+    New dirs still go through the `umask(0077) + mkdir(0700)`
+    atomic pattern.
+  * **M1** `getpeereid()` peer-uid check after `accept()`. Even
+    with the inode at 0600 we reject any peer whose uid differs
+    from `geteuid()` before the first byte is read. Portable
+    across macOS (LOCAL_PEERCRED) and Linux (SO_PEERCRED).
+  * **M2** `SO_RCVTIMEO = 300s` on every accepted connection. A
+    stalled peer no longer pins the dispatcher thread forever;
+    `FdStreambuf::underflow` maps the EAGAIN to traits_type::eof
+    which `serve_one_connection` already handles cleanly.
+  * **M3** `--listen unix:PATH` rejects relative paths (exit 2
+    with a stderr message mentioning "absolute"). The symlinked-
+    parent guard needs a fixed reference point and the default-
+    path policies already produce absolute paths, so this only
+    restricts user-supplied values.
+  * **M6** `fchmod(fd, 0600)` instead of path-based `chmod`, with
+    EINVAL/ENOTSUP fallback to path-based chmod on macOS where
+    fchmod on AF_UNIX sockets is rejected. Closes a tiny TOCTOU
+    window where an FS filter could replace the inode between
+    `bind()` and `chmod()`.
+  * **Correctness #2** `memcpy(addr.sun_path, ..., size+1)` — copy
+    the trailing NUL explicitly. The pre-existing brace-init of
+    `addr` already zeroed sun_path[size]; the explicit form is
+    just impossible to silently break in a future refactor.
+  * **Trust model doc.** New "Trust model" subsection in §2
+    documents the phase-1 single-uid assumption and the
+    out-of-scope cases (shared-uid hosts, NFS-homed uid,
+    in-uid LLM sandboxes — deferred to phase 2 + token auth).
+    `ldbd --help` reflects the same.
+  * **Tests:** `tests/smoke/test_socket_perms.py` grew three new
+    scenarios (relative path refused, symlinked parent refused,
+    symlinked lockfile refused with target untouched). All three
+    failed before the fix and pass after.
+
+- Commit `27d2d1f` — correctness: drop dead peers + close both
+  socket halves + M7 flag-beats-env.
+  * **#1** `FdStreambuf` latches write failures into a sticky
+    `write_failed_` flag. sync/overflow/xsputn short-circuit
+    once latched. `FdOstream::flush()` forwards the latch to the
+    ostream's `badbit`. `protocol::write_json_line` /
+    `write_cbor_frame` now throw `protocol::Error` when
+    `!out.good()` after flush — `serve_one_connection`'s
+    existing catch block tears the connection down. Before this:
+    a closed-mid-write peer caused sync to scrub the buffer and
+    the NEXT flush to "succeed" (nothing to write), masking the
+    failure and pinning the daemon in a write-to-dead-peer loop.
+  * **#3** `_SocketProc.__init__` calls `settimeout(300)` on the
+    socket — matches the daemon-side `SO_RCVTIMEO`. fetch_catalog
+    / do_rpc catch `socket.timeout` at `tr.recv()` and translate
+    to a clean "daemon socket timeout after 300s" error.
+  * **#4** fetch_catalog and do_rpc `finally` blocks now close
+    `proc.stdout` in addition to `proc.stdin`. For `_SocketProc`
+    both halves are independent makefile() dups of the socket fd
+    — closing only stdin left a dup open and the daemon's read()
+    didn't see EOF until process exit. Verified safe for the
+    Popen-shaped local/ssh daemons too.
+  * **M7** Flipped precedence: explicit `--socket` / `--ssh` flag
+    wins over `LDB_SOCKET` / `LDB_SSH_TARGET`. Rationale:
+    transport selectors that the operator typed at the prompt
+    should not be silently overridden by stale env from a
+    previous shell. The daemon-side env knobs
+    (LDB_STORE_ROOT, LDB_OBSERVER_EXEC_ALLOWLIST) keep
+    env-beats-flag because those are launcher-style policy knobs
+    intended to pin behaviour across argv rewrites.
+
+- This commit (nits + worklog + phase-2 doc note):
+  * **N1** Alphabetised `LDBD_SOURCES` so `daemon/dispatcher.cpp`,
+    `daemon/socket_loop.cpp`, `daemon/stdio_loop.cpp` appear in
+    the expected order.
+  * **N2** Explicit `static` keyword on `g_shutdown` and
+    `on_term_signal` (alongside the anon namespace) so file-scope
+    intent is unambiguous to a future flattening refactor.
+  * **N3** `bind_listener` comment now says the umask(0077) +
+    bind() atomicity only holds because daemon startup is
+    single-threaded.
+  * **N4** Lockfile comment reworded: flock is the exclusivity
+    mechanism, the stamped pid is best-effort diagnostic only.
+    Reflects what the code actually does.
+  * **N5** All three socket smoke tests use a small
+    `read_stderr_nonblocking()` helper (select w/ 200ms timeout)
+    in place of the blocking `proc.stderr.read1(4096)`. A healthy
+    daemon's silent stderr no longer stalls the test runner.
+  * **Phase-2 doc.** §2 grew a "Phase-2 follow-ups" subsection
+    recording the deferred items: in-flight RPC interruption on
+    SIGTERM (today only takes effect between connections), token
+    auth for shared-uid environments, per-connection
+    notification sinks, dispatcher mutability audit.
+
+**Decisions:**
+
+- **`O_NOFOLLOW`, not `O_EXCL`, on the lockfile.** O_EXCL would
+  refuse a stale lockfile from a crashed daemon — legitimate and
+  recoverable. O_NOFOLLOW alone is enough to close H1, since flock
+  semantics + ftruncate already make stale-lockfile reuse safe.
+- **`fchmod` with platform fallback** rather than `fchmod`-only.
+  macOS's `fchmod` on AF_UNIX socket fds returns EINVAL; refusing
+  to start there would break every Darwin user. The umask(0077)
+  trick around `bind()` already makes the inode land 0600
+  atomically, so the path-based `chmod` fallback is purely
+  defense-in-depth for filesystems that ignore umask. Net: M6's
+  TOCTOU intent is satisfied on Linux; macOS keeps the previous
+  guarantee, which was already adequate.
+- **`socket.timeout` to clean exit, not to retry.** A daemon that
+  goes silent for 300s is wedged; retrying just moves the wedge.
+  The CLI exits 1 with a clear message; the operator can
+  investigate or restart the daemon.
+- **Flag-beats-env only for transport selectors.** Store root and
+  observer-allowlist policy keep env-beats-flag because those are
+  launcher-side knobs. The principle: per-invocation knobs respect
+  what the operator typed; long-lived policy knobs respect the
+  launcher.
+
+**Surprises / blockers:**
+
+- macOS `fchmod()` on a unix-socket fd → EINVAL. Caught when the
+  smoke tests turned red the first time. Fallback added; no
+  behavioural change on Linux.
+- `write_message`'s flush() wasn't checking `out.good()` before
+  this branch — even the pre-existing stdio mode silently
+  swallowed write failures, which the new `write_failed_` latch
+  surfaces. Verified the stdio smoke tests still pass: they don't
+  exercise mid-write close, so the new throw path doesn't trip.
+
+**Next:**
+
+- The phase-2 follow-ups in §2's new subsection are the natural
+  next slice: SIGTERM-during-RPC fix + token auth for shared-uid
+  + per-connection notification sinks. None blocks the merge of
+  this branch.
+
+---
+
 ## 2026-05-16 — persistent unix-socket daemon (§2 phase 1)
 
 **Goal:** Implement `docs/35-field-report-followups.md §2` phase 1 — a
