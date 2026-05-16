@@ -298,9 +298,17 @@ json module_to_json(const backend::Module& m) {
   j["uuid"] = m.uuid;
   j["triple"] = m.triple;
   j["load_addr"] = m.load_address;
-  json secs = json::array();
-  for (const auto& s : m.sections) secs.push_back(section_to_json(s));
-  j["sections"] = std::move(secs);
+  j["section_count"] = m.section_count;
+  // sections inline only when the backend actually filled them (the
+  // open_executable / load_core path that asked for the full walk).
+  // For the cheap default `target.open` shape we leave the key off
+  // entirely so the agent can distinguish "absent, ask for it via
+  // module.list" from "present but empty".
+  if (!m.sections.empty()) {
+    json secs = json::array();
+    for (const auto& s : m.sections) secs.push_back(section_to_json(s));
+    j["sections"] = std::move(secs);
+  }
   return j;
 }
 
@@ -1027,9 +1035,24 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   // ============== target.* ==============
 
   add("target.open",
-      "Create a target from a binary on disk (no process).",
-      obj({{"path", str("Absolute path to executable on the daemon's host.")}},
-          {"path"}),
+      "Create a target from a binary on disk (no process). The default "
+      "response is summary-only: each module reports path, uuid, triple, "
+      "load_addr, and section_count, but the section table is NOT inlined "
+      "(call module.list when you need it). Pass "
+      "view={include_sections:true} to inline the full per-module section "
+      "walk in the response — useful for one-shot CLI introspection of a "
+      "small binary, expensive for hundred-MB Mach-Os.",
+      obj({
+          {"path", str("Absolute path to executable on the daemon's host.")},
+          {"view", obj({
+              {"include_sections", bool_(
+                  "Default false. When true, each returned module carries "
+                  "an inline `sections` array with the recursive section "
+                  "walk (same shape as module.list). When false (default), "
+                  "only `section_count` is returned and `sections` is "
+                  "omitted.")},
+          })},
+      }, {"path"}),
       with_defs(obj({
           {"target_id", uint_min(1)},
           {"triple",    str()},
@@ -3142,7 +3165,16 @@ Response Dispatcher::handle_target_open(const Request& req) {
                               "missing string param 'path'");
   }
 
-  auto res = backend_->open_executable(*path);
+  backend::OpenOptions open_opts{};
+  if (auto vit = req.params.find("view");
+      vit != req.params.end() && vit->is_object()) {
+    if (auto inc = vit->find("include_sections");
+        inc != vit->end() && inc->is_boolean()) {
+      open_opts.include_sections = inc->get<bool>();
+    }
+  }
+
+  auto res = backend_->open_executable(*path, open_opts);
   // Remember the executable's {build_id, path} for resolve_main_module.
   // OpenResult docs say modules[0] is "typically the executable itself"
   // — explicitly relied on here. If that ever changes, the picker

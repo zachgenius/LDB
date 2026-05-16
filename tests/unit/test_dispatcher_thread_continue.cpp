@@ -81,7 +81,7 @@ class CountingStub : public DebuggerBackend {
   }
 
   // The rest are unused stubs.
-  ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
+  ldb::backend::OpenResult open_executable(const std::string&, const ldb::backend::OpenOptions& = {}) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }
   ldb::backend::OpenResult load_core(const std::string&) override { return {}; }
   std::vector<ldb::backend::Module> list_modules(TID) override { return {}; }

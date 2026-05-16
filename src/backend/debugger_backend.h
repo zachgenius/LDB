@@ -36,7 +36,24 @@ struct Module {
   std::string uuid;               // LLDB-reported UUID (build-id on ELF)
   std::string triple;             // e.g. "x86_64-apple-macosx-"
   std::uint64_t load_address = 0; // 0 if not loaded
-  std::vector<Section> sections;
+  std::uint64_t section_count = 0; // top-level + nested sections; always set
+  std::vector<Section> sections;  // empty unless OpenOptions.include_sections
+                                  // (or list_modules) explicitly asked for the
+                                  // walk. section_count is the cheap proxy.
+};
+
+// Options for open_executable. Defaults are tuned for the common
+// "just opened the binary, what is it" question: cheap, no eager
+// SBAPI walks. Pricey enumerations are opt-in.
+//
+// include_sections=false skips the recursive SBSection walk in
+// convert_module. For a binary with hundreds of (sub)sections this
+// is a few hundred SBAPI roundtrips' worth of work — and a few MB
+// of JSON on the wire — per call. Agents that need the section
+// table call module.list with the appropriate view (or re-open
+// with include_sections=true).
+struct OpenOptions {
+  bool include_sections = false;
 };
 
 struct OpenResult {
@@ -428,7 +445,11 @@ class DebuggerBackend {
   virtual ~DebuggerBackend() = default;
 
   // Create a target from a binary on disk; no process is spawned.
-  virtual OpenResult open_executable(const std::string& path) = 0;
+  // The default OpenOptions returns summary modules (no inline section
+  // tables) — this is the cheap path. Pass include_sections=true to
+  // get the full section walk in the response.
+  virtual OpenResult open_executable(const std::string& path,
+                                     const OpenOptions& opts = OpenOptions{}) = 0;
 
   // Create a target with no associated executable. Used as the host
   // for target.attach by PID (where the inferior's image is discovered

@@ -71,7 +71,7 @@ class DisasmStub : public DebuggerBackend {
   // Inert stubs.
   std::optional<ldb::backend::TypeLayout>
       find_type_layout(TID, const std::string&) override { return std::nullopt; }
-  ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
+  ldb::backend::OpenResult open_executable(const std::string&, const ldb::backend::OpenOptions& = {}) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }
   ldb::backend::OpenResult load_core(const std::string&) override { return {}; }
   std::vector<ldb::backend::Module> list_modules(TID) override { return {}; }

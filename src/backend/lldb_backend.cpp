@@ -110,7 +110,21 @@ void collect_sections(lldb::SBSection parent, std::vector<Section>& out,
   }
 }
 
-Module convert_module(lldb::SBModule m) {
+// Count the top-level + nested sections in a module without
+// materialising any Section records. The recursion mirrors
+// collect_sections but only increments a counter — same shape, no
+// allocations, no name/perm/type fetches.
+std::uint64_t count_sections(lldb::SBSection parent) {
+  std::uint64_t total = 1;
+  size_t n = parent.GetNumSubSections();
+  for (size_t i = 0; i < n; ++i) {
+    auto sub = parent.GetSubSectionAtIndex(i);
+    if (sub.IsValid()) total += count_sections(sub);
+  }
+  return total;
+}
+
+Module convert_module(lldb::SBModule m, bool include_sections) {
   Module out;
   lldb::SBFileSpec file = m.GetFileSpec();
   if (file.IsValid()) {
@@ -125,12 +139,25 @@ Module convert_module(lldb::SBModule m) {
   // Triple
   if (const char* tr = m.GetTriple()) out.triple = tr;
 
-  // Top-level sections
   size_t n = m.GetNumSections();
-  out.sections.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    auto s = m.GetSectionAtIndex(i);
-    if (s.IsValid()) collect_sections(s, out.sections);
+  if (include_sections) {
+    out.sections.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      auto s = m.GetSectionAtIndex(i);
+      if (s.IsValid()) collect_sections(s, out.sections);
+    }
+    out.section_count = out.sections.size();
+  } else {
+    // Cheap path: just count. The recursion is bounded by the Mach-O /
+    // ELF section nesting depth (typically 2), so the worst case for a
+    // 587-section iOS app is one GetNumSubSections per top-level
+    // section — orders of magnitude less work than the full walk.
+    std::uint64_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+      auto s = m.GetSectionAtIndex(i);
+      if (s.IsValid()) total += count_sections(s);
+    }
+    out.section_count = total;
   }
   return out;
 }
@@ -334,6 +361,18 @@ LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
   ensure_lldb_initialized();
   impl_->debugger = lldb::SBDebugger::Create();
   impl_->debugger.SetAsync(false);
+  // Stop LLDB from eagerly parsing the entire symbol table + DWARF on
+  // CreateTarget. For a stripped 503 MB Obj-C iOS Mach-O this single
+  // knob was the difference between target.open returning in <1s and
+  // never returning (RSS grew linearly at ~5 MB/s past 36 GB, building
+  // an in-memory index over __objc_methname / function symbols that
+  // nobody had asked for yet). Symbol queries (symbol.find,
+  // disasm.function, ...) still work — they just trigger the parse
+  // on demand, scoped to the module they actually need.
+  if (const char* name = impl_->debugger.GetInstanceName()) {
+    lldb::SBDebugger::SetInternalVariable("target.preload-symbols", "false",
+                                          name);
+  }
   // Module-load listener (slice 1c). Created up front and reused for
   // every target's broadcaster — synchronous drain in
   // snapshot_for_target means we never block on it.
@@ -364,7 +403,8 @@ LldbBackend::~LldbBackend() {
   // on ensure_lldb_initialized.
 }
 
-OpenResult LldbBackend::open_executable(const std::string& path) {
+OpenResult LldbBackend::open_executable(const std::string& path,
+                                        const OpenOptions& opts) {
   lldb::SBError err;
   // CreateTarget(filename, triple, platform, add_dependent_modules, error)
   auto target = impl_->debugger.CreateTarget(
@@ -390,7 +430,9 @@ OpenResult LldbBackend::open_executable(const std::string& path) {
   res.modules.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     auto mod = target.GetModuleAtIndex(i);
-    if (mod.IsValid()) res.modules.push_back(convert_module(mod));
+    if (mod.IsValid()) {
+      res.modules.push_back(convert_module(mod, opts.include_sections));
+    }
   }
   return res;
 }
@@ -467,7 +509,12 @@ OpenResult LldbBackend::load_core(const std::string& core_path) {
   res.modules.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     auto mod = target.GetModuleAtIndex(i);
-    if (mod.IsValid()) res.modules.push_back(convert_module(mod));
+    // load_core is the postmortem-analysis entry point; the caller has
+    // already paid the cost of opening a core file and almost certainly
+    // wants the module-level section detail to navigate the snapshot.
+    if (mod.IsValid()) {
+      res.modules.push_back(convert_module(mod, /*include_sections=*/true));
+    }
   }
   return res;
 }
@@ -488,7 +535,10 @@ std::vector<Module> LldbBackend::list_modules(TargetId tid) {
   out.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     auto m = target.GetModuleAtIndex(i);
-    if (m.IsValid()) out.push_back(convert_module(m));
+    // module.list shape is unchanged: callers expect sections inline.
+    // Projection out of sections is the view descriptor's job
+    // (view.fields=["path","uuid",...]).
+    if (m.IsValid()) out.push_back(convert_module(m, /*include_sections=*/true));
   }
   // Stable ordering (audit §3.3 / R4): sort by module path ascending.
   // LLDB's load-order iteration is per-target and stable, but two
