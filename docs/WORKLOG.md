@@ -95,6 +95,102 @@ pipeline so `xref.address` on iOS/macOS arm64 binaries built with
 - Phase 3 of §3: on-disk fixup-map cache, bind-table resolution,
   `correlate.symbols`/`correlate.strings` wire-up, multi-module
   support, real WeChat-binary validation.
+- Phase 3 follow-ups captured from the post-review punch list (not
+  fixed in this branch): FAT (universal) Mach-O silently drops to a
+  literal-operand scan; pre-/post-indexed LDR (`[x8, #imm]!`, `[x8],
+  #imm`) writeback side-effect not modelled; register-offset LDR
+  (`[x8, x9]`, `[x8, w0, sxtw #3]`) skipped with no diagnostic.
+  Acceptance gates for phase 3 are in `docs/35-field-report-followups.md
+  §3 — Phase 3 — acceptance criteria for the ADRP-pair resolver`.
+
+### 2026-05-16 — post-review cleanup of phase-2 xref wire-up
+
+**Goal:** Apply the linus-reviewer punch list before merging the
+phase-2 chained-fixup xref wire-up.
+
+**Done:**
+
+- **I1 (blocker):** Negative ADRP immediates (`adrp x8, -2`) silently
+  dropped or — worse — bound to a stale prior ADRP. Lifted
+  `parse_uint_at` / `parse_reg_at` out of lldb_backend.cpp's anonymous
+  namespace into `src/backend/xref_arm64_parsers.{h,cpp}` and added
+  `parse_int_at`. ADRP-recording block now uses the signed parser;
+  page math becomes `(pc & ~0xfff) + (static_cast<uint64_t>(imm) <<
+  12)` so the two's-complement wrap gives correct below-PC pages.
+  TDD: `tests/unit/test_xref_arm64_parsers.cpp` pins negative decimal,
+  negative hex, positive, `#`-prefixed negative, missing-digit
+  rejection, parse_uint_at-still-rejects-`-`, and `w8` → `x8`
+  canonicalisation. (Commit `3b8704a`.)
+- **I2:** xref_address was holding `impl_->mu` across the entire
+  Mach-O on-disk read + chained-fixup parse (500+ MiB on real iOS
+  apps). Restructured to check-flag-under-lock → read+parse-outside
+  → double-check-and-publish. Benign race: two callers may both
+  read+parse, only the first publishes. Stdio dispatcher rarely
+  triggers; forward-compatible with §2 socket-daemon multi-client.
+  (Commit `f23cc49`.)
+- **N1:** `resolve_adrp_consumer` set `is_slot_load = true` for all
+  of ldr/ldrsw/ldrh/ldrb. Restricted to `mnemonic == "ldr"` with
+  destination width == `x` (not `w`); ldrsw / ldrh / ldrb keep the
+  direct ADRP-target match path but no longer trigger the chained-
+  fixup map lookup that would always miss. (Commit `fcdbcea`.)
+- **N2:** `extract_chained_fixups_from_macho`'s `LC_SEGMENT_64` size
+  check tightened from `<56` to `<72` (the real `segment_command_64`
+  minimum, including maxprot/initprot/nsects/flags). No OOB today;
+  consistency-with-spec fix. Updated test fixture to match.
+  (Commit `fcdbcea`.)
+- **N4:** Dedupe sort → `std::stable_sort` so the
+  first-of-each-address-group survivor of `std::unique` is reproducible
+  across runs. (Commit `fcdbcea`.)
+- **N5:** `xref_address` re-derived `image_base` from `mod.GetSectionAtIndex
+  (i).GetFileAddress()`. Added `image_base` field to `ChainedFixupMap`,
+  populated inside `parse_chained_fixups`; xref reads
+  `fixup_map.image_base` instead. (Commit `fcdbcea`.)
+- **Phase-3 acceptance criteria** written into
+  `docs/35-field-report-followups.md §3` — call-clobber AAPCS64 reg
+  clear on BL/BLR, function-boundary clear on RET/B/BR, ADD/MOV
+  liveness, FAT Mach-O slice selection, adversarial smoke tests
+  with a zero-false-positive bar, and a `provenance.warnings` field
+  surfacing skipped resolutions to the caller.
+
+**Decisions:**
+
+- **Extract parser helpers into an internal header** rather than
+  testing through xref_address's smoke surface. The smoke path
+  requires a hand-assembled negative-ADRP binary which is fiddly to
+  produce with clang; the parser unit test pins the load-bearing
+  fix at the right altitude. Internal-only header
+  (`src/backend/xref_arm64_parsers.h`); the helpers aren't part of
+  `ldb::backend`'s public surface.
+- **Lock pattern: find() not at() on the publish-back read.** A
+  concurrent `close_target` between publish and read would let
+  `.at()` throw `std::out_of_range`; `find()` lets the caller fall
+  through with an empty local map. In the stdio dispatcher the race
+  window is empty by construction, but the safer surface is free.
+- **N5: drop the LLDB section-table re-derivation.** The parser already
+  computed `image_base` from `(segment[0].vm_addr - segment_offset)`;
+  duplicating the derivation gave two sources of truth that could
+  drift (especially once phase 3 lands FAT-slice handling, where the
+  parser's image_base must reflect the slice and LLDB's section
+  table is per-slice already). Single source of truth.
+
+**Surprises / blockers:**
+
+- N1's slot-load gate needs the destination register's *width* (x vs
+  w), but `parse_reg_at` canonicalises `w` → `x`. Re-scanned the
+  destination's first character from the un-normalised operands
+  string before calling parse_reg_at. Internal-only ugliness; the
+  alternative is plumbing a second return value through parse_reg_at
+  which costs more readability than it saves.
+- Skipped synthesising a clang-built negative-ADRP fixture: the
+  parser unit test covers the load-bearing fix, and the existing
+  chain_slot fixture exercises the positive-ADRP path. A real
+  negative-page fixture is a phase-3 adversarial-smoke deliverable.
+
+**Next:**
+
+- Phase 3 work picks up the acceptance criteria from
+  `docs/35-field-report-followups.md §3`. No further phase-2 work
+  outstanding from the punch list.
 
 ---
 

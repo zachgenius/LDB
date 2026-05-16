@@ -335,6 +335,47 @@ chained-fixup binaries. Real iOS app validation deferred to phase 3.
   file address. Without the wire-up the result is empty; with it,
   the LDR inside `reference_string` is surfaced.
 
+### Phase 3 — acceptance criteria for the ADRP-pair resolver
+
+The phase-2 resolver is a "last ADRP wins for this register" heuristic.
+That subsumes the common compiler-emitted single-def-then-immediate-use
+case but produces false positives across control flow (calls clobber
+caller-saved regs; branches end basic blocks). Phase 3 closes those
+gaps. Acceptance gates:
+
+- **BL / BLR** clears `adrp_regs` entries for `x0`–`x18` and `x30`
+  (AAPCS64 call-clobber set — anything else is callee-saved and may
+  still hold the prior ADRP).
+- **RET / unconditional B / BR Xn** clears all of `adrp_regs` (function
+  boundary; the next block can't safely assume any prior page).
+- **ADD `dst, src, #imm`** with `src != dst`: clears `adrp_regs[dst]`.
+  Phase 3 does NOT propagate the chain through arithmetic — modelling
+  proper dataflow (especially through SXTW / LSL shifts) is out of
+  scope. The clear is the conservative answer.
+- **ADD `dst, dst, #imm`**: clears `adrp_regs[dst]` for the same
+  reason — the value is no longer the ADRP page.
+- **MOV `dst, src`**: clears `adrp_regs[dst]` unless `src` is also
+  tracked (in which case propagate the page through MOV). The simple
+  shape is the only one worth modelling — anything register-to-register
+  with a shift is real dataflow.
+- **FAT (universal) Mach-O**: parse the slice matching the SBTarget's
+  triple (or, if absent, prefer arm64e over arm64 over x86_64) instead
+  of returning an empty fixup map. Today extract_chained_fixups_from_macho
+  silently no-ops on FAT magic.
+- **Adversarial smoke tests**: at minimum cover call-clobber (ADRP →
+  BL → LDR-against-stale-register), cross-function (function boundary
+  doesn't carry ADRP state forward), and ADD-then-LDR (LDR against an
+  ADD-derived address that phase 3 must NOT resolve). The phase-2
+  fixture (`chain_slot.c`) only exercises the happy path; the
+  regression bar for phase 3 is **zero false positives** from these
+  patterns.
+- **`provenance.warnings` field** on `xref.address` responses: count
+  of "ADRP-pair resolutions skipped due to ambiguity" (e.g. a tracked
+  ADRP that was clobbered by an untracked instruction between def and
+  use). A non-zero count surfaces to the caller that the heuristic
+  isn't authoritative on this binary, which the agent can use to
+  prefer the chained-fixup map or fall back to symbol-index correlate.
+
 ### Out of scope (phase 2)
 
 Carried over to phase 3:
