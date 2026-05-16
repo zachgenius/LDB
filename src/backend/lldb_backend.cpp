@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "backend/lldb_backend.h"
 
+#include "backend/xref_arm64_parsers.h"
 #include "ldb/backend/chained_fixups.h"
 #include "transport/rr.h"
 #include "transport/ssh.h"
@@ -1835,62 +1836,12 @@ struct AdrpPair {
   std::uint64_t pc   = 0;  // pc of the ADRP that set this register
 };
 
-// Parse a decimal-or-hex non-negative integer starting at s[pos]. Returns
-// {ok, value, end_pos}. Skips a leading '#' if present.
-std::tuple<bool, std::uint64_t, std::size_t>
-parse_uint_at(const std::string& s, std::size_t pos) {
-  while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos;
-  if (pos < s.size() && s[pos] == '#') ++pos;
-  if (pos >= s.size()) return {false, 0, pos};
-  bool hex = false;
-  if (pos + 1 < s.size() && s[pos] == '0' &&
-      (s[pos + 1] == 'x' || s[pos + 1] == 'X')) {
-    hex = true;
-    pos += 2;
-  }
-  std::uint64_t value = 0;
-  std::size_t   start = pos;
-  while (pos < s.size()) {
-    char c = s[pos];
-    unsigned int d;
-    if (c >= '0' && c <= '9')      d = static_cast<unsigned int>(c - '0');
-    else if (hex && c >= 'a' && c <= 'f') d = static_cast<unsigned int>(c - 'a' + 10);
-    else if (hex && c >= 'A' && c <= 'F') d = static_cast<unsigned int>(c - 'A' + 10);
-    else break;
-    value = (value * (hex ? 16ULL : 10ULL)) + d;
-    ++pos;
-  }
-  if (pos == start) return {false, 0, pos};
-  return {true, value, pos};
-}
-
-// Parse a register token like "x8", "X8", "w8", "sp" starting at s[pos].
-// Returns {ok, normalised_token, end_pos}. We only need the literal
-// register name to key the AdrpPair map; we don't bother distinguishing
-// x/w forms since ADRP always produces an x register and the same x
-// register is later consumed.
-std::tuple<bool, std::string, std::size_t>
-parse_reg_at(const std::string& s, std::size_t pos) {
-  while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == ','))
-    ++pos;
-  std::size_t start = pos;
-  while (pos < s.size()) {
-    char c = s[pos];
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-        (c >= '0' && c <= '9')) {
-      ++pos;
-    } else {
-      break;
-    }
-  }
-  if (pos == start) return {false, {}, pos};
-  std::string tok = s.substr(start, pos - start);
-  // Normalise: lower-case, treat "w" and "x" forms the same. We
-  // canonicalise to the "x" form because ADRP only produces x.
-  for (auto& ch : tok) ch = static_cast<char>(std::tolower(ch));
-  if (!tok.empty() && (tok[0] == 'w')) tok[0] = 'x';
-  return {true, std::move(tok), pos};
-}
+// The decimal/hex/signed/register parsers live in
+// src/backend/xref_arm64_parsers.{h,cpp} so unit tests can exercise
+// them without standing up a live LLDB target.
+using xref_arm64::parse_int_at;
+using xref_arm64::parse_reg_at;
+using xref_arm64::parse_uint_at;
 
 // Extract the target address an ARM64 memory operand refers to, given a
 // known {adrp_page, register_name} pair. Recognised shapes:
@@ -2140,19 +2091,28 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
           for (auto& c : mnem_lower) c = static_cast<char>(std::tolower(c));
 
           if (mnem_lower == "adrp") {
-            // "adrp xN, <imm>" — record the absolute target page.
+            // "adrp xN, <imm>" — record the absolute target page. The
+            // immediate is *signed* (21-bit, +/- 1 MiB pages); LLDB
+            // emits e.g. `adrp x8, -2` for pages below the PC's page.
+            // parse_uint_at would refuse the leading '-' and we'd
+            // either miss the xref or — worse — silently bind to a
+            // stale prior ADRP entry for the same register.
             auto [ok_dst, dst, p1] = parse_reg_at(i.operands, 0);
             if (ok_dst) {
               std::size_t pos = p1;
               while (pos < i.operands.size() &&
                      (i.operands[pos] == ' ' || i.operands[pos] == ','))
                 ++pos;
-              auto [ok_imm, imm, _e] = parse_uint_at(i.operands, pos);
+              auto [ok_imm, imm, _e] = parse_int_at(i.operands, pos);
               if (ok_imm) {
                 AdrpPair p;
                 p.pc   = i.address;
+                // Cast → shift → add. Two's-complement wrap on the
+                // unsigned addition is exactly the page-below-PC case
+                // we want; for positive imm the high bits are zero
+                // and the math is identical to the old unsigned path.
                 p.page = (i.address & ~static_cast<std::uint64_t>(0xfff)) +
-                         (imm << 12);
+                         (static_cast<std::uint64_t>(imm) << 12);
                 adrp_regs[dst] = p;
               }
             }
