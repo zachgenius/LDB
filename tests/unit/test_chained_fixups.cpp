@@ -585,6 +585,12 @@ void put_u32_be(std::vector<std::uint8_t>& buf, std::size_t off,
   buf[off + 3] = static_cast<std::uint8_t>(v & 0xff);
 }
 
+void put_u64_be(std::vector<std::uint8_t>& buf, std::size_t off,
+                std::uint64_t v) {
+  put_u32_be(buf, off + 0, static_cast<std::uint32_t>(v >> 32));
+  put_u32_be(buf, off + 4, static_cast<std::uint32_t>(v & 0xffffffffULL));
+}
+
 }  // namespace
 
 TEST_CASE("extract_chained_fixups_from_macho: FAT picks arm64 slice",
@@ -715,4 +721,50 @@ TEST_CASE("extract_chained_fixups_from_macho: malformed FAT is a no-op",
   ChainedFixupMap m2 =
       extract_chained_fixups_from_macho(oob.data(), oob.size());
   CHECK(m2.resolved.empty());
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: FAT64 (cafebabf) picks arm64 slice",
+          "[chained_fixups][macho][fat][fat64]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // FAT64 layout: 8-byte header (magic=CAFEBABF, nfat_arch) plus
+  // 32-byte fat_arch_64 entries (cputype, cpusubtype, offset:u64,
+  // size:u64, align, reserved). The 64-bit offset/size path is
+  // exercised here — N8 post-review nit: the prior FAT tests only
+  // covered the 32-bit fat_arch path.
+  //
+  // Single arm64 slice (no preference disambiguation needed); the
+  // assertion is that the picker correctly reads the 64-bit offset
+  // and lands on the right Mach-O.
+
+  constexpr std::uint64_t kSliceOff = 0x4000;
+  constexpr std::uint64_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSliceOff + kSliceSize, 0);
+
+  // fat_header (big-endian)
+  put_u32_be(fat, 0, 0xCAFEBABF);  // FAT64 magic
+  put_u32_be(fat, 4, 1);
+
+  // fat_arch_64 entry (big-endian, 32 bytes)
+  //   off 0:  cputype     (u32)
+  //   off 4:  cpusubtype  (u32)
+  //   off 8:  offset      (u64)
+  //   off 16: size        (u64)
+  //   off 24: align       (u32)
+  //   off 28: reserved    (u32)
+  put_u32_be(fat,  8, 0x0100000C);   // cputype = CPU_TYPE_ARM64
+  put_u32_be(fat, 12, 0);            // cpusubtype = ARM64_ALL
+  put_u64_be(fat, 16, kSliceOff);
+  put_u64_be(fat, 24, kSliceSize);
+  put_u32_be(fat, 32, 12);
+  put_u32_be(fat, 36, 0);
+
+  emit_thin_arm64_macho(fat, kSliceOff, 0x100000000ULL);
+
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size());
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.resolved.at(0x8000) == 0x100000500ULL);
+  CHECK(m.resolved.at(0x8008) == 0x100000600ULL);
+  CHECK(m.image_base == 0x100000000ULL);
 }

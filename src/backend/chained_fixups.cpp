@@ -501,6 +501,24 @@ ChainedFixupMap extract_chained_fixups_from_fat(
         fat_bytes + a.offset, static_cast<std::size_t>(a.size));
   };
 
+  // Slice preference: arm64e first, then plain arm64. We treat a
+  // slice with an EMPTY resolved map as "this slice has no chained
+  // fixups, try the next" rather than "use this empty result." That
+  // means a FAT binary whose arm64e slice has chained fixups but
+  // whose arm64 slice doesn't will return the arm64e result; a FAT
+  // binary whose arm64 slice has fixups but arm64e doesn't will
+  // fall through to the arm64 slice.
+  //
+  // Hazard: if BOTH slices have chained fixups but with different
+  // image_bases (which happens when the slices have different
+  // segment layouts — possible after a thinning + repacking
+  // pipeline), the arm64e slice wins and its image_base is what we
+  // hand back. The caller then walks the LLDB-loaded slice (which
+  // might be arm64) and tries to resolve its file-addresses against
+  // the wrong image_base, producing zero matches. Phase-4 follow-up
+  // tracked in the worklog: thread the SBTarget's triple through
+  // extract_chained_fixups_from_macho so the picker matches what
+  // LLDB actually loaded.
   for (const auto& a : archs) {
     if (a.cpu_type == kCpuTypeArm64 &&
         a.cpu_subtype_masked == kCpuSubTypeArm64E) {

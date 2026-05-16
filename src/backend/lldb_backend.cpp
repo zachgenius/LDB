@@ -1890,26 +1890,50 @@ struct AdrpResolved {
   std::string writeback_base;
 };
 
-// AAPCS64 caller-saved general-purpose register set, in the
-// canonical x-form `parse_reg_at` normalises to. A BL / BLR clears
-// any tracked ADRP page held in one of these regs because the callee
-// is free to overwrite them. x19..x28 are callee-saved and may keep
-// their pre-call value across the call; we leave those alone.
+// AAPCS64 caller-saved general-purpose register set. A BL / BLR (and
+// the PAC-authenticated branch family) clears any tracked ADRP page
+// held in one of these regs because the callee is free to overwrite
+// them. x19..x28 are callee-saved per AAPCS64 — the callee is required
+// to preserve them across the call.
 //
-// x29 (FP) and x30 (LR) are technically special-purpose, but x30
-// IS clobbered (BL writes the return address there) so it belongs
-// in the clobber set. x29 we leave alone — clang preserves it
-// across calls when -fno-omit-frame-pointer is in effect.
-const std::array<std::string_view, 20> kAapcs64CallerSavedGPR = {
-  "x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",
-  "x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",
-  "x16", "x17", "x18", "x30",
-};
+// x29 (FP) is callee-saved per AAPCS64 — the callee is required to
+// restore it before returning, so we leave it alone. x30 (LR) is the
+// return-address register; BL writes the return address there, so it
+// belongs in the clobber set.
+//
+// The classifier is a small switch on the first-character + numeric
+// suffix; faster than a hash-set lookup and avoids the 20-string
+// per-call construction the original implementation performed (each
+// `adrp_regs.erase(std::string(reg))` allocated a temporary
+// std::string for the key conversion).
+bool is_aapcs64_caller_saved(std::string_view reg) {
+  if (reg.size() < 2 || reg.size() > 3) return false;
+  if (reg[0] != 'x') return false;
+  // x0..x18: caller-saved. x30: caller-saved. Everything else: not.
+  if (reg.size() == 2) {
+    // x0..x9
+    return reg[1] >= '0' && reg[1] <= '9';
+  }
+  // x10..x18 or x30
+  if (reg[1] < '0' || reg[1] > '9' || reg[2] < '0' || reg[2] > '9') {
+    return false;
+  }
+  int n = (reg[1] - '0') * 10 + (reg[2] - '0');
+  return (n >= 10 && n <= 18) || n == 30;
+}
 
 void clobber_aapcs64_caller_saved(
     std::unordered_map<std::string, AdrpPair>& adrp_regs) {
-  for (auto reg : kAapcs64CallerSavedGPR) {
-    adrp_regs.erase(std::string(reg));
+  // Iterate-and-erase-by-predicate to avoid the 20-string-per-call
+  // construction the kAapcs64CallerSavedGPR table loop performed.
+  // Typical adrp_regs holds 1–3 entries; the inner check is a small
+  // switch and erase() returns the next iterator.
+  for (auto it = adrp_regs.begin(); it != adrp_regs.end(); ) {
+    if (is_aapcs64_caller_saved(it->first)) {
+      it = adrp_regs.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
@@ -1927,6 +1951,50 @@ void clobber_aapcs64_caller_saved(
 // for ORR xN, xzr, xM (reg-reg) or MOVZ/MOVN/MOVK (imm). LLDB
 // canonicalises the alias back to "mov" in its disasm output, which
 // is what we match against here.
+// Tokenise the MOV source operand to one of:
+//   - kImmediate     — `#<n>`
+//   - kZero          — `xzr` / `wzr`
+//   - kStackPointer  — `sp` / `wsp`
+//   - kLinkRegister  — `lr` (alias for x30)
+//   - kWReg          — wN — the upper 32 bits are zeroed, so even if
+//                     the source happened to be tracked, the copy is
+//                     not a page address.
+//   - kXReg          — xN — the only shape that propagates.
+//   - kOther         — unrecognised; conservative clobber.
+enum class MovSrcKind { kOther, kImmediate, kZero, kStackPointer,
+                       kLinkRegister, kWReg, kXReg };
+
+MovSrcKind classify_mov_source(std::string_view tok) {
+  if (tok.empty()) return MovSrcKind::kOther;
+  if (tok[0] == '#') return MovSrcKind::kImmediate;
+  // Strip a trailing comma/space if the caller left it on. parse_reg_at
+  // normalises register tokens for the xN/wN case below; for the
+  // alias-name cases we compare exactly against the canonical
+  // spellings.
+  if (tok == "xzr" || tok == "wzr") return MovSrcKind::kZero;
+  if (tok == "sp"  || tok == "wsp") return MovSrcKind::kStackPointer;
+  if (tok == "lr") return MovSrcKind::kLinkRegister;
+  if (tok.size() >= 2 && (tok[0] == 'x' || tok[0] == 'w')) {
+    // Verify the rest are digits; otherwise treat as kOther.
+    for (std::size_t i = 1; i < tok.size(); ++i) {
+      if (tok[i] < '0' || tok[i] > '9') return MovSrcKind::kOther;
+    }
+    return tok[0] == 'x' ? MovSrcKind::kXReg : MovSrcKind::kWReg;
+  }
+  return MovSrcKind::kOther;
+}
+
+// Apply a MOV instruction's effect on the ADRP-tracking map. Returns
+// true iff the mnemonic was recognised as a MOV variant — the caller
+// (`resolve_adrp_consumer`) uses this to short-circuit and skip
+// LDR/ADD parsing, which would never apply.
+//
+// Recognised shapes:
+//   mov  xN, xM       — propagate xM's tracking to xN (or clear if xM
+//                       isn't tracked).
+//   mov  xN, <other>  — clobber xN. Covers immediate, xzr/wzr, sp,
+//                       lr, wN copies, and anything we can't parse.
+//   movz/movn/movk    — immediate-loading; always clobber xN.
 bool apply_mov_state(
     const std::string& mnemonic, const std::string& operands,
     std::unordered_map<std::string, AdrpPair>& adrp_regs) {
@@ -1941,41 +2009,51 @@ bool apply_mov_state(
     adrp_regs.erase(dst);
     return true;
   }
-  // "mov  dst, <src>": <src> is either xN (register copy), #imm, sp,
-  // xzr, lr, or wN/wzr (32-bit). Only the reg-reg xN form propagates.
+  // Skip ", " or whitespace between dst and src.
   std::size_t pos = p1;
   while (pos < operands.size() &&
          (operands[pos] == ' ' || operands[pos] == ',')) ++pos;
-  // Try to parse a register source. parse_reg_at canonicalises wN→xN
-  // and recognises sp/zr; we want only the plain xN propagation, and
-  // we want sp/lr/zr to clobber the destination.
-  if (pos < operands.size()) {
-    char first = static_cast<char>(std::tolower(operands[pos]));
-    if (first == '#') {
-      // Immediate. Clobber.
-      adrp_regs.erase(dst);
+  // Lift the source token (up to next whitespace, comma, or end) and
+  // classify by exact match against the canonical alias spellings.
+  // Order of token isolation: dst is canonicalised by parse_reg_at;
+  // src is matched raw because the alias spellings (xzr, wzr, sp,
+  // wsp, lr) don't pass through parse_reg_at as plain xN names.
+  std::size_t tok_end = pos;
+  while (tok_end < operands.size() &&
+         operands[tok_end] != ' ' && operands[tok_end] != ',' &&
+         operands[tok_end] != '\t') {
+    ++tok_end;
+  }
+  std::string_view tok(operands.data() + pos, tok_end - pos);
+  switch (classify_mov_source(tok)) {
+    case MovSrcKind::kXReg: {
+      // Propagate if src is tracked; otherwise dst becomes untracked.
+      // parse_reg_at canonicalises here too so the lookup hits the
+      // normalised key.
+      auto [ok_src, src, _p2] = parse_reg_at(operands, pos);
+      if (!ok_src) {
+        adrp_regs.erase(dst);
+        return true;
+      }
+      auto it = adrp_regs.find(src);
+      if (it != adrp_regs.end()) {
+        adrp_regs[dst] = it->second;
+      } else {
+        adrp_regs.erase(dst);
+      }
       return true;
     }
-    if (first == 's' || first == 'l' || first == 'w') {
-      // sp / lr / wN — all clobber the tracked x-register's ADRP page.
-      // (wN copies have known-zero upper bits → not a page address.)
+    case MovSrcKind::kImmediate:
+    case MovSrcKind::kZero:
+    case MovSrcKind::kStackPointer:
+    case MovSrcKind::kLinkRegister:
+    case MovSrcKind::kWReg:
+    case MovSrcKind::kOther:
+      // All these clobber the destination's tracked page.
       adrp_regs.erase(dst);
       return true;
-    }
   }
-  auto [ok_src, src, _p2] = parse_reg_at(operands, pos);
-  if (!ok_src) {
-    adrp_regs.erase(dst);
-    return true;
-  }
-  // Propagate if src is tracked; otherwise dst becomes untracked.
-  auto it = adrp_regs.find(src);
-  if (it != adrp_regs.end()) {
-    adrp_regs[dst] = it->second;
-  } else {
-    adrp_regs.erase(dst);
-  }
-  return true;
+  return true;  // unreachable; appeases -Wreturn-type
 }
 
 // ARM64 ADD / SUB (and the flag-setting ADDS / SUBS variants) all
@@ -2078,6 +2156,15 @@ AdrpAddrOperand parse_adrp_addr_operand(const std::string& operands,
 std::optional<AdrpResolved>
 resolve_adrp_consumer(const std::string& mnemonic, const std::string& operands,
                       const std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  // Short-circuit on mnemonics that can never be an ADRP-pair consumer
+  // (MOV variants, calls, returns, ...). The post-emit state-mutation
+  // block in xref_address handles state changes for these; running
+  // the operand parser below would just churn for nothing. N5 cleanup
+  // — the prior apply_mov_state return value was discarded.
+  if (mnemonic == "mov" || mnemonic == "movz" || mnemonic == "movk" ||
+      mnemonic == "movn") {
+    return std::nullopt;
+  }
   if (mnemonic == "add") {
     // "add  dst, src, #imm"
     auto [ok_dst, dst, p1] = parse_reg_at(operands, 0);
@@ -2560,8 +2647,13 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             clobber_arith_destination(i.operands, adrp_regs);
           } else if (mnem_lower == "mov" || mnem_lower == "movz" ||
                      mnem_lower == "movk" || mnem_lower == "movn") {
-            // Gate 4: MOV may propagate or clobber.
-            apply_mov_state(mnem_lower, i.operands, adrp_regs);
+            // Gate 4: MOV may propagate or clobber. The bool return is
+            // discarded here — the mnemonic check above already
+            // narrowed to MOV variants. The same return is what lets
+            // resolve_adrp_consumer short-circuit on MOV without
+            // running the LDR/STR operand parser (see the early-bail
+            // at the top of resolve_adrp_consumer).
+            (void)apply_mov_state(mnem_lower, i.operands, adrp_regs);
           } else if (is_return || is_indirect_branch || mnem_lower == "b") {
             // Gate 1 follow-up: end-of-basic-block instructions that
             // exit the current function reset the entire map. We don't
