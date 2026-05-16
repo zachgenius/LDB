@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <vector>
 
 namespace ldb::backend::xref_arm64 {
 
@@ -77,5 +78,49 @@ enum class MovSrcKind { kOther, kImmediate, kZero, kStackPointer,
                        kLinkRegister, kWReg, kXReg };
 
 MovSrcKind classify_mov_source(std::string_view tok);
+
+// Parse the destination register(s) an instruction writes, given its
+// lower-cased mnemonic and operand string.
+//
+// Phase-4 cleanup C3+C4 (docs/35-field-report-followups.md §3): the
+// ADRP-pair resolver's original clobber strategy was a whitelist of
+// mnemonics — every instruction NOT in the list left destination
+// register tracking intact, which silently bound stale ADRP pages to
+// CSEL, CSET, CSINC, CSINV, CSNEG, LDP, LDPSW, LDXP, LDAR, LDAXR,
+// MADD, MSUB, EXTR, BFI, BFM, UBFX, SBFX, FMOV, and dozens of other
+// register-writing instructions.
+//
+// The cleanup pass shifts to clobber-by-default: the resolver's
+// post-emit logic enumerates every instruction's destination register
+// via this helper, applies any explicit propagation (e.g. MOV xN, xM),
+// and then clears every remaining destination. The whitelist becomes
+// a propagation-paths allowlist.
+//
+// Conventions:
+//   - Returns canonical x-register names ("x8", not "w8"); parse_reg_at
+//     does the w→x normalisation.
+//   - STR/STP/STUR/STRH/STRB write to memory, not a register — they
+//     return an empty vector.
+//   - LDP/LDPSW/LDXP return two destinations.
+//   - LDR/LDUR/LDRSW/LDRH/LDRB/LDXR/LDAR/LDAXR return one.
+//   - CSEL/CSET/CSINC/CSINV/CSNEG/CINV/CINC/CNEG return one (the first
+//     operand).
+//   - MADD/MSUB/SMADDL/UMADDL/SMSUBL/UMSUBL return one.
+//   - CMP/CMN/TST/CCMP/CCMN don't write a destination (they write
+//     flags); return empty.
+//   - Branches (B/BL/BR/BLR/CBZ/CBNZ/TBZ/TBNZ/RET) don't return a
+//     destination in the register sense the resolver cares about; the
+//     return-address writes for BL/BLR are handled separately by the
+//     AAPCS64 clobber set.
+//   - For instructions the helper doesn't recognise, the destination
+//     register is conservatively assumed to be the first operand
+//     register (matches >95% of ARM64 ISA: destination first).
+//
+// This intentionally over-clobbers some encodings (e.g. some FPU forms
+// where the first operand is a flags-only consumer). The trade-off:
+// over-clobbering loses a potential xref, under-clobbering produces
+// false positives. We pick the conservative side.
+std::vector<std::string> parse_destination_registers(std::string_view mnemonic,
+                                                      const std::string& operands);
 
 }  // namespace ldb::backend::xref_arm64

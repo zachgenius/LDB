@@ -2034,38 +2034,12 @@ bool apply_mov_state(
   return true;  // unreachable; appeases -Wreturn-type
 }
 
-// ARM64 ADD / SUB (and the flag-setting ADDS / SUBS variants) all
-// write an arithmetic result, not an ADRP page, into the destination
-// register. The phase-3 rule is the same in every shape: after we've
-// consumed the (possibly-tracked) source for the resolve_adrp_consumer
-// match, clear adrp_regs[dst] so the next instruction can't reach back
-// through dst to an obsolete page.
-//
-// SUB joins the family because its destination-write semantics are
-// identical to ADD's — `sub xN, xN, #imm` overwrites the tracked
-// register exactly as `add xN, xN, #imm` does. The original phase-3
-// patch only clobbered on ADD, leaving SUB as a silent false-positive
-// vector (covered by xref_subclobber post-review fixture).
-//
-// Note on match-emit: ADD currently emits a direct-target match when
-// `page + imm == target_addr` (the legitimate ADRP+ADD pattern).
-// SUB+ADRP doesn't have a corresponding "compute target = page - imm"
-// pattern in real compiler output (compilers emit ADD with a signed
-// immediate or pre-compute via a different scheme). We only model the
-// SUB clobber here, not a SUB match-emit; resolve_adrp_consumer
-// remains ADD-only.
-//
-// Handles:
-//   add/sub/adds/subs  xN, xM, #imm        — xN may equal xM
-//   add/sub/adds/subs  xN, xM, xL{, shift} — register-register
-void clobber_arith_destination(
-    const std::string& operands,
-    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
-  auto [ok_dst, dst, _p] = parse_reg_at(operands, 0);
-  if (ok_dst) {
-    adrp_regs.erase(dst);
-  }
-}
+// (clobber_arith_destination was removed in the phase-4 cleanup
+// C3+C4 refactor: ADD / SUB / ADDS / SUBS destination-register
+// clobbering is now handled by the generic
+// parse_destination_registers + clobber-by-default pass in
+// xref_address. The previous helper duplicated logic the generic
+// pass already covers.)
 
 // Parse the `[base{, #imm}]` / `[base], #imm` / `[base, #imm]!` /
 // `[base]` shapes starting at `pos` in `operands`. On success returns
@@ -2759,30 +2733,32 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             }
           }
 
+          // ADRP itself sets adrp_regs[dst] in the ADRP branch above.
+          // Skipping clobber-by-default here preserves that tracking
+          // insertion as the ONE legitimate "this dst now holds an
+          // ADRP page" path.
+          bool dst_already_handled = (mnem_lower == "adrp");
+
           if (is_call) {
             // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
             // callee may overwrite x0..x18 + x30 — the scanner has
-            // no way to know the callee's behaviour.
+            // no way to know the callee's behaviour. Calls don't have
+            // a GPR destination in the destination-register sense the
+            // resolver tracks (BL writes x30 but that's covered by
+            // the caller-saved set), so clobber-by-default is a no-op
+            // here.
             clobber_aapcs64_caller_saved(adrp_regs);
-          } else if (mnem_lower == "add" || mnem_lower == "sub" ||
-                     mnem_lower == "adds" || mnem_lower == "subs") {
-            // Gate 3: ADD / SUB (and the flag-setting siblings) write
-            // a computed value, not an ADRP page. Clear adrp_regs[dst]
-            // regardless of whether dst==src or the second operand was
-            // tracked. resolve_adrp_consumer has already run; the match
-            // (if any — only the ADD shape emits one) is already in
-            // `out`. SUB joins per the post-review spec: same
-            // destination-write semantics, same false-positive class.
-            clobber_arith_destination(i.operands, adrp_regs);
+            dst_already_handled = true;
           } else if (mnem_lower == "mov" || mnem_lower == "movz" ||
                      mnem_lower == "movk" || mnem_lower == "movn") {
-            // Gate 4: MOV may propagate or clobber. The bool return is
-            // discarded here — the mnemonic check above already
-            // narrowed to MOV variants. The same return is what lets
-            // resolve_adrp_consumer short-circuit on MOV without
-            // running the LDR/STR operand parser (see the early-bail
-            // at the top of resolve_adrp_consumer).
+            // MOV may propagate or clobber. apply_mov_state owns the
+            // destination's tracking — either setting it from a
+            // tracked source (mov xN, xM) or erasing it (every other
+            // form). Mark the destination as handled so the
+            // clobber-by-default pass below doesn't undo a legitimate
+            // propagation.
             (void)apply_mov_state(mnem_lower, i.operands, adrp_regs);
+            dst_already_handled = true;
           } else if (is_return || is_indirect_branch || mnem_lower == "b") {
             // Gate 1 follow-up: end-of-basic-block instructions that
             // exit the current function reset the entire map. We don't
@@ -2797,6 +2773,7 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // closes that.
             adrp_regs.clear();
             current_function_known = false;
+            dst_already_handled = true;
           } else if (is_cond_branch) {
             // Phase 4 item 1 (post-cleanup C1+C2,
             // docs/35-field-report-followups.md §3): parse the
@@ -2861,6 +2838,39 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                   provenance->warnings.push_back(w.str());
                 }
               }
+            }
+          }
+
+          // Clobber-by-default (phase-4 cleanup C3+C4,
+          // docs/35-field-report-followups.md §3). After every explicit
+          // propagation path has fired (ADRP records, MOV propagates,
+          // call clobbers caller-saved set, return/B clears all), erase
+          // every destination register the instruction wrote. This
+          // catches CSEL / CSET / CSINC / CSINV / CSNEG / LDP / LDPSW /
+          // LDXP / LDAR / LDAXR / MADD / MSUB / EOR-with-shift / ORR /
+          // AND / ASR / LSL / EXTR / BFI / BFM / UBFX / SBFX / FMOV /
+          // SDIV / UDIV / REV / CLZ — every "writes a register"
+          // instruction the previous whitelist missed.
+          //
+          // dst_already_handled gates this — set by ADRP (the
+          // tracking-insertion path) and the explicit MOV/call/return
+          // arms. Without that gate, ADRP would set adrp_regs[dst] and
+          // we'd immediately erase it; MOV xN, xM would propagate and
+          // then be undone.
+          //
+          // ADD with a matched-emit isn't in the explicit arm above
+          // — it falls through to this clobber, which is exactly what
+          // the post-emit semantics require (the ADD's result is
+          // page+imm, no longer a clean page address; subsequent loads
+          // through dst must not bind to the old page). The
+          // legitimate xref has already been pushed to `out` by the
+          // match-emit block above.
+          if (!dst_already_handled) {
+            auto dsts =
+                xref_arm64::parse_destination_registers(mnem_lower,
+                                                         i.operands);
+            for (const auto& d : dsts) {
+              adrp_regs.erase(d);
             }
           }
         }

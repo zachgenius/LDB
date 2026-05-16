@@ -15,6 +15,7 @@
 
 using ldb::backend::xref_arm64::classify_mov_source;
 using ldb::backend::xref_arm64::MovSrcKind;
+using ldb::backend::xref_arm64::parse_destination_registers;
 using ldb::backend::xref_arm64::parse_int_at;
 using ldb::backend::xref_arm64::parse_reg_at;
 using ldb::backend::xref_arm64::parse_uint_at;
@@ -149,4 +150,181 @@ TEST_CASE("classify_mov_source: malformed inputs classified as kOther",
   REQUIRE(classify_mov_source("")   == MovSrcKind::kOther);
   REQUIRE(classify_mov_source("xq") == MovSrcKind::kOther);  // not a number
   REQUIRE(classify_mov_source("foo") == MovSrcKind::kOther);
+}
+
+// ---------------------------------------------------------------------------
+// parse_destination_registers — phase-4 cleanup C3+C4
+// (docs/35-field-report-followups.md §3). Drive the clobber-by-default
+// pass: every instruction that writes a register must surface its
+// destination(s) here so the resolver erases stale ADRP tracking.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parse_destination_registers: CSEL writes the first operand",
+          "[xref][arm64][parse_dst]") {
+  // The motivating C3 case: CSEL was missed by the phase-3 whitelist,
+  // so a `csel x8, x9, x8, gt` left adrp_regs[x8] intact.
+  auto dsts = parse_destination_registers("csel", "x8, x9, x8, gt");
+  REQUIRE(dsts.size() == 1);
+  REQUIRE(dsts[0] == "x8");
+}
+
+TEST_CASE("parse_destination_registers: CSET / CSINC / CSINV / CSNEG / "
+          "CINC / CINV / CNEG all write first operand",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"cset", "csinc", "csinv", "csneg",
+                            "cinc",  "cinv",  "cneg"}) {
+    auto dsts = parse_destination_registers(mnem, "x9, eq");
+    REQUIRE(dsts.size() == 1);
+    REQUIRE(dsts[0] == "x9");
+  }
+}
+
+TEST_CASE("parse_destination_registers: LDP / LDPSW return two destinations",
+          "[xref][arm64][parse_dst]") {
+  // C4 motivating case: `ldp x8, x9, [sp]` writes BOTH x8 and x9.
+  auto dsts = parse_destination_registers("ldp", "x8, x9, [sp]");
+  REQUIRE(dsts.size() == 2);
+  REQUIRE(dsts[0] == "x8");
+  REQUIRE(dsts[1] == "x9");
+
+  auto dsts2 = parse_destination_registers("ldpsw", "x10, x11, [x0, #8]");
+  REQUIRE(dsts2.size() == 2);
+  REQUIRE(dsts2[0] == "x10");
+  REQUIRE(dsts2[1] == "x11");
+}
+
+TEST_CASE("parse_destination_registers: LDXP / LDAXP return two destinations",
+          "[xref][arm64][parse_dst]") {
+  auto dsts = parse_destination_registers("ldxp", "x0, x1, [x2]");
+  REQUIRE(dsts.size() == 2);
+  auto dsts2 = parse_destination_registers("ldaxp", "x3, x4, [x5]");
+  REQUIRE(dsts2.size() == 2);
+}
+
+TEST_CASE("parse_destination_registers: LDR / LDUR / LDRSW / LDRH / LDRB "
+          "return one destination",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"ldr", "ldur", "ldrsw", "ldrh", "ldrb"}) {
+    auto dsts = parse_destination_registers(mnem, "x8, [x9, #0x10]");
+    REQUIRE(dsts.size() == 1);
+    REQUIRE(dsts[0] == "x8");
+  }
+}
+
+TEST_CASE("parse_destination_registers: ADD / SUB / ADDS / SUBS write first "
+          "operand",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"add", "sub", "adds", "subs"}) {
+    auto dsts = parse_destination_registers(mnem, "x0, x1, #0x40");
+    REQUIRE(dsts.size() == 1);
+    REQUIRE(dsts[0] == "x0");
+  }
+}
+
+TEST_CASE("parse_destination_registers: STR / STP / STUR / STRH / STRB "
+          "produce no destinations",
+          "[xref][arm64][parse_dst]") {
+  // Stores write to memory, not a register. The first operand is the
+  // SOURCE, not a destination — must not be erased.
+  for (const char* mnem : {"str", "stur", "strh", "strb", "stp", "stnp"}) {
+    auto dsts = parse_destination_registers(mnem, "x8, [sp, #0x10]");
+    REQUIRE(dsts.empty());
+  }
+}
+
+TEST_CASE("parse_destination_registers: CMP / CMN / TST / CCMP / CCMN "
+          "produce no destinations",
+          "[xref][arm64][parse_dst]") {
+  // Compare/test instructions write flags only.
+  for (const char* mnem : {"cmp", "cmn", "tst", "ccmp", "ccmn"}) {
+    auto dsts = parse_destination_registers(mnem, "x0, x1");
+    REQUIRE(dsts.empty());
+  }
+}
+
+TEST_CASE("parse_destination_registers: branches and returns produce no "
+          "destinations",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"ret", "retaa", "retab",
+                            "b", "br", "braa", "brab",
+                            "bl", "blr", "blraa", "blrab",
+                            "cbz", "cbnz", "tbz", "tbnz",
+                            "b.eq", "b.ne", "b.gt", "b.le"}) {
+    auto dsts = parse_destination_registers(mnem, "x0, 0x100000");
+    REQUIRE(dsts.empty());
+  }
+}
+
+TEST_CASE("parse_destination_registers: MADD / MSUB / SMADDL / UMADDL / "
+          "SMSUBL / UMSUBL write first operand",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"madd", "msub", "smaddl", "umaddl",
+                            "smsubl", "umsubl"}) {
+    auto dsts = parse_destination_registers(mnem, "x0, x1, x2, x3");
+    REQUIRE(dsts.size() == 1);
+    REQUIRE(dsts[0] == "x0");
+  }
+}
+
+TEST_CASE("parse_destination_registers: ORR / AND / EOR / EON / BIC / ORN "
+          "(register-with-shift form) write first operand",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"orr", "and", "eor", "eon", "bic", "orn"}) {
+    auto dsts = parse_destination_registers(mnem, "x0, x1, x2, lsl #3");
+    REQUIRE(dsts.size() == 1);
+    REQUIRE(dsts[0] == "x0");
+  }
+}
+
+TEST_CASE("parse_destination_registers: EXTR / BFI / BFM / UBFX / SBFX / "
+          "UBFM / SBFM write first operand",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"extr", "bfi", "bfm", "ubfx", "sbfx",
+                            "ubfm", "sbfm"}) {
+    auto dsts = parse_destination_registers(mnem, "x0, x1, #4, #12");
+    REQUIRE(dsts.size() == 1);
+    REQUIRE(dsts[0] == "x0");
+  }
+}
+
+TEST_CASE("parse_destination_registers: w-form destinations canonicalise to "
+          "x-form",
+          "[xref][arm64][parse_dst]") {
+  // parse_reg_at lower-cases AND maps w→x; the dst vector must report
+  // "x" regardless of whether the operand was "w8" or "x8" so the
+  // adrp_regs erase hits the canonical key.
+  auto dsts = parse_destination_registers("csel", "w8, w9, w8, eq");
+  REQUIRE(dsts.size() == 1);
+  REQUIRE(dsts[0] == "x8");
+}
+
+TEST_CASE("parse_destination_registers: unrecognised mnemonic defaults to "
+          "first-operand-is-destination",
+          "[xref][arm64][parse_dst]") {
+  // For instructions the helper doesn't enumerate, the conservative
+  // default is "first operand register is the destination" — matches
+  // >95% of the ARM64 ISA convention. Over-clobbering is safe;
+  // under-clobbering is silent wrong-result.
+  auto dsts = parse_destination_registers("not_a_real_insn", "x12, x13");
+  REQUIRE(dsts.size() == 1);
+  REQUIRE(dsts[0] == "x12");
+}
+
+TEST_CASE("parse_destination_registers: NOP / YIELD / WFE / WFI / DMB / DSB "
+          "/ ISB produce no destinations",
+          "[xref][arm64][parse_dst]") {
+  for (const char* mnem : {"nop", "yield", "wfe", "wfi", "sev", "sevl",
+                            "dmb", "dsb", "isb"}) {
+    auto dsts = parse_destination_registers(mnem, "");
+    REQUIRE(dsts.empty());
+  }
+}
+
+TEST_CASE("parse_destination_registers: paired-load operand starting with "
+          "w-form returns two canonical x-form destinations",
+          "[xref][arm64][parse_dst]") {
+  auto dsts = parse_destination_registers("ldp", "w0, w1, [sp]");
+  REQUIRE(dsts.size() == 2);
+  REQUIRE(dsts[0] == "x0");
+  REQUIRE(dsts[1] == "x1");
 }
