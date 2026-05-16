@@ -53,11 +53,27 @@ class Dispatcher {
 
   // Install the daemon's notification sink. The sink is borrowed —
   // the caller (main.cpp's StreamNotificationSink over the OutputChannel)
-  // owns the lifetime. Called once at startup before any RPCs arrive,
-  // so the NonStopRuntime's atomic sink_ load is a relaxed read of a
-  // value that was set during single-threaded init. See docs/27.
+  // owns the lifetime. Called once at startup before any RPCs arrive
+  // in stdio mode. See docs/27.
+  //
+  // For multi-client socket mode (§2 phase 2), prefer add/remove —
+  // set_notification_sink REPLACES the entire subscriber set, which
+  // is the right thing for a single-writer daemon but loses every
+  // other connection's sink. The socket loop calls add+remove instead.
   void set_notification_sink(protocol::NotificationSink* sink) {
     nonstop_.set_notification_sink(sink);
+  }
+
+  // Subscribe / unsubscribe a notification sink without disturbing the
+  // others. Used by the §2 phase-2 socket loop: each connection adds
+  // its OutputChannel's sink on accept and removes it on disconnect.
+  // The sink is borrowed; the caller owns the lifetime.
+  using SubscriptionHandle = runtime::NonStopRuntime::SubscriptionHandle;
+  SubscriptionHandle add_notification_sink(protocol::NotificationSink* sink) {
+    return nonstop_.add_notification_sink(sink);
+  }
+  void remove_notification_sink(SubscriptionHandle h) {
+    nonstop_.remove_notification_sink(h);
   }
 
   // Test-only seam: install a pre-made RspChannel under target_id +

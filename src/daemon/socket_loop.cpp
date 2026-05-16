@@ -476,18 +476,20 @@ int run_socket_listener(Dispatcher& dispatcher,
     FdOstream  out_stream(conn);
     protocol::OutputChannel out(out_stream, fmt);
 
-    // The dispatcher's notification sink is shared across the daemon's
-    // lifetime in stdio mode; in listen mode we re-point it at the
-    // per-connection OutputChannel so async notifications go to the
-    // current client. Phase 1 has at most one connection alive, so
-    // this re-pointing is race-free. Phase 2 will need per-connection
-    // sinks plumbed through the dispatcher.
+    // §2 phase 2 — each connection registers its own NotificationSink
+    // in the dispatcher's subscriber set, then deregisters on
+    // disconnect. The dispatcher's runtime fans every stop event out
+    // to every live subscriber under its own shared lock. Replaces
+    // the phase-1 single-sink re-pointing, which only worked because
+    // phase-1 was strictly one-connection-at-a-time; multi-client
+    // phase-2 needs the subscriber set so connection A's notifications
+    // don't leak to connection B.
     protocol::StreamNotificationSink sink(out);
-    dispatcher.set_notification_sink(&sink);
+    auto sub = dispatcher.add_notification_sink(&sink);
 
     (void) serve_one_connection(dispatcher, out, in, fmt);
 
-    dispatcher.set_notification_sink(nullptr);
+    dispatcher.remove_notification_sink(sub);
     ::close(conn);
     log::debug("client disconnected; awaiting next");
   }

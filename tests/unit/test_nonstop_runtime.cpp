@@ -169,3 +169,75 @@ TEST_CASE("nonstop: no sink installed → no emission, no crash",
                  ThreadStop{.reason = "trace"});
   CHECK(rt.stop_event_seq(TargetId{1}) == 1);  // state machine still runs
 }
+
+// §2 phase 2 — prerequisite for multi-client. The old single-sink atomic
+// pointer cannot route notifications correctly when two connections are
+// attached: a stop event for target_id=1 (originating from client A)
+// would arrive at whichever sink happened to be installed last. The
+// fix is a subscriber SET — each connection adds its own sink, drops
+// it on disconnect, and all live subscribers receive every notification.
+
+TEST_CASE("nonstop: multi-subscriber sinks both receive a stop event",
+          "[nonstop][notification][multi-client]") {
+  NonStopRuntime rt;
+  CapturingNotificationSink a, b;
+  auto ha = rt.add_notification_sink(&a);
+  auto hb = rt.add_notification_sink(&b);
+
+  rt.set_stopped(TargetId{1}, ThreadId{100},
+                 ThreadStop{.reason = "trace", .signal = 5, .pc = 0xdead});
+
+  REQUIRE(a.events.size() == 1);
+  REQUIRE(b.events.size() == 1);
+  CHECK(a.events.front().method == "thread.event");
+  CHECK(b.events.front().method == "thread.event");
+  // Both see the same seq — there's exactly one stop event in the world.
+  CHECK(a.events.front().params.value("seq", 0) == 1);
+  CHECK(b.events.front().params.value("seq", 0) == 1);
+
+  rt.remove_notification_sink(ha);
+  rt.remove_notification_sink(hb);
+}
+
+TEST_CASE("nonstop: removed sink stops receiving notifications",
+          "[nonstop][notification][multi-client]") {
+  NonStopRuntime rt;
+  CapturingNotificationSink a, b;
+  auto ha = rt.add_notification_sink(&a);
+  auto hb = rt.add_notification_sink(&b);
+
+  rt.set_stopped(TargetId{1}, ThreadId{100}, ThreadStop{.reason = "trace"});
+  rt.remove_notification_sink(ha);
+  rt.set_stopped(TargetId{1}, ThreadId{100}, ThreadStop{.reason = "step"});
+
+  // a got the first event but not the second; b got both.
+  CHECK(a.events.size() == 1);
+  CHECK(b.events.size() == 2);
+  rt.remove_notification_sink(hb);
+}
+
+TEST_CASE("nonstop: set_notification_sink replaces the entire subscriber set",
+          "[nonstop][notification][multi-client]") {
+  // Back-compat shim for stdio mode: callers that haven't been migrated
+  // to add/remove keep calling set_notification_sink. The new semantics
+  // are "clear all subscribers, install this one" — so the stdio
+  // daemon still wires up correctly without code changes downstream.
+  NonStopRuntime rt;
+  CapturingNotificationSink a, b;
+  rt.add_notification_sink(&a);  // intentionally unused handle — see below
+  rt.set_notification_sink(&b);
+
+  rt.set_stopped(TargetId{1}, ThreadId{100}, ThreadStop{.reason = "trace"});
+  CHECK(a.events.empty());        // replaced
+  CHECK(b.events.size() == 1);    // sole subscriber now
+}
+
+TEST_CASE("nonstop: set_notification_sink(nullptr) clears all subscribers",
+          "[nonstop][notification][multi-client]") {
+  NonStopRuntime rt;
+  CapturingNotificationSink a;
+  rt.set_notification_sink(&a);
+  rt.set_notification_sink(nullptr);  // legacy "clear" usage
+  rt.set_stopped(TargetId{1}, ThreadId{100}, ThreadStop{.reason = "trace"});
+  CHECK(a.events.empty());
+}
