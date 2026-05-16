@@ -142,6 +142,41 @@ Lifecycle questions to resolve before code:
 | Auth? | uid-only via filesystem permissions (mode 0600 on the socket, parent dir 0700). No cross-user access. Document it; don't add token auth in phase 1. |
 | Concurrent calls from multiple clients? | Dispatcher is already thread-safe enough for the read-only static surface (uses `impl_->mu`). Audit the mutable paths (probes, sessions, breakpoints) before exposing — possibly serialise per-target via a per-target mutex in phase 1. |
 
+#### Trust model
+
+Phase 1 explicitly assumes **the uid is a single trust domain**.
+That assumption shapes every access-control decision in the daemon:
+
+- Socket inode lives at mode 0600; parent dir at 0700 when the
+  daemon creates it.
+- The daemon refuses to use a pre-existing parent that is a symlink,
+  is owned by another uid, or has group/other permission bits set.
+- The sidecar lockfile is opened with `O_NOFOLLOW` to refuse a pre-
+  staged symlink (otherwise a same-uid attacker could pre-create
+  `${PATH}.lock` as a symlink to e.g. `~/.ssh/authorized_keys` and
+  have our `ftruncate`+`pwrite(pid)` corrupt the symlink target).
+- Every accepted connection is run through `getpeereid()`; peers
+  whose uid differs from the daemon's are rejected before the first
+  byte is read.
+- Accepted connections carry a 300-second `SO_RCVTIMEO` so a stalled
+  peer doesn't pin the daemon's accept loop indefinitely.
+
+Explicitly **out of scope** for phase 1:
+
+- **Shared-uid hosts.** Multi-tenant CI runners, NFS-homed uid where
+  several humans share one account, LLM/agent sandboxes that run
+  inside the daemon's uid — all of these collapse the trust
+  boundary the phase-1 design relies on. Anyone wanting LDB in that
+  shape should wait for phase 2.
+- **Cross-uid access.** No SUID, no group-readable sockets, no
+  cross-user proxying. The "two engineers share a host" pattern
+  requires phase 2.
+
+Phase-2 will add token auth (the daemon hands out a one-shot bearer
+on startup; the client presents it before the first RPC) so the
+shared-uid and cross-uid cases become tractable without re-doing
+the filesystem permissions story.
+
 #### Client side
 
 `tools/ldb/ldb`:

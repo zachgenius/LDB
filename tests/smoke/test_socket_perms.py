@@ -8,6 +8,17 @@
 This is the only access control in phase 1 (no token auth, no cross-
 user access). A regression here silently widens the daemon's
 exposure, so it gets its own pinned test.
+
+Post-review hardening additions:
+  * Symlinked parent directory must be refused (H2): an attacker who
+    pre-creates ${PATH}'s parent as a symlink to a sensitive dir
+    must not trick the daemon into bind()ing inside it.
+  * Symlinked lock file must be refused (H1): pre-creating
+    ${PATH}.lock as a symlink to an unrelated file must not let the
+    daemon's ftruncate/pwrite corrupt the symlink target.
+  * Relative `--listen unix:PATH` must be refused (M3): we only
+    accept absolute paths so the operator can't accidentally bind a
+    socket in a CWD they don't expect.
 """
 import os
 import signal
@@ -124,12 +135,81 @@ def main():
                 daemon.kill()
                 daemon.wait(timeout=2)
 
+    # Scenario C: relative `--listen unix:PATH` must be refused (M3).
+    # The daemon should exit with a clear stderr message; we don't
+    # care about the exact path, only that startup fails fast and
+    # mentions absolute.
+    relative_run = subprocess.run(
+        [ldbd, "--listen", "unix:relative/path.sock",
+         "--log-level", "error"],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+    )
+    expect(relative_run.returncode != 0,
+           f"relative --listen path: should fail, rc="
+           f"{relative_run.returncode} stderr={relative_run.stderr!r}")
+    expect("absolute" in relative_run.stderr.lower(),
+           f"relative --listen path: stderr should mention 'absolute': "
+           f"{relative_run.stderr!r}")
+
+    # Scenario D: parent of socket path is a symlink (H2). Daemon
+    # must refuse — current code follows the symlink and bind()s
+    # inside whatever the symlink points to.
+    with tempfile.TemporaryDirectory() as outer:
+        real = os.path.join(outer, "realdir")
+        link = os.path.join(outer, "linkdir")
+        os.mkdir(real, 0o700)
+        os.symlink(real, link)
+        sock = os.path.join(link, "ldbd.sock")
+        run = subprocess.run(
+            [ldbd, "--listen", f"unix:{sock}", "--log-level", "error"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        expect(run.returncode != 0,
+               f"symlinked parent: should fail, rc={run.returncode} "
+               f"stderr={run.stderr!r}")
+        # Don't pin exact wording — just that the error explains.
+        expect("symlink" in run.stderr.lower()
+               or "refus" in run.stderr.lower(),
+               f"symlinked parent: stderr should explain refusal: "
+               f"{run.stderr!r}")
+
+    # Scenario E: lockfile is a pre-existing symlink (H1). The
+    # daemon must refuse to open the lockfile through a symlink —
+    # otherwise ftruncate+pwrite of the holder pid would corrupt
+    # the symlink target.
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = os.path.join(tmp, "ldbd.sock")
+        lock = sock + ".lock"
+        target = os.path.join(tmp, "victim")
+        with open(target, "w") as f:
+            f.write("DO NOT OVERWRITE\n")
+        os.symlink(target, lock)
+        run = subprocess.run(
+            [ldbd, "--listen", f"unix:{sock}", "--log-level", "error"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        expect(run.returncode != 0,
+               f"symlinked lockfile: should fail, rc={run.returncode} "
+               f"stderr={run.stderr!r}")
+        # Victim file must be untouched.
+        with open(target) as f:
+            body = f.read()
+        expect(body == "DO NOT OVERWRITE\n",
+               f"symlinked lockfile: victim was modified: {body!r}")
+
     if failures:
         sys.stderr.write("FAILURES:\n")
         for f in failures:
             sys.stderr.write(f"  - {f}\n")
         sys.exit(1)
-    print("OK: socket / parent-dir permissions enforced")
+    print("OK: socket / parent-dir permissions + symlink + abs-path "
+          "guards enforced")
 
 
 if __name__ == "__main__":

@@ -39,16 +39,38 @@ void print_usage() {
     "                   JSON-RPC connections one at a time (phase 1:\n"
     "                   single-client, persistent daemon). target_id and\n"
     "                   other dispatcher state survive across client\n"
-    "                   disconnects. Access control is filesystem-only:\n"
-    "                   socket mode 0600, parent dir 0700 if we create\n"
-    "                   it. A `${PATH}.lock` file is taken with flock\n"
+    "                   disconnects. PATH must be absolute.\n"
+    "\n"
+    "                   Access control is filesystem-only plus a\n"
+    "                   defense-in-depth peer-uid check:\n"
+    "                     * socket inode mode 0600,\n"
+    "                     * parent dir 0700 if we create it (and we\n"
+    "                       refuse to use a pre-existing parent that\n"
+    "                       is a symlink, owned by another uid, or\n"
+    "                       group/other-writable),\n"
+    "                     * the lockfile is opened with O_NOFOLLOW to\n"
+    "                       refuse a pre-staged symlinked lockfile,\n"
+    "                     * every accepted connection is checked with\n"
+    "                       getpeereid() and rejected if the peer's\n"
+    "                       uid differs from ours,\n"
+    "                     * accepted connections get a 300s\n"
+    "                       SO_RCVTIMEO so a stalled peer doesn't pin\n"
+    "                       the daemon forever.\n"
+    "                   A `${PATH}.lock` file is taken with flock\n"
     "                   LOCK_EX|LOCK_NB to prevent two daemons binding\n"
-    "                   the same path. See docs/35-field-report-followups.md\n"
-    "                   §2. Mutually exclusive with --stdio.\n"
+    "                   the same path.\n"
+    "\n"
+    "                   Trust model (phase 1): the uid is a single\n"
+    "                   trust domain. Shared-uid hosts (multi-tenant\n"
+    "                   CI runners, NFS-homed uid, LLM sandboxes\n"
+    "                   running inside the daemon's uid) are out of\n"
+    "                   scope — phase 2 will add token auth for those.\n"
+    "                   See docs/35-field-report-followups.md §2.\n"
+    "                   Mutually exclusive with --stdio.\n"
     "\n"
     "                   Default path policy when PATH is omitted by the\n"
     "                   client side (the daemon always wants an\n"
-    "                   explicit PATH):\n"
+    "                   explicit absolute PATH):\n"
     "                     $XDG_RUNTIME_DIR/ldbd.sock   (if set)\n"
     "                     $TMPDIR/ldbd-$UID.sock       (else)\n"
     "                     /tmp/ldbd-$UID.sock          (last resort)\n"
@@ -176,6 +198,17 @@ int main(int argc, char** argv) {
       listen_socket_path = spec.substr(std::strlen(kPrefix));
       if (listen_socket_path.empty()) {
         std::cerr << "ldbd: --listen unix: requires a non-empty PATH\n";
+        return 2;
+      }
+      // Refuse relative paths. The default-path policies in both the
+      // daemon's --help text and the client's `default_socket_path()`
+      // always produce absolute paths; restricting the user-supplied
+      // form to absolute prevents accidentally bind()ing inside a
+      // CWD the operator didn't expect, and gives the symlinked-
+      // parent guard in ensure_parent_dir() a fixed reference point.
+      if (listen_socket_path[0] != '/') {
+        std::cerr << "ldbd: --listen unix:PATH must be absolute (got: "
+                  << listen_socket_path << ")\n";
         return 2;
       }
       listen_mode = true;

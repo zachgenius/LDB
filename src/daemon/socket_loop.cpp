@@ -152,24 +152,32 @@ class FdOstream : public std::ostream {
   FdStreambuf buf_;
 };
 
-// flock-based exclusivity. The lock file lives alongside the socket
-// path so an operator running `lsof` or `ls -l` can see who owns it.
-// LOCK_NB is critical — without it a stale daemon would block startup
-// forever; with it, we get instant EWOULDBLOCK and a clear diagnostic.
-// The descriptor is kept open for the daemon's lifetime so the kernel
-// holds the lock; closing it releases the lock automatically on exit.
+// flock-based exclusivity on a sidecar lockfile. flock is the
+// exclusivity mechanism (the kernel releases the lock when the holder
+// dies, so stale lockfiles from crashed daemons stay reusable). The
+// pid we stamp into the file is best-effort diagnostic only — used
+// by the next colliding daemon to name the holder in stderr.
+//
+// O_NOFOLLOW: a same-uid attacker who pre-creates ${PATH}.lock as a
+// symlink to e.g. ~/.ssh/authorized_keys would otherwise have our
+// ftruncate+pwrite corrupt the symlink target. ELOOP is fatal —
+// refuse to start rather than try to disambiguate.
 int acquire_lock(const std::string& lock_path) {
-  int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  int fd = ::open(lock_path.c_str(),
+                  O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (fd < 0) {
-    std::cerr << "ldbd: cannot open lock " << lock_path
-              << ": " << std::strerror(errno) << "\n";
+    if (errno == ELOOP) {
+      std::cerr << "ldbd: refusing to open lock path through symlink: "
+                << lock_path << "\n";
+    } else {
+      std::cerr << "ldbd: cannot open lock " << lock_path
+                << ": " << std::strerror(errno) << "\n";
+    }
     return -1;
   }
   if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-    // Best-effort: tell the user who's holding it. The lock file is
-    // not the pid file — the pid we report is what the holder wrote
-    // there (if anything). We don't fabricate one if the file is
-    // empty.
+    // Best-effort: tell the user who's holding it. We don't
+    // fabricate a pid if the file is empty.
     std::string holder = "(unknown pid)";
     std::ifstream pf(lock_path);
     std::string line;
@@ -189,27 +197,64 @@ int acquire_lock(const std::string& lock_path) {
   return fd;
 }
 
+// Validate (or create) the socket's parent dir. The validation uses
+// ::lstat() rather than std::filesystem::exists/is_directory because
+// the latter follow symlinks — a same-uid attacker pre-creating the
+// parent as a symlink to a sensitive directory would otherwise trick
+// the daemon into bind()ing inside the symlink target. The phase-1
+// trust model (docs/35-field-report-followups.md §2 "Trust model")
+// assumes the uid is a single trust domain; the symlink/uid/mode
+// guards here defend against accidental misconfiguration, not a
+// cross-uid attacker.
 bool ensure_parent_dir(const std::string& sock_path) {
   std::filesystem::path p(sock_path);
   auto parent = p.parent_path();
   if (parent.empty() || parent == ".") return true;
-  if (std::filesystem::exists(parent)) {
-    if (!std::filesystem::is_directory(parent)) {
+
+  struct stat st{};
+  if (::lstat(parent.c_str(), &st) == 0) {
+    if (S_ISLNK(st.st_mode)) {
+      std::cerr << "ldbd: refusing socket parent that is a symlink: "
+                << parent << "\n";
+      return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
       std::cerr << "ldbd: parent of socket path is not a directory: "
                 << parent << "\n";
       return false;
     }
+    if (st.st_uid != ::geteuid()) {
+      std::cerr << "ldbd: refusing socket parent owned by uid "
+                << st.st_uid << " (expected " << ::geteuid() << "): "
+                << parent << "\n";
+      return false;
+    }
+    if ((st.st_mode & 0077) != 0) {
+      std::cerr << "ldbd: refusing socket parent with group/other "
+                << "permission bits set (mode 0"
+                << std::oct << (st.st_mode & 0777) << std::dec
+                << "): " << parent << "\n";
+      return false;
+    }
     return true;
   }
-  // Create the dir 0700 atomically. mkdir() honours umask, so save and
-  // restore. We only chmod when we created it ourselves — pre-existing
-  // parents are the operator's concern.
-  mode_t old = ::umask(0);
-  int rc = ::mkdir(parent.c_str(), 0700);
-  ::umask(old);
-  if (rc != 0 && errno != EEXIST) {
-    std::cerr << "ldbd: mkdir(" << parent << ") failed: "
+  if (errno != ENOENT) {
+    std::cerr << "ldbd: lstat(" << parent << "): "
               << std::strerror(errno) << "\n";
+    return false;
+  }
+  // Create the dir 0700 atomically. umask(0077) makes the inode land
+  // at 0700 even if mkdir's mode argument is widened by an inherited
+  // umask. The atomicity here only holds because daemon startup is
+  // single-threaded — a sibling thread changing umask mid-call would
+  // break it.
+  mode_t old = ::umask(0077);
+  int rc = ::mkdir(parent.c_str(), 0700);
+  int mkdir_errno = errno;
+  ::umask(old);
+  if (rc != 0 && mkdir_errno != EEXIST) {
+    std::cerr << "ldbd: mkdir(" << parent << ") failed: "
+              << std::strerror(mkdir_errno) << "\n";
     return false;
   }
   return true;
@@ -251,7 +296,11 @@ int bind_listener(const std::string& sock_path) {
   ::unlink(sock_path.c_str());
 
   addr.sun_family = AF_UNIX;
-  std::memcpy(addr.sun_path, sock_path.c_str(), sock_path.size());
+  // Copy the trailing NUL too. addr is brace-initialized to zero, so
+  // sun_path[size] is already 0 — but copying size+1 makes the
+  // contract explicit and impossible to silently break in a future
+  // refactor.
+  std::memcpy(addr.sun_path, sock_path.c_str(), sock_path.size() + 1);
 
   mode_t old = ::umask(0077);
   int rc = ::bind(fd, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr));
@@ -265,14 +314,29 @@ int bind_listener(const std::string& sock_path) {
   }
 
   // Defensive chmod — some filesystems (e.g. tmpfs over NFS) ignore
-  // umask. Cheap, idempotent, and a wrong-perms socket is a security
-  // bug we don't want to discover in production.
-  if (::chmod(sock_path.c_str(), 0600) != 0) {
-    std::cerr << "ldbd: chmod(" << sock_path << ", 0600): "
-              << std::strerror(errno) << "\n";
-    ::close(fd);
-    ::unlink(sock_path.c_str());
-    return -1;
+  // umask. fchmod on the listener fd closes a tiny TOCTOU window
+  // where an FS filter could replace the inode between bind() and a
+  // path-based chmod, so we try it first. macOS rejects fchmod() on
+  // AF_UNIX socket fds with EINVAL; on that platform we fall back to
+  // path-based chmod, which is still defended by the umask(0077)
+  // trick above making the bind() inode land at 0600 atomically.
+  if (::fchmod(fd, 0600) != 0) {
+    int fchmod_errno = errno;
+    if (fchmod_errno == EINVAL || fchmod_errno == ENOTSUP) {
+      if (::chmod(sock_path.c_str(), 0600) != 0) {
+        std::cerr << "ldbd: chmod(" << sock_path << ", 0600): "
+                  << std::strerror(errno) << "\n";
+        ::close(fd);
+        ::unlink(sock_path.c_str());
+        return -1;
+      }
+    } else {
+      std::cerr << "ldbd: fchmod(socket fd, 0600): "
+                << std::strerror(fchmod_errno) << "\n";
+      ::close(fd);
+      ::unlink(sock_path.c_str());
+      return -1;
+    }
   }
 
   if (::listen(fd, 4) != 0) {
@@ -335,6 +399,40 @@ int run_socket_listener(Dispatcher& dispatcher,
       continue;
     }
     ::fcntl(conn, F_SETFD, FD_CLOEXEC);
+
+    // Phase-1 trust model is uid-only: even though the socket inode
+    // is 0600, a defense-in-depth peer-cred check rejects any caller
+    // whose uid differs from ours. getpeereid() is portable across
+    // macOS and Linux; on Linux it wraps SO_PEERCRED, on macOS it
+    // wraps LOCAL_PEERCRED.
+    uid_t peer_uid = 0;
+    gid_t peer_gid = 0;
+    if (::getpeereid(conn, &peer_uid, &peer_gid) != 0) {
+      log::error(std::string("getpeereid: ") + std::strerror(errno));
+      ::close(conn);
+      continue;
+    }
+    if (peer_uid != ::geteuid()) {
+      log::error("rejecting connection from uid " +
+                 std::to_string(peer_uid) +
+                 " (daemon uid is " + std::to_string(::geteuid()) + ")");
+      ::close(conn);
+      continue;
+    }
+
+    // 5-minute receive timeout. If a peer attaches and then stalls
+    // mid-message, we want the dispatcher thread back rather than
+    // pinned forever. read(2) returning -1/EAGAIN is surfaced by
+    // FdStreambuf::underflow as traits_type::eof(), which cleanly
+    // closes the connection in serve_one_connection.
+    ::timeval rcv_timeout{};
+    rcv_timeout.tv_sec  = 300;
+    rcv_timeout.tv_usec = 0;
+    if (::setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO,
+                     &rcv_timeout, sizeof(rcv_timeout)) != 0) {
+      log::warn(std::string("setsockopt(SO_RCVTIMEO): ") +
+                std::strerror(errno));
+    }
 
     FdIstream  in(conn);
     FdOstream  out_stream(conn);
