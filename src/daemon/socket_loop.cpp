@@ -48,6 +48,16 @@ void on_term_signal(int sig) {
 // hatch with confusing close semantics. A 200-line streambuf with
 // behaviour we control is cheaper to reason about than the fd-bridge in
 // the platform ABI.
+//
+// Failure semantics: once a write fails (closed-mid-write peer, EPIPE,
+// truncated tmpfs), `write_failed_` latches true. All subsequent
+// sync/overflow/xsputn calls short-circuit, returning -1 / eof / 0
+// without re-attempting the syscall. FdOstream observes the latch in
+// its overrides and sets `badbit` on the parent ostream so callers'
+// `out.flush()` and `out << ...` reliably report failure. Without
+// this latch a sync that scrubs the buffer would let the NEXT flush
+// "succeed" (nothing to write), masking the original write failure
+// and pinning the daemon in a write-to-dead-peer loop.
 class FdStreambuf : public std::streambuf {
  public:
   explicit FdStreambuf(int fd) : fd_(fd) {
@@ -59,6 +69,8 @@ class FdStreambuf : public std::streambuf {
 
   FdStreambuf(const FdStreambuf&)            = delete;
   FdStreambuf& operator=(const FdStreambuf&) = delete;
+
+  bool write_failed() const noexcept { return write_failed_; }
 
  protected:
   int_type underflow() override {
@@ -89,6 +101,7 @@ class FdStreambuf : public std::streambuf {
   }
 
   int_type overflow(int_type ch) override {
+    if (write_failed_) return traits_type::eof();
     if (sync() != 0) return traits_type::eof();
     if (!traits_type::eq_int_type(ch, traits_type::eof())) {
       *pptr() = traits_type::to_char_type(ch);
@@ -98,6 +111,7 @@ class FdStreambuf : public std::streambuf {
   }
 
   std::streamsize xsputn(const char_type* s, std::streamsize n) override {
+    if (write_failed_) return 0;
     std::streamsize total = 0;
     while (total < n) {
       std::streamsize space = epptr() - pptr();
@@ -114,6 +128,7 @@ class FdStreambuf : public std::streambuf {
   }
 
   int sync() override {
+    if (write_failed_) return -1;
     char* p = pbase();
     while (p < pptr()) {
       ssize_t n = ::write(fd_, p, static_cast<size_t>(pptr() - p));
@@ -122,9 +137,10 @@ class FdStreambuf : public std::streambuf {
         continue;
       }
       if (n < 0 && errno == EINTR) continue;
-      // Tear down the buffer so we don't try to re-flush garbage on
-      // next sync. The caller's write_message will surface this as a
-      // stream failbit; the loop drops the connection.
+      // Latch and scrub. Subsequent sync/overflow/xsputn short-
+      // circuit, so write_response sees a stream failbit on the
+      // NEXT attempt instead of silently retrying forever.
+      write_failed_ = true;
       setp(write_buf_, write_buf_ + sizeof(write_buf_));
       return -1;
     }
@@ -134,6 +150,7 @@ class FdStreambuf : public std::streambuf {
 
  private:
   int fd_;
+  bool write_failed_ = false;
   char read_buf_[4096];
   char write_buf_[4096];
 };
@@ -145,9 +162,24 @@ class FdIstream : public std::istream {
   FdStreambuf buf_;
 };
 
+// FdOstream forwards write failure from the underlying streambuf to
+// the ostream's iostate so callers' `out.flush()` and `out << ...`
+// observe `badbit`. The streambuf base does this for short xsputn
+// returns automatically, but flush() can succeed when the buffer is
+// already drained — once we've latched a write failure we re-flag it
+// on every flush.
 class FdOstream : public std::ostream {
  public:
   explicit FdOstream(int fd) : std::ostream(&buf_), buf_(fd) {}
+
+  // Wrap flush so a previously-latched write failure shows up as
+  // badbit even if the buffer happens to be empty.
+  std::ostream& flush() {
+    std::ostream::flush();
+    if (buf_.write_failed()) setstate(std::ios::badbit);
+    return *this;
+  }
+
  private:
   FdStreambuf buf_;
 };

@@ -303,6 +303,13 @@ class _SocketProc:
             raise IOError(
                 f"could not connect to ldbd socket {sock_path!r}: {e}"
             ) from None
+        # 5-minute recv timeout matches the daemon's SO_RCVTIMEO. A
+        # hung daemon (deadlocked dispatcher, runaway target.open)
+        # must NOT pin `fetch_catalog` or `do_rpc` forever — without
+        # this the CLI would block on the makefile.read() with no
+        # signal-safe escape. socket.timeout is translated upstream
+        # into a clean error message; see do_rpc/fetch_catalog.
+        self._sock.settimeout(300)
         # makefile() on a socket bumps a ref so the file object's close
         # doesn't tear the underlying socket out from under the other
         # half. We separately close `self._sock` in `wait()`/`kill()`.
@@ -700,7 +707,13 @@ def fetch_catalog(spec, fmt: str, verbose: bool) -> list[dict]:
         if verbose:
             sys.stderr.write(f"ldb: -> {json.dumps(req)}\n")
         tr.send(req)
-        resp = tr.recv()
+        try:
+            resp = tr.recv()
+        except socket.timeout:
+            sys.stderr.write(
+                "ldb: daemon socket timeout after 300s while fetching "
+                "catalog (daemon hung?)\n")
+            sys.exit(1)
         if resp is None:
             stderr = proc.stderr.read().decode("utf-8", errors="replace")
             sys.stderr.write(
@@ -721,8 +734,16 @@ def fetch_catalog(spec, fmt: str, verbose: bool) -> list[dict]:
             sys.exit(1)
         return eps
     finally:
+        # For _SocketProc both stdin and stdout each hold a dup of the
+        # underlying socket fd via makefile(); both must be closed for
+        # the daemon to see EOF and move on to the next caller.
+        # Closing stdout on a real subprocess.Popen is also safe.
         try:
             proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
         except Exception:
             pass
         try:
@@ -745,7 +766,13 @@ def do_rpc(spec, fmt: str, verbose: bool, method: str,
         if verbose:
             sys.stderr.write(f"ldb: -> {json.dumps(req)}\n")
         tr.send(req)
-        resp = tr.recv()
+        try:
+            resp = tr.recv()
+        except socket.timeout:
+            sys.stderr.write(
+                f"ldb: daemon socket timeout after 300s waiting for "
+                f"{method!r} (daemon hung?)\n")
+            sys.exit(1)
         if resp is None:
             stderr = proc.stderr.read().decode("utf-8", errors="replace")
             sys.stderr.write(
@@ -755,8 +782,15 @@ def do_rpc(spec, fmt: str, verbose: bool, method: str,
             sys.stderr.write(f"ldb: <- {json.dumps(resp)[:512]}\n")
         return resp
     finally:
+        # See fetch_catalog's matching block. _SocketProc's stdout
+        # holds an independent makefile() handle on the socket fd;
+        # close both halves so the daemon sees EOF promptly.
         try:
             proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.stdout.close()
         except Exception:
             pass
         try:
@@ -1357,18 +1391,21 @@ def main(argv: list[str]) -> int:
         print(f"ldb {CLIENT_VERSION}")
         return 0
 
-    # LDB_SSH_TARGET (if set) overrides --ssh, matching the convention
-    # used elsewhere (env beats flag — same precedence as LDB_STORE_ROOT
-    # for the daemon). Empty env value is treated as unset.
+    # Flag-over-env precedence for transport selectors. An explicit
+    # --ssh / --socket on the command line wins over LDB_SSH_TARGET /
+    # LDB_SOCKET; an unset / empty flag falls back to the env var.
+    # This matches the CLI principle of least surprise — an operator
+    # who typed --socket meant "this socket, right now"; if the env
+    # silently overrode the flag they'd debug for a long time. The
+    # daemon's resolve_store_root and resolve_observer_exec_allowlist
+    # still use env-over-flag, because those are launcher-style knobs
+    # whose env should pin policy across argv rewrites.
     env_ssh = os.environ.get("LDB_SSH_TARGET") or None
-    if env_ssh:
+    if env_ssh and not opts["ssh"]:
         opts["ssh"] = env_ssh
 
-    # Same env-over-flag precedence: LDB_SOCKET wins over --socket.
-    # Empty env value is treated as unset. §2 phase-1 of
-    # docs/35-field-report-followups.md.
     env_socket = os.environ.get("LDB_SOCKET") or None
-    if env_socket:
+    if env_socket and not opts["socket"]:
         opts["socket"] = env_socket
 
     # All three transport selectors are mutually exclusive. We surface

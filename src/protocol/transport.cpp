@@ -89,6 +89,12 @@ std::optional<json> read_cbor_frame(std::istream& in) {
 void write_json_line(std::ostream& out, const json& j) {
   out << j.dump() << '\n';
   out.flush();
+  // A closed-mid-write peer must cause the daemon to drop the
+  // connection on the NEXT write attempt, not silently retry. The
+  // socket-mode FdOstream latches write failures into the streambuf
+  // and surfaces them on flush() via badbit; throwing here lets
+  // serve_one_connection catch and tear down the connection.
+  if (!out.good()) throw Error("stream error writing JSON frame");
 }
 
 void write_cbor_frame(std::ostream& out, const json& j) {
@@ -102,6 +108,7 @@ void write_cbor_frame(std::ostream& out, const json& j) {
   out.write(reinterpret_cast<const char*>(body.data()),
             static_cast<std::streamsize>(body.size()));
   out.flush();
+  if (!out.good()) throw Error("stream error writing CBOR frame");
 }
 
 }  // namespace
