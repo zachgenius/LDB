@@ -7,7 +7,13 @@ Pattern (see tests/fixtures/asm/xref_pcrel_literal.s):
     ldr x0, pcrel_const     ; PC-relative literal load
     ret
   pcrel_const:
-    .quad pcrel_data        ; literal pool slot
+    .quad 0xfeedbeefcafebabe ; opaque magic — NOT a pointer to a
+                             ; data symbol. The fixture intentionally
+                             ; doesn't link the literal slot to any
+                             ; resolvable address: phase 4 doesn't
+                             ; statically dereference literal slots,
+                             ; so the test pins the counter-bump
+                             ; signal, not a real xref.
 
 Acceptance:
   - xref.addr against `pcrel_data` returns ZERO matches (no static

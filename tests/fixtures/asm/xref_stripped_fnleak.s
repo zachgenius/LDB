@@ -1,14 +1,18 @@
-// Phase-4 adversarial fixture (docs/35-field-report-followups.md §3
+// Phase-4 counter-bump fixture (docs/35-field-report-followups.md §3
 // item 3).
 //
-// Reproduces the stripped-binary function-boundary leak. Phase 3's
-// gate 1 uses function_name_at() to detect boundaries; in a stripped
-// binary BOTH adjacent functions return "" so the gate can't tell
-// them apart. Phase 3's RET/B-based clear catches MOST cases, but
-// when adjacent functions are reachable only through B/BL targets
-// (no intervening RET visible in the disassembly stream — e.g. tail-
-// call patterns, compiler-emitted trampolines), the ADRP page from
-// function A leaks into function B.
+// HONEST limitation (phase-4 cleanup N2): on macOS / Apple-silicon
+// LLDB synthesises `___lldb_unnamed_symbol_<addr>` names even after
+// `strip -x`, so gate 1's function_name_at boundary reset already
+// catches the leak on this fixture. The smoke's "zero false
+// positives" assertion passes against pre-phase-4 code too. What
+// this fixture's role becomes: proving the new function_starts path
+// FIRES (the BL target ends up in function_starts and gate 3 either
+// fires or is harmlessly redundant with gate 1 in this run). A
+// genuine "two adjacent stripped functions reachable only via
+// indirect dispatch (vtable / jump table)" fixture — where neither
+// gate 1 nor BL/B recording can see the boundary — would require
+// constructing a jump table; deferred to phase 5.
 //
 // Phase 4 item 3 closes the gap by recording every B/BL target inside
 // __TEXT/__text as a function-start hint. When the scanner reaches an

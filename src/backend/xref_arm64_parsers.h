@@ -123,4 +123,32 @@ MovSrcKind classify_mov_source(std::string_view tok);
 std::vector<std::string> parse_destination_registers(std::string_view mnemonic,
                                                       const std::string& operands);
 
+// Parse a branch / immediate-load target from the LAST comma-separated
+// operand of `ops`. LLDB renders ARM64 branch targets as the FINAL
+// operand:
+//   `b 0x100003f00`               → 0x100003f00
+//   `cbz x9, 0x100003f00`         → 0x100003f00
+//   `tbz w0, #0x10, 0x100003f00`  → 0x100003f00  (NOT 0x10!)
+//   `ldr x0, #0x40`               → 0x40
+//
+// Phase-4 cleanup I3 + N3 (docs/35-field-report-followups.md §3):
+// the prior implementation scanned the whole operand string for any
+// `0xN` substring and kept the LAST one. On `tbz w0, #0x10, _label`
+// it returned 0x10 (the bit position) — a small numeric value that
+// could happen to land inside __TEXT section bounds and silently
+// inject a bogus function-start hint.
+//
+// N3: cap hex literal at 16 digits (64 bits). Anything wider
+// overflows std::uint64_t and is meaningless as a code address;
+// return nullopt rather than truncate silently.
+//
+// Returns std::nullopt when:
+//   - the final operand is a textual label (LLDB sometimes renders
+//     unresolved targets that way),
+//   - the final operand has no `0x` prefix after optional whitespace
+//     and an optional `#` immediate-prefix,
+//   - the literal would overflow 64-bit (17+ hex digits).
+std::optional<std::uint64_t>
+parse_last_hex_in_operands(const std::string& ops);
+
 }  // namespace ldb::backend::xref_arm64

@@ -2425,6 +2425,17 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
         // code with no tracked ADRPs the boundary check is free.
         std::string current_function;
         bool current_function_known = false;
+
+        // Phase-4 cleanup N5 (docs/35-field-report-followups.md §3):
+        // tiny one-entry cache for function_name_at queries on branch
+        // targets. The cond-branch path can hit the same target address
+        // repeatedly (loop backedges, tail-calls to common helpers);
+        // ResolveSymbolContextForAddress is the dominant cost in those
+        // patterns. The cache invalidates implicitly when the scanner
+        // moves to a different target address.
+        std::uint64_t last_target_addr = 0;
+        std::string   last_target_fn;
+        bool          last_target_known = false;
         // Phase 4 item 3: function_starts records addresses we've
         // discovered as function entries — every B / BL target that
         // lands inside this code section is a "this is where a
@@ -2442,41 +2453,12 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
         const std::uint64_t section_end = start + size;
         std::unordered_set<std::uint64_t> function_starts;
 
-        // Helper: parse the LAST hex token (LLDB renders branch
-        // targets as `0xNNNNNNN`) from an operand string. Used by
-        // the conditional-branch boundary check (item 1) AND the
-        // function-start recording (item 3) AND the unresolvable-
-        // load detection (item 4).
-        auto parse_last_hex_in_operands =
-            [](const std::string& ops) -> std::optional<std::uint64_t> {
-          std::optional<std::uint64_t> result;
-          for (std::size_t scan = 0; scan + 2 <= ops.size(); ++scan) {
-            if (ops[scan] == '0' &&
-                (ops[scan + 1] == 'x' || ops[scan + 1] == 'X')) {
-              std::size_t hex_start = scan + 2;
-              std::uint64_t v = 0;
-              std::size_t end = hex_start;
-              while (end < ops.size()) {
-                char c = ops[end];
-                unsigned int d;
-                if (c >= '0' && c <= '9')
-                  d = static_cast<unsigned int>(c - '0');
-                else if (c >= 'a' && c <= 'f')
-                  d = static_cast<unsigned int>(c - 'a' + 10);
-                else if (c >= 'A' && c <= 'F')
-                  d = static_cast<unsigned int>(c - 'A' + 10);
-                else break;
-                v = (v << 4) | d;
-                ++end;
-              }
-              if (end > hex_start) {
-                result = v;
-                scan = end - 1;
-              }
-            }
-          }
-          return result;
-        };
+        // Branch-target parser lifted to xref_arm64::parse_last_hex_in_operands
+        // for unit testability (phase-4 cleanup I3 + N3,
+        // docs/35-field-report-followups.md §3). See the helper's
+        // header doc for the tbz bit-position vs. branch-target bug
+        // it fixes and the 16-digit overflow cap.
+        auto parse_last_hex_in_operands = &xref_arm64::parse_last_hex_in_operands;
 
         for (const auto& i : insns) {
           std::string mnem_lower = i.mnemonic;
@@ -2734,6 +2716,19 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
           // recorded address must lie inside the current code
           // section to be useful — out-of-section targets (calls
           // into dyld stubs, etc.) won't be visited by our scanner.
+          //
+          // Phase-4 cleanup N6 limitation: function_starts is local
+          // to this section's scan. A BL that targets a function in a
+          // DIFFERENT __TEXT section (rare but possible with
+          // -fsplit-data-sections or multi-segment executables) is
+          // recorded into THIS section's function_starts set; the
+          // OTHER section's scan never sees it. The function-boundary
+          // signal there falls back to gate 1's function_name_at.
+          // A unified cross-section function_starts would close this,
+          // but the trade-off (one shared set keyed on absolute
+          // file_addr, scanned per-instruction) hasn't shown up as a
+          // false-positive in any real binary we've measured.
+          // Phase-5 follow-up.
           if ((mnem_lower == "bl" || mnem_lower == "b") &&
               !i.operands.empty()) {
             auto t = parse_last_hex_in_operands(i.operands);
@@ -2819,8 +2814,16 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                 current_function = function_name_at(target, sa);
                 current_function_known = true;
               }
-              auto sa_target = target.ResolveFileAddress(*branch_target);
-              std::string target_fn = function_name_at(target, sa_target);
+              std::string target_fn;
+              if (last_target_known && *branch_target == last_target_addr) {
+                target_fn = last_target_fn;
+              } else {
+                auto sa_target = target.ResolveFileAddress(*branch_target);
+                target_fn = function_name_at(target, sa_target);
+                last_target_addr  = *branch_target;
+                last_target_fn    = target_fn;
+                last_target_known = true;
+              }
               // Cross-function only: bump the recorded-target counter
               // and add to function_starts. Non-empty target_fn matters
               // because stripped binaries return "" on both sides and

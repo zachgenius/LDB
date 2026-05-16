@@ -1,24 +1,24 @@
-// Phase-4 adversarial fixture (docs/35-field-report-followups.md §3
+// Phase-4 counter-bump fixture (docs/35-field-report-followups.md §3
 // item 1).
 //
-// Reproduces a conditional-branch boundary leak. Phase 3 resets
-// adrp_regs only on RET / unconditional B / BR. A conditional branch
-// (b.cond / cbz / cbnz / tbz / tbnz) that crosses into a different
-// function should also reset, otherwise the scanner walks straight
-// into the branch target's body with the source function's
-// adrp_regs[x8] still live.
+// HONEST limitation (phase-4 cleanup N1): this fixture doesn't
+// reproduce the false-positive the worklog originally claimed it did.
+// On symbolised binaries gate 1's function_name_at boundary reset
+// already catches the cross-function cbz on the NEXT iteration (when
+// the scanner walks into the target function and sees a different
+// name); the fixture's "zero false positives" assertion would pass
+// even against pre-phase-4 code. What this fixture DOES prove is that
+// phase 4's cross-function cbz path FIRES on this input — the
+// adrp_pair_cond_branch_recorded provenance counter bumps. Without
+// that counter, a future refactor could silently delete the cbz
+// path while gate 1 covered up the regression — the counter is the
+// canary.
 //
-// The fixture relies on phase-3's gate 1 (function_name_at-based
-// boundary reset) being defeated. That gate IS sufficient on
-// symbolized binaries — when the scanner steps from the source
-// function's last instruction to the target function's first
-// instruction, function_name_at differs and adrp_regs clears. The
-// fixture below is symbolized, so gate 1 already prevents the leak.
-// The fixture's role: assert phase 4's conditional-branch path also
-// fires on the same input (proven via the
-// adrp_pair_cond_branch_reset provenance counter), so future
-// refactors can't silently delete the path while gate 1 silently
-// covers up the regression.
+// The TRUE adversarial fixtures for phase-4 cleanup's C1+C2 bugs
+// (the silent-wrong-result regressions phase 4 ITEM 1 introduced)
+// are xref_cond_fallthrough.s (fall-through preservation) and
+// xref_cond_same_fn.s (same-fn target no-poison). Those fail RED
+// against pre-cleanup code; this one is the counter-emission canary.
 //
 // Pattern:
 //   _pattern_cond_a:

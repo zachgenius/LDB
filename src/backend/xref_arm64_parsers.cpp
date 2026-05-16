@@ -239,4 +239,37 @@ parse_destination_registers(std::string_view mnemonic,
   return dests;
 }
 
+std::optional<std::uint64_t>
+parse_last_hex_in_operands(const std::string& ops) {
+  std::size_t last_comma = ops.rfind(',');
+  std::size_t pos = (last_comma == std::string::npos) ? 0 : last_comma + 1;
+  while (pos < ops.size() && (ops[pos] == ' ' || ops[pos] == '\t')) ++pos;
+  // Skip an optional '#' immediate-prefix — only relevant when the
+  // operand is the whole string (`ldr x0, #0x40`). A branch target
+  // wouldn't carry a '#' but the immediate-load shape this helper
+  // also serves does.
+  if (pos < ops.size() && ops[pos] == '#') ++pos;
+  if (pos + 2 > ops.size()) return std::nullopt;
+  if (ops[pos] != '0' || (ops[pos + 1] != 'x' && ops[pos + 1] != 'X')) {
+    return std::nullopt;
+  }
+  std::size_t hex_start = pos + 2;
+  std::uint64_t v = 0;
+  std::size_t end = hex_start;
+  while (end < ops.size()) {
+    char c = ops[end];
+    unsigned int d;
+    if (c >= '0' && c <= '9')      d = static_cast<unsigned int>(c - '0');
+    else if (c >= 'a' && c <= 'f') d = static_cast<unsigned int>(c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') d = static_cast<unsigned int>(c - 'A' + 10);
+    else break;
+    // N3: 17+ hex digits overflow uint64_t. Bail.
+    if (end - hex_start >= 16) return std::nullopt;
+    v = (v << 4) | d;
+    ++end;
+  }
+  if (end == hex_start) return std::nullopt;
+  return v;
+}
+
 }  // namespace ldb::backend::xref_arm64
