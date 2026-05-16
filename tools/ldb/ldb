@@ -255,10 +255,13 @@ class DaemonSpec:
 
 
 def _find_ldbd_sibling() -> str | None:
-    # tools/ldb/ldb → tools/ldb → tools → <repo>; the in-tree build
-    # always emits ldbd to <repo>/build/bin/ldbd. Anchoring on
-    # __file__ (not CWD) lets the CLI be invoked from anywhere a user
-    # happens to be, without forcing --ldbd on every call.
+    # <repo>/tools/ldb/ldb → dirname → <repo>/tools/ldb
+    #                      → dirname → <repo>/tools
+    #                      → dirname → <repo>
+    # The in-tree build always emits ldbd to <repo>/build/bin/ldbd.
+    # Anchoring on __file__ (not CWD) lets the CLI be invoked from
+    # anywhere a user happens to be, without forcing --ldbd on every
+    # call.
     try:
         script = os.path.realpath(__file__)
     except NameError:
