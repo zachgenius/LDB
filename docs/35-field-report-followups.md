@@ -376,6 +376,38 @@ gaps. Acceptance gates:
   isn't authoritative on this binary, which the agent can use to
   prefer the chained-fixup map or fall back to symbol-index correlate.
 
+### Phase 3 — what shipped (this branch)
+
+All seven acceptance gates above closed. Commits on the phase-3
+branch (each addresses one or more gates):
+
+- **TDD-red fixtures** (commit `adc083a`): three hand-assembled
+  ARM64 fixtures (`tests/fixtures/asm/xref_{addclobber,fnleak,
+  callclobber}.s`) + Python smoke drivers
+  (`tests/smoke/test_xref_{addclobber,fnleak,callclobber}.py`)
+  reproducing the phase-2 false positives. Built and tests added
+  before the implementation; they FAILED against `25f35de` with the
+  expected single-match output.
+
+- **ADRP-pair register-state clobber rules** (commit `7419945`):
+  gates 1 (function-boundary reset, lazy `function_name_at`), 2
+  (AAPCS64 BL/BLR caller-saved set), 3 (ADD always clears dst), 4
+  (MOV propagate-or-clobber). All three adversarial smoke tests
+  flip to green; ctest 73/73.
+
+- **FAT (universal) Mach-O slice selection** (commit `eebebca`):
+  gate 5. Refactored thin-Mach-O walk into a helper; new FAT
+  dispatcher iterates fat_arch[] / fat_arch_64[], prefers arm64e
+  > arm64. Three new unit tests cover slice picking, arm64e
+  preference, and malformed-FAT rejection.
+
+- **`provenance.warnings` field** (commit `c01fa47`): gate 7.
+  `XrefProvenance` struct in `debugger_backend.h`; xref.address
+  takes an optional out-param. Dispatcher attaches the provenance
+  block to the response only when something was skipped. Phase 3
+  populates one case (register-offset LDR with tracked base);
+  phase 4 will accumulate more.
+
 ### Out of scope (phase 2)
 
 Carried over to phase 3:

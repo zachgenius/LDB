@@ -4,6 +4,117 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — ARM64 chained-fixup xref ADRP-pair phase 3 (§3)
+
+**Goal:** Close the silently-wrong patterns in phase 2's ADRP-pair
+resolver (`docs/35-field-report-followups.md §3`). The phase-2
+"last ADRP wins for this register" heuristic produces false
+positives across BL call boundaries, function boundaries, and ADD
+self-writes — three modes the existing `chain_slot.c` fixture
+can't catch because it only exercises the happy path.
+
+**Done:**
+
+- Branch `worktree-phase3-adrp`, forked off `origin/fix/chained-
+  fixups-phase2` (tip `25f35de`).
+- **TDD red (commit `adc083a`):** three hand-assembled adversarial
+  fixtures (`tests/fixtures/asm/xref_{addclobber,fnleak,
+  callclobber}.s`) + Python smoke drivers
+  (`tests/smoke/test_xref_{addclobber,fnleak,callclobber}.py`).
+  Apple-silicon-arm64 gated identically to the phase-2 fixture.
+  Tests verified to FAIL against `25f35de` with the expected
+  single-false-match output. CMake `enable_language(ASM)` scoped
+  to `tests/fixtures/CMakeLists.txt`.
+- **Register-state clobber rules (commit `7419945`):** phase-3
+  gates 1–4. Per-instruction state mutations layered on the
+  existing single-pass scan:
+  - Function-boundary reset via `function_name_at` (lazy — only
+    consulted when `adrp_regs` non-empty).
+  - AAPCS64 BL/BLR clobber clears x0..x18 + x30; x19..x28
+    preserved.
+  - ADD always clears `adrp_regs[dst]` after the (possibly
+    legitimate) match emit.
+  - MOV xN, xM propagates AdrpPair when xM tracked; any other
+    MOV form clobbers.
+  - RET / B / BR reset the entire map.
+  All three adversarial tests turn green; 73/73 ctest.
+- **FAT (universal) Mach-O slice selection (commit `eebebca`):**
+  phase-3 gate 5. Refactored thin-Mach-O parsing into a static
+  helper; new FAT dispatcher iterates `fat_arch` / `fat_arch_64`
+  (big-endian on disk — dedicated `read_u32_be` / `read_u64_be`),
+  prefers arm64e > arm64. Three new unit tests
+  (`tests/unit/test_chained_fixups.cpp`): FAT picks arm64 slice,
+  FAT prefers arm64e, malformed FAT is a no-op. `nfat_arch` capped
+  at 16 to reject hostile headers.
+- **`provenance.warnings` field (commit `c01fa47`):** phase-3
+  gate 7. New `backend::XrefProvenance` struct; `xref_address`
+  takes an optional `XrefProvenance*` out-param. Dispatcher
+  populates and attaches the block only when something was
+  skipped (empty is the common case; zero wire cost). Phase 3
+  ships one populated case: register-offset LDR with an ADRP-
+  tracked base (`[xN, xM]` / `[xN, xM, lsl #imm]`). Eight test
+  stubs updated for the new virtual signature. `describe.endpoints`
+  schema for `xref.addr` documents the new field.
+- **Docs:** `docs/35-field-report-followups.md §3` gets a new
+  "Phase 3 — what shipped" subsection summarising the four
+  commits and which gate each addresses. The phase-3 acceptance
+  criteria are left intact (phase-4 work will reference them).
+
+**Decisions:**
+
+- **`function_name_at` per-instruction is conditional** on
+  `adrp_regs` being non-empty. This makes the boundary check
+  free on no-ADRP code paths (Linux ELF, x86_64, and ARM64 hot
+  sections that don't use PIE pointers in the regions we visit).
+  On dense ADRP code (every few insns) the symbol-context
+  lookup dominates the scan — defer profiling until phase 4's
+  real iOS smoke arrives.
+- **No leaf-function specialisation** for BL/BLR clobber. The
+  scanner can't statically know what the callee does; assuming
+  worst-case clobber is the phase-3 acceptance bar (zero false
+  positives in the adversarial suite).
+- **FAT preference order arm64e > arm64** approximates the
+  spec's "SBTarget triple match" rule. A full triple-match
+  would need threading SBTarget through the extractor's
+  signature; deferred until we see a binary where the
+  approximation isn't enough.
+- **`provenance` attached only when skipped > 0.** Empty
+  provenance is the common case and would cost ~30 bytes per
+  response with no signal; the explicit field is the "this
+  run had ambiguous patterns" indicator the agent reads.
+
+**Surprises / blockers:**
+
+- The existing test stubs implementing the `DebuggerBackend`
+  virtual interface (eight files in `tests/unit/`) all needed
+  signature updates for the new `XrefProvenance*` param. A
+  default arg on the virtual is allowed but each override still
+  has to match; programmatic sed + qualification fix-up
+  resolved them.
+- LLDB strips the leading `_` from ARM64 Mach-O symbols when
+  surfacing them via `SBTarget::FindSymbols` — the adversarial
+  smoke tests assume the bare name (`pattern_addclobber`,
+  not `_pattern_addclobber`). Caught during the TDD-red run.
+
+**Next:**
+
+Phase 4 (deferred per spec):
+- Real iOS .ipa smoke (validate against `dyld_info --fixups`
+  output).
+- Bind resolution (imports table parsing — phase 2's
+  resolved=0 stays on binds).
+- More provenance cases — pre/post-indexed LDRs with tracked
+  bases (`ldr xN, [xM], #imm` / `ldr xN, [xM, #imm]!`), auth-
+  rebase key-class filtering, multi-start-page diagnostics.
+- Auth-rebase semantics: phase 3 doesn't filter on PAC key
+  class. A consumer that uses `__auth_got` indirection vs
+  `__got` would currently be conflated.
+- On-disk cache of the fixup map keyed on `build_id` — phase 2's
+  per-target rebuild is still cheap at fixture scale (~1 ms on
+  33 KB) but a real WeChat-class binary needs measurement.
+
+---
+
 ## 2026-05-16 — ARM64 chained-fixup xref wire-up (§3 phase 2)
 
 **Goal:** Land phase 2 of `docs/35-field-report-followups.md §3` —
