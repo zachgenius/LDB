@@ -4,6 +4,176 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — persistent unix-socket daemon (§2 phase 2)
+
+**Goal:** Land §2 phase-2 of `docs/35-field-report-followups.md` —
+multi-client persistent unix-socket daemon, plus the four ergonomic
+follow-ups (per-connection notification routing, client-side auto-
+spawn, signal-driven accept-loop interruption, idle timeout, and the
+`daemon.shutdown` RPC). Phase-1's single-client design ships; phase-2
+lifts the serialisation to support multiple concurrent connections
+and adds the orchestration ergonomics that an agent-driven workflow
+wants.
+
+**Done:**
+
+- Branch `phase2-socket-multiclient` off `master@15808a2`. (Worktree
+  was checked out on a stale phase-4 xref-improvements branch; reset
+  to master and re-applied the socket changes via stash before
+  starting committed work.)
+
+- Commit `1e8d525` (prereq): `NonStopRuntime` ditches the single
+  atomic-NotificationSink pointer in favour of a subscriber SET
+  protected by `sinks_mu_`. Each `add_notification_sink` returns an
+  opaque handle; `remove_notification_sink` deregisters. The
+  legacy `set_notification_sink(sink)` survives as a clear-then-add
+  shim so stdio mode's main.cpp keeps working unchanged. The
+  emit_stopped_ fan-out snapshots the subscriber list under a
+  shared lock then drops the lock before iterating, so a slow sink
+  (OutputChannel's mutex contended) doesn't stall the others. TDD:
+  four new unit tests in `tests/unit/test_nonstop_runtime.cpp`,
+  all RED before the implementation, all green after; the 16
+  existing nonstop tests stay green via the back-compat semantics.
+
+- Commit `b94326d` (multi-client): `socket_loop.cpp` spawns one
+  `std::thread` per accepted connection via the new
+  `serve_socket_client` helper. The shared `Dispatcher` serialises
+  overlapping RPC service through a new outer `dispatch_mu_`
+  acquired for the entire `dispatch()` lifetime. New
+  `tests/smoke/test_socket_multiclient.py` exercises the parallel
+  case: two Python threads each open a socket, run target.open +
+  module.list synchronising on a barrier. Pre-fix daemon
+  serialises and the barrier times out at 10s; post-fix both make
+  progress concurrently. Concurrency audit committed inline in
+  `dispatcher.h` and the docs file.
+
+- Commit `3fc62e1` (auto-spawn): `tools/ldb/ldb`'s `_SocketProc`
+  detects ECONNREFUSED / ENOENT / ENXIO and fork+execs
+  `ldbd --listen unix:PATH` detached (`start_new_session=True` =
+  setsid). stdin/stdout/stderr ALL go to /dev/null;
+  `$LDB_LDBD_LOG_FILE` opts the operator into stderr capture.
+  Resolution order for the binary: `$LDB_LDBD_SPAWN`,
+  `shutil.which("ldbd")`, in-tree sibling. New
+  `tests/smoke/test_socket_autospawn.py` covers the
+  no-daemon-pre-test path and the daemon-reuse path. Help text
+  updated.
+
+- Commit `72785ff` (daemon.shutdown + signal wake-up): self-pipe
+  pattern. Signal handler writes a byte (async-signal-safe);
+  daemon.shutdown's callback (wired by the listener via
+  `Dispatcher::set_shutdown_callback`) writes the same byte from
+  the worker thread. The accept loop's poll() monitors srv + the
+  self-pipe read end; on POLLIN of the pipe we drain (non-blocking
+  reads, so the loop terminates with EAGAIN once empty) and check
+  `g_shutdown`. New describe.endpoints entry for daemon.shutdown.
+  Two new smoke tests: `test_daemon_shutdown_rpc.py` and
+  `test_socket_interruption.py`.
+
+- Commit `ac655ec` (idle timeout): `--listen-idle-timeout N`. Atomic
+  `g_live_workers` counter bumped before std::thread construction
+  and decremented on worker exit. poll() takes N*1000ms when
+  `live_workers == 0`; on timeout the loop rechecks the counter
+  (closing the race where a worker raced in during the gap) and
+  exits cleanly. Workers write a wake byte on exit so the loop
+  re-evaluates the timeout (Linux poll resets the deadline per
+  call, macOS preserves it; the explicit wake makes the
+  behaviour uniform). New `tests/smoke/test_socket_idle_timeout.py`.
+
+- This commit: `docs/35-field-report-followups.md §2` "Phase 2 —
+  what shipped" subsection records what landed; a "Phase 3 —
+  carried forward" subsection records the deferred items (token
+  auth, per-target dispatcher sharding, true in-flight RPC
+  cancellation, worker reaping mid-flight, TLS, single-client
+  RPC multiplexing).
+
+**Decisions:**
+
+- **Subscriber set, not target-id routing.** The brief proposed
+  routing by target_id; the simpler equivalent is "every live
+  connection subscribes to every notification." That covers all
+  the documented use cases (`thread.event`, probe callbacks,
+  breakpoint hits) without a routing-key plumbing layer between
+  the runtime and the connection. Per-target routing can land on
+  top of the subscriber set later if a future caller wants
+  narrower scope — at that point it's a notification-router layer
+  over the runtime, not inside it.
+
+- **Single outer dispatch mutex.** Per-target sharding would be
+  more parallel but requires the dispatcher's own mutable state
+  (target_main_module_, diff_cache_, cost_samples_,
+  python_unwinders_, rsp_channels_, active_session_writer_) to
+  migrate to per-target maps first. The brief explicitly called
+  this out as a phase-3 refinement and pre-described the
+  "serialise via the dispatcher's outer mutex" approach as
+  acceptable phase-2 scope. Concurrency audit recorded in
+  dispatcher.h and the docs.
+
+- **Auto-spawn stderr to /dev/null, not inherited.** The original
+  sketch inherited the client's stderr "for operator diagnostics"
+  but broke any caller that wrapped `ldb` in `subprocess.run
+  capture_output=True` — the daemon kept the captured pipe alive
+  past the CLI's exit and the wrapper hung forever on a read
+  that never saw EOF. The smoke test caught this immediately.
+  `$LDB_LDBD_LOG_FILE` is the opt-in for diagnostics.
+
+- **Non-blocking BOTH ends of the self-pipe.** Write end so the
+  signal handler can't deadlock (multiple coalesced signals); read
+  end so the drain loop terminates with EAGAIN instead of blocking
+  on the empty pipe after consuming the single wake-up byte. This
+  one bit me: the daemon.shutdown test failed for a frustrating
+  20 minutes before I realised the read end was still blocking.
+
+- **Phase-2 scope on RPC interruption.** Stops accepting new RPCs
+  immediately, lets the currently-executing dispatch run to
+  completion. LLDB SBAPI calls aren't externally interruptible
+  against the binary ABI; a real cancellation story would require
+  an `SBHostInterrupt`-style shim. Documented in the test
+  (`test_socket_interruption.py`) and the docs file.
+
+- **Idle timeout gates on worker count, not connection count.**
+  Long-lived agent sessions can sit idle on a connected socket
+  for hours; pulling the daemon down would be hostile. The
+  timeout only fires when no workers are alive.
+
+**Surprises / blockers:**
+
+- The worktree harness checked us out on `phase4-xref-improvements`
+  (one commit past master with unrelated WIP) rather than master.
+  Stashed both the WIP and my socket changes, hard-reset to master,
+  reapplied my socket-only changes.
+
+- macOS `poll()` preserves its timeout across spurious wakes; Linux
+  resets per-call. The idle-timeout test would have been flaky on
+  macOS without the explicit worker-exit wake byte.
+
+- The auto-spawn test's first iteration hung the test runner
+  forever — see "Auto-spawn stderr to /dev/null" above. Took an
+  awkward amount of time to spot because the daemon LOOKED healthy
+  (socket bound, accepting connections) and the CLI LOOKED healthy
+  (clean exit on its own); the bug was visible only when the test
+  wrapped both in `subprocess.run(capture_output=True)`.
+
+**Verification:**
+
+- `cmake --build build` — warning-clean.
+- `ctest --test-dir build` — 81/81 pass. Six new tests:
+  `smoke_socket_multiclient`, `smoke_socket_autospawn`,
+  `smoke_daemon_shutdown_rpc`, `smoke_socket_interruption`,
+  `smoke_socket_idle_timeout`, and four new unit cases in the
+  existing `test_nonstop_runtime.cpp` group. The phase-1 socket
+  tests (lifecycle, collision, perms) still pass.
+
+**Next:**
+
+Phase-3 of §2 is enumerated in `docs/35-field-report-followups.md`'s
+new "Phase 3 — carried forward" subsection. Top of list: token
+auth for shared-uid environments. The dispatch-mu refinement
+(per-target sharding) is a measured-cost call — phase-2's outer
+mutex doesn't appear to be a bottleneck against realistic
+workloads, so don't refactor until profiling shows the need.
+
+---
+
 ## 2026-05-16 — ldb CLI sibling lookup for in-tree ldbd
 
 **Goal:** Land item §1 from `docs/35-field-report-followups.md`. The

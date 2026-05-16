@@ -244,42 +244,133 @@ If this slips, phase-1 (single-client persistent socket) is the
 useful core; phase-2 (multi-client + auto-spawn) can land as a
 separate branch.
 
-### Phase-2 follow-ups (post-phase-1 review)
+### Phase 2 — what shipped (this branch)
 
-These items were flagged by the linus-code-reviewer and security-
-auditor on `worktree-agent-ae73d824f609b6e86` and consciously
-deferred — phase 1 still ships, but the gaps are recorded so they
-don't get re-discovered as surprises.
+Phase-2 lands six items in order; see the commit log for the
+individual SHAs and the rationale per piece.
 
-- **In-flight RPC interruption on SIGTERM.** The accept loop polls
-  `g_shutdown` only between connections; a long-running `target.open`
-  or hung backend call holds the daemon up indefinitely. Three
-  candidate fixes:
-    1. Pump signals into a self-pipe and replace the blocking
-       `accept()` with `pselect`; abort the in-flight RPC by
-       closing the connection fd from the signal handler's side.
-    2. Expose a `daemon.shutdown` RPC that the client can call
-       to drain in-flight work and exit cleanly.
-    3. Add a per-RPC idle timeout (config knob; default off in
-       phase 1, on for phase 2).
-  All three need a thread-safety audit of the dispatcher's mutable
-  state before they're safe to land.
-- **Token auth for shared-uid environments.** Phase-1's trust model
-  (above) explicitly excludes shared-uid hosts; phase 2's token
-  auth covers them. Sketch: daemon writes a one-shot bearer to
-  `${PATH}.token` (mode 0600) at startup; the client reads it and
-  presents it on the first frame; daemon rejects connections that
-  don't present it. The token rotates on restart.
-- **Per-connection notification sinks.** Phase 1 re-points the
-  dispatcher's single `notif_sink` on accept and clears it on
-  disconnect — race-free only because at most one connection is
-  alive at a time. Multi-client phase 2 needs per-connection sinks
-  plumbed through `NonStopRuntime` so async notifications go to
-  the right peer.
-- **Dispatcher mutability audit.** Probes, sessions, breakpoints —
-  audit anything that today assumes single-client serial RPC.
-  Phase-1 mitigation is the "single connection at a time" promise;
-  multi-client phase 2 forces the audit.
+1. **Multi-subscriber notification sinks** (runtime change).
+   `NonStopRuntime` now owns a subscriber SET protected by
+   `sinks_mu_`. Each connection registers its own
+   `NotificationSink` via `add_notification_sink` and drops it on
+   disconnect via `remove_notification_sink`. The pre-phase-2
+   single-atomic-sink-pointer design was race-free only because
+   phase-1 allowed at most one connection alive at a time; the
+   subscriber set lets every live connection's `OutputChannel`
+   receive every async notification without cross-talk. The
+   legacy `set_notification_sink(sink)` API survives as a
+   clear-then-add shim for stdio mode.
+
+2. **Multi-client socket listener.** `socket_loop.cpp`'s accept
+   loop now spawns a `std::thread` per accepted connection. The
+   shared `Dispatcher` serialises overlapping RPC service through
+   a new `dispatch_mu_` outer mutex (acquired for the entire
+   `dispatch()` lifetime). Documented concurrency audit:
+     - `LldbBackend::Impl::mu` (existing): every public method
+       takes it; phase-3 chained-fixups branch's mu-drop-during-
+       file-IO pattern stays intact.
+     - `ProbeOrchestrator::mu_` (existing): every public method
+       takes it; callback paths re-acquire on re-entry.
+     - `SessionStore`, `ArtifactStore`: each has its own internal
+       mutex around sqlite. Single-writer assumption preserved
+       by WAL.
+     - `NonStopRuntime`: state-map shared_mutex + the new
+       subscriber-set shared_mutex.
+     - `Dispatcher`'s own mutable state (target_main_module_,
+       diff_cache_, cost_samples_, python_unwinders_,
+       rsp_channels_, active_session_writer_) — NOT thread-safe,
+       now covered by `dispatch_mu_`. Phase-3 refinement could
+       shard by target_id; not done here because the dispatcher
+       state would need to migrate to a per-target map first.
+
+3. **Client-side auto-spawn.** `tools/ldb/ldb` detects
+   ECONNREFUSED / ENOENT / ENXIO on the unix-socket connect()
+   and `fork+exec`s `ldbd --listen unix:PATH` detached
+   (`start_new_session=True` ⇒ setsid; stdin/stdout/stderr all
+   redirected to /dev/null to avoid pipe-inheritance hangs in
+   wrappers that capture_output the CLI; `LDB_LDBD_LOG_FILE`
+   redirects stderr instead for operators who want diagnostics).
+   Spawned daemon outlives the client. Resolution order for the
+   ldbd binary: `$LDB_LDBD_SPAWN` → `shutil.which("ldbd")` →
+   sibling-of-`ldb` heuristic.
+
+4. **Signal-driven accept-loop wakeup.** A self-pipe
+   (`g_shutdown_pipe`) replaces the bare `accept()` with
+   `poll(srv, pipe)`. The signal handler writes a byte (write(2)
+   is async-signal-safe); the accept loop wakes on POLLIN,
+   drains the pipe (both ends are `O_NONBLOCK` so the drain
+   loop terminates with EAGAIN), and checks `g_shutdown`.
+   Documented scope: shutdown stops accepting new RPCs
+   immediately but lets the currently-executing dispatch run to
+   completion — interrupting an in-flight LldbBackend SBAPI
+   call from outside is genuinely impossible against the LLDB
+   ABI.
+
+5. **`--listen-idle-timeout N`.** Opt-in shutdown when no
+   workers are alive and no new connection arrives within N
+   seconds. The accept loop's `poll()` timeout becomes
+   `N * 1000ms` when `live_workers == 0`; on `poll() == 0`, the
+   loop rechecks live_workers (closing the race where a worker
+   raced in during the gap) and, if still zero, exits cleanly.
+   A new atomic `g_live_workers` is bumped before
+   `std::thread` construction and decremented on worker exit;
+   workers write a wake byte to the self-pipe on exit so the
+   accept loop re-evaluates the timeout on platforms where
+   `poll`'s deadline survives spurious wakes.
+
+6. **`daemon.shutdown` RPC.** Dispatcher endpoint that invokes
+   a callback wired by `socket_loop.cpp` (sets `g_shutdown` +
+   writes to self-pipe). Returns -32002 with a "not supported
+   in this mode" message when run under `--stdio` (no
+   callback). Listed in `describe.endpoints`. The reply
+   (`{ok:true}`) is sent first; the accept loop's poll wakes
+   on the next byte from the self-pipe.
+
+### Phase 3 — carried forward
+
+Items deferred from the phase-2 work, in roughly priority order:
+
+- **Token auth for shared-uid environments.** Phase-1's trust
+  model (above) excludes shared-uid hosts. Phase-3 sketch:
+  daemon writes a one-shot bearer to `${PATH}.token` (mode
+  0600) at startup; the client reads it and presents it on the
+  first frame; daemon rejects connections that don't present
+  it. The token rotates on restart.
+- **Per-target dispatcher sharding.** Phase-2 serialises all
+  dispatch through `dispatch_mu_`. The dispatcher's per-target
+  mutable state (target_main_module_, the diff cache keyed by
+  snapshot, the cost-samples ring) would migrate to a per-target
+  map under a per-target mutex; the truly-global pieces
+  (active_session_writer_, recipe loader bookkeeping) stay
+  under the outer mutex. Phase-3 problem, not phase-2: today's
+  workloads don't appear to spend significant time contended on
+  `dispatch_mu_`.
+- **True in-flight RPC cancellation.** Phase-2 stops accepting
+  new RPCs on shutdown but waits for in-flight workers to
+  finish their current dispatch. LLDB SBAPI calls aren't
+  externally interruptible against the binary ABI; a real
+  cancellation story would require an `SBHostInterrupt`-style
+  shim plus dispatcher-side cooperation. Out of scope for
+  socket-daemon work; tracked separately.
+- **Worker reaping mid-flight.** Today the worker thread list
+  grows for the daemon's lifetime; phase-2 only joins on
+  shutdown. A long-lived daemon servicing many short-lived
+  connections accumulates `std::thread` state until exit.
+  Negligible at realistic session counts (~24 bytes per
+  entry) but a 20-line refactor away if it ever matters: each
+  worker posts its `thread::id` into a `done_ids` deque under
+  `done_mu` before returning; the main loop's idle paths join
+  + erase any threads in that list. Sketch left in
+  `socket_loop.cpp`'s `reap_finished_workers` lambda.
+- **TLS / cross-host transports.** Out of scope for socket-
+  daemon; the existing `--ssh` knob plus the socket path
+  inside the SSH tunnel covers the practical cross-host
+  story.
+- **Connection multiplexing within a single client.** One
+  client opening N parallel RPCs over one socket is a phase-3
+  story that requires both ID-tagged request/response routing
+  and a per-channel dispatcher state model. Not on any
+  current roadmap.
 
 ---
 

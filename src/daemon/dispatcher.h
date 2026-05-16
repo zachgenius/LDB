@@ -239,10 +239,19 @@ class Dispatcher {
   // the entire duration of dispatch() — phase-3 may refine to per-
   // target sharding if contention shows up.
   //
+  // **Recursive** because `session.replay`'s loop calls
+  // `dispatch()` re-entrantly on the same thread (the replayed
+  // request goes through the full outer wrapper so provenance
+  // decoration + the per-RPC cost recording still fire — the
+  // session-log append no-ops because replay suspends the writer).
+  // A non-recursive mutex deadlocks here. The recursive flavour is
+  // slightly slower per acquisition than std::mutex but the
+  // overhead is dwarfed by the work inside any real RPC.
+  //
   // Notifications fire OUTSIDE this mutex: NonStopRuntime takes its
   // own internal locks and fans out to subscribers without ever
   // touching the dispatcher's bookkeeping.
-  std::mutex                                               dispatch_mu_;
+  std::recursive_mutex                                     dispatch_mu_;
 
   // Wired by set_shutdown_callback (only in listen mode today). The
   // `daemon.shutdown` handler invokes this after the reply is sent

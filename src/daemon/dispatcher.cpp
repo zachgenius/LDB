@@ -658,17 +658,11 @@ void decorate_provenance(Response& resp,
 
 Response Dispatcher::dispatch(const Request& req) {
   using clock = std::chrono::steady_clock;
-  // §2 phase 2 — outer serialisation lock. Held for the entire
-  // dispatch lifetime so the dispatcher's own mutable state
-  // (target_main_module_, diff_cache_, cost_samples_,
-  // active_session_writer_, python_unwinders_, rsp_channels_, ...)
-  // sees one-writer-at-a-time semantics even when multiple
-  // connection threads dispatch concurrently. The backend's
-  // SBTarget access is protected by its own internal mutex; this
-  // outer lock is strictly dispatcher-side. Notifications fire
-  // through NonStopRuntime which has its own internal locks and
-  // doesn't touch dispatch_mu_.
-  std::lock_guard<std::mutex> dispatch_lk(dispatch_mu_);
+  // §2 phase 2 — outer serialisation lock. See dispatcher.h's
+  // dispatch_mu_ comment for the full rationale, including why
+  // this is a recursive_mutex (session.replay's loop re-enters
+  // dispatch() on the same thread).
+  std::lock_guard<std::recursive_mutex> dispatch_lk(dispatch_mu_);
   auto t0 = clock::now();
   Response resp = dispatch_inner(req);
   decorate_provenance(resp, backend_.get(), req);
