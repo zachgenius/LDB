@@ -2629,6 +2629,29 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                   if (ok_src && adrp_regs.count(src)) {
                     provenance->adrp_pair_skipped++;
                   }
+                } else if (pos < i.operands.size() &&
+                           (i.operands[pos] == '#' || i.operands[pos] == '0' ||
+                            i.operands[pos] == '-')) {
+                  // Phase 4 item 4 (docs/35-field-report-followups.md §3):
+                  // PC-relative literal load. LLDB renders these as
+                  // `ldr xN, #imm` (immediate is the PC-relative offset)
+                  // or `ldr xN, 0xNNN` (resolved load-time address).
+                  // The literal-pool slot might hold a pointer to a
+                  // string in __TEXT/__cstring or __DATA_CONST; the
+                  // scanner can't statically dereference the slot
+                  // without a runtime image_base. Bump the
+                  // unresolvable-load counter so callers see this
+                  // happened. Only meaningful for `ldr` (literal pool
+                  // loads); stores and short loads don't share the
+                  // shape.
+                  if (mnem_lower == "ldr" || mnem_lower == "ldrsw") {
+                    provenance->adrp_pair_unresolvable_load++;
+                    std::ostringstream w;
+                    w << "PC-relative literal " << mnem_lower
+                      << " at 0x" << std::hex << i.address
+                      << " — literal-pool slot not statically resolved";
+                    provenance->warnings.push_back(w.str());
+                  }
                 }
               }
             }
