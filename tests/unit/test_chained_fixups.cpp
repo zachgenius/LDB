@@ -942,8 +942,11 @@ TEST_CASE("extract_chained_fixups_from_macho: triple-matching slice missing "
           "[chained_fixups][macho][fat][triple]") {
   using ldb::backend::extract_chained_fixups_from_macho;
 
-  // FAT with only an arm64e slice. Triple says arm64. The arm64
-  // slice doesn't exist; fall back to phase-3 preference (arm64e).
+  // FAT with only an arm64e slice. Triple says arm64. NO arm64 slice
+  // exists in the FAT — fall back to phase-3 preference (arm64e).
+  // This is the legitimate fallback path: when the FAT carries no
+  // slice the triple matches, we'd rather surface SOMETHING than
+  // nothing.
   constexpr std::size_t kSlice0Off = 0x1000;
   constexpr std::size_t kSliceSize = 0x300;
   std::vector<std::uint8_t> fat(kSlice0Off + kSliceSize, 0);
@@ -959,11 +962,127 @@ TEST_CASE("extract_chained_fixups_from_macho: triple-matching slice missing "
 
   emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
 
-  // The arm64 slice doesn't exist in this FAT. Phase 4: fall through
-  // to the arm64e slice rather than returning empty.
   ChainedFixupMap m =
       extract_chained_fixups_from_macho(fat.data(), fat.size(),
                                          "arm64-apple-ios13.0");
   REQUIRE(m.resolved.size() == 2);
   CHECK(m.image_base == 0x100000000ULL);
+}
+
+// Emit a minimal arm64 Mach-O with one LC_SEGMENT_64 and NO chained
+// fixups. The parser walks the load commands; without
+// LC_DYLD_CHAINED_FIXUPS it returns ChainedFixupMap{} (empty
+// resolved/binds, image_base from segments). Used to construct the
+// "FAT slice exists but has no chained fixups" scenario for the C5
+// regression test below.
+std::size_t emit_thin_arm64_macho_no_fixups(std::vector<std::uint8_t>& buf,
+                                             std::size_t offset,
+                                             std::uint64_t vmaddr_base) {
+  constexpr std::size_t kHeader     = 32;
+  constexpr std::size_t kSegCmdSize = 72;
+  constexpr std::size_t kSegOff     = 0x100;
+  constexpr std::size_t kSegSize    = 0x10;
+  const std::size_t kFileSize = kSegOff + kSegSize;
+  REQUIRE(offset + kFileSize <= buf.size());
+
+  auto put_u32 = [&](std::size_t off, std::uint32_t v) {
+    buf[offset + off + 0] = static_cast<std::uint8_t>(v & 0xff);
+    buf[offset + off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+    buf[offset + off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xff);
+    buf[offset + off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xff);
+  };
+  auto put_u64 = [&](std::size_t off, std::uint64_t v) {
+    for (std::size_t i = 0; i < 8; ++i) {
+      buf[offset + off + i] =
+          static_cast<std::uint8_t>((v >> (i * 8)) & 0xff);
+    }
+  };
+
+  put_u32(0,  0xFEEDFACF);          // MH_MAGIC_64
+  put_u32(4,  0x0100000C);          // CPU_TYPE_ARM64
+  put_u32(8,  0);                   // cpu_subtype = ARM64_ALL
+  put_u32(12, 2);                   // filetype = MH_EXECUTE
+  put_u32(16, 1);                   // ncmds = 1 (one LC_SEGMENT_64)
+  put_u32(20, kSegCmdSize);
+  put_u32(24, 0);
+  put_u32(28, 0);
+
+  std::size_t off = kHeader;
+  put_u32(off + 0, 0x19);            // LC_SEGMENT_64
+  put_u32(off + 4, kSegCmdSize);
+  put_u64(off + 24, vmaddr_base + 0x8000);
+  put_u64(off + 32, 0x4000ULL);
+  put_u64(off + 40, kSegOff);
+  put_u64(off + 48, kSegSize);
+  // No LC_DYLD_CHAINED_FIXUPS — that's the whole point.
+
+  return kFileSize;
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: triple-matched slice WITHOUT "
+          "chained fixups wins (C5 silent-wrong-result fix)",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // The C5 silent-wrong-result regression
+  // (docs/35-field-report-followups.md §3 phase-4 cleanup C5):
+  // a FAT with both an arm64 slice (LC_DYLD_INFO_ONLY-era, no
+  // chained fixups) and an arm64e slice (with chained fixups). The
+  // triple says arm64 — LLDB loaded the arm64 slice and its
+  // image_base is the source of truth for the xref scan. The buggy
+  // phase-4 code returned the arm64 slice's empty parse only if
+  // resolved was non-empty; otherwise it silently fell through to
+  // the arm64e slice's parse and returned arm64e's image_base, which
+  // is the wrong basis for the arm64 binary the agent is analysing.
+  //
+  // Post-cleanup: a triple-matched slice's parse wins UNCONDITIONALLY
+  // — even when its chained-fixup map is empty. The caller then
+  // gets ChainedFixupMap{} (no chained-fixup-based xref resolution)
+  // and the literal-operand / ADRP-pair scan runs against the
+  // CORRECT image_base.
+  constexpr std::size_t kSlice0Off = 0x1000;   // arm64 (no fixups)
+  constexpr std::size_t kSlice1Off = 0x2000;   // arm64e (with fixups)
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  // Slice 0: arm64 (cpu_type=0x0100000C, cpu_subtype=0).
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 0);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  // Slice 1: arm64e (cpu_type=0x0100000C, cpu_subtype=2).
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 2);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho_no_fixups(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho        (fat, kSlice1Off, 0x200000000ULL);
+
+  // Triple says arm64. The arm64 slice exists in the FAT — it must
+  // win, even though it has no chained fixups.
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64-apple-macosx14.0.0");
+  // The arm64 slice has no chained fixups → resolved is empty.
+  CHECK(m.resolved.empty());
+  // Critically, the image_base must come from the arm64 slice
+  // (image_base from its segments), NOT from the arm64e slice. If we
+  // accidentally fell through to arm64e the image_base would be
+  // 0x200000000.
+  //
+  // emit_thin_arm64_macho_no_fixups doesn't populate image_base via
+  // the chained-fixup header (there isn't one), but the parser's
+  // image_base derivation is "first chain-bearing segment's vm_addr
+  // - segment_offset", which only applies when there ARE chained
+  // fixups. With none, image_base stays at its default 0. What
+  // matters for C5 is that we DON'T get arm64e's 0x200000000 (which
+  // would corrupt the caller's xref slot lookup).
+  CHECK(m.image_base != 0x200000000ULL);
 }

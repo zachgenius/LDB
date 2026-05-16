@@ -544,19 +544,27 @@ ChainedFixupMap extract_chained_fixups_from_fat(
         fat_bytes + a.offset, static_cast<std::size_t>(a.size));
   };
 
-  // Phase 4 item 2: if the caller provided a triple, try the exact
-  // (cpu_type, cpu_subtype) match first. The image_base in the
-  // returned ChainedFixupMap then matches the slice LLDB actually
-  // loaded — the phase-3 hazard (arm64e wins picker; LLDB loaded
-  // arm64 slice; wrong image_base, zero matches) goes away.
+  // Phase 4 item 2 + cleanup C5: if the caller provided a triple and
+  // a slice with the matching (cpu_type, cpu_subtype) EXISTS in the
+  // FAT, that slice's parse result wins — even when its resolved map
+  // is empty. The C5 silent-wrong-result bug was returning a
+  // DIFFERENT slice's result (with that slice's image_base) when the
+  // triple-matched slice happened to be a classic LC_DYLD_INFO_ONLY
+  // binary with no chained fixups; the caller's xref scan then
+  // resolved every ADRP page through the wrong slice's image_base
+  // and silently produced garbage.
+  //
+  // Correct semantics: if the triple matched ANY slice in the FAT,
+  // honour LLDB's choice and return THAT slice's parse — including
+  // the empty-fixups case. Only fall back to phase-3 preference
+  // when NO slice in the FAT matches the triple at all.
   std::uint32_t triple_cpu_type = 0, triple_cpu_subtype = 0;
   if (triple_to_preferred_arch(triple, &triple_cpu_type,
                                 &triple_cpu_subtype)) {
     for (const auto& a : archs) {
       if (a.cpu_type == triple_cpu_type &&
           a.cpu_subtype_masked == triple_cpu_subtype) {
-        auto m = pick_and_run(a);
-        if (!m.resolved.empty()) return m;
+        return pick_and_run(a);
       }
     }
     // ARM64_ALL match also accepts CPU_SUBTYPE_ARM64_V8 (=1). The
@@ -568,14 +576,13 @@ ChainedFixupMap extract_chained_fixups_from_fat(
       for (const auto& a : archs) {
         if (a.cpu_type == kCpuTypeArm64 &&
             a.cpu_subtype_masked == 1) {
-          auto m = pick_and_run(a);
-          if (!m.resolved.empty()) return m;
+          return pick_and_run(a);
         }
       }
     }
-    // Triple-specified slice missing or had no fixups — fall through
-    // to the phase-3 preference order below. Better to surface SOME
-    // result than nothing.
+    // No slice in the FAT matches the triple at all. Fall through
+    // to the preference order below — this is the legitimate
+    // "triple says x86_64 but the FAT only ships arm64{e}" path.
   }
 
   // Phase-3 preference order (also the fallback when triple is empty
