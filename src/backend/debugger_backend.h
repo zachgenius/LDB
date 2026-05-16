@@ -653,8 +653,18 @@ class DebuggerBackend {
   // Returns a result per matching StringMatch; each carries the
   // string and the xrefs to its address. Empty result = string not
   // found OR no xrefs. Throws backend::Error for invalid target_id.
+  //
+  // The `provenance` out-param (optional) is the AGGREGATE of every
+  // underlying xref_address call's provenance — counters sum, warning
+  // strings concat. Phase-4 cleanup I1
+  // (docs/35-field-report-followups.md §3): the prior signature had
+  // no provenance, so `string.xref` callers silently lost every
+  // adrp_pair_* diagnostic the ADRP-pair resolver produced. Without
+  // these counters an agent can't decide whether the heuristic was
+  // authoritative on this binary.
   virtual std::vector<StringXrefResult>
-      find_string_xrefs(TargetId tid, const std::string& text) = 0;
+      find_string_xrefs(TargetId tid, const std::string& text,
+                        XrefProvenance* provenance = nullptr) = 0;
 
   // --- Process lifecycle -------------------------------------------------
   //

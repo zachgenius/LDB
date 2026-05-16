@@ -88,7 +88,8 @@ class GdbMiBackend final : public DebuggerBackend {
       xref_address(TargetId tid, std::uint64_t addr,
                    XrefProvenance* provenance = nullptr) override;
   std::vector<StringXrefResult>
-      find_string_xrefs(TargetId tid, const std::string& text) override;
+      find_string_xrefs(TargetId tid, const std::string& text,
+                        XrefProvenance* provenance = nullptr) override;
 
   // ── threads / frames / values ──────────────────────────────────────
   std::vector<ThreadInfo> list_threads(TargetId tid) override;

@@ -84,7 +84,7 @@ class NoOpBackend : public DebuggerBackend {
   std::vector<ldb::backend::XrefMatch>
       xref_address(TID, std::uint64_t, ldb::backend::XrefProvenance*) override { return {}; }
   std::vector<ldb::backend::StringXrefResult>
-      find_string_xrefs(TID, const std::string&) override { return {}; }
+      find_string_xrefs(TID, const std::string&, ldb::backend::XrefProvenance*) override { return {}; }
   ProcessStatus launch_process(TID, const ldb::backend::LaunchOptions&) override { return {}; }
   ProcessStatus get_process_state(TID) override { return {}; }
   ProcessStatus kill_process(TID) override { return {}; }

@@ -1362,15 +1362,35 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
   add("string.xref",
       "Find xrefs to an exact-text string. Combines address-hex "
       "detection (x86-64 direct loads) with LLDB comment-text "
-      "matching (ARM64 ADRP+ADD pairs).",
+      "matching (ARM64 ADRP+ADD pairs). The optional `provenance` "
+      "field surfaces ADRP-pair-resolver diagnostics aggregated "
+      "across every underlying xref scan — see xref.addr's "
+      "provenance for field semantics.",
       obj({
           {"target_id", target_id_param()},
           {"text",      str("Exact string text to match.")},
       }, {"target_id", "text"}),
-      with_defs(obj({{"results", arr_of(obj({
-          {"string", ref("StringEntry")},
-          {"xrefs",  arr_of(ref("XrefMatch"))},
-      }))}}, {"results"}),
+      with_defs(obj({
+          {"results", arr_of(obj({
+              {"string", ref("StringEntry")},
+              {"xrefs",  arr_of(ref("XrefMatch"))},
+          }))},
+          {"provenance", obj({
+              {"adrp_pair_skipped", uint_(
+                  "Aggregate across every underlying xref scan. See "
+                  "xref.addr.provenance.adrp_pair_skipped.")},
+              {"adrp_pair_writeback_cleared", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"adrp_pair_cond_branch_recorded", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"adrp_pair_function_start_reset", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"adrp_pair_unresolvable_load", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"warnings", arr_of(str(), "Aggregate human-readable "
+                  "diagnostics from every xref scan.")},
+          })},
+      }, {"results"}),
           {{"StringEntry", string_entry_def()},
            {"XrefMatch",   xref_match_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "high");
@@ -4542,8 +4562,13 @@ Response Dispatcher::handle_string_xref(const Request& req) {
   }
 
   auto view_spec = protocol::view::parse_from_params(req.params);
+  // Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): collect
+  // the aggregate ADRP-pair-resolver provenance across every
+  // xref_address call so the agent sees skipped patterns even when
+  // it routed through string.xref instead of xref.addr.
+  backend::XrefProvenance prov;
   auto results = backend_->find_string_xrefs(
-      static_cast<backend::TargetId>(tid), *text);
+      static_cast<backend::TargetId>(tid), *text, &prov);
 
   json arr = json::array();
   for (const auto& r : results) {
@@ -4554,8 +4579,28 @@ Response Dispatcher::handle_string_xref(const Request& req) {
     one["xrefs"] = std::move(xrefs);
     arr.push_back(std::move(one));
   }
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "results"));
+  auto data = protocol::view::apply_to_array(
+      std::move(arr), view_spec, "results");
+  // Attach provenance only when at least one ADRP-pair-resolver counter
+  // bumped or a warning fired — same emission policy as xref.addr.
+  if (prov.adrp_pair_skipped > 0 ||
+      prov.adrp_pair_writeback_cleared > 0 ||
+      prov.adrp_pair_cond_branch_recorded > 0 ||
+      prov.adrp_pair_function_start_reset > 0 ||
+      prov.adrp_pair_unresolvable_load > 0 ||
+      !prov.warnings.empty()) {
+    json p = json::object();
+    p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
+    p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
+    p["adrp_pair_cond_branch_recorded"] = prov.adrp_pair_cond_branch_recorded;
+    p["adrp_pair_function_start_reset"] = prov.adrp_pair_function_start_reset;
+    p["adrp_pair_unresolvable_load"] = prov.adrp_pair_unresolvable_load;
+    json ws = json::array();
+    for (const auto& w : prov.warnings) ws.push_back(w);
+    p["warnings"] = std::move(ws);
+    data["provenance"] = std::move(p);
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_xref_addr(const Request& req) {

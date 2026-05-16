@@ -2292,6 +2292,15 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
     target = it->second;
   }
 
+  // Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): when the
+  // caller passes an existing provenance (e.g. find_string_xrefs sharing
+  // one struct across N target addresses), the gate-7 summary warning
+  // at the bottom must only fire when THIS call contributed new skips.
+  // Capture the baseline counter so we can compute the delta after the
+  // scan and avoid emitting "skipped 0" warnings on subsequent calls.
+  const std::uint32_t baseline_adrp_pair_skipped =
+      (provenance != nullptr) ? provenance->adrp_pair_skipped : 0;
+
   std::vector<XrefMatch> out;
 
   // Scan only the main executable's code sections. Walking every
@@ -2904,13 +2913,24 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
   out.erase(last, out.end());
 
   // Phase-3 gate 7: emit a human-readable warning when at least one
-  // register-offset LDR was skipped. The agent uses this to decide
-  // whether the ADRP-pair heuristic is authoritative on this binary
-  // or whether it should fall back to symbol-index correlate.
-  if (provenance != nullptr && provenance->adrp_pair_skipped > 0) {
+  // register-offset LDR was skipped IN THIS CALL. The agent uses this
+  // to decide whether the ADRP-pair heuristic is authoritative on this
+  // binary or whether it should fall back to symbol-index correlate.
+  //
+  // Delta-based emission (phase-4 cleanup I1): when the caller shares
+  // a provenance across multiple xref_address invocations
+  // (find_string_xrefs does this), we'd otherwise emit the warning at
+  // each call with the cumulative skip count, producing duplicate
+  // (and increasingly stale) warning strings. Compare against the
+  // baseline captured at function entry and emit only if THIS call
+  // added skips.
+  if (provenance != nullptr &&
+      provenance->adrp_pair_skipped > baseline_adrp_pair_skipped) {
+    const std::uint32_t this_call_skipped =
+        provenance->adrp_pair_skipped - baseline_adrp_pair_skipped;
     provenance->warnings.push_back(
         "adrp-pair resolver skipped " +
-        std::to_string(provenance->adrp_pair_skipped) +
+        std::to_string(this_call_skipped) +
         " register-offset LDR(s) with tracked base "
         "(`[xN, xM]` / `[xN, xM, lsl #imm]`) — these are potential xrefs "
         "the heuristic cannot statically resolve");
@@ -2920,7 +2940,8 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
 }
 
 std::vector<StringXrefResult>
-LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
+LldbBackend::find_string_xrefs(TargetId tid, const std::string& text,
+                                XrefProvenance* provenance) {
   // Sanity-check the target up front (throws on invalid).
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
@@ -2959,7 +2980,15 @@ LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
     r.string = sm;
 
     // Address-based xrefs (catches x86-64 direct loads, etc.).
-    auto addr_hits = xref_address(tid, sm.address);
+    // Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): thread
+    // the caller-supplied provenance so the ADRP-pair resolver's
+    // diagnostics (adrp_pair_skipped, adrp_pair_writeback_cleared,
+    // adrp_pair_cond_branch_recorded, adrp_pair_function_start_reset,
+    // adrp_pair_unresolvable_load, warnings) aren't dropped on the
+    // floor when xref is invoked via string.xref. Each StringMatch
+    // contributes its own xref_address scan; the counters and warnings
+    // accumulate across all matches into the same `provenance` slot.
+    auto addr_hits = xref_address(tid, sm.address, provenance);
     r.xrefs.insert(r.xrefs.end(),
                    std::make_move_iterator(addr_hits.begin()),
                    std::make_move_iterator(addr_hits.end()));
