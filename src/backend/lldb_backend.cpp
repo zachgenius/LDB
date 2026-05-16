@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string_view>
 #include <tuple>
 #include <signal.h>
@@ -1877,6 +1878,16 @@ using xref_arm64::parse_uint_at;
 struct AdrpResolved {
   std::uint64_t target = 0;
   bool is_slot_load = false;
+  // True iff the consumer instruction had a pre- or post-indexed
+  // writeback that rewrites the base register (`[xM, #imm]!` or
+  // `[xM], #imm`). The match-emit for the legitimate effective
+  // address still fires, but the caller must then clear
+  // adrp_regs[base_reg] so a subsequent LDR through xM doesn't
+  // false-match the now-stale page.
+  bool has_writeback = false;
+  // The base register whose tracking should be cleared on writeback.
+  // Only meaningful when has_writeback is true.
+  std::string writeback_base;
 };
 
 // AAPCS64 caller-saved general-purpose register set, in the
@@ -2051,27 +2062,75 @@ resolve_adrp_consumer(const std::string& mnemonic, const std::string& operands,
     if (!ok_src) return std::nullopt;
     auto it = adrp_regs.find(src);
     if (it == adrp_regs.end()) return std::nullopt;
-    // Either "]" or ", #imm]"
+    // Three shapes after the base register:
+    //   `]`            — `ldr dst, [src]`             (no offset, no writeback)
+    //   `, #imm]`      — `ldr dst, [src, #imm]`       (offset, no writeback)
+    //   `, #imm]!`     — `ldr dst, [src, #imm]!`      (pre-indexed writeback)
+    //   `], #imm`      — `ldr dst, [src], #imm`       (post-indexed writeback)
+    //
+    // Pre/post-indexed forms rewrite the base register (src ← src+imm).
+    // The match-emit for the legitimate effective address still fires;
+    // we surface the writeback to the caller so adrp_regs[src] can be
+    // cleared after the emit. The post-review spec (docs/35-field-
+    // report-followups.md §3 improvement 3) calls this out explicitly.
     pos = p3;
     while (pos < operands.size() &&
            (operands[pos] == ' ')) ++pos;
     std::uint64_t imm = 0;
+    bool pre_writeback = false;
+    bool post_writeback = false;
     if (pos < operands.size() && operands[pos] == ',') {
+      // `, #imm]` or `, #imm]!` — offset form, possibly pre-indexed.
       ++pos;
-      auto [ok_imm, v, _p] = parse_uint_at(operands, pos);
+      auto [ok_imm, v, p_after_imm] = parse_uint_at(operands, pos);
       if (!ok_imm) return std::nullopt;
       imm = v;
-    } else if (pos >= operands.size() || operands[pos] != ']') {
+      pos = p_after_imm;
+      while (pos < operands.size() && operands[pos] == ' ') ++pos;
+      if (pos >= operands.size() || operands[pos] != ']') return std::nullopt;
+      ++pos;
+      if (pos < operands.size() && operands[pos] == '!') {
+        pre_writeback = true;
+      }
+    } else if (pos < operands.size() && operands[pos] == ']') {
+      // `]` or `], #imm` — either no offset, or post-indexed writeback.
+      ++pos;
+      while (pos < operands.size() && operands[pos] == ' ') ++pos;
+      if (pos < operands.size() && operands[pos] == ',') {
+        ++pos;
+        auto [ok_imm, v, _p] = parse_uint_at(operands, pos);
+        if (!ok_imm) return std::nullopt;
+        imm = v;
+        post_writeback = true;
+        // Post-indexed effective address is the unmodified base. The
+        // match-emit must NOT include the imm; the writeback happens
+        // after the load. Falls through with imm=v but effective=page.
+      }
+      // imm stays at its initial 0 for the no-offset form.
+    } else {
       return std::nullopt;
     }
     AdrpResolved r;
-    r.target = it->second.page + imm;
+    // Pre-indexed: effective = page + imm (writeback BEFORE load).
+    // Post-indexed: effective = page (writeback AFTER load).
+    // No-writeback: effective = page + imm.
+    if (post_writeback) {
+      r.target = it->second.page;
+    } else {
+      r.target = it->second.page + imm;
+    }
     // Slot-indirection only applies to 8-byte LDRs into x-registers.
     // Halfword/byte loads and LDRSW are 32→64-bit sign-extension loads;
     // their effective address may match a slot but the value at that
     // address is not a chained pointer. We still emit the direct
     // ADRP-target match so the caller can resolve string-byte loads.
     r.is_slot_load = (mnemonic == "ldr" && dst_width == 'x');
+    r.has_writeback = pre_writeback || post_writeback;
+    if (r.has_writeback) r.writeback_base = src;
+    // Suppress an unused-warning if a future toolchain flags `imm`
+    // as unread on the post-writeback path; the read above already
+    // happened, this is for readability only.
+    (void)imm;
     return r;
   }
   return std::nullopt;
@@ -2338,12 +2397,20 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                                     target_addr);
 
           bool matched_adrp = false;
+          // Captured so the post-emit register-state mutation block can
+          // apply the LDR pre/post-indexed writeback clobber AFTER the
+          // match emit. resolve_adrp_consumer fires regardless of
+          // whether the consumer matched the needle — we still need to
+          // know "this consumer rewrites its base" so subsequent loads
+          // through the same register don't false-match.
+          std::optional<AdrpResolved> consumer_resolved;
           if (!matched_literal) {
             auto resolved = resolve_adrp_consumer(mnem_lower, i.operands,
                                                   adrp_regs);
             if (resolved) {
               matched_adrp = target_matches(resolved->target,
                                             resolved->is_slot_load);
+              consumer_resolved = resolved;
             } else if (provenance != nullptr &&
                        (mnem_lower == "ldr" || mnem_lower == "ldrsw" ||
                         mnem_lower == "ldrh" || mnem_lower == "ldrb")) {
@@ -2384,6 +2451,25 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             auto sa = target.ResolveFileAddress(i.address);
             m.function = function_name_at(target, sa);
             out.push_back(std::move(m));
+          }
+
+          // Pre/post-indexed LDR writeback (post-review improvement 3,
+          // docs/35-field-report-followups.md §3). The match-emit above
+          // has already captured the legitimate xref against the load's
+          // effective address; now clear the base register's tracking
+          // so a subsequent LDR through it can't false-match the stale
+          // page. Bumping the counter + emitting a warning surfaces the
+          // clobber to the caller via provenance.
+          if (consumer_resolved && consumer_resolved->has_writeback) {
+            adrp_regs.erase(consumer_resolved->writeback_base);
+            if (provenance != nullptr) {
+              provenance->adrp_pair_writeback_cleared++;
+              std::ostringstream w;
+              w << "pre/post-indexed LDR writeback at 0x" << std::hex
+                << i.address << " cleared ADRP tracking for register "
+                << consumer_resolved->writeback_base;
+              provenance->warnings.push_back(w.str());
+            }
           }
 
           // Phase-3 register-state mutations (after match emit so the

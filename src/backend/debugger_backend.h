@@ -217,6 +217,14 @@ struct XrefProvenance {
   // potential xref the heuristic can't surface.
   std::uint32_t adrp_pair_skipped = 0;
 
+  // Number of times a pre- or post-indexed LDR through an ADRP-
+  // tracked base caused the base register to be cleared. The
+  // legitimate xref against the load's effective address still fires;
+  // this counter exists so the caller can see that subsequent loads
+  // through the same register are no longer trackable. Post-review
+  // addition (docs/35-field-report-followups.md §3 improvement 3).
+  std::uint32_t adrp_pair_writeback_cleared = 0;
+
   // Human-readable warnings — phase 3 starts with a single
   // "register-offset LDR skipped" warning when adrp_pair_skipped > 0.
   // Phase 4 will extend with more codes as additional patterns

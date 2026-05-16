@@ -1323,6 +1323,12 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
                   "evaluate (e.g. `[xN, xM]`, `[xN, xM, lsl #imm]`). "
                   "Each skip is a potential xref the heuristic cannot "
                   "surface; phase 4 will close the most common cases.")},
+              {"adrp_pair_writeback_cleared", uint_(
+                  "Number of pre/post-indexed LDRs whose base register "
+                  "the resolver cleared after the match emit. The "
+                  "legitimate xref still fires; subsequent loads through "
+                  "the same register are no longer trackable because "
+                  "the writeback rewrote it.")},
               {"warnings", arr_of(str(), "Human-readable diagnostics "
                   "from the ADRP-pair resolver; emitted only when at "
                   "least one ambiguous pattern was encountered.")},
@@ -4555,13 +4561,16 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
   for (const auto& r : refs) arr.push_back(xref_match_to_json(r));
   auto data = protocol::view::apply_to_array(std::move(arr), view_spec,
                                               "matches");
-  // Attach provenance only when something was actually skipped. Empty
-  // provenance is the common case and would cost ~30 bytes per
-  // response if always emitted; the explicit field is a clear "this
-  // run had ambiguous patterns" signal when present.
-  if (prov.adrp_pair_skipped > 0 || !prov.warnings.empty()) {
+  // Attach provenance only when something was actually skipped or
+  // cleared. Empty provenance is the common case and would cost ~30
+  // bytes per response if always emitted; the explicit field is a
+  // clear "this run had ambiguous patterns" signal when present.
+  if (prov.adrp_pair_skipped > 0 ||
+      prov.adrp_pair_writeback_cleared > 0 ||
+      !prov.warnings.empty()) {
     json p = json::object();
     p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
+    p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
     json ws = json::array();
     for (const auto& w : prov.warnings) ws.push_back(w);
     p["warnings"] = std::move(ws);
