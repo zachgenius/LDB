@@ -949,6 +949,21 @@ set_tests_properties(smoke_socket_slow_reader PROPERTIES
   TIMEOUT 60
 )
 
+# §2 phase 2 (post-review I4): concurrent daemon stderr lines must
+# stay atomic. Several daemons race to bind the same socket; the
+# losers share one stderr destination. Pre-fix multi-syscall
+# `std::cerr << ... << ...` chains interleaved bytes mid-line.
+# Post-fix log_err_line emits each diagnostic with one fwrite —
+# POSIX-atomic for sub-PIPE_BUF writes.
+add_test(
+  NAME smoke_socket_autospawn_logs
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_autospawn_logs.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_autospawn_logs PROPERTIES
+  TIMEOUT 30
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

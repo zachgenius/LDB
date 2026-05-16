@@ -18,6 +18,19 @@ Test sequence:
   4. Send SIGTERM to the daemon and assert the socket inode is
      cleaned up. (The daemon is detached, so we have to find its
      pid via the lockfile or `ps`.)
+
+Adjacent case covered post-review (I4): when N clients race-spawn N
+daemons against the same socket path, the (N-1) losers all write
+diagnostic lines to the SAME stderr / log file (set via
+LDB_LDBD_LOG_FILE). Pre-fix those lines were emitted via multiple
+`std::cerr << ... << ...` chained shifts, producing multiple write(2)
+syscalls per line; concurrent processes interleaved the bytes mid-
+line. Post-fix the daemon builds each diagnostic as a single
+std::string and writes it with one fwrite — POSIX-atomic for
+≤PIPE_BUF lines. Verified by inspection (single fwrite per
+diagnostic in `log_err_line`) rather than racing N processes in
+ctest, because reliably reproducing the byte interleave depends on
+scheduler timing that's hostile to CI determinism.
 """
 import json
 import os

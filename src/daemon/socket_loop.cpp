@@ -38,7 +38,7 @@ namespace {
 // listener fd OR the self-pipe; once g_shutdown is non-zero it exits
 // the loop. The signal handler must touch nothing the stdlib doesn't
 // allow from async-signal context — std::atomic<int> stores and the
-// write(2) to g_shutdown_pipe[1] are both conformant.
+// write(2) to g_shutdown_pipe_write are both conformant.
 //
 // Explicit `static` (alongside the surrounding anonymous namespace) so
 // the file-scope intent is unambiguous to readers and to any future
@@ -53,17 +53,50 @@ static std::atomic<int> g_shutdown{0};
 // hung RPC. -1 sentinel means "not initialised yet" — the signal
 // handler checks before calling write so an early signal during
 // startup is a no-op (the loop hasn't started running anyway).
+//
+// Post-review N3: the write end is now `std::atomic<int>` rather
+// than a plain int read directly out of the array. On aligned-int
+// aarch64 the unrelaxed read is harmless in practice — but the
+// signal-handler ↔ main-thread synchronisation is a relaxed atomic
+// store/load by spec, so this gets us strict conformance without
+// changing the observable behaviour.
 static int g_shutdown_pipe[2] = {-1, -1};
+static std::atomic<int> g_shutdown_pipe_write{-1};
 
 static void on_term_signal(int sig) {
   g_shutdown.store(sig, std::memory_order_release);
-  if (g_shutdown_pipe[1] >= 0) {
+  // N3: load once. Re-reading the global between the >=0 check and
+  // the write() would let a concurrent teardown (main thread closing
+  // the pipe in run_socket_listener's tail) sneak a -1 in between.
+  int wfd = g_shutdown_pipe_write.load(std::memory_order_acquire);
+  if (wfd >= 0) {
     const char byte = 'q';
     // Best-effort write; an already-full pipe (multiple signals
     // coalesced) is fine — one byte is enough to wake poll().
     // write() in a signal handler is async-signal-safe per POSIX.
-    (void) ::write(g_shutdown_pipe[1], &byte, 1);
+    (void) ::write(wfd, &byte, 1);
   }
+}
+
+// Post-review I4: atomic single-line stderr writer. The auto-spawn
+// race in §2 phase-2 produces multiple daemon processes that all
+// race to bind the same socket; the losers write diagnostic lines
+// to the same stderr / log file. Multiple `std::cerr << "ldbd: ..."
+// << ... << "\n"` calls expand into multiple `write(2)` syscalls,
+// and concurrent processes can interleave them — operators see
+// "ldbd: another daemon is already lis ldbd: another daemon is alr"
+// instead of two clean lines.
+//
+// Building the line as a single std::string and writing it with one
+// fwrite gets us a single write(2) per line. POSIX guarantees a
+// write of ≤PIPE_BUF bytes (typically 512) to a regular file is
+// atomic w.r.t. other writers; our lines fit comfortably.
+static void log_err_line(const std::string& s) {
+  std::fwrite(s.data(), 1, s.size(), stderr);
+  // No explicit flush — stderr is line-buffered by default; our
+  // newline-terminated line flushes implicitly. Calling fflush
+  // is a no-op for unbuffered streams and would add a syscall
+  // for stream variants that ARE buffered.
 }
 
 // Minimal fd-backed streambuf: one read buffer, one write buffer, both
@@ -224,11 +257,11 @@ int acquire_lock(const std::string& lock_path) {
                   O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (fd < 0) {
     if (errno == ELOOP) {
-      std::cerr << "ldbd: refusing to open lock path through symlink: "
-                << lock_path << "\n";
+      log_err_line("ldbd: refusing to open lock path through symlink: "
+                   + lock_path + "\n");
     } else {
-      std::cerr << "ldbd: cannot open lock " << lock_path
-                << ": " << std::strerror(errno) << "\n";
+      log_err_line("ldbd: cannot open lock " + lock_path + ": "
+                   + std::strerror(errno) + "\n");
     }
     return -1;
   }
@@ -241,8 +274,8 @@ int acquire_lock(const std::string& lock_path) {
     if (pf && std::getline(pf, line) && !line.empty()) {
       holder = "pid " + line;
     }
-    std::cerr << "ldbd: another daemon is already listening on "
-              << "this socket (" << holder << "); refusing to start\n";
+    log_err_line("ldbd: another daemon is already listening on "
+                 "this socket (" + holder + "); refusing to start\n");
     ::close(fd);
     return -1;
   }
@@ -271,33 +304,36 @@ bool ensure_parent_dir(const std::string& sock_path) {
   struct stat st{};
   if (::lstat(parent.c_str(), &st) == 0) {
     if (S_ISLNK(st.st_mode)) {
-      std::cerr << "ldbd: refusing socket parent that is a symlink: "
-                << parent << "\n";
+      log_err_line("ldbd: refusing socket parent that is a symlink: "
+                   + parent.string() + "\n");
       return false;
     }
     if (!S_ISDIR(st.st_mode)) {
-      std::cerr << "ldbd: parent of socket path is not a directory: "
-                << parent << "\n";
+      log_err_line("ldbd: parent of socket path is not a directory: "
+                   + parent.string() + "\n");
       return false;
     }
     if (st.st_uid != ::geteuid()) {
-      std::cerr << "ldbd: refusing socket parent owned by uid "
-                << st.st_uid << " (expected " << ::geteuid() << "): "
-                << parent << "\n";
+      log_err_line("ldbd: refusing socket parent owned by uid "
+                   + std::to_string(st.st_uid) + " (expected "
+                   + std::to_string(::geteuid()) + "): "
+                   + parent.string() + "\n");
       return false;
     }
     if ((st.st_mode & 0077) != 0) {
-      std::cerr << "ldbd: refusing socket parent with group/other "
-                << "permission bits set (mode 0"
-                << std::oct << (st.st_mode & 0777) << std::dec
-                << "): " << parent << "\n";
+      char mode_str[8];
+      std::snprintf(mode_str, sizeof(mode_str), "%o", st.st_mode & 0777);
+      log_err_line("ldbd: refusing socket parent with group/other "
+                   "permission bits set (mode 0"
+                   + std::string(mode_str) + "): "
+                   + parent.string() + "\n");
       return false;
     }
     return true;
   }
   if (errno != ENOENT) {
-    std::cerr << "ldbd: lstat(" << parent << "): "
-              << std::strerror(errno) << "\n";
+    log_err_line("ldbd: lstat(" + parent.string() + "): "
+                 + std::strerror(errno) + "\n");
     return false;
   }
   // Create the dir 0700 atomically. umask(0077) makes the inode land
@@ -310,8 +346,8 @@ bool ensure_parent_dir(const std::string& sock_path) {
   int mkdir_errno = errno;
   ::umask(old);
   if (rc != 0 && mkdir_errno != EEXIST) {
-    std::cerr << "ldbd: mkdir(" << parent << ") failed: "
-              << std::strerror(mkdir_errno) << "\n";
+    log_err_line("ldbd: mkdir(" + parent.string() + ") failed: "
+                 + std::strerror(mkdir_errno) + "\n");
     return false;
   }
   return true;
@@ -329,9 +365,11 @@ int bind_listener(const std::string& sock_path) {
   // which our smoke tests would catch but real users wouldn't.
   ::sockaddr_un addr{};
   if (sock_path.size() + 1 > sizeof(addr.sun_path)) {
-    std::cerr << "ldbd: socket path too long (" << sock_path.size()
-              << " bytes > sun_path limit "
-              << (sizeof(addr.sun_path) - 1) << ")\n";
+    log_err_line("ldbd: socket path too long ("
+                 + std::to_string(sock_path.size())
+                 + " bytes > sun_path limit "
+                 + std::to_string(sizeof(addr.sun_path) - 1)
+                 + ")\n");
     return -1;
   }
 
@@ -342,7 +380,8 @@ int bind_listener(const std::string& sock_path) {
   // the two syscalls.
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
-    std::cerr << "ldbd: socket(): " << std::strerror(errno) << "\n";
+    log_err_line(std::string("ldbd: socket(): ")
+                 + std::strerror(errno) + "\n");
     return -1;
   }
   ::fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -366,8 +405,8 @@ int bind_listener(const std::string& sock_path) {
   int bind_errno = errno;
   ::umask(old);
   if (rc != 0) {
-    std::cerr << "ldbd: bind(" << sock_path << "): "
-              << std::strerror(bind_errno) << "\n";
+    log_err_line("ldbd: bind(" + sock_path + "): "
+                 + std::strerror(bind_errno) + "\n");
     ::close(fd);
     return -1;
   }
@@ -383,15 +422,15 @@ int bind_listener(const std::string& sock_path) {
     int fchmod_errno = errno;
     if (fchmod_errno == EINVAL || fchmod_errno == ENOTSUP) {
       if (::chmod(sock_path.c_str(), 0600) != 0) {
-        std::cerr << "ldbd: chmod(" << sock_path << ", 0600): "
-                  << std::strerror(errno) << "\n";
+        log_err_line("ldbd: chmod(" + sock_path + ", 0600): "
+                     + std::strerror(errno) + "\n");
         ::close(fd);
         ::unlink(sock_path.c_str());
         return -1;
       }
     } else {
-      std::cerr << "ldbd: fchmod(socket fd, 0600): "
-                << std::strerror(fchmod_errno) << "\n";
+      log_err_line(std::string("ldbd: fchmod(socket fd, 0600): ")
+                   + std::strerror(fchmod_errno) + "\n");
       ::close(fd);
       ::unlink(sock_path.c_str());
       return -1;
@@ -399,7 +438,8 @@ int bind_listener(const std::string& sock_path) {
   }
 
   if (::listen(fd, 4) != 0) {
-    std::cerr << "ldbd: listen(): " << std::strerror(errno) << "\n";
+    log_err_line(std::string("ldbd: listen(): ")
+                 + std::strerror(errno) + "\n");
     ::close(fd);
     ::unlink(sock_path.c_str());
     return -1;
@@ -483,9 +523,10 @@ void serve_socket_client(Dispatcher* dispatcher,
   // resolved by the next poll iteration, but on macOS poll's
   // timeout is preserved across spurious wakes, so without an
   // explicit wake the loop would always sit out the full window.
-  if (g_shutdown_pipe[1] >= 0) {
+  int wfd = g_shutdown_pipe_write.load(std::memory_order_acquire);
+  if (wfd >= 0) {
     const char byte = 'w';
-    (void) ::write(g_shutdown_pipe[1], &byte, 1);
+    (void) ::write(wfd, &byte, 1);
   }
   log::debug("client disconnected");
 }
@@ -538,6 +579,13 @@ int run_socket_listener(Dispatcher& dispatcher,
     int fl1 = ::fcntl(g_shutdown_pipe[1], F_GETFL);
     if (fl1 >= 0) ::fcntl(g_shutdown_pipe[1], F_SETFL, fl1 | O_NONBLOCK);
   }
+  // Publish the write end atomically AFTER FD_CLOEXEC + O_NONBLOCK
+  // are in place. The signal handler reads this atomic and only
+  // touches the fd through the snapshot it loaded — the close-then-
+  // -1 teardown in the tail of this function uses release-store -1
+  // so a late signal arriving during shutdown sees the sentinel and
+  // skips the write. (N3.)
+  g_shutdown_pipe_write.store(g_shutdown_pipe[1], std::memory_order_release);
 
   // `daemon.shutdown` RPC handler invokes this. We push a byte into
   // the self-pipe to wake the accept loop; g_shutdown is set in
@@ -545,9 +593,10 @@ int run_socket_listener(Dispatcher& dispatcher,
   // its next wake-up regardless of who fired.
   dispatcher.set_shutdown_callback([]() {
     g_shutdown.store(1, std::memory_order_release);
-    if (g_shutdown_pipe[1] >= 0) {
+    int wfd = g_shutdown_pipe_write.load(std::memory_order_acquire);
+    if (wfd >= 0) {
       const char byte = 'q';
-      (void) ::write(g_shutdown_pipe[1], &byte, 1);
+      (void) ::write(wfd, &byte, 1);
     }
   });
 
@@ -565,6 +614,14 @@ int run_socket_listener(Dispatcher& dispatcher,
   // hit serve_one_connection's read-side EAGAIN/SO_RCVTIMEO; the
   // shutdown signal alone doesn't reach an in-flight RPC (see the
   // "in-flight RPC interruption" follow-up).
+  //
+  // TODO(phase 3 / N4): reap finished workers. The list grows for the
+  // daemon's lifetime; each entry is ~24 bytes plus the joinable
+  // std::thread state. For realistic session counts this is
+  // negligible, but a long-lived daemon servicing many short-lived
+  // connections accumulates. The done-list-side-channel sketch in
+  // reap_finished_workers below is the planned shape; reviewer
+  // deferred it to phase 3 explicitly.
   std::list<std::thread> workers;
   auto reap_finished_workers = [&]() {
     // Joinable threads we know to have exited can't be detected
@@ -743,10 +800,13 @@ int run_socket_listener(Dispatcher& dispatcher,
   ::close(lock_fd);
   ::unlink(lock_path.c_str());
 
-  // Tear down the self-pipe. The dispatcher's shutdown callback
-  // closes over g_shutdown_pipe[1]; we clear it AFTER the worker
-  // joins above so any callback still in flight harmlessly writes
-  // to a now-closed fd (the write returns EBADF; we don't care).
+  // Tear down the self-pipe. The signal handler and the dispatcher's
+  // shutdown callback both read `g_shutdown_pipe_write`; we publish
+  // -1 BEFORE the close so a late signal sees the sentinel and skips
+  // the write entirely. (N3 — without the atomic publish-then-close
+  // ordering, a signal racing the close could write to a closed fd
+  // or, worse, to a recently-recycled fd of an unrelated open.)
+  g_shutdown_pipe_write.store(-1, std::memory_order_release);
   if (g_shutdown_pipe[0] >= 0) {
     ::close(g_shutdown_pipe[0]);
     g_shutdown_pipe[0] = -1;
