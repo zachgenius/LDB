@@ -4,6 +4,95 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — ldb CLI sibling lookup for in-tree ldbd
+
+**Goal:** Land item §1 from `docs/35-field-report-followups.md`. The
+field-report engineer hit "ldbd not found" the moment they ran
+`tools/ldb/ldb <subcommand>` from anywhere outside the repo root,
+because neither `ldb` nor `ldbd` was on `$PATH` and the CWD-relative
+fallback only fired when the user happened to be standing in the repo
+root. Forcing `--ldbd /abs/path/to/build/bin/ldbd` on every invocation
+was the workaround.
+
+**Done:**
+
+- TDD: new `tests/smoke/test_cli_sibling_lookup.py` runs the CLI from
+  an unrelated tempdir CWD with `$PATH` scrubbed of `ldbd` and no
+  `--ldbd` flag, asserts `ldb hello` succeeds; also pins precedence
+  by passing `--ldbd <non-executable>` and asserting fail-fast (i.e.
+  the new sibling layer must not silently rescue a bad explicit
+  override). Failed first with the exact "ldbd not found on PATH or
+  at ./build/bin/ldbd" stderr; passing after the fix.
+- Registered as `smoke_cli_sibling_lookup` in `tests/CMakeLists.txt`
+  with a 30 s timeout, slotted next to `smoke_ldb_cli`.
+- `tools/ldb/ldb`: new `_find_ldbd_sibling()` derives
+  `<repo>/build/bin/ldbd` from `__file__` (script path → three
+  `dirname`s up → `build/bin/ldbd`) and returns it when executable;
+  inserted between the `$PATH` lookup and the CWD-relative fallback
+  in `find_ldbd()`. Final precedence: `--ldbd PATH` > `which("ldbd")`
+  > sibling-from-`__file__` > `./build/bin/ldbd`. Error message
+  updated to mention the new lookup layer so a future user staring at
+  "not found" sees all three search axes.
+
+**Decisions:**
+
+- **Anchor on `__file__`, not `sys.argv[0]`.** A user who symlinks
+  `ldb` onto their `$PATH` would still have `__file__` resolve through
+  the symlink to the in-tree location (after `os.path.realpath`),
+  which is what they want. `sys.argv[0]` would resolve to the symlink
+  path and break the heuristic.
+- **Keep the CWD-relative fallback.** Doc §1's sketch elides it, but
+  there's a narrow case where someone vendors `tools/ldb/ldb` into
+  their own repo with a different layout and has their own
+  `./build/bin/ldbd` under CWD. The cost of keeping the old fallback
+  is zero (it only fires after the new layer returns None), and
+  ripping it out is a separate behaviour-change discussion. I left it
+  in; the task statement explicitly preserved it in the precedence
+  table.
+- **Used `os.path.dirname` × 3 rather than `pathlib.Path(...).parent
+  ** 3`** because everything else in `tools/ldb/ldb` uses `os.path`
+  primitives; no need to add the `from pathlib import Path` import
+  for one call site. (`pathlib` is stdlib, so this is purely
+  stylistic — the rest of the file is `os.path`-shaped.)
+- **Used `try / except NameError` around `__file__`.** Belt-and-braces
+  for the case where the script is somehow exec'd in a context where
+  `__file__` isn't defined (e.g. `python -c "exec(open(...).read())"`
+  wrappers). Falls through to the CWD-relative fallback in that
+  edge case rather than crashing with `NameError`.
+
+**Surprises / blockers:**
+
+- Worktree started on `master` (`d01de7d`), but the spec doc
+  `docs/35-field-report-followups.md` only exists on
+  `fix/target-open-lazy-load` (`4252ad2`). Rebased the worktree
+  branch onto `4252ad2` before starting so the doc and the
+  `tools/ldb/ldb --help` daemon-lifecycle copy (which §1 implicitly
+  builds on) were both present.
+- One pre-existing C++ warning in `src/transport/rr.cpp:32` (struct/
+  class tag mismatch) — not introduced here; survives unchanged.
+
+**Verification:**
+
+- `ctest --test-dir build -R "smoke_ldb_cli|smoke_cli_sibling"
+  --output-on-failure`:
+  - `smoke_ldb_cli` Passed 6.91 s (pins `--ldbd PATH` precedence;
+    still green after the change).
+  - `smoke_cli_sibling_lookup` Passed 0.65 s (new test; verified
+    failing first against the un-patched CLI).
+- `ctest -R "smoke_cli_repl|smoke_cli_ssh"`: both Passed (neighboring
+  CLI surface unaffected).
+- Build warning-clean on incremental rebuild after the change (no new
+  diagnostics; only Python + CMake list-file touched).
+
+**Next:**
+
+- §2 (persistent socket-attached daemon) and §3 (ARM64e chained
+  fixups) from `docs/35-field-report-followups.md` remain. §2 is
+  multi-day; §3 should land after the symbol-index cache work in
+  `docs/23-symbol-index.md` matures.
+
+---
+
 ## 2026-05-16 — target.open lazy load: preload-symbols off + summary modules
 
 **Goal:** Take a RE-engineer field report (driving LDB against a 503 MB

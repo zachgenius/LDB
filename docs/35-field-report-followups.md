@@ -46,6 +46,10 @@ Insert into `find_ldbd()` in `tools/ldb/ldb`:
 ```python
 def find_ldbd(explicit: Optional[str]) -> str:
     if explicit:
+        # Validate executability up front; otherwise the failure
+        # surfaces deep inside subprocess.Popen as a confusing EACCES.
+        if not os.access(explicit, os.X_OK):
+            raise SystemExit(f"ldb: --ldbd {explicit!r} not executable")
         return explicit
     if which := shutil.which("ldbd"):
         return which
