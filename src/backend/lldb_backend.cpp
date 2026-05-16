@@ -7,6 +7,7 @@
 #include "transport/ssh.h"
 
 #include <algorithm>
+#include <array>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -1831,6 +1832,18 @@ bool rip_relative_targets(const std::string& operands,
 //     the load/add — we'd need real liveness analysis. The common case
 //     in compiler-emitted code is ADRP+LDR/ADD as adjacent or near-adjacent
 //     instructions, which a single-register "last ADRP wins" map handles.
+//
+// Phase 3 (docs/35-field-report-followups.md §3) layers deterministic
+// register-state clobber rules on top of the phase-2 single-pass scan:
+//   - BL / BLR → clear x0..x18 + x30 (AAPCS64 caller-saved set)
+//   - RET / B / BR / function-boundary transition → clear entire map
+//   - ADD writes (any form) → clear adrp_regs[dst] AFTER emit (the dst
+//     no longer holds an ADRP page once we've folded the imm in)
+//   - MOV xN, xM → propagate adrp_regs[xM] into adrp_regs[xN]
+//   - MOV xN, #imm / MOVZ / MOVK / MOVN / MOV xN, sp / MOV xN, lr →
+//     clear adrp_regs[dst]
+// These rules don't add a dataflow pass — they're per-instruction
+// state mutations the loop applies inline.
 struct AdrpPair {
   std::uint64_t page = 0;  // absolute target page (already << 12'd)
   std::uint64_t pc   = 0;  // pc of the ADRP that set this register
@@ -1865,6 +1878,112 @@ struct AdrpResolved {
   std::uint64_t target = 0;
   bool is_slot_load = false;
 };
+
+// AAPCS64 caller-saved general-purpose register set, in the
+// canonical x-form `parse_reg_at` normalises to. A BL / BLR clears
+// any tracked ADRP page held in one of these regs because the callee
+// is free to overwrite them. x19..x28 are callee-saved and may keep
+// their pre-call value across the call; we leave those alone.
+//
+// x29 (FP) and x30 (LR) are technically special-purpose, but x30
+// IS clobbered (BL writes the return address there) so it belongs
+// in the clobber set. x29 we leave alone — clang preserves it
+// across calls when -fno-omit-frame-pointer is in effect.
+const std::array<std::string_view, 20> kAapcs64CallerSavedGPR = {
+  "x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",
+  "x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",
+  "x16", "x17", "x18", "x30",
+};
+
+void clobber_aapcs64_caller_saved(
+    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  for (auto reg : kAapcs64CallerSavedGPR) {
+    adrp_regs.erase(std::string(reg));
+  }
+}
+
+// MOV xN, xM is a register-to-register copy with no shift. LLDB
+// renders it identically to ARM64 disasm: "mov  x0, x8". The phase-3
+// rule (docs/35-field-report-followups.md §3) propagates ADRP
+// tracking through this shape — if xM has a tracked page, so does
+// xN. Any other MOV form (immediate, MOVZ/MOVK/MOVN, mov xN, sp,
+// mov xN, lr, mov xN, xzr) clears adrp_regs[xN] because the result
+// isn't an ADRP page. Returns true iff the instruction was a MOV
+// that we handled (caller must NOT then fall through to the
+// resolve_adrp_consumer path).
+//
+// Note: arm64 doesn't have a real MOV instruction — it's an alias
+// for ORR xN, xzr, xM (reg-reg) or MOVZ/MOVN/MOVK (imm). LLDB
+// canonicalises the alias back to "mov" in its disasm output, which
+// is what we match against here.
+bool apply_mov_state(
+    const std::string& mnemonic, const std::string& operands,
+    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  if (mnemonic != "mov" && mnemonic != "movz" && mnemonic != "movk" &&
+      mnemonic != "movn") {
+    return false;
+  }
+  auto [ok_dst, dst, p1] = parse_reg_at(operands, 0);
+  if (!ok_dst) return true;  // unparseable — be conservative, ignore
+  if (mnemonic == "movz" || mnemonic == "movn" || mnemonic == "movk") {
+    // Immediate-loading MOVs always clobber the page.
+    adrp_regs.erase(dst);
+    return true;
+  }
+  // "mov  dst, <src>": <src> is either xN (register copy), #imm, sp,
+  // xzr, lr, or wN/wzr (32-bit). Only the reg-reg xN form propagates.
+  std::size_t pos = p1;
+  while (pos < operands.size() &&
+         (operands[pos] == ' ' || operands[pos] == ',')) ++pos;
+  // Try to parse a register source. parse_reg_at canonicalises wN→xN
+  // and recognises sp/zr; we want only the plain xN propagation, and
+  // we want sp/lr/zr to clobber the destination.
+  if (pos < operands.size()) {
+    char first = static_cast<char>(std::tolower(operands[pos]));
+    if (first == '#') {
+      // Immediate. Clobber.
+      adrp_regs.erase(dst);
+      return true;
+    }
+    if (first == 's' || first == 'l' || first == 'w') {
+      // sp / lr / wN — all clobber the tracked x-register's ADRP page.
+      // (wN copies have known-zero upper bits → not a page address.)
+      adrp_regs.erase(dst);
+      return true;
+    }
+  }
+  auto [ok_src, src, _p2] = parse_reg_at(operands, pos);
+  if (!ok_src) {
+    adrp_regs.erase(dst);
+    return true;
+  }
+  // Propagate if src is tracked; otherwise dst becomes untracked.
+  auto it = adrp_regs.find(src);
+  if (it != adrp_regs.end()) {
+    adrp_regs[dst] = it->second;
+  } else {
+    adrp_regs.erase(dst);
+  }
+  return true;
+}
+
+// ARM64 "ADD" writes an arithmetic result, not an ADRP page, into the
+// destination register. The phase-3 rule is the same in every shape:
+// after we've consumed the (possibly-tracked) source for the
+// resolve_adrp_consumer match, clear adrp_regs[dst] so the next
+// instruction can't reach back through dst to an obsolete page.
+//
+// Handles:
+//   add  xN, xM, #imm        — phase-2 ADRP+ADD case (xN may equal xM)
+//   add  xN, xM, xL{, shift} — register-register, never tracked
+void clobber_add_destination(
+    const std::string& operands,
+    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  auto [ok_dst, dst, _p] = parse_reg_at(operands, 0);
+  if (ok_dst) {
+    adrp_regs.erase(dst);
+  }
+}
 
 std::optional<AdrpResolved>
 resolve_adrp_consumer(const std::string& mnemonic, const std::string& operands,
@@ -2123,15 +2242,37 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
       std::uint64_t size  = sec.GetByteSize();
       if (start != 0 && size > 0) {
         auto insns = disassemble_range_lldb(target, start, start + size);
-        // Track recent ADRP results per destination register. We use
-        // an unordered_map keyed on the lowercased register name. An
-        // ADRP that re-targets a previously-seen register simply
-        // overwrites the entry — matching what compiler-emitted code
-        // expects (single-def-then-immediate-use).
+        // Track recent ADRP results per destination register. Phase 3
+        // (docs/35-field-report-followups.md §3) augments the phase-2
+        // "last ADRP wins for this register" map with deterministic
+        // clobber rules — BL/BLR clears caller-saved, function-boundary
+        // transitions reset the map, ADD writes clear adrp_regs[dst]
+        // AFTER the match emit, MOV propagates or clears.
         std::unordered_map<std::string, AdrpPair> adrp_regs;
+        // Track the enclosing function for boundary detection. We only
+        // resolve `function_name_at` when adrp_regs is non-empty; on
+        // code with no tracked ADRPs the boundary check is free.
+        std::string current_function;
+        bool current_function_known = false;
         for (const auto& i : insns) {
           std::string mnem_lower = i.mnemonic;
           for (auto& c : mnem_lower) c = static_cast<char>(std::tolower(c));
+
+          // Phase-3 gate 1 (function-boundary reset). When we have
+          // tracked ADRP state, check the current instruction's
+          // function against the one the state was recorded under.
+          // A mismatch means we walked past RET / fell into a new
+          // function via tail-call / hit an unconditional B target
+          // and the prior ADRP is no longer in scope.
+          if (!adrp_regs.empty()) {
+            auto sa = target.ResolveFileAddress(i.address);
+            std::string fn = function_name_at(target, sa);
+            if (current_function_known && fn != current_function) {
+              adrp_regs.clear();
+            }
+            current_function = std::move(fn);
+            current_function_known = true;
+          }
 
           if (mnem_lower == "adrp") {
             // "adrp xN, <imm>" — record the absolute target page. The
@@ -2157,6 +2298,15 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
                 p.page = (i.address & ~static_cast<std::uint64_t>(0xfff)) +
                          (static_cast<std::uint64_t>(imm) << 12);
                 adrp_regs[dst] = p;
+                // First tracked ADRP in this section needs current_function
+                // primed; subsequent iterations refresh on the boundary
+                // check above. Cheap when an ADRP is rare; on hot ADRP-
+                // emitting code the per-iteration lookup dominates anyway.
+                if (!current_function_known) {
+                  auto sa = target.ResolveFileAddress(i.address);
+                  current_function = function_name_at(target, sa);
+                  current_function_known = true;
+                }
               }
             }
             // Note: ADRP itself never matches a string-pointer target
@@ -2191,6 +2341,40 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
             auto sa = target.ResolveFileAddress(i.address);
             m.function = function_name_at(target, sa);
             out.push_back(std::move(m));
+          }
+
+          // Phase-3 register-state mutations (after match emit so the
+          // instruction we just resolved doesn't lose its tracking
+          // mid-emit). Order matters: BL/BLR clobber first because a
+          // call-site has no other state-mutating effect we care about;
+          // ADD/MOV are exclusive of each other and of BL/BLR.
+          if (mnem_lower == "bl" || mnem_lower == "blr") {
+            // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
+            // callee may overwrite x0..x18 + x30 — the scanner has
+            // no way to know the callee's behaviour.
+            clobber_aapcs64_caller_saved(adrp_regs);
+          } else if (mnem_lower == "add") {
+            // Gate 3: ADD writes a computed value, not an ADRP page.
+            // Clear adrp_regs[dst] regardless of whether dst==src or
+            // the second operand was tracked. resolve_adrp_consumer
+            // has already run; the match (if any) is already in `out`.
+            clobber_add_destination(i.operands, adrp_regs);
+          } else if (mnem_lower == "mov" || mnem_lower == "movz" ||
+                     mnem_lower == "movk" || mnem_lower == "movn") {
+            // Gate 4: MOV may propagate or clobber.
+            apply_mov_state(mnem_lower, i.operands, adrp_regs);
+          } else if (mnem_lower == "ret" || mnem_lower == "br" ||
+                     mnem_lower == "b") {
+            // Gate 1 follow-up: end-of-basic-block instructions that
+            // exit the current function reset the entire map. We don't
+            // distinguish "B to within current function" from
+            // "B to tail-call target" — both look the same in the
+            // disasm and the next-iteration function-boundary check
+            // will restore tracking when we re-enter the right
+            // function via subsequent ADRPs. The conservative reset is
+            // the phase-3 acceptance bar.
+            adrp_regs.clear();
+            current_function_known = false;
           }
         }
       }
