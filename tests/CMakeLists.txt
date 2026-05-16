@@ -873,6 +873,20 @@ set_tests_properties(smoke_socket_multiclient PROPERTIES
   TIMEOUT 60
 )
 
+# §2 phase 2: `ldb --socket PATH` auto-spawns a daemon when the socket
+# isn't backed by a running ldbd. Daemon is detached so it outlives
+# the client; a second invocation reuses it.
+add_test(
+  NAME smoke_socket_autospawn
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_autospawn.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_autospawn PROPERTIES
+  TIMEOUT 60
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

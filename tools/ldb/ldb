@@ -41,6 +41,7 @@ hand-rolled for the wire-format subset ldbd emits.
 from __future__ import annotations
 
 import argparse
+import errno
 import io
 import json
 import os
@@ -49,6 +50,7 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 from typing import Any
 
 
@@ -281,6 +283,94 @@ def default_socket_path() -> str:
     return os.path.join(tmpdir, f"ldbd-{uid}.sock")
 
 
+def _resolve_autospawn_ldbd() -> str | None:
+    """Find an `ldbd` binary suitable for auto-spawn.
+
+    Resolution order:
+      1. `$LDB_LDBD_SPAWN`           — explicit operator override (also
+                                       used by the smoke test to pin
+                                       the build's ldbd binary).
+      2. `shutil.which("ldbd")`      — `ldbd` on `$PATH`.
+      3. `_find_ldbd_sibling()`      — `<repo>/build/bin/ldbd` if the
+                                       `ldb` CLI is being run from a
+                                       checkout.
+    Returns the resolved absolute path, or None when nothing was found
+    (caller surfaces a "could not auto-spawn" diagnostic). We don't
+    auto-spawn from an arbitrary local path the user typed via `--ldbd`
+    because `--ldbd` is mutually exclusive with `--socket` anyway.
+    """
+    env = os.environ.get("LDB_LDBD_SPAWN")
+    if env and os.access(env, os.X_OK):
+        return env
+    onpath = shutil.which("ldbd")
+    if onpath:
+        return onpath
+    sibling = _find_ldbd_sibling()
+    if sibling:
+        return sibling
+    return None
+
+
+def _autospawn_daemon(sock_path: str, verbose: bool) -> bool:
+    """Fork+exec `ldbd --listen unix:<sock_path>` detached from us.
+
+    "Detached" = the daemon outlives the client process. We
+    fork-exec a child that calls `setsid()` and closes stdin/stdout
+    (logs still go to its own stderr — operators ran into
+    `os.devnull` redirection making debugging impossible, so we
+    leave stderr connected to whatever the original process had).
+    Returns True if the spawn was initiated (caller still waits for
+    the socket to start accepting), False if no ldbd binary was
+    found.
+    """
+    ldbd = _resolve_autospawn_ldbd()
+    if not ldbd:
+        return False
+
+    if verbose:
+        sys.stderr.write(
+            f"ldb: auto-spawning {ldbd} --listen unix:{sock_path}\n")
+
+    # Use start_new_session=True for setsid() — the daemon detaches
+    # from our process group / controlling terminal so it survives
+    # the CLI process's exit. stdin/stdout/stderr are ALL redirected
+    # to /dev/null. The original implementation inherited the
+    # client's stderr so operators could see diagnostics, but that
+    # broke any caller that wrapped `ldb` with subprocess.run
+    # capture_output=True — the daemon kept the captured-stderr pipe
+    # alive, and the wrapper hung forever on a read that never saw
+    # EOF. Diagnostics are still available via $LDB_LDBD_LOG_FILE:
+    # if set, stderr is redirected there instead of /dev/null so an
+    # operator can opt in by exporting the variable in their shell.
+    log_path = os.environ.get("LDB_LDBD_LOG_FILE")
+    devnull = open(os.devnull, "rb")
+    devnull_w = open(os.devnull, "wb")
+    log_fh = None
+    if log_path:
+        try:
+            log_fh = open(log_path, "ab")
+        except OSError as e:
+            sys.stderr.write(
+                f"ldb: cannot open LDB_LDBD_LOG_FILE {log_path!r}: {e}; "
+                f"daemon stderr will be discarded\n")
+            log_fh = None
+    try:
+        subprocess.Popen(
+            [ldbd, "--listen", f"unix:{sock_path}", "--log-level", "error"],
+            stdin=devnull,
+            stdout=devnull_w,
+            stderr=log_fh if log_fh is not None else devnull_w,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        devnull.close()
+        devnull_w.close()
+        if log_fh is not None:
+            log_fh.close()
+    return True
+
+
 class _SocketProc:
     """Popen-shaped adapter wrapping a connected unix socket.
 
@@ -292,17 +382,57 @@ class _SocketProc:
     from this shim's stderr in error paths simply returns b"". Code
     paths that report "daemon stderr was: ..." just print an empty
     string in socket mode — acceptable for phase 1.
+
+    Phase-2 auto-spawn: if the initial connect() fails with
+    ECONNREFUSED / ENOENT, we fork+exec `ldbd --listen unix:PATH`
+    as a detached subprocess and retry the connect with a short
+    backoff. The auto-spawned daemon outlives the client process so
+    the next invocation reuses it. Disabled by passing
+    `autospawn=False` (used by tests that want a hard "no daemon"
+    failure).
     """
 
-    def __init__(self, sock_path: str):
+    def __init__(self, sock_path: str, autospawn: bool = True,
+                 verbose: bool = False):
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self._sock.connect(sock_path)
         except OSError as e:
             self._sock.close()
-            raise IOError(
-                f"could not connect to ldbd socket {sock_path!r}: {e}"
-            ) from None
+            # Auto-spawn is gated to "no daemon listening here" errors:
+            # ECONNREFUSED (socket inode exists but nobody accept()s)
+            # and ENOENT (no inode at all). Any other error — EACCES,
+            # ELOOP, ENOTDIR — is a configuration problem the user
+            # has to fix; retrying after spawn wouldn't change it.
+            transient = e.errno in (
+                errno.ECONNREFUSED, errno.ENOENT, errno.ENXIO)
+            if not autospawn or not transient:
+                raise IOError(
+                    f"could not connect to ldbd socket {sock_path!r}: {e}"
+                ) from None
+            if not _autospawn_daemon(sock_path, verbose):
+                raise IOError(
+                    f"could not auto-spawn ldbd for {sock_path!r}: "
+                    f"daemon binary not found"
+                ) from None
+            # Retry the connect with bounded backoff. The auto-spawned
+            # daemon needs a moment to bind + listen; 200ms * 10
+            # retries (~2s) is generous on macOS, very loose on Linux.
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connected = False
+            for _ in range(15):
+                try:
+                    self._sock.connect(sock_path)
+                    connected = True
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            if not connected:
+                self._sock.close()
+                raise IOError(
+                    f"auto-spawned ldbd never began accepting on "
+                    f"{sock_path!r}"
+                ) from None
         # 5-minute recv timeout matches the daemon's SO_RCVTIMEO. A
         # hung daemon (deadlocked dispatcher, runaway target.open)
         # must NOT pin `fetch_catalog` or `do_rpc` forever — without
@@ -445,7 +575,7 @@ def spawn_daemon(spec_or_path, fmt: str, verbose: bool):
         if verbose:
             sys.stderr.write(
                 f"ldb: connecting to unix:{spec.socket_path}\n")
-        return _SocketProc(spec.socket_path)
+        return _SocketProc(spec.socket_path, autospawn=True, verbose=verbose)
 
     if spec.is_ssh:
         cmd = _build_ssh_argv(spec, fmt)
@@ -668,9 +798,18 @@ def render_top_help(catalog: list[dict]) -> str:
         "  Alternatively, run `ldbd --listen unix:PATH` once out-of-band\n"
         "  and connect every `ldb` invocation with `--socket PATH`.\n"
         "  target_id and other daemon-side state survive across CLI\n"
-        "  invocations because the daemon outlives them (§2 phase-1 of\n"
-        "  docs/35-field-report-followups.md). Phase-1 is single-client:\n"
-        "  the daemon serves one connection at a time.\n"
+        "  invocations because the daemon outlives them (§2 of\n"
+        "  docs/35-field-report-followups.md). Phase-2 the daemon\n"
+        "  serves multiple clients concurrently.\n"
+        "\n"
+        "  Auto-spawn: if --socket PATH points at a socket whose\n"
+        "  backing daemon isn't running (ECONNREFUSED / ENOENT), the\n"
+        "  CLI fork+execs `ldbd --listen unix:PATH` detached from the\n"
+        "  client, waits up to ~3s for the daemon to bind, and\n"
+        "  retries the connect. The spawned daemon survives the\n"
+        "  client process; subsequent `ldb --socket PATH` calls reuse\n"
+        "  it. The ldbd binary is found via $LDB_LDBD_SPAWN (if set),\n"
+        "  then $PATH, then the sibling-of-`ldb` heuristic.\n"
         "\n"
         "Top-level options:\n"
         "  --ldbd PATH          local ldbd binary (default: PATH, then ./build/bin/ldbd)\n"
