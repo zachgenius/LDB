@@ -2013,29 +2013,53 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
   // scan for ARM64 ADRP+ADD/LDR pairs that the existing
   // string_references_address heuristic misses.
   //
-  // We copy the map by value out of the cache so concurrent close_target
-  // can't invalidate our view. Maps are O(slots), measured in low
-  // thousands for typical iOS apps; the copy is cheap vs the
-  // disassembly walk that follows.
+  // Three-phase pattern: check-flag-under-lock → read+parse-outside-lock
+  // → double-check-and-publish-under-lock. The on-disk Mach-O can be
+  // 500+ MiB (real iOS apps); holding impl_->mu across that read would
+  // block every other RPC and the listener-thread breakpoint dispatch
+  // path for the full read+parse duration. Phase-1 stdio dispatcher is
+  // single-RPC so the benign race below (two callers both load, only
+  // the first publishes) is forward-compatible with the upcoming
+  // socket-daemon multi-client surface in §2.
   ChainedFixupMap fixup_map;
+  bool need_load = false;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
-    auto loaded_it = impl_->chained_fixup_loaded.find(tid);
-    if (loaded_it == impl_->chained_fixup_loaded.end() || !loaded_it->second) {
-      auto bytes = read_module_file_bytes(mod);
-      ChainedFixupMap m;
-      if (!bytes.empty()) {
-        try {
-          m = extract_chained_fixups_from_macho(bytes.data(), bytes.size());
-        } catch (const Error&) {
-          // Malformed payload: cache an empty map so we don't retry on
-          // every call. Phase 3 will surface this as a diagnostic.
-        }
-      }
-      impl_->chained_fixup_maps[tid]   = std::move(m);
-      impl_->chained_fixup_loaded[tid] = true;
+    auto it = impl_->chained_fixup_loaded.find(tid);
+    if (it == impl_->chained_fixup_loaded.end() || !it->second) {
+      need_load = true;
     }
-    fixup_map = impl_->chained_fixup_maps[tid];
+  }
+  if (need_load) {
+    auto bytes = read_module_file_bytes(mod);
+    ChainedFixupMap m;
+    if (!bytes.empty()) {
+      try {
+        m = extract_chained_fixups_from_macho(bytes.data(), bytes.size());
+      } catch (const Error&) {
+        // Malformed payload: publish an empty map so we don't retry on
+        // every call. Phase 3 will surface this as a diagnostic.
+      }
+    }
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto& flag = impl_->chained_fixup_loaded[tid];
+    if (!flag) {
+      impl_->chained_fixup_maps[tid] = std::move(m);
+      flag = true;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    // find() not operator[]: a concurrent close_target could in theory
+    // evict our entry between the publish above and this read. The
+    // operator[] default-construction would silently re-create an
+    // empty entry and leak it; find() lets us simply fall through with
+    // an empty local map. In the stdio dispatcher this race window is
+    // empty by construction (single RPC at a time).
+    auto map_it = impl_->chained_fixup_maps.find(tid);
+    if (map_it != impl_->chained_fixup_maps.end()) {
+      fixup_map = map_it->second;
+    }
   }
 
   // Image base for converting slot RVAs to file addresses. For the
