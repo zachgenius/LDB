@@ -14,14 +14,16 @@ Pattern (see tests/fixtures/asm/xref_condbranch.s):
 
 Acceptance:
   - xref.addr against `cond_data_a + 0x10` returns ZERO matches in
-    pattern_cond_other. (Phase 3's gate 1 already catches the
-    symbolized case via function_name_at; phase 4 adds a cbz boundary
-    pre-empt that ALSO closes it.)
-  - The response carries provenance.adrp_pair_cond_branch_reset > 0
-    proving phase 4's new code path fired. Without phase 4 the
-    counter stays at 0 and the leak would only have been caught by
-    gate 1's RET-then-new-function check (which is the path stripped
-    binaries can't rely on).
+    pattern_cond_other. Phase-4 cleanup C1+C2 reframed the reset:
+    instead of clobbering adrp_regs on the source side (which broke
+    the fall-through path), the cross-function branch target is
+    recorded as a function_start hint. Gate 3 then fires when the
+    scanner reaches that target on a later iteration. Either way,
+    pattern_cond_other must NOT inherit pattern_cond_a's x8.
+  - The response carries provenance.adrp_pair_cond_branch_recorded > 0
+    proving phase 4's new code path fired. The counter was renamed
+    from `*_reset` to `*_recorded` in the cleanup pass — the source
+    side no longer "resets", it records the target.
 """
 import json
 import os
@@ -90,22 +92,21 @@ def main():
             sys.exit(1)
 
         # The provenance counter proves phase 4's new code path fired.
-        # Without phase 4, the only reset would have been gate 1's
-        # function_name_at check on the LDR's address — and the
-        # adrp_pair_cond_branch_reset counter would stay at 0.
+        # Post-cleanup the counter is `adrp_pair_cond_branch_recorded`
+        # — the source-side "reset" was the C1 silent-wrong-result bug.
         prov = r_false["data"].get("provenance", {})
-        cond_reset = prov.get("adrp_pair_cond_branch_reset", 0)
-        if cond_reset < 1:
+        cond_recorded = prov.get("adrp_pair_cond_branch_recorded", 0)
+        if cond_recorded < 1:
             sys.stderr.write(
                 "FAIL: phase-4 conditional-branch path didn't fire — "
-                "expected provenance.adrp_pair_cond_branch_reset >= 1 "
-                f"after cross-function cbz; got {cond_reset}. "
+                "expected provenance.adrp_pair_cond_branch_recorded >= 1 "
+                f"after cross-function cbz; got {cond_recorded}. "
                 f"Full provenance: {prov}\n")
             sys.exit(1)
 
         print(f"xref conditional-branch boundary smoke test PASSED "
               f"(data={data_addr:#x}, fn_other_false_hits={len(bad)}, "
-              f"cond_reset_count={cond_reset})")
+              f"cond_recorded_count={cond_recorded})")
     finally:
         try:
             proc.stdin.close()

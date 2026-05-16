@@ -151,7 +151,9 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
       xref_writeback_ldr
       xref_str
       xref_condbranch
-      xref_pcrel_literal)
+      xref_pcrel_literal
+      xref_cond_fallthrough
+      xref_cond_same_fn)
     add_executable(ldb_fix_${_phase3_fix} asm/${_phase3_fix}.s)
     set_target_properties(ldb_fix_${_phase3_fix} PROPERTIES
       OUTPUT_NAME    ${_phase3_fix}

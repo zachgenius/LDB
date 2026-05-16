@@ -1322,13 +1322,35 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
                   "offset operand the resolver couldn't statically "
                   "evaluate (e.g. `[xN, xM]`, `[xN, xM, lsl #imm]`). "
                   "Each skip is a potential xref the heuristic cannot "
-                  "surface; phase 4 will close the most common cases.")},
+                  "surface; phase 5 will close the most common cases.")},
               {"adrp_pair_writeback_cleared", uint_(
                   "Number of pre/post-indexed LDRs whose base register "
                   "the resolver cleared after the match emit. The "
                   "legitimate xref still fires; subsequent loads through "
                   "the same register are no longer trackable because "
                   "the writeback rewrote it.")},
+              {"adrp_pair_cond_branch_recorded", uint_(
+                  "Phase 4 item 1 (post-cleanup): number of cross-function "
+                  "conditional branches (b.cond / cbz / cbnz / tbz / tbnz) "
+                  "whose targets the scanner recorded as function_start "
+                  "hints. The source-side fall-through tracking is "
+                  "intentionally preserved; gate 3 fires when the scanner "
+                  "later reaches the taken side via the recorded hint.")},
+              {"adrp_pair_function_start_reset", uint_(
+                  "Phase 4 item 3: number of times the scanner crossed an "
+                  "instruction whose address was previously recorded as a "
+                  "function start (a B / BL / cross-fn cbz target inside "
+                  "the same code section) and cleared adrp_regs. Catches "
+                  "the stripped-binary case where gate 1's "
+                  "function_name_at returns \"\" for adjacent functions.")},
+              {"adrp_pair_unresolvable_load", uint_(
+                  "Phase 4 item 4: number of loads the resolver explicitly "
+                  "gave up on — PC-relative literal loads (`ldr xN, #imm` "
+                  "/ `ldr xN, 0xNNNN`) whose literal-pool slot can't be "
+                  "statically dereferenced. Distinct from "
+                  "adrp_pair_skipped (register-offset memops with a "
+                  "tracked base); together they cover the universe of "
+                  "memops the heuristic can't resolve.")},
               {"warnings", arr_of(str(), "Human-readable diagnostics "
                   "from the ADRP-pair resolver; emitted only when at "
                   "least one ambiguous pattern was encountered.")},
@@ -4569,14 +4591,14 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
   // include them so they're surfaced when non-zero.
   if (prov.adrp_pair_skipped > 0 ||
       prov.adrp_pair_writeback_cleared > 0 ||
-      prov.adrp_pair_cond_branch_reset > 0 ||
+      prov.adrp_pair_cond_branch_recorded > 0 ||
       prov.adrp_pair_function_start_reset > 0 ||
       prov.adrp_pair_unresolvable_load > 0 ||
       !prov.warnings.empty()) {
     json p = json::object();
     p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
     p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
-    p["adrp_pair_cond_branch_reset"] = prov.adrp_pair_cond_branch_reset;
+    p["adrp_pair_cond_branch_recorded"] = prov.adrp_pair_cond_branch_recorded;
     p["adrp_pair_function_start_reset"] = prov.adrp_pair_function_start_reset;
     p["adrp_pair_unresolvable_load"] = prov.adrp_pair_unresolvable_load;
     json ws = json::array();

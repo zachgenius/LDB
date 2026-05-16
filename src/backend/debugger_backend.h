@@ -225,14 +225,16 @@ struct XrefProvenance {
   // addition (docs/35-field-report-followups.md §3 improvement 3).
   std::uint32_t adrp_pair_writeback_cleared = 0;
 
-  // Phase 4 item 1 (docs/35-field-report-followups.md §3): conditional
-  // branch (b.cond / cbz / cbnz / tbz / tbnz) whose target sat in a
-  // different function caused the entire adrp_regs map to clear. This
-  // counter increments per such conditional-branch reset. A non-zero
-  // value signals the scanner conservatively dropped tracking; in
-  // stripped binaries (where gate 1's function_name_at can't tell the
-  // boundary) this is the ONLY signal the heuristic isn't authoritative.
-  std::uint32_t adrp_pair_cond_branch_reset = 0;
+  // Phase 4 item 1 (post-cleanup, docs/35-field-report-followups.md §3):
+  // conditional branch (b.cond / cbz / cbnz / tbz / tbnz) whose target
+  // sat in a different function. The branch target is recorded as a
+  // function_start hint so gate 3 fires when the scanner later reaches
+  // it. The source-side fall-through tracking is intentionally
+  // preserved (the original phase-4 unconditional clear was a silent
+  // wrong-result regression — see cleanup C1). A non-zero value signals
+  // the scanner saw a cross-function cond-branch and bookkept its
+  // target.
+  std::uint32_t adrp_pair_cond_branch_recorded = 0;
 
   // Phase 4 item 3 (docs/35-field-report-followups.md §3): the scanner
   // crossed an instruction whose address was previously recorded as a

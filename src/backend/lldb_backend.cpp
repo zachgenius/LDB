@@ -2797,51 +2797,69 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // closes that.
             adrp_regs.clear();
             current_function_known = false;
-          } else if (is_cond_branch && !adrp_regs.empty()) {
-            // Phase 4 item 1: parse the conditional branch's target
-            // address from the operands (LLDB renders it as
-            // `0xNNNNNNN`), look up the function name at that target,
-            // and reset adrp_regs when it differs from the current
-            // function. The pre-empt is what closes the stripped-
-            // binary case where gate 1 can't see the boundary.
+          } else if (is_cond_branch) {
+            // Phase 4 item 1 (post-cleanup C1+C2,
+            // docs/35-field-report-followups.md §3): parse the
+            // conditional branch's target address from operands and
+            // decide if the target is in a different function. Only
+            // when target_fn != current_function do we (a) record the
+            // target as a function_start hint so gate 3 fires when the
+            // scanner later reaches it via fall-through, and (b) bump
+            // the provenance counter. We do NOT clear adrp_regs on
+            // the source side — by definition the fall-through is in
+            // the same function and the spec requires the fall-through
+            // tracking to be preserved (an `add x0, x8, #imm` right
+            // after a cbz to another function is a legitimate xref).
             //
-            // We only do the lookup when adrp_regs is non-empty —
-            // when there's no tracked state, the reset is a no-op and
-            // function_name_at is the dominant cost. Same optimisation
-            // gate 1 uses.
-            // LLDB renders cbz / tbz with the conditional register
-            // first and the address last; `b.eq 0x100003f00` puts the
-            // address first. parse_last_hex_in_operands scans to end
-            // and keeps the last hit — works for both shapes.
+            // Same-function cbz/tbz targets (local merge labels, loop
+            // backedges) MUST NOT enter function_starts. If they did,
+            // gate 3 would clear adrp_regs at the label and kill
+            // legitimate xrefs on the post-label consumer — the C2
+            // bug. The cross-fn check below is the gate.
+            //
+            // We skip the lookup when adrp_regs is empty AND the
+            // hint isn't useful yet — but the function_starts hint
+            // is still valuable for LATER iterations once an ADRP
+            // gets tracked, so phase 4 cleanup I4 lifts the hint
+            // bookkeeping outside the adrp_regs-non-empty guard.
             auto branch_target = parse_last_hex_in_operands(i.operands);
             if (branch_target.has_value()) {
+              // current_function may be unknown (no prior ADRP). Prime
+              // it from the current instruction so the cross-fn check
+              // has both sides to compare. This is cheap (one SBAPI
+              // call) and only fires on the cond-branch path.
+              if (!current_function_known) {
+                auto sa = target.ResolveFileAddress(i.address);
+                current_function = function_name_at(target, sa);
+                current_function_known = true;
+              }
               auto sa_target = target.ResolveFileAddress(*branch_target);
               std::string target_fn = function_name_at(target, sa_target);
-              // current_function was primed by gate 1 above (when
-              // adrp_regs first became non-empty). The reset fires
-              // when target_fn is non-empty AND distinct from
-              // current_function — non-empty matters because stripped
-              // binaries return "" on both sides and we don't want
-              // to false-trigger on same-stripped-fn cbz patterns
-              // (item 3 handles those via function_starts).
+              // Cross-function only: bump the recorded-target counter
+              // and add to function_starts. Non-empty target_fn matters
+              // because stripped binaries return "" on both sides and
+              // we don't want to false-trigger on same-stripped-fn
+              // cbz patterns (item 3 handles those via the B/BL-target
+              // function_starts set below).
               if (!target_fn.empty() && target_fn != current_function) {
-                adrp_regs.clear();
+                // Record the target so gate 3 fires on the TAKEN side
+                // when the scanner reaches it on a later iteration.
+                // Fall-through tracking on the source side is
+                // intentionally preserved (C1 spec: "Fall-through
+                // path: preserve state").
+                if (*branch_target >= start && *branch_target < section_end) {
+                  function_starts.insert(*branch_target);
+                }
                 if (provenance != nullptr) {
-                  provenance->adrp_pair_cond_branch_reset++;
+                  provenance->adrp_pair_cond_branch_recorded++;
                   std::ostringstream w;
                   w << "conditional branch " << mnem_lower
                     << " at 0x" << std::hex << i.address
                     << " targets a different function ("
-                    << target_fn << ") — adrp_regs cleared";
+                    << target_fn
+                    << ") — target recorded as function-start hint";
                   provenance->warnings.push_back(w.str());
                 }
-              }
-              // Also record the conditional-branch target as a
-              // function start when it falls inside this section.
-              // The taken side of a conditional that crosses functions
-              // is a function entry just like an unconditional B.
-              if (*branch_target >= start && *branch_target < section_end) {
-                function_starts.insert(*branch_target);
               }
             }
           }
