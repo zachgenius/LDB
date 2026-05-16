@@ -2,6 +2,7 @@
 #include "backend/gdbmi/backend.h"
 #include "backend/lldb_backend.h"
 #include "daemon/dispatcher.h"
+#include "daemon/socket_loop.h"
 #include "daemon/stdio_loop.h"
 #include "ldb/version.h"
 #include "observers/exec_allowlist.h"
@@ -25,14 +26,32 @@ namespace {
 void print_usage() {
   std::cerr <<
     "ldbd " << ldb::kVersionString << "\n"
-    "Usage: ldbd [--stdio] [--format json|cbor]\n"
+    "Usage: ldbd [--stdio | --listen unix:PATH] [--format json|cbor]\n"
     "            [--log-level debug|info|warn|error]\n"
     "            [--store-root <path>]\n"
     "            [--observer-exec-allowlist <path>] [-h|--help]\n"
     "\n"
     "Modes:\n"
     "  --stdio          Read JSON-RPC from stdin, write responses to stdout\n"
-    "                   (default)\n"
+    "                   (default).\n"
+    "  --listen unix:PATH\n"
+    "                   Bind a unix-domain socket at PATH and serve\n"
+    "                   JSON-RPC connections one at a time (phase 1:\n"
+    "                   single-client, persistent daemon). target_id and\n"
+    "                   other dispatcher state survive across client\n"
+    "                   disconnects. Access control is filesystem-only:\n"
+    "                   socket mode 0600, parent dir 0700 if we create\n"
+    "                   it. A `${PATH}.lock` file is taken with flock\n"
+    "                   LOCK_EX|LOCK_NB to prevent two daemons binding\n"
+    "                   the same path. See docs/35-field-report-followups.md\n"
+    "                   §2. Mutually exclusive with --stdio.\n"
+    "\n"
+    "                   Default path policy when PATH is omitted by the\n"
+    "                   client side (the daemon always wants an\n"
+    "                   explicit PATH):\n"
+    "                     $XDG_RUNTIME_DIR/ldbd.sock   (if set)\n"
+    "                     $TMPDIR/ldbd-$UID.sock       (else)\n"
+    "                     /tmp/ldbd-$UID.sock          (last resort)\n"
     "  --format <fmt>   Wire format on stdin/stdout. `json` (default) is\n"
     "                   line-delimited JSON. `cbor` is length-prefixed RFC\n"
     "                   8949 binary frames (4-byte big-endian uint32 length\n"
@@ -127,6 +146,8 @@ std::string resolve_backend(const std::string& cli_arg) {
 
 int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
+  bool listen_mode = false;
+  std::string listen_socket_path;
   std::string store_root_arg;
   std::string observer_exec_allowlist_arg;
   std::string backend_arg;
@@ -142,6 +163,23 @@ int main(int argc, char** argv) {
       return 0;
     } else if (a == "--stdio") {
       stdio_mode = true;
+    } else if (a == "--listen" && i + 1 < argc) {
+      // Currently only the `unix:PATH` form is accepted. A future
+      // `tcp:HOST:PORT` form would land here behind the same flag.
+      std::string spec = argv[++i];
+      constexpr const char* kPrefix = "unix:";
+      if (spec.rfind(kPrefix, 0) != 0) {
+        std::cerr << "ldbd: --listen requires a unix:PATH argument; got "
+                  << spec << "\n";
+        return 2;
+      }
+      listen_socket_path = spec.substr(std::strlen(kPrefix));
+      if (listen_socket_path.empty()) {
+        std::cerr << "ldbd: --listen unix: requires a non-empty PATH\n";
+        return 2;
+      }
+      listen_mode = true;
+      stdio_mode = false;
     } else if (a == "--format" && i + 1 < argc) {
       if (!parse_wire_format(argv[++i], wire_format)) {
         std::cerr << "invalid format: " << argv[i]
@@ -277,6 +315,15 @@ int main(int argc, char** argv) {
 
   ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes,
                                      exec_allowlist, backend_name);
+
+  if (listen_mode) {
+    // §2 phase 1: listen mode owns its own per-connection OutputChannel.
+    // run_socket_listener installs and removes the notification sink
+    // around each accept()ed connection so async notifications go to
+    // the right peer. No stdout writer is created at startup.
+    return ldb::daemon::run_socket_listener(dispatcher, listen_socket_path,
+                                            wire_format);
+  }
 
   // Post-V1 #21 phase-2 (docs/27): single stdout writer with mutex;
   // the listener thread's thread.event notifications and the
