@@ -936,6 +936,19 @@ set_tests_properties(smoke_socket_shutdown_active_clients PROPERTIES
   TIMEOUT 30
 )
 
+# §2 phase 2 (post-review I3): SO_SNDTIMEO bounds slow-reader stalls.
+# A connected-but-not-reading peer fills the kernel send buffer; pre-
+# fix the daemon's ::write() blocked indefinitely. Post-fix the worker
+# trips an EAGAIN within 60s and closes the connection cleanly.
+add_test(
+  NAME smoke_socket_slow_reader
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_slow_reader.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_slow_reader PROPERTIES
+  TIMEOUT 60
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

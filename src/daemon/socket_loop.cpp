@@ -688,6 +688,27 @@ int run_socket_listener(Dispatcher& dispatcher,
                 std::strerror(errno));
     }
 
+    // 60-second send timeout (post-review I3). A connected-but-not-
+    // reading peer lets the kernel send buffer fill; without this
+    // setsockopt, the worker's ::write() blocks indefinitely. The
+    // listener thread serving notifications also calls ::write()
+    // (through OutputChannel), and an indefinite write held the
+    // dispatcher's recursive_mutex via the cascade target.close →
+    // map_mu_ unique. Adding SO_SNDTIMEO bounds the worst-case
+    // stall: on EAGAIN the streambuf latches write_failed_,
+    // write_response throws Error, and the worker exits cleanly.
+    // 60s is generous (a real RPC reply round-trip is ~milliseconds)
+    // but tight enough that a wedge doesn't keep the daemon
+    // unresponsive for minutes.
+    ::timeval snd_timeout{};
+    snd_timeout.tv_sec  = 60;
+    snd_timeout.tv_usec = 0;
+    if (::setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO,
+                     &snd_timeout, sizeof(snd_timeout)) != 0) {
+      log::warn(std::string("setsockopt(SO_SNDTIMEO): ") +
+                std::strerror(errno));
+    }
+
     // Spawn a worker thread; let it run for the connection's
     // lifetime. The Dispatcher is shared; its internal mutex
     // serialises overlapping RPC service. The notification sink is
