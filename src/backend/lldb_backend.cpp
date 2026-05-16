@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1951,38 +1952,15 @@ void clobber_aapcs64_caller_saved(
 // for ORR xN, xzr, xM (reg-reg) or MOVZ/MOVN/MOVK (imm). LLDB
 // canonicalises the alias back to "mov" in its disasm output, which
 // is what we match against here.
-// Tokenise the MOV source operand to one of:
-//   - kImmediate     — `#<n>`
-//   - kZero          — `xzr` / `wzr`
-//   - kStackPointer  — `sp` / `wsp`
-//   - kLinkRegister  — `lr` (alias for x30)
-//   - kWReg          — wN — the upper 32 bits are zeroed, so even if
-//                     the source happened to be tracked, the copy is
-//                     not a page address.
-//   - kXReg          — xN — the only shape that propagates.
-//   - kOther         — unrecognised; conservative clobber.
-enum class MovSrcKind { kOther, kImmediate, kZero, kStackPointer,
-                       kLinkRegister, kWReg, kXReg };
-
-MovSrcKind classify_mov_source(std::string_view tok) {
-  if (tok.empty()) return MovSrcKind::kOther;
-  if (tok[0] == '#') return MovSrcKind::kImmediate;
-  // Strip a trailing comma/space if the caller left it on. parse_reg_at
-  // normalises register tokens for the xN/wN case below; for the
-  // alias-name cases we compare exactly against the canonical
-  // spellings.
-  if (tok == "xzr" || tok == "wzr") return MovSrcKind::kZero;
-  if (tok == "sp"  || tok == "wsp") return MovSrcKind::kStackPointer;
-  if (tok == "lr") return MovSrcKind::kLinkRegister;
-  if (tok.size() >= 2 && (tok[0] == 'x' || tok[0] == 'w')) {
-    // Verify the rest are digits; otherwise treat as kOther.
-    for (std::size_t i = 1; i < tok.size(); ++i) {
-      if (tok[i] < '0' || tok[i] > '9') return MovSrcKind::kOther;
-    }
-    return tok[0] == 'x' ? MovSrcKind::kXReg : MovSrcKind::kWReg;
-  }
-  return MovSrcKind::kOther;
-}
+//
+// MOV-source classification (kZero / kImmediate / kXReg / ...) lives
+// in xref_arm64_parsers.{h,cpp} so unit tests can pin its alias-name-
+// first match order independently of a live LLDB target. Phase 4
+// item 5 (docs/35-field-report-followups.md §3) lifted it here so the
+// `mov xN, xzr` / `mov xN, #0` cases are pinned in unit tests rather
+// than depending on the prefix heuristic by accident.
+using xref_arm64::MovSrcKind;
+using xref_arm64::classify_mov_source;
 
 // Apply a MOV instruction's effect on the ADRP-tracking map. Returns
 // true iff the mnemonic was recognised as a MOV variant — the caller
@@ -2056,38 +2034,12 @@ bool apply_mov_state(
   return true;  // unreachable; appeases -Wreturn-type
 }
 
-// ARM64 ADD / SUB (and the flag-setting ADDS / SUBS variants) all
-// write an arithmetic result, not an ADRP page, into the destination
-// register. The phase-3 rule is the same in every shape: after we've
-// consumed the (possibly-tracked) source for the resolve_adrp_consumer
-// match, clear adrp_regs[dst] so the next instruction can't reach back
-// through dst to an obsolete page.
-//
-// SUB joins the family because its destination-write semantics are
-// identical to ADD's — `sub xN, xN, #imm` overwrites the tracked
-// register exactly as `add xN, xN, #imm` does. The original phase-3
-// patch only clobbered on ADD, leaving SUB as a silent false-positive
-// vector (covered by xref_subclobber post-review fixture).
-//
-// Note on match-emit: ADD currently emits a direct-target match when
-// `page + imm == target_addr` (the legitimate ADRP+ADD pattern).
-// SUB+ADRP doesn't have a corresponding "compute target = page - imm"
-// pattern in real compiler output (compilers emit ADD with a signed
-// immediate or pre-compute via a different scheme). We only model the
-// SUB clobber here, not a SUB match-emit; resolve_adrp_consumer
-// remains ADD-only.
-//
-// Handles:
-//   add/sub/adds/subs  xN, xM, #imm        — xN may equal xM
-//   add/sub/adds/subs  xN, xM, xL{, shift} — register-register
-void clobber_arith_destination(
-    const std::string& operands,
-    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
-  auto [ok_dst, dst, _p] = parse_reg_at(operands, 0);
-  if (ok_dst) {
-    adrp_regs.erase(dst);
-  }
-}
+// (clobber_arith_destination was removed in the phase-4 cleanup
+// C3+C4 refactor: ADD / SUB / ADDS / SUBS destination-register
+// clobbering is now handled by the generic
+// parse_destination_registers + clobber-by-default pass in
+// xref_address. The previous helper duplicated logic the generic
+// pass already covers.)
 
 // Parse the `[base{, #imm}]` / `[base], #imm` / `[base, #imm]!` /
 // `[base]` shapes starting at `pos` in `operands`. On success returns
@@ -2340,6 +2292,15 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
     target = it->second;
   }
 
+  // Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): when the
+  // caller passes an existing provenance (e.g. find_string_xrefs sharing
+  // one struct across N target addresses), the gate-7 summary warning
+  // at the bottom must only fire when THIS call contributed new skips.
+  // Capture the baseline counter so we can compute the delta after the
+  // scan and avoid emitting "skipped 0" warnings on subsequent calls.
+  const std::uint32_t baseline_adrp_pair_skipped =
+      (provenance != nullptr) ? provenance->adrp_pair_skipped : 0;
+
   std::vector<XrefMatch> out;
 
   // Scan only the main executable's code sections. Walking every
@@ -2378,8 +2339,20 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
     auto bytes = read_module_file_bytes(mod);
     ChainedFixupMap m;
     if (!bytes.empty()) {
+      // Phase 4 item 2: pass the SBTarget's triple through so the FAT
+      // picker matches the slice LLDB actually loaded. SBTarget::
+      // GetTriple() returns a stable C string ("arm64e-apple-...",
+      // "arm64-apple-ios13.0", "x86_64-apple-...", ...); empty when
+      // LLDB couldn't classify the binary (we fall back to the
+      // phase-3 preference order in that case). The triple is
+      // ignored for thin Mach-Os.
+      const char* triple_cstr = target.GetTriple();
+      std::string_view triple_sv =
+          (triple_cstr != nullptr) ? std::string_view(triple_cstr)
+                                    : std::string_view{};
       try {
-        m = extract_chained_fixups_from_macho(bytes.data(), bytes.size());
+        m = extract_chained_fixups_from_macho(bytes.data(), bytes.size(),
+                                               triple_sv);
       } catch (const Error&) {
         // Malformed payload: publish an empty map so we don't retry on
         // every call. Phase 3 will surface this as a diagnostic.
@@ -2452,9 +2425,64 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
         // code with no tracked ADRPs the boundary check is free.
         std::string current_function;
         bool current_function_known = false;
+
+        // Phase-4 cleanup N5 (docs/35-field-report-followups.md §3):
+        // tiny one-entry cache for function_name_at queries on branch
+        // targets. The cond-branch path can hit the same target address
+        // repeatedly (loop backedges, tail-calls to common helpers);
+        // ResolveSymbolContextForAddress is the dominant cost in those
+        // patterns. The cache invalidates implicitly when the scanner
+        // moves to a different target address.
+        std::uint64_t last_target_addr = 0;
+        std::string   last_target_fn;
+        bool          last_target_known = false;
+        // Phase 4 item 3: function_starts records addresses we've
+        // discovered as function entries — every B / BL target that
+        // lands inside this code section is a "this is where a
+        // function starts" signal even when function_name_at returns
+        // "" (stripped binary). When the scanner reaches an
+        // instruction whose address is in this set, reset adrp_regs.
+        // Single-pass / forward-only: a B / BL at file_addr X to
+        // target Y only takes effect for Y > X (the scanner has
+        // already walked past Y < X by the time it sees the branch).
+        // Real compiler output emits BLs forward to callees that
+        // appear LATER in __text, so the common case is covered. A
+        // backward-only-reached function (e.g. indirect-only via
+        // vtable) still misses the boundary; documented as a
+        // phase-5 follow-up.
+        const std::uint64_t section_end = start + size;
+        std::unordered_set<std::uint64_t> function_starts;
+
+        // Branch-target parser lifted to xref_arm64::parse_last_hex_in_operands
+        // for unit testability (phase-4 cleanup I3 + N3,
+        // docs/35-field-report-followups.md §3). See the helper's
+        // header doc for the tbz bit-position vs. branch-target bug
+        // it fixes and the 16-digit overflow cap.
+        auto parse_last_hex_in_operands = &xref_arm64::parse_last_hex_in_operands;
+
         for (const auto& i : insns) {
           std::string mnem_lower = i.mnemonic;
           for (auto& c : mnem_lower) c = static_cast<char>(std::tolower(c));
+
+          // Phase 4 item 3 (function-start reset). Check the current
+          // instruction's address against the function_starts set
+          // BEFORE gate 1's name-based check. The two are
+          // complementary: gate 1 fires on symbolized boundaries
+          // (different function name); item 3 fires on stripped
+          // boundaries (B / BL target previously recorded). Either
+          // is sufficient; the union is the discriminating signal.
+          if (!adrp_regs.empty() &&
+              function_starts.count(i.address) > 0) {
+            adrp_regs.clear();
+            current_function_known = false;
+            if (provenance != nullptr) {
+              provenance->adrp_pair_function_start_reset++;
+              std::ostringstream w;
+              w << "function-start reset at 0x" << std::hex << i.address
+                << " (target of a prior B / BL); adrp_regs cleared";
+              provenance->warnings.push_back(w.str());
+            }
+          }
 
           // Phase-3 gate 1 (function-boundary reset). When we have
           // tracked ADRP state, check the current instruction's
@@ -2566,6 +2594,29 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                   if (ok_src && adrp_regs.count(src)) {
                     provenance->adrp_pair_skipped++;
                   }
+                } else if (pos < i.operands.size() &&
+                           (i.operands[pos] == '#' || i.operands[pos] == '0' ||
+                            i.operands[pos] == '-')) {
+                  // Phase 4 item 4 (docs/35-field-report-followups.md §3):
+                  // PC-relative literal load. LLDB renders these as
+                  // `ldr xN, #imm` (immediate is the PC-relative offset)
+                  // or `ldr xN, 0xNNN` (resolved load-time address).
+                  // The literal-pool slot might hold a pointer to a
+                  // string in __TEXT/__cstring or __DATA_CONST; the
+                  // scanner can't statically dereference the slot
+                  // without a runtime image_base. Bump the
+                  // unresolvable-load counter so callers see this
+                  // happened. Only meaningful for `ldr` (literal pool
+                  // loads); stores and short loads don't share the
+                  // shape.
+                  if (mnem_lower == "ldr" || mnem_lower == "ldrsw") {
+                    provenance->adrp_pair_unresolvable_load++;
+                    std::ostringstream w;
+                    w << "PC-relative literal " << mnem_lower
+                      << " at 0x" << std::hex << i.address
+                      << " — literal-pool slot not statically resolved";
+                    provenance->warnings.push_back(w.str());
+                  }
                 }
               }
             }
@@ -2630,30 +2681,88 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
               mnem_lower == "ret"    ||
               mnem_lower == "retaa"  || mnem_lower == "retab";
 
+          // Phase 4 item 1 (docs/35-field-report-followups.md §3):
+          // conditional branches don't write registers, but a cbz / tbz
+          // / b.cond whose target lands in a different function is a
+          // tail-call-like control-flow handoff. Gate 1's
+          // function_name_at check catches the symbolized case on the
+          // NEXT iteration (when the scanner steps into the target
+          // function); the new code below pre-empts gate 1 by parsing
+          // the conditional's target operand inline. The pre-empt is
+          // necessary for stripped binaries where function_name_at
+          // returns "" for both sides and gate 1 silently misses the
+          // boundary. The bump on adrp_pair_cond_branch_reset signals
+          // when the new path fires.
+          //
+          // Conditional branch mnemonics:
+          //   b.eq / b.ne / b.cs / b.cc / b.mi / b.pl / b.vs / b.vc
+          //   b.hi / b.ls / b.ge / b.lt / b.gt / b.le / b.al / b.nv
+          //   cbz / cbnz / tbz / tbnz
+          const bool is_cond_branch =
+              (mnem_lower.size() >= 4 && mnem_lower.compare(0, 2, "b.") == 0) ||
+              mnem_lower == "cbz"  || mnem_lower == "cbnz" ||
+              mnem_lower == "tbz"  || mnem_lower == "tbnz";
+
+          // Phase 4 item 3: record B / BL targets as function-start
+          // hints. The scanner uses these to reset adrp_regs on the
+          // stripped-binary case where function_name_at returns ""
+          // and gate 1 can't tell two adjacent functions apart. We
+          // record both calls (BL — target is a callee function
+          // entry) and unconditional branches (B — target is a
+          // tail-call destination, also a function entry). BR has
+          // a register operand, not a literal address — skip.
+          // BLR / BLRAA / BLRAB / BLRAAZ / BLRABZ are also register-
+          // operand calls and don't expose a literal target. The
+          // recorded address must lie inside the current code
+          // section to be useful — out-of-section targets (calls
+          // into dyld stubs, etc.) won't be visited by our scanner.
+          //
+          // Phase-4 cleanup N6 limitation: function_starts is local
+          // to this section's scan. A BL that targets a function in a
+          // DIFFERENT __TEXT section (rare but possible with
+          // -fsplit-data-sections or multi-segment executables) is
+          // recorded into THIS section's function_starts set; the
+          // OTHER section's scan never sees it. The function-boundary
+          // signal there falls back to gate 1's function_name_at.
+          // A unified cross-section function_starts would close this,
+          // but the trade-off (one shared set keyed on absolute
+          // file_addr, scanned per-instruction) hasn't shown up as a
+          // false-positive in any real binary we've measured.
+          // Phase-5 follow-up.
+          if ((mnem_lower == "bl" || mnem_lower == "b") &&
+              !i.operands.empty()) {
+            auto t = parse_last_hex_in_operands(i.operands);
+            if (t.has_value() && *t >= start && *t < section_end) {
+              function_starts.insert(*t);
+            }
+          }
+
+          // ADRP itself sets adrp_regs[dst] in the ADRP branch above.
+          // Skipping clobber-by-default here preserves that tracking
+          // insertion as the ONE legitimate "this dst now holds an
+          // ADRP page" path.
+          bool dst_already_handled = (mnem_lower == "adrp");
+
           if (is_call) {
             // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
             // callee may overwrite x0..x18 + x30 — the scanner has
-            // no way to know the callee's behaviour.
+            // no way to know the callee's behaviour. Calls don't have
+            // a GPR destination in the destination-register sense the
+            // resolver tracks (BL writes x30 but that's covered by
+            // the caller-saved set), so clobber-by-default is a no-op
+            // here.
             clobber_aapcs64_caller_saved(adrp_regs);
-          } else if (mnem_lower == "add" || mnem_lower == "sub" ||
-                     mnem_lower == "adds" || mnem_lower == "subs") {
-            // Gate 3: ADD / SUB (and the flag-setting siblings) write
-            // a computed value, not an ADRP page. Clear adrp_regs[dst]
-            // regardless of whether dst==src or the second operand was
-            // tracked. resolve_adrp_consumer has already run; the match
-            // (if any — only the ADD shape emits one) is already in
-            // `out`. SUB joins per the post-review spec: same
-            // destination-write semantics, same false-positive class.
-            clobber_arith_destination(i.operands, adrp_regs);
+            dst_already_handled = true;
           } else if (mnem_lower == "mov" || mnem_lower == "movz" ||
                      mnem_lower == "movk" || mnem_lower == "movn") {
-            // Gate 4: MOV may propagate or clobber. The bool return is
-            // discarded here — the mnemonic check above already
-            // narrowed to MOV variants. The same return is what lets
-            // resolve_adrp_consumer short-circuit on MOV without
-            // running the LDR/STR operand parser (see the early-bail
-            // at the top of resolve_adrp_consumer).
+            // MOV may propagate or clobber. apply_mov_state owns the
+            // destination's tracking — either setting it from a
+            // tracked source (mov xN, xM) or erasing it (every other
+            // form). Mark the destination as handled so the
+            // clobber-by-default pass below doesn't undo a legitimate
+            // propagation.
             (void)apply_mov_state(mnem_lower, i.operands, adrp_regs);
+            dst_already_handled = true;
           } else if (is_return || is_indirect_branch || mnem_lower == "b") {
             // Gate 1 follow-up: end-of-basic-block instructions that
             // exit the current function reset the entire map. We don't
@@ -2664,9 +2773,117 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // function via subsequent ADRPs. The conservative reset is
             // the phase-3 acceptance bar. Function-boundary detection
             // by symbol name would miss the two-adjacent-stripped-
-            // functions case; phase-4 follow-up tracked in the worklog.
+            // functions case; phase 4 item 3's function_starts set
+            // closes that.
             adrp_regs.clear();
             current_function_known = false;
+            dst_already_handled = true;
+          } else if (is_cond_branch) {
+            // Phase 4 item 1 (post-cleanup C1+C2,
+            // docs/35-field-report-followups.md §3): parse the
+            // conditional branch's target address from operands and
+            // decide if the target is in a different function. Only
+            // when target_fn != current_function do we (a) record the
+            // target as a function_start hint so gate 3 fires when the
+            // scanner later reaches it via fall-through, and (b) bump
+            // the provenance counter. We do NOT clear adrp_regs on
+            // the source side — by definition the fall-through is in
+            // the same function and the spec requires the fall-through
+            // tracking to be preserved (an `add x0, x8, #imm` right
+            // after a cbz to another function is a legitimate xref).
+            //
+            // Same-function cbz/tbz targets (local merge labels, loop
+            // backedges) MUST NOT enter function_starts. If they did,
+            // gate 3 would clear adrp_regs at the label and kill
+            // legitimate xrefs on the post-label consumer — the C2
+            // bug. The cross-fn check below is the gate.
+            //
+            // We skip the lookup when adrp_regs is empty AND the
+            // hint isn't useful yet — but the function_starts hint
+            // is still valuable for LATER iterations once an ADRP
+            // gets tracked, so phase 4 cleanup I4 lifts the hint
+            // bookkeeping outside the adrp_regs-non-empty guard.
+            auto branch_target = parse_last_hex_in_operands(i.operands);
+            if (branch_target.has_value()) {
+              // current_function may be unknown (no prior ADRP). Prime
+              // it from the current instruction so the cross-fn check
+              // has both sides to compare. This is cheap (one SBAPI
+              // call) and only fires on the cond-branch path.
+              if (!current_function_known) {
+                auto sa = target.ResolveFileAddress(i.address);
+                current_function = function_name_at(target, sa);
+                current_function_known = true;
+              }
+              std::string target_fn;
+              if (last_target_known && *branch_target == last_target_addr) {
+                target_fn = last_target_fn;
+              } else {
+                auto sa_target = target.ResolveFileAddress(*branch_target);
+                target_fn = function_name_at(target, sa_target);
+                last_target_addr  = *branch_target;
+                last_target_fn    = target_fn;
+                last_target_known = true;
+              }
+              // Cross-function only: bump the recorded-target counter
+              // and add to function_starts. Non-empty target_fn matters
+              // because stripped binaries return "" on both sides and
+              // we don't want to false-trigger on same-stripped-fn
+              // cbz patterns (item 3 handles those via the B/BL-target
+              // function_starts set below).
+              if (!target_fn.empty() && target_fn != current_function) {
+                // Record the target so gate 3 fires on the TAKEN side
+                // when the scanner reaches it on a later iteration.
+                // Fall-through tracking on the source side is
+                // intentionally preserved (C1 spec: "Fall-through
+                // path: preserve state").
+                if (*branch_target >= start && *branch_target < section_end) {
+                  function_starts.insert(*branch_target);
+                }
+                if (provenance != nullptr) {
+                  provenance->adrp_pair_cond_branch_recorded++;
+                  std::ostringstream w;
+                  w << "conditional branch " << mnem_lower
+                    << " at 0x" << std::hex << i.address
+                    << " targets a different function ("
+                    << target_fn
+                    << ") — target recorded as function-start hint";
+                  provenance->warnings.push_back(w.str());
+                }
+              }
+            }
+          }
+
+          // Clobber-by-default (phase-4 cleanup C3+C4,
+          // docs/35-field-report-followups.md §3). After every explicit
+          // propagation path has fired (ADRP records, MOV propagates,
+          // call clobbers caller-saved set, return/B clears all), erase
+          // every destination register the instruction wrote. This
+          // catches CSEL / CSET / CSINC / CSINV / CSNEG / LDP / LDPSW /
+          // LDXP / LDAR / LDAXR / MADD / MSUB / EOR-with-shift / ORR /
+          // AND / ASR / LSL / EXTR / BFI / BFM / UBFX / SBFX / FMOV /
+          // SDIV / UDIV / REV / CLZ — every "writes a register"
+          // instruction the previous whitelist missed.
+          //
+          // dst_already_handled gates this — set by ADRP (the
+          // tracking-insertion path) and the explicit MOV/call/return
+          // arms. Without that gate, ADRP would set adrp_regs[dst] and
+          // we'd immediately erase it; MOV xN, xM would propagate and
+          // then be undone.
+          //
+          // ADD with a matched-emit isn't in the explicit arm above
+          // — it falls through to this clobber, which is exactly what
+          // the post-emit semantics require (the ADD's result is
+          // page+imm, no longer a clean page address; subsequent loads
+          // through dst must not bind to the old page). The
+          // legitimate xref has already been pushed to `out` by the
+          // match-emit block above.
+          if (!dst_already_handled) {
+            auto dsts =
+                xref_arm64::parse_destination_registers(mnem_lower,
+                                                         i.operands);
+            for (const auto& d : dsts) {
+              adrp_regs.erase(d);
+            }
           }
         }
       }
@@ -2699,13 +2916,24 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
   out.erase(last, out.end());
 
   // Phase-3 gate 7: emit a human-readable warning when at least one
-  // register-offset LDR was skipped. The agent uses this to decide
-  // whether the ADRP-pair heuristic is authoritative on this binary
-  // or whether it should fall back to symbol-index correlate.
-  if (provenance != nullptr && provenance->adrp_pair_skipped > 0) {
+  // register-offset LDR was skipped IN THIS CALL. The agent uses this
+  // to decide whether the ADRP-pair heuristic is authoritative on this
+  // binary or whether it should fall back to symbol-index correlate.
+  //
+  // Delta-based emission (phase-4 cleanup I1): when the caller shares
+  // a provenance across multiple xref_address invocations
+  // (find_string_xrefs does this), we'd otherwise emit the warning at
+  // each call with the cumulative skip count, producing duplicate
+  // (and increasingly stale) warning strings. Compare against the
+  // baseline captured at function entry and emit only if THIS call
+  // added skips.
+  if (provenance != nullptr &&
+      provenance->adrp_pair_skipped > baseline_adrp_pair_skipped) {
+    const std::uint32_t this_call_skipped =
+        provenance->adrp_pair_skipped - baseline_adrp_pair_skipped;
     provenance->warnings.push_back(
         "adrp-pair resolver skipped " +
-        std::to_string(provenance->adrp_pair_skipped) +
+        std::to_string(this_call_skipped) +
         " register-offset LDR(s) with tracked base "
         "(`[xN, xM]` / `[xN, xM, lsl #imm]`) — these are potential xrefs "
         "the heuristic cannot statically resolve");
@@ -2715,7 +2943,8 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
 }
 
 std::vector<StringXrefResult>
-LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
+LldbBackend::find_string_xrefs(TargetId tid, const std::string& text,
+                                XrefProvenance* provenance) {
   // Sanity-check the target up front (throws on invalid).
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
@@ -2754,7 +2983,15 @@ LldbBackend::find_string_xrefs(TargetId tid, const std::string& text) {
     r.string = sm;
 
     // Address-based xrefs (catches x86-64 direct loads, etc.).
-    auto addr_hits = xref_address(tid, sm.address);
+    // Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): thread
+    // the caller-supplied provenance so the ADRP-pair resolver's
+    // diagnostics (adrp_pair_skipped, adrp_pair_writeback_cleared,
+    // adrp_pair_cond_branch_recorded, adrp_pair_function_start_reset,
+    // adrp_pair_unresolvable_load, warnings) aren't dropped on the
+    // floor when xref is invoked via string.xref. Each StringMatch
+    // contributes its own xref_address scan; the counters and warnings
+    // accumulate across all matches into the same `provenance` slot.
+    auto addr_hits = xref_address(tid, sm.address, provenance);
     r.xrefs.insert(r.xrefs.end(),
                    std::make_move_iterator(addr_hits.begin()),
                    std::make_move_iterator(addr_hits.end()));

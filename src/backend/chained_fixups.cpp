@@ -21,6 +21,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ldb::backend {
@@ -435,16 +436,58 @@ ChainedFixupMap extract_chained_fixups_from_thin_macho(
   return parse_chained_fixups(fixups_payload, fixups_size, segments);
 }
 
+// Phase 4 item 2 (docs/35-field-report-followups.md §3): classify a
+// triple string into the (cpu_type, cpu_subtype) pair the FAT picker
+// should prefer. Returns false when the triple is empty or doesn't
+// name a known arch — in which case the picker falls back to the
+// phase-3 preference order (arm64e > arm64).
+//
+// Triple substring -> (cpu_type, cpu_subtype) table:
+//   "arm64e-" -> CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E (2)
+//   "arm64-"  -> CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL (0)
+//   "x86_64-" -> CPU_TYPE_X86_64, any subtype (x86_64 has no chained
+//                fixups today; the picker still skips past it the
+//                same way phase 3 did)
+//
+// "arm64-" matching must come AFTER "arm64e-" — the LLDB-reported
+// triple for arm64e binaries contains "arm64e-", which starts with
+// "arm64" without the trailing dash. The substring check is bracketed
+// by the dash so we don't accidentally match "arm64-" inside
+// "arm64e-apple-...".
+constexpr std::uint32_t kCpuTypeX86_64 = 0x01000007;
+
+bool triple_to_preferred_arch(std::string_view triple,
+                              std::uint32_t* cpu_type,
+                              std::uint32_t* cpu_subtype) {
+  if (triple.empty()) return false;
+  if (triple.find("arm64e-") != std::string_view::npos) {
+    *cpu_type    = kCpuTypeArm64;
+    *cpu_subtype = kCpuSubTypeArm64E;
+    return true;
+  }
+  if (triple.find("arm64-") != std::string_view::npos) {
+    *cpu_type    = kCpuTypeArm64;
+    *cpu_subtype = 0;  // ARM64_ALL — the picker also accepts _V8 (1)
+    return true;
+  }
+  if (triple.find("x86_64-") != std::string_view::npos) {
+    *cpu_type    = kCpuTypeX86_64;
+    *cpu_subtype = 0;
+    return true;
+  }
+  // Unknown / unhandled triple — fall back to preference order.
+  return false;
+}
+
 // FAT slice selection (docs/35-field-report-followups.md §3 phase 3
-// gate 5). Iterate the fat_arch[] table, prefer arm64e, then arm64,
-// then anything else, then dispatch to the thin parser on the picked
-// slice's (offset, size) sub-region. The phase-3 acceptance criteria
-// say "match the SBTarget's triple"; here we approximate that with
-// arm64e-then-arm64 preference because the xref pipeline only
-// produces chained-fixup output on those archs.
+// gate 5; phase 4 item 2). Iterate the fat_arch[] table; if a triple
+// hint is supplied, try the matching slice first. Otherwise fall back
+// to the phase-3 preference order (arm64e > arm64). The phase-3
+// acceptance criteria said "match the SBTarget's triple"; phase 4
+// closes the loop by actually threading it through.
 ChainedFixupMap extract_chained_fixups_from_fat(
     const std::uint8_t* fat_bytes, std::size_t fat_size,
-    bool is_fat64) {
+    bool is_fat64, std::string_view triple) {
   if (fat_bytes == nullptr || fat_size < 8) return {};
   // fat_header: magic[0..4] nfat_arch[4..8]. Big-endian on disk.
   const std::uint32_t nfat_arch = read_u32_be(fat_bytes + 4);
@@ -501,24 +544,52 @@ ChainedFixupMap extract_chained_fixups_from_fat(
         fat_bytes + a.offset, static_cast<std::size_t>(a.size));
   };
 
-  // Slice preference: arm64e first, then plain arm64. We treat a
-  // slice with an EMPTY resolved map as "this slice has no chained
-  // fixups, try the next" rather than "use this empty result." That
-  // means a FAT binary whose arm64e slice has chained fixups but
-  // whose arm64 slice doesn't will return the arm64e result; a FAT
-  // binary whose arm64 slice has fixups but arm64e doesn't will
-  // fall through to the arm64 slice.
+  // Phase 4 item 2 + cleanup C5: if the caller provided a triple and
+  // a slice with the matching (cpu_type, cpu_subtype) EXISTS in the
+  // FAT, that slice's parse result wins — even when its resolved map
+  // is empty. The C5 silent-wrong-result bug was returning a
+  // DIFFERENT slice's result (with that slice's image_base) when the
+  // triple-matched slice happened to be a classic LC_DYLD_INFO_ONLY
+  // binary with no chained fixups; the caller's xref scan then
+  // resolved every ADRP page through the wrong slice's image_base
+  // and silently produced garbage.
   //
-  // Hazard: if BOTH slices have chained fixups but with different
-  // image_bases (which happens when the slices have different
-  // segment layouts — possible after a thinning + repacking
-  // pipeline), the arm64e slice wins and its image_base is what we
-  // hand back. The caller then walks the LLDB-loaded slice (which
-  // might be arm64) and tries to resolve its file-addresses against
-  // the wrong image_base, producing zero matches. Phase-4 follow-up
-  // tracked in the worklog: thread the SBTarget's triple through
-  // extract_chained_fixups_from_macho so the picker matches what
-  // LLDB actually loaded.
+  // Correct semantics: if the triple matched ANY slice in the FAT,
+  // honour LLDB's choice and return THAT slice's parse — including
+  // the empty-fixups case. Only fall back to phase-3 preference
+  // when NO slice in the FAT matches the triple at all.
+  std::uint32_t triple_cpu_type = 0, triple_cpu_subtype = 0;
+  if (triple_to_preferred_arch(triple, &triple_cpu_type,
+                                &triple_cpu_subtype)) {
+    for (const auto& a : archs) {
+      if (a.cpu_type == triple_cpu_type &&
+          a.cpu_subtype_masked == triple_cpu_subtype) {
+        return pick_and_run(a);
+      }
+    }
+    // ARM64_ALL match also accepts CPU_SUBTYPE_ARM64_V8 (=1). The
+    // exact-match pass above would have missed a V8-tagged slice;
+    // the second pass below catches it. Skip when the triple
+    // demanded arm64e — V8 is not arm64e.
+    if (triple_cpu_type == kCpuTypeArm64 &&
+        triple_cpu_subtype == 0) {
+      for (const auto& a : archs) {
+        if (a.cpu_type == kCpuTypeArm64 &&
+            a.cpu_subtype_masked == 1) {
+          return pick_and_run(a);
+        }
+      }
+    }
+    // No slice in the FAT matches the triple at all. Fall through
+    // to the preference order below — this is the legitimate
+    // "triple says x86_64 but the FAT only ships arm64{e}" path.
+  }
+
+  // Phase-3 preference order (also the fallback when triple is empty
+  // or didn't match a known arch). arm64e first, then plain arm64.
+  // A slice with an EMPTY resolved map is treated as "no chained
+  // fixups in this slice; try the next" rather than "use this empty
+  // result."
   for (const auto& a : archs) {
     if (a.cpu_type == kCpuTypeArm64 &&
         a.cpu_subtype_masked == kCpuSubTypeArm64E) {
@@ -541,19 +612,21 @@ ChainedFixupMap extract_chained_fixups_from_fat(
 }  // namespace
 
 ChainedFixupMap extract_chained_fixups_from_macho(
-    const std::uint8_t* macho_bytes, std::size_t macho_size) {
+    const std::uint8_t* macho_bytes, std::size_t macho_size,
+    std::string_view triple) {
   if (macho_bytes == nullptr || macho_size < 8) {
     return {};
   }
   const std::uint32_t magic = read_u32(macho_bytes);
   if (magic == kFatMagicLE) {
     return extract_chained_fixups_from_fat(macho_bytes, macho_size,
-                                            /*is_fat64=*/false);
+                                            /*is_fat64=*/false, triple);
   }
   if (magic == kFatMagic64LE) {
     return extract_chained_fixups_from_fat(macho_bytes, macho_size,
-                                            /*is_fat64=*/true);
+                                            /*is_fat64=*/true, triple);
   }
+  // Thin Mach-O — no slice to pick, triple is irrelevant.
   return extract_chained_fixups_from_thin_macho(macho_bytes, macho_size);
 }
 

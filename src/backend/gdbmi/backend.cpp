@@ -1272,7 +1272,8 @@ GdbMiBackend::xref_address(TargetId tid, std::uint64_t,
 }
 
 std::vector<StringXrefResult>
-GdbMiBackend::find_string_xrefs(TargetId tid, const std::string&) {
+GdbMiBackend::find_string_xrefs(TargetId tid, const std::string&,
+                                  XrefProvenance*) {
   // Same scope decision as xref_address — composed of find_strings
   // (also punted on this backend) + xref_address (also punted), so
   // the result would always be empty even if we wired it up. Keep
