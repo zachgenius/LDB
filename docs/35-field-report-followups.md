@@ -255,11 +255,16 @@ individual SHAs and the rationale per piece.
    `NotificationSink` via `add_notification_sink` and drops it on
    disconnect via `remove_notification_sink`. The pre-phase-2
    single-atomic-sink-pointer design was race-free only because
-   phase-1 allowed at most one connection alive at a time; the
-   subscriber set lets every live connection's `OutputChannel`
-   receive every async notification without cross-talk. The
-   legacy `set_notification_sink(sink)` API survives as a
-   clear-then-add shim for stdio mode.
+   phase-1 allowed at most one connection alive at a time.
+   Post-review honesty fix (I1): the subscriber set is
+   broadcast-to-all — every live subscriber receives every
+   notification; per-target filtering happens at the client. The
+   prior wording ("without cross-talk") implied server-side
+   target_id routing, which is a phase-3 item. Subscriber storage
+   is `std::shared_ptr<NotificationSink>` so a concurrent disconnect
+   can't free a sink mid-emit (post-review C1 fix). The legacy
+   `set_notification_sink(sink)` API survives as a clear-then-add
+   shim for stdio mode.
 
 2. **Multi-client socket listener.** `socket_loop.cpp`'s accept
    loop now spawns a `std::thread` per accepted connection. The
@@ -336,14 +341,23 @@ Items deferred from the phase-2 work, in roughly priority order:
   0600) at startup; the client reads it and presents it on the
   first frame; daemon rejects connections that don't present
   it. The token rotates on restart.
-- **Per-target dispatcher sharding.** Phase-2 serialises all
-  dispatch through `dispatch_mu_`. The dispatcher's per-target
+- **Target_id-aware notification routing.** Phase-2's subscriber
+  set is broadcast-to-all: every live `OutputChannel` receives
+  every async notification regardless of which target_id it
+  originated from. Clients filter by `params.target_id` today.
+  Phase-3: have `NonStopRuntime` accept a target_id filter at
+  subscription time so the daemon does the filtering and per-
+  client traffic stays scoped to the targets they actually opened.
+- **Per-target dispatcher sharding (true per-connection
+  parallelism).** Phase-2 serialises all dispatch through
+  `dispatch_mu_`, so two clients hitting separate target_ids
+  still queue at the dispatcher. The dispatcher's per-target
   mutable state (target_main_module_, the diff cache keyed by
   snapshot, the cost-samples ring) would migrate to a per-target
   map under a per-target mutex; the truly-global pieces
-  (active_session_writer_, recipe loader bookkeeping) stay
-  under the outer mutex. Phase-3 problem, not phase-2: today's
-  workloads don't appear to spend significant time contended on
+  (active_session_writer_, recipe loader bookkeeping) stay under
+  the outer mutex. Phase-3 problem, not phase-2: today's workloads
+  don't appear to spend significant time contended on
   `dispatch_mu_`.
 - **True in-flight RPC cancellation.** Phase-2 stops accepting
   new RPCs on shutdown but waits for in-flight workers to

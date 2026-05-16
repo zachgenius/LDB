@@ -4,6 +4,189 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — §2 phase-2 post-review cleanup
+
+**Goal:** Close out the opus-linus-style review findings on
+`phase2-socket-multiclient` before the branch merges. The review
+flagged one critical UAF (C1), four hardening items (I1–I5), and
+six naming/comment honesty fixes (N1–N6). All landed on the same
+branch as the phase-2 commits — keeping the original work and the
+hardening together so anyone bisecting sees a consistent picture.
+
+**Done:**
+
+Pre-existing commits on this branch (landed earlier in the session
+and NOT amended here):
+
+- `2e6f4ed` — **C1 (UAF fix).** Migrated `NonStopRuntime`'s
+  subscriber storage from raw `NotificationSink*` to
+  `std::shared_ptr<NotificationSink>`. emit_stopped_'s snapshot now
+  copies shared_ptrs, bumping refcount across the (lock-dropped)
+  iteration. Reviewer reproduced the original race with TSan
+  (vptr race) and ASan (heap-use-after-free) on a focused
+  multi-threaded unit test. Also folded in the unit-test tag
+  rename N6 (`[multi-client]` → `[broadcast]`) because the runtime
+  is broadcast-to-all; per-target routing is phase-3.
+- `bad8f90` — **I2 (worker shutdown gate).** Workers now check
+  the shutdown latch before entering `dispatch()`. Pre-fix, a
+  signal racing with accept() could let a worker run to completion
+  on a daemon the operator just SIGTERMed.
+- `2978590` — **I3 (SO_SNDTIMEO on accepted sockets).** A wedged
+  client (paused on a sigstop, or `kill -STOP` mid-read) used to
+  pin the dispatcher's write thread forever; SO_SNDTIMEO breaks
+  the write loop after the same 5-minute window the recv side
+  uses. Closes the cascading-failure mode where one stuck client
+  brings down the daemon's responsiveness to every other
+  connection.
+- `8c03765` — **I4 + N3 + N4 (atomic stderr, atomic shutdown-pipe
+  write end).** I4: log lines built as a single `std::string` and
+  emitted with one `fwrite` so concurrent writers don't interleave
+  bytes mid-line (sub-PIPE_BUF lines are POSIX-atomic). N3:
+  shutdown-pipe write end opened O_NONBLOCK so the signal handler's
+  write(2) can't block on a full pipe. N4: drain loop is also
+  non-blocking and terminates on EAGAIN.
+
+New commits in this cleanup pass (in order):
+
+- **I5 + N1 + N2 + N5 (CLI hardening).** `tools/ldb/ldb`:
+  - I5: `_resolve_autospawn_ldbd()` probes `<path> --version`
+    with a 2s timeout and rejects the binary if the output
+    doesn't contain "ldbd". Pre-fix, a mistyped
+    `$LDB_LDBD_SPAWN=/usr/bin/yes` would spawn a child that never
+    bound the socket; the client burned 3s of retries before
+    surfacing "auto-spawned ldbd never began accepting" with no
+    hint the env var was wrong. Post-fix, the operator sees
+    "LDB_LDBD_SPAWN=... does not look like ldbd" at config time
+    and the resolver falls through to PATH / sibling lookup.
+  - Companion daemon change: `ldbd --version` now prints
+    `ldbd <version>` (matching the `ldb-dap --version` convention
+    and the `--help` first-line format). The I5 probe greps for
+    "ldbd", so this is a coupled change — folded into the same
+    commit so bisection sees both.
+  - N1: docstring on `_autospawn_daemon` matched to the actual
+    behaviour (stderr → /dev/null by default, opt-in via
+    `$LDB_LDBD_LOG_FILE`). The old text claimed stderr was
+    inherited from the parent, which was wrong post-phase-2.
+  - N2: retry-loop comment ("200ms * 10 retries (~2s)") was lying
+    — loop is `range(15)`. Comment updated to "200ms * 15 retries
+    (~3s)". One-line factual fix.
+  - N5: socket re-created inside the retry loop on each
+    iteration. POSIX leaves a socket whose `connect()` failed in
+    an unspecified state for further connect() calls; reusing it
+    works on Linux and macOS today but is pedantically undefined.
+    Fresh socket per iteration removes the corner case at the
+    cost of one extra socket() syscall per retry.
+  - Smoke test `test_socket_autospawn_validates_binary.py`: pins
+    LDB_LDBD_SPAWN to `/bin/echo` (real X_OK binary, doesn't print
+    "ldbd"), strips $PATH down to python+coreutils so the
+    `which("ldbd")` step also fails, asserts the CLI completes
+    via sibling-fallback under 2.5s with the expected diagnostic
+    on stderr. TDD-verified red: with the probe reverted, the test
+    fails at 3.08s with the pre-fix "never began accepting"
+    message and no env-var context. Registered as
+    `smoke_socket_autospawn_validates_binary` with 30s TIMEOUT.
+
+- **N6 (smoke test naming honesty) + docs I1.**
+  - `tests/smoke/test_socket_multiclient.py`: docstring rewritten
+    to "Validates accept-level concurrency + state persistence
+    across connections." Pre-fix the docstring claimed
+    "concurrent dispatch" which is overstated — `dispatch_mu_`
+    serialises overlapping dispatch in phase-2. The test does NOT
+    pin dispatch parallelism (it pins accept-level concurrency
+    and per-connection target_id state persistence); the docstring
+    now says so. Updated the in-test comment and the success
+    message in the same spirit. CMake test name kept as
+    `smoke_socket_multiclient` — still accurate at the file level.
+  - `docs/35-field-report-followups.md`: §2 phase-2 item 1
+    ("Multi-subscriber notification sinks") rewritten to say
+    "broadcast-to-all; per-target filtering happens at the
+    client." The original "without cross-talk" wording implied
+    server-side routing by target_id, which doesn't exist
+    in phase-2.
+
+- **Phase-3 list + worklog.** `docs/35-field-report-followups.md`'s
+  "Phase 3 — carried forward" section split the dispatcher-sharding
+  item into two — one for the notification-routing dimension
+  (new bullet) and one for the dispatch-parallelism dimension
+  (rewording of the existing bullet to call out that overlapping
+  dispatches on independent target_ids still queue today). The
+  SBAPI cancellation item and the worker-reaping item were
+  already in the list and stay as-is. This worklog entry.
+
+**Decisions:**
+
+- **`ldbd --version` cosmetic change rolled into the I5 commit.**
+  Could have been its own one-line commit but the I5 probe
+  literally depends on the new output format. Bisecting from
+  "smoke_socket_autospawn_validates_binary fails" should land on
+  one commit that simultaneously fixes the probe AND adjusts the
+  daemon output it grepped — anything else makes the failure mode
+  confusing. Verified no smoke / unit test asserts on the
+  pre-change `ldbd --version` byte sequence.
+- **/bin/echo for the bad-binary test, not /usr/bin/yes.** `yes`
+  exits non-zero when `--version` SIGPIPEs on the captured stdout
+  buffer fill; that path would test the rc!=0 branch of
+  `_looks_like_ldbd`, not the "contains 'ldbd'" substring check.
+  `echo` exits 0 cleanly and prints output that doesn't contain
+  "ldbd" on macOS and Linux. Tests the substring path
+  specifically — the more important branch because that's the
+  failure mode the operator is most likely to hit (e.g. pointing
+  at the wrong subcommand of a multi-tool binary).
+- **Did NOT rename the multiclient smoke test file or its CMake
+  registration name** for N6. The brief said "rename test OR
+  docstring"; the docstring is the more semantically loaded
+  surface, the filename is fine. Renaming the file would have
+  churned git history and CMake without changing what the test
+  verifies.
+- **Did NOT modify pre-existing commits on this branch.** Any
+  history rewrite (rebase, fixup, amend) on `2e6f4ed`, `bad8f90`,
+  `2978590`, or `8c03765` would invalidate any local checkouts of
+  those SHAs that reviewer / CI may already have. Cleanup landed
+  as new commits on top.
+
+**Surprises / blockers:**
+
+- The original WIP in `tools/ldb/ldb` was nearly complete (97+/18-)
+  and well-commented when I picked it up after the rate-limit
+  interruption — author had already wired I5, N1, N2, AND N5 into
+  one diff. Only outstanding bug was that `ldbd --version` printed
+  just `1.6.1`, not "ldbd 1.6.1" — so the new `_looks_like_ldbd`
+  probe would reject the real daemon. Fixed by updating
+  `src/main.cpp` to match `ldb-dap`'s convention. Finished the
+  WIP rather than restarting; comment quality was already good.
+- The new smoke test initially failed with `env: python3: No such
+  file or directory` because I'd stripped $PATH to "/nonexistent"
+  to force the bad-binary path. Python shebang via `env` needs
+  python3 on $PATH. Fixed by setting $PATH to the test
+  interpreter's bin dir + /usr/bin + /bin — enough for python and
+  coreutils but no ldbd discovery.
+- TDD-red verification of the new smoke test: stashed the I5 fix,
+  ran the test, watched it fail at 3.08s elapsed with exactly the
+  pre-fix symptom (no LDB_LDBD_SPAWN diagnostic, "never began
+  accepting" message). Confirms the test pins the regression we
+  care about. Restored fix, test now passes in 0.49s.
+
+**Verification:**
+
+- `cmake --build build` — warning-clean (rebuilt twice, once after
+  the `--version` change in src/main.cpp).
+- `ctest --test-dir build --output-on-failure` — 90/90 pass.
+  One new test (`smoke_socket_autospawn_validates_binary`) plus
+  the 89 from phase-2. Phase-1 socket tests, multiclient,
+  autospawn, daemon.shutdown, interruption, idle-timeout,
+  autospawn-logs, and the broadcast / nonstop unit tests all
+  green.
+
+**Next:**
+
+Branch is ready for review/merge. Phase-3 items are enumerated
+in `docs/35-field-report-followups.md`'s updated "Phase 3 —
+carried forward" subsection; top priority is token auth (the
+trust-model phase-1 ducked) and target_id-aware notification
+routing (the broadcast-to-all phase-2 ducked).
+
+---
+
 ## 2026-05-16 — persistent unix-socket daemon (§2 phase 2)
 
 **Goal:** Land §2 phase-2 of `docs/35-field-report-followups.md` —
