@@ -27,7 +27,7 @@ void print_usage() {
   std::cerr <<
     "ldbd " << ldb::kVersionString << "\n"
     "Usage: ldbd [--stdio | --listen unix:PATH] [--format json|cbor]\n"
-    "            [--log-level debug|info|warn|error]\n"
+    "            [--listen-idle-timeout N] [--log-level debug|info|warn|error]\n"
     "            [--store-root <path>]\n"
     "            [--observer-exec-allowlist <path>] [-h|--help]\n"
     "\n"
@@ -74,6 +74,14 @@ void print_usage() {
     "                     $XDG_RUNTIME_DIR/ldbd.sock   (if set)\n"
     "                     $TMPDIR/ldbd-$UID.sock       (else)\n"
     "                     /tmp/ldbd-$UID.sock          (last resort)\n"
+    "  --listen-idle-timeout N\n"
+    "                   Exit cleanly after N seconds with no active\n"
+    "                   connections (and no in-flight worker threads).\n"
+    "                   0 = disabled, the default. Useful for\n"
+    "                   orchestrators that auto-spawn the daemon and\n"
+    "                   want it to die quietly after a burst of\n"
+    "                   activity finishes. Only honoured in --listen\n"
+    "                   mode.\n"
     "  --format <fmt>   Wire format on stdin/stdout. `json` (default) is\n"
     "                   line-delimited JSON. `cbor` is length-prefixed RFC\n"
     "                   8949 binary frames (4-byte big-endian uint32 length\n"
@@ -170,6 +178,7 @@ int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
   bool listen_mode = false;
   std::string listen_socket_path;
+  int listen_idle_timeout_sec = 0;  // 0 = disabled
   std::string store_root_arg;
   std::string observer_exec_allowlist_arg;
   std::string backend_arg;
@@ -181,7 +190,13 @@ int main(int argc, char** argv) {
       print_usage();
       return 0;
     } else if (a == "--version") {
-      std::cout << ldb::kVersionString << '\n';
+      // Print "ldbd <version>" not just "<version>": the `ldb` CLI's
+      // auto-spawn probe (`_looks_like_ldbd`) greps the output of
+      // `--version` for the literal "ldbd" so a misconfigured
+      // `$LDB_LDBD_SPAWN` pointing at e.g. /usr/bin/yes is rejected
+      // before we burn the 3s retry-then-fail path. Matches the
+      // `ldb-dap --version` convention.
+      std::cout << "ldbd " << ldb::kVersionString << '\n';
       return 0;
     } else if (a == "--stdio") {
       stdio_mode = true;
@@ -213,6 +228,22 @@ int main(int argc, char** argv) {
       }
       listen_mode = true;
       stdio_mode = false;
+    } else if (a == "--listen-idle-timeout" && i + 1 < argc) {
+      // §2 phase 2: opt-in idle-shutdown. Daemon exits if no new
+      // connection arrives within N seconds AND no worker thread is
+      // alive. 0 (default) disables the timeout; the daemon runs
+      // until SIGTERM / daemon.shutdown.
+      try {
+        listen_idle_timeout_sec = std::stoi(argv[++i]);
+      } catch (const std::exception&) {
+        std::cerr << "ldbd: --listen-idle-timeout requires a "
+                  << "non-negative integer (got " << argv[i] << ")\n";
+        return 2;
+      }
+      if (listen_idle_timeout_sec < 0) {
+        std::cerr << "ldbd: --listen-idle-timeout must be non-negative\n";
+        return 2;
+      }
     } else if (a == "--format" && i + 1 < argc) {
       if (!parse_wire_format(argv[++i], wire_format)) {
         std::cerr << "invalid format: " << argv[i]
@@ -350,22 +381,30 @@ int main(int argc, char** argv) {
                                      exec_allowlist, backend_name);
 
   if (listen_mode) {
-    // §2 phase 1: listen mode owns its own per-connection OutputChannel.
-    // run_socket_listener installs and removes the notification sink
-    // around each accept()ed connection so async notifications go to
-    // the right peer. No stdout writer is created at startup.
+    // §2 phase 2: listen mode spawns one worker thread per accepted
+    // connection. Each worker registers its own NotificationSink
+    // with the dispatcher and removes it on disconnect — async
+    // notifications fan out to every live subscriber via the
+    // dispatcher's NonStopRuntime. No stdout writer is created at
+    // startup; the per-connection OutputChannel lives on the
+    // worker's stack.
     return ldb::daemon::run_socket_listener(dispatcher, listen_socket_path,
-                                            wire_format);
+                                            wire_format,
+                                            listen_idle_timeout_sec);
   }
 
   // Post-V1 #21 phase-2 (docs/27): single stdout writer with mutex;
   // the listener thread's thread.event notifications and the
   // dispatcher's replies funnel through this so they never byte-
-  // interleave. The sink is borrowed by the dispatcher; both live
-  // for the duration of main(), so the borrow is stable.
+  // interleave. Post-review C1: the sink is held by shared_ptr by
+  // the dispatcher / NonStopRuntime so the listener-thread emit
+  // path cannot race against a destruction of the sink. Stdio mode
+  // is single-client and doesn't exercise that race, but the API
+  // is the same in both modes.
   ldb::protocol::OutputChannel out(std::cout, wire_format);
-  ldb::protocol::StreamNotificationSink notif_sink(out);
-  dispatcher.set_notification_sink(&notif_sink);
+  auto notif_sink =
+      std::make_shared<ldb::protocol::StreamNotificationSink>(out);
+  dispatcher.set_notification_sink(notif_sink);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher, out, wire_format);

@@ -78,7 +78,8 @@ protocol::json response_to_json(const protocol::Response& r) {
 int serve_one_connection(Dispatcher& dispatcher,
                          protocol::OutputChannel& out,
                          std::istream& in,
-                         protocol::WireFormat fmt) {
+                         protocol::WireFormat fmt,
+                         const std::function<bool()>& is_shutdown) {
   while (true) {
     std::optional<protocol::json> incoming;
     try {
@@ -107,6 +108,33 @@ int serve_one_connection(Dispatcher& dispatcher,
       continue;
     }
     if (!incoming.has_value()) return 0;  // clean EOF
+
+    // Pre-dispatch shutdown gate (post-review I2). Once
+    // daemon.shutdown or SIGTERM has fired, the daemon stops
+    // accepting new connections — and an already-connected peer that
+    // keeps sending RPCs must NOT have those RPCs dispatched against
+    // a backend the listener has already decided to tear down. We
+    // synthesise a typed error response, echoing the request id when
+    // present so the client can correlate, then break out of the
+    // loop. The worker exits; the accept-loop's join lets the
+    // process complete shutdown promptly.
+    if (is_shutdown && is_shutdown()) {
+      std::optional<protocol::json> id;
+      if (incoming->is_object()) {
+        auto it = incoming->find("id");
+        if (it != incoming->end()) id = *it;
+      }
+      auto err = protocol::make_err(id,
+                                    protocol::ErrorCode::kBadState,
+                                    "daemon shutting down");
+      try {
+        out.write_response(response_to_json(err));
+      } catch (const protocol::Error& we) {
+        log::error(std::string("failed to send shutdown error: ") +
+                   we.what());
+      }
+      return 0;
+    }
 
     protocol::Response resp;
     bool is_notification = false;

@@ -4,8 +4,8 @@
 #include "backend/debugger_backend.h"   // TargetId, ThreadId
 #include "protocol/notifications.h"
 
-#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -58,21 +58,56 @@ struct ThreadEntry {
 
 class NonStopRuntime {
  public:
-  // Lifetime: install a sink pointer (the daemon's NotificationSink)
-  // before any thread starts emitting transitions. Null sink = silent
-  // mode (state machine still runs; no notifications). The pointer is
-  // borrowed; the caller owns the lifetime.
+  // Opaque handle returned by add_notification_sink. Pass to
+  // remove_notification_sink to deregister. Stable across the
+  // lifetime of the runtime — handles are not recycled when sinks
+  // are removed.
+  using SubscriptionHandle = std::uint64_t;
+
+  // Multi-subscriber notification surface (post-V1 §2 phase-2, multi-
+  // client socket daemon; post-review C1 fix). Each connection that
+  // wants async notifications registers its own NotificationSink via
+  // add_notification_sink and deregisters on disconnect via
+  // remove_notification_sink. Stop events broadcast to every
+  // registered sink under a shared lock — there is no per-target-id
+  // routing at this layer; all subscribers receive all notifications.
+  // (Per-target routing is doable on top of this if a future caller
+  // wants narrower scope; the natural place is a notification-router
+  // layer over the runtime, not inside it.)
   //
-  // Stored as std::atomic — phase-2's listener thread is a second
-  // writer to set_stopped, and emit_stopped_ reads sink_ on that
-  // thread. The dispatcher sets the sink once at startup; we
-  // atomic-store there and atomic-load in emit_stopped_ so the load
-  // doesn't race the (one and only) store. Relaxed ordering is enough
-  // since the sink's own state (vectors, mutexes) carries its own
-  // happens-before via the sink-side machinery.
-  void set_notification_sink(protocol::NotificationSink* sink) {
-    sink_.store(sink, std::memory_order_relaxed);
-  }
+  // Lifetime: subscribers are held as `std::shared_ptr<NotificationSink>`
+  // (post-review C1). The pre-fix design stored raw pointers; the
+  // listener-thread emit path snapshotted the raw pointers under a
+  // shared lock, dropped the lock, then dereferenced — a concurrent
+  // remove_notification_sink + sink destruction could free the sink
+  // out from under the iterating listener (TSan-confirmed UAF). The
+  // shared_ptr storage means the snapshot bumps refcounts, keeping
+  // every sink alive across the iteration regardless of concurrent
+  // remove. Callers MUST allocate sinks on the heap via std::make_shared
+  // (or equivalent); a non-owning shared_ptr to a stack object is the
+  // same hazard as before, just spelled differently.
+  //
+  // Thread-safety: subscriber set protected by `sinks_mu_`. Reads
+  // (emit_stopped_) take a shared lock to snapshot the vector (cloning
+  // shared_ptrs), drop the lock, and iterate over the snapshot;
+  // writes (add/remove/clear) take a unique lock. The runtime is the
+  // only owner of the mutex; sinks themselves carry their own
+  // synchronisation (OutputChannel's mutex, the captor's vector).
+  //
+  // The returned handle uniquely identifies the subscription. Passing
+  // it to remove_notification_sink removes exactly that registration.
+  // Subscribing the same shared_ptr twice produces two handles and
+  // two delivery slots — a peculiar but well-defined contract.
+  SubscriptionHandle add_notification_sink(
+      std::shared_ptr<protocol::NotificationSink> sink);
+  void               remove_notification_sink(SubscriptionHandle h);
+
+  // Back-compat / single-subscriber shorthand (stdio mode). Replaces
+  // the entire subscriber set with this one sink (or clears it on
+  // an empty shared_ptr). Sums the common "main.cpp installs the
+  // only sink at startup" pattern into one call. Equivalent to a
+  // clear-then-add.
+  void set_notification_sink(std::shared_ptr<protocol::NotificationSink> sink);
 
   // State transitions. set_running / set_stopped insert the thread if
   // we haven't seen it before, so the dispatcher can register state
@@ -111,17 +146,36 @@ class NonStopRuntime {
   mutable std::shared_mutex mu_;
   std::unordered_map<backend::TargetId, TargetState> by_target_;
 
-  std::atomic<protocol::NotificationSink*> sink_{nullptr};
+  // Subscriber set for thread.event notifications. Phase-2 socket
+  // multi-client needs every accepted connection to have its own sink;
+  // a single atomic<NotificationSink*> would route the wrong way
+  // under concurrent connections. Stored as a vector — N is small
+  // (one per open connection) and emit_stopped_ wants stable
+  // iteration, so a flat vector beats a map. `sinks_mu_` guards the
+  // vector + counter.
+  //
+  // Post-review C1: storage migrated from `NotificationSink*` to
+  // `std::shared_ptr<NotificationSink>`. The emit_stopped_ snapshot
+  // copies the shared_ptrs (bumping refcounts) under the shared lock,
+  // then iterates outside the lock — concurrent remove cannot free
+  // the sink while the listener is still calling emit() on it.
+  struct Subscription {
+    SubscriptionHandle                            handle;
+    std::shared_ptr<protocol::NotificationSink>   sink;
+  };
+  mutable std::shared_mutex   sinks_mu_;
+  std::vector<Subscription>   sinks_;
+  SubscriptionHandle          next_handle_ = 1;
 
-  // Build the {jsonrpc=2.0, method=thread.event, params={...}} payload
-  // and forward to sink->emit. Takes the sink as a parameter so the
-  // caller atomically loads it once (avoiding a TOCTOU between a null
-  // check and the dereference). Holds no locks.
-  void emit_stopped_via_(protocol::NotificationSink* sink,
-                          backend::TargetId target,
-                          backend::ThreadId tid,
-                          std::uint64_t seq,
-                          const ThreadStop& info) const;
+  // Fan a stop event out to every registered subscriber. Takes the
+  // shared lock on sinks_mu_ for the iteration, then drops it before
+  // calling sink->emit on each — sinks acquire their own mutexes and
+  // we don't want a sink-side block to stall fan-out for the others.
+  // Holds no other locks.
+  void emit_stopped_(backend::TargetId target,
+                     backend::ThreadId tid,
+                     std::uint64_t seq,
+                     const ThreadStop& info) const;
 };
 
 }  // namespace ldb::runtime

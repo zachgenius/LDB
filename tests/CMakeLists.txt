@@ -859,6 +859,129 @@ set_tests_properties(smoke_socket_perms PROPERTIES
   TIMEOUT 30
 )
 
+# §2 phase 2: two concurrent socket clients exercising target.open +
+# module.list against the same daemon. Fails if the accept loop is
+# still single-client (the second connection's accept blocks until
+# the first disconnects, the barrier times out).
+add_test(
+  NAME smoke_socket_multiclient
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_multiclient.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_multiclient PROPERTIES
+  TIMEOUT 60
+)
+
+# §2 phase 2: `ldb --socket PATH` auto-spawns a daemon when the socket
+# isn't backed by a running ldbd. Daemon is detached so it outlives
+# the client; a second invocation reuses it.
+add_test(
+  NAME smoke_socket_autospawn
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_autospawn.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_autospawn PROPERTIES
+  TIMEOUT 60
+)
+
+# §2 phase 2: `daemon.shutdown` RPC tears the daemon down cleanly.
+# Reply ok=true is sent first; then the accept loop wakes (self-pipe)
+# and the listener / lockfile / socket inode are unlinked.
+add_test(
+  NAME smoke_daemon_shutdown_rpc
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_daemon_shutdown_rpc.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_daemon_shutdown_rpc PROPERTIES
+  TIMEOUT 30
+)
+
+# §2 phase 2: SIGTERM with an idle connection still alive — the
+# self-pipe wakes the accept loop within ~100ms so shutdown
+# completes within a few seconds (vs hanging in pre-fix
+# blocking accept).
+add_test(
+  NAME smoke_socket_interruption
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_interruption.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_interruption PROPERTIES
+  TIMEOUT 30
+)
+
+# §2 phase 2: `--listen-idle-timeout N` exits the daemon when no
+# workers are alive and no new connection arrives within N seconds.
+add_test(
+  NAME smoke_socket_idle_timeout
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_idle_timeout.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_idle_timeout PROPERTIES
+  TIMEOUT 30
+)
+
+# §2 phase 2 (post-review I2): an active connection's worker must gate
+# on the shutdown latch — pre-fix it kept dispatching RPCs after
+# daemon.shutdown fired, holding the daemon process alive past the
+# accept-loop exit.
+add_test(
+  NAME smoke_socket_shutdown_active_clients
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_shutdown_active_clients.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_shutdown_active_clients PROPERTIES
+  TIMEOUT 30
+)
+
+# §2 phase 2 (post-review I3): SO_SNDTIMEO bounds slow-reader stalls.
+# A connected-but-not-reading peer fills the kernel send buffer; pre-
+# fix the daemon's ::write() blocked indefinitely. Post-fix the worker
+# trips an EAGAIN within 60s and closes the connection cleanly.
+add_test(
+  NAME smoke_socket_slow_reader
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_slow_reader.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_slow_reader PROPERTIES
+  TIMEOUT 60
+)
+
+# §2 phase 2 (post-review I4): concurrent daemon stderr lines must
+# stay atomic. Several daemons race to bind the same socket; the
+# losers share one stderr destination. Pre-fix multi-syscall
+# `std::cerr << ... << ...` chains interleaved bytes mid-line.
+# Post-fix log_err_line emits each diagnostic with one fwrite —
+# POSIX-atomic for sub-PIPE_BUF writes.
+add_test(
+  NAME smoke_socket_autospawn_logs
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_autospawn_logs.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_autospawn_logs PROPERTIES
+  TIMEOUT 30
+)
+
+# §2 phase 2 post-review I5: a mistyped `$LDB_LDBD_SPAWN` pointing at
+# an X_OK but non-ldbd binary should be rejected at resolve-time with
+# a clear stderr diagnostic, not silently spawned and then surfaced
+# as "auto-spawned ldbd never began accepting" after 3s of retries.
+# The resolver runs `<path> --version` and greps for "ldbd"; this
+# test pins both the rejection and the graceful-degradation path
+# (sibling fallback rescues the invocation).
+add_test(
+  NAME smoke_socket_autospawn_validates_binary
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_autospawn_validates_binary.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_autospawn_validates_binary PROPERTIES
+  TIMEOUT 30
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

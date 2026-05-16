@@ -10,8 +10,10 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -51,13 +53,45 @@ class Dispatcher {
 
   protocol::Response dispatch(const protocol::Request& req);
 
-  // Install the daemon's notification sink. The sink is borrowed —
-  // the caller (main.cpp's StreamNotificationSink over the OutputChannel)
-  // owns the lifetime. Called once at startup before any RPCs arrive,
-  // so the NonStopRuntime's atomic sink_ load is a relaxed read of a
-  // value that was set during single-threaded init. See docs/27.
-  void set_notification_sink(protocol::NotificationSink* sink) {
-    nonstop_.set_notification_sink(sink);
+  // Install the daemon's notification sink. The sink is held by
+  // shared_ptr (post-review C1); the runtime keeps it alive for the
+  // duration of its registration. Called once at startup before any
+  // RPCs arrive in stdio mode. See docs/27.
+  //
+  // For multi-client socket mode (§2 phase 2), prefer add/remove —
+  // set_notification_sink REPLACES the entire subscriber set, which
+  // is the right thing for a single-writer daemon but loses every
+  // other connection's sink. The socket loop calls add+remove instead.
+  void set_notification_sink(
+      std::shared_ptr<protocol::NotificationSink> sink) {
+    nonstop_.set_notification_sink(std::move(sink));
+  }
+
+  // Subscribe / unsubscribe a notification sink without disturbing the
+  // others. Used by the §2 phase-2 socket loop: each connection adds
+  // its OutputChannel's sink on accept and removes it on disconnect.
+  // The sink is held by shared_ptr (post-review C1) so a remove on
+  // one thread cannot free the sink under a concurrent emit on the
+  // listener thread.
+  using SubscriptionHandle = runtime::NonStopRuntime::SubscriptionHandle;
+  SubscriptionHandle add_notification_sink(
+      std::shared_ptr<protocol::NotificationSink> sink) {
+    return nonstop_.add_notification_sink(std::move(sink));
+  }
+  void remove_notification_sink(SubscriptionHandle h) {
+    nonstop_.remove_notification_sink(h);
+  }
+
+  // Wire a callback to be invoked by the `daemon.shutdown` RPC after
+  // the handler returns its `{ok: true}` reply. In listen mode the
+  // socket loop sets this to a function that writes a byte to its
+  // self-pipe, which causes the accept loop to wake up and exit. In
+  // stdio mode this is left unset; the only way to stop a stdio
+  // daemon is SIGTERM (or stdin EOF) — `daemon.shutdown` returns
+  // -32002 with a "not supported in this mode" message when no
+  // callback has been wired.
+  void set_shutdown_callback(std::function<void()> cb) {
+    shutdown_callback_ = std::move(cb);
   }
 
   // Test-only seam: install a pre-made RspChannel under target_id +
@@ -198,9 +232,44 @@ class Dispatcher {
   // joins before the runtime is destroyed.
   runtime::NonStopListener                                 nonstop_listener_;
 
+  // §2 phase 2 — multi-client serialisation. The socket listener
+  // spawns one std::thread per accepted connection; without this
+  // lock, two concurrent RPCs would race on the dispatcher's mutable
+  // state: target_main_module_, diff_cache_, cost_samples_,
+  // python_unwinders_, rsp_channels_, active_session_writer_, and
+  // session-log bookkeeping all assume single-writer serial dispatch.
+  // The backend (LldbBackend) has its own per-instance mutex; this
+  // outer mutex covers the dispatcher's bookkeeping only. Held for
+  // the entire duration of dispatch() — phase-3 may refine to per-
+  // target sharding if contention shows up.
+  //
+  // **Recursive** because `session.replay`'s loop calls
+  // `dispatch()` re-entrantly on the same thread (the replayed
+  // request goes through the full outer wrapper so provenance
+  // decoration + the per-RPC cost recording still fire — the
+  // session-log append no-ops because replay suspends the writer).
+  // A non-recursive mutex deadlocks here. The recursive flavour is
+  // slightly slower per acquisition than std::mutex but the
+  // overhead is dwarfed by the work inside any real RPC.
+  //
+  // Notifications fire OUTSIDE this mutex: NonStopRuntime takes its
+  // own internal locks and fans out to subscribers without ever
+  // touching the dispatcher's bookkeeping.
+  std::recursive_mutex                                     dispatch_mu_;
+
+  // Wired by set_shutdown_callback (only in listen mode today). The
+  // `daemon.shutdown` handler invokes this after the reply is sent
+  // so the socket loop's accept thread wakes up and exits cleanly.
+  // Empty in stdio mode — the handler returns -32002 there.
+  std::function<void()>                                    shutdown_callback_;
+
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
   protocol::Response handle_describe_endpoints(const protocol::Request& req);
+  // §2 phase 2 — `daemon.shutdown`. Invokes shutdown_callback_ after
+  // replying ok=true. Returns -32002 (kBadState) if no callback was
+  // wired (stdio mode).
+  protocol::Response handle_daemon_shutdown(const protocol::Request& req);
   protocol::Response handle_target_open(const protocol::Request& req);
   protocol::Response handle_target_create_empty(const protocol::Request& req);
   protocol::Response handle_target_attach(const protocol::Request& req);
