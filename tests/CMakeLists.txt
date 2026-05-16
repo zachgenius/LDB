@@ -912,6 +912,17 @@ set_tests_properties(smoke_socket_interruption PROPERTIES
   TIMEOUT 30
 )
 
+# §2 phase 2: `--listen-idle-timeout N` exits the daemon when no
+# workers are alive and no new connection arrives within N seconds.
+add_test(
+  NAME smoke_socket_idle_timeout
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_idle_timeout.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_idle_timeout PROPERTIES
+  TIMEOUT 30
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

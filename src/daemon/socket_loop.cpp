@@ -425,6 +425,13 @@ void install_signal_handlers() {
   ::sigaction(SIGPIPE, &ign, nullptr);
 }
 
+// §2 phase 2 — live worker count. Incremented on accept(), decremented
+// on serve_socket_client exit. Read by the accept loop to gate the
+// idle-timeout shutdown — the timeout fires only when no workers
+// are alive, so a long-lived but idle connection doesn't get the
+// daemon pulled out from under it.
+static std::atomic<int> g_live_workers{0};
+
 // §2 phase 2 — per-connection worker. Owns the connection fd for its
 // entire lifetime: registers a per-connection notification sink with
 // the dispatcher, runs serve_one_connection until the peer closes,
@@ -447,6 +454,18 @@ void serve_socket_client(Dispatcher* dispatcher,
 
   dispatcher->remove_notification_sink(sub);
   ::close(conn);
+  g_live_workers.fetch_sub(1, std::memory_order_release);
+  // Wake the accept loop's poll() so it re-evaluates the idle
+  // timeout. Without this, a worker that exits right after the
+  // idle window starts would leave the daemon polling with the
+  // (now-elapsed) timeout still in flight; on Linux this is
+  // resolved by the next poll iteration, but on macOS poll's
+  // timeout is preserved across spurious wakes, so without an
+  // explicit wake the loop would always sit out the full window.
+  if (g_shutdown_pipe[1] >= 0) {
+    const char byte = 'w';
+    (void) ::write(g_shutdown_pipe[1], &byte, 1);
+  }
   log::debug("client disconnected");
 }
 
@@ -454,7 +473,8 @@ void serve_socket_client(Dispatcher* dispatcher,
 
 int run_socket_listener(Dispatcher& dispatcher,
                         const std::string& sock_path,
-                        protocol::WireFormat fmt) {
+                        protocol::WireFormat fmt,
+                        int idle_timeout_sec) {
   if (!ensure_parent_dir(sock_path)) return 1;
 
   const std::string lock_path = sock_path + ".lock";
@@ -554,6 +574,14 @@ int run_socket_listener(Dispatcher& dispatcher,
     // shutdown self-pipe so a hung listener (no incoming
     // connections) still exits within ~milliseconds of the
     // shutdown signal.
+    //
+    // Timeout: -1 (block indefinitely) by default. When the
+    // idle-timeout knob is set AND no workers are alive, we use
+    // idle_timeout_sec * 1000ms; if poll returns 0 (timeout
+    // elapsed) AND workers are still zero, the daemon shuts down.
+    // Worker liveness recheck after the poll closes the race
+    // between "worker exits, wakes us, we re-poll" and "we time
+    // out exactly here".
     ::pollfd fds[2];
     fds[0].fd = srv;
     fds[0].events = POLLIN;
@@ -561,10 +589,27 @@ int run_socket_listener(Dispatcher& dispatcher,
     fds[1].fd = g_shutdown_pipe[0];
     fds[1].events = POLLIN;
     fds[1].revents = 0;
-    int pr = ::poll(fds, 2, -1);
+    int timeout_ms = -1;
+    if (idle_timeout_sec > 0 &&
+        g_live_workers.load(std::memory_order_acquire) == 0) {
+      timeout_ms = idle_timeout_sec * 1000;
+    }
+    int pr = ::poll(fds, 2, timeout_ms);
     if (pr < 0) {
       if (errno == EINTR) continue;
       log::error(std::string("poll: ") + std::strerror(errno));
+      continue;
+    }
+    if (pr == 0) {
+      // poll timed out — idle window elapsed. Confirm no worker
+      // raced in during the gap; if so, this is the clean idle
+      // shutdown path.
+      if (g_live_workers.load(std::memory_order_acquire) == 0) {
+        log::info("idle for " + std::to_string(idle_timeout_sec) +
+                  "s; shutting down");
+        g_shutdown.store(1, std::memory_order_release);
+        break;
+      }
       continue;
     }
     if (fds[1].revents & POLLIN) {
@@ -628,6 +673,12 @@ int run_socket_listener(Dispatcher& dispatcher,
     // per-connection (registered inside serve_socket_client) so
     // stop events fired from any target route to every live
     // subscriber's OutputChannel without cross-talk.
+    //
+    // Bump the live-workers counter BEFORE std::thread construction
+    // so a poll wake-up that races with this spawn can't see zero
+    // workers between accept and emplace. The worker decrements on
+    // exit.
+    g_live_workers.fetch_add(1, std::memory_order_release);
     workers.emplace_back(serve_socket_client, &dispatcher, conn, fmt);
   }
 
