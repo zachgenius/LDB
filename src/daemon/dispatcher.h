@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -213,6 +214,22 @@ class Dispatcher {
   // the installed sink. Declared AFTER nonstop_ so the listener
   // joins before the runtime is destroyed.
   runtime::NonStopListener                                 nonstop_listener_;
+
+  // §2 phase 2 — multi-client serialisation. The socket listener
+  // spawns one std::thread per accepted connection; without this
+  // lock, two concurrent RPCs would race on the dispatcher's mutable
+  // state: target_main_module_, diff_cache_, cost_samples_,
+  // python_unwinders_, rsp_channels_, active_session_writer_, and
+  // session-log bookkeeping all assume single-writer serial dispatch.
+  // The backend (LldbBackend) has its own per-instance mutex; this
+  // outer mutex covers the dispatcher's bookkeeping only. Held for
+  // the entire duration of dispatch() — phase-3 may refine to per-
+  // target sharding if contention shows up.
+  //
+  // Notifications fire OUTSIDE this mutex: NonStopRuntime takes its
+  // own internal locks and fans out to subscribers without ever
+  // touching the dispatcher's bookkeeping.
+  std::mutex                                               dispatch_mu_;
 
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);

@@ -859,6 +859,20 @@ set_tests_properties(smoke_socket_perms PROPERTIES
   TIMEOUT 30
 )
 
+# §2 phase 2: two concurrent socket clients exercising target.open +
+# module.list against the same daemon. Fails if the accept loop is
+# still single-client (the second connection's accept blocks until
+# the first disconnects, the barrier times out).
+add_test(
+  NAME smoke_socket_multiclient
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_multiclient.py"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_multiclient PROPERTIES
+  TIMEOUT 60
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(
