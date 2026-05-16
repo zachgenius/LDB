@@ -5,6 +5,8 @@
 #include "protocol/output_channel.h"
 #include "protocol/transport.h"
 
+#include <iosfwd>
+
 namespace ldb::daemon {
 
 // Reads framed JSON-RPC requests from stdin, writes framed responses
@@ -18,5 +20,18 @@ namespace ldb::daemon {
 int run_stdio_loop(Dispatcher& dispatcher,
                    protocol::OutputChannel& out,
                    protocol::WireFormat fmt = protocol::WireFormat::kJson);
+
+// Pump one connection: read framed JSON-RPC from `in`, dispatch through
+// `dispatcher`, write framed responses to `out`. Returns 0 on clean EOF
+// from the peer, 1 on an unrecoverable framing desync (CBOR only) or a
+// write failure. Designed to be called once per accept() in the
+// `--listen` socket loop AND once for the lifetime of stdin in the
+// `--stdio` loop — both modes share this body so dispatch semantics
+// stay identical regardless of transport. `in` and `out` may refer to
+// different fds (a TCP/unix socket pair) or to stdin/stdout.
+int serve_one_connection(Dispatcher& dispatcher,
+                         protocol::OutputChannel& out,
+                         std::istream& in,
+                         protocol::WireFormat fmt);
 
 }  // namespace ldb::daemon

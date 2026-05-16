@@ -146,6 +146,41 @@ Lifecycle questions to resolve before code:
 | Auth? | uid-only via filesystem permissions (mode 0600 on the socket, parent dir 0700). No cross-user access. Document it; don't add token auth in phase 1. |
 | Concurrent calls from multiple clients? | Dispatcher is already thread-safe enough for the read-only static surface (uses `impl_->mu`). Audit the mutable paths (probes, sessions, breakpoints) before exposing — possibly serialise per-target via a per-target mutex in phase 1. |
 
+#### Trust model
+
+Phase 1 explicitly assumes **the uid is a single trust domain**.
+That assumption shapes every access-control decision in the daemon:
+
+- Socket inode lives at mode 0600; parent dir at 0700 when the
+  daemon creates it.
+- The daemon refuses to use a pre-existing parent that is a symlink,
+  is owned by another uid, or has group/other permission bits set.
+- The sidecar lockfile is opened with `O_NOFOLLOW` to refuse a pre-
+  staged symlink (otherwise a same-uid attacker could pre-create
+  `${PATH}.lock` as a symlink to e.g. `~/.ssh/authorized_keys` and
+  have our `ftruncate`+`pwrite(pid)` corrupt the symlink target).
+- Every accepted connection is run through `getpeereid()`; peers
+  whose uid differs from the daemon's are rejected before the first
+  byte is read.
+- Accepted connections carry a 300-second `SO_RCVTIMEO` so a stalled
+  peer doesn't pin the daemon's accept loop indefinitely.
+
+Explicitly **out of scope** for phase 1:
+
+- **Shared-uid hosts.** Multi-tenant CI runners, NFS-homed uid where
+  several humans share one account, LLM/agent sandboxes that run
+  inside the daemon's uid — all of these collapse the trust
+  boundary the phase-1 design relies on. Anyone wanting LDB in that
+  shape should wait for phase 2.
+- **Cross-uid access.** No SUID, no group-readable sockets, no
+  cross-user proxying. The "two engineers share a host" pattern
+  requires phase 2.
+
+Phase-2 will add token auth (the daemon hands out a one-shot bearer
+on startup; the client presents it before the first RPC) so the
+shared-uid and cross-uid cases become tractable without re-doing
+the filesystem permissions story.
+
 #### Client side
 
 `tools/ldb/ldb`:
@@ -208,6 +243,43 @@ Probably 2–3 days. Roughly:
 If this slips, phase-1 (single-client persistent socket) is the
 useful core; phase-2 (multi-client + auto-spawn) can land as a
 separate branch.
+
+### Phase-2 follow-ups (post-phase-1 review)
+
+These items were flagged by the linus-code-reviewer and security-
+auditor on `worktree-agent-ae73d824f609b6e86` and consciously
+deferred — phase 1 still ships, but the gaps are recorded so they
+don't get re-discovered as surprises.
+
+- **In-flight RPC interruption on SIGTERM.** The accept loop polls
+  `g_shutdown` only between connections; a long-running `target.open`
+  or hung backend call holds the daemon up indefinitely. Three
+  candidate fixes:
+    1. Pump signals into a self-pipe and replace the blocking
+       `accept()` with `pselect`; abort the in-flight RPC by
+       closing the connection fd from the signal handler's side.
+    2. Expose a `daemon.shutdown` RPC that the client can call
+       to drain in-flight work and exit cleanly.
+    3. Add a per-RPC idle timeout (config knob; default off in
+       phase 1, on for phase 2).
+  All three need a thread-safety audit of the dispatcher's mutable
+  state before they're safe to land.
+- **Token auth for shared-uid environments.** Phase-1's trust model
+  (above) explicitly excludes shared-uid hosts; phase 2's token
+  auth covers them. Sketch: daemon writes a one-shot bearer to
+  `${PATH}.token` (mode 0600) at startup; the client reads it and
+  presents it on the first frame; daemon rejects connections that
+  don't present it. The token rotates on restart.
+- **Per-connection notification sinks.** Phase 1 re-points the
+  dispatcher's single `notif_sink` on accept and clears it on
+  disconnect — race-free only because at most one connection is
+  alive at a time. Multi-client phase 2 needs per-connection sinks
+  plumbed through `NonStopRuntime` so async notifications go to
+  the right peer.
+- **Dispatcher mutability audit.** Probes, sessions, breakpoints —
+  audit anything that today assumes single-client serial RPC.
+  Phase-1 mitigation is the "single connection at a time" promise;
+  multi-client phase 2 forces the audit.
 
 ---
 
