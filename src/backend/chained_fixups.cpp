@@ -311,32 +311,57 @@ namespace {
 // the host SDK's <mach-o/*.h> on Linux build legs — the byte layout
 // is fixed and little-endian on every Apple-supported architecture.
 constexpr std::uint32_t kMagic64       = 0xFEEDFACF;
-constexpr std::uint32_t kMagic64Swap   = 0xCFFAEDFE;  // big-endian header
-constexpr std::uint32_t kFatMagic      = 0xCAFEBABE;
-constexpr std::uint32_t kFatMagic64    = 0xCAFEBABF;
-constexpr std::uint32_t kFatMagicSwap  = 0xBEBAFECA;
-constexpr std::uint32_t kFatMagic64Swap= 0xBFBAFECA;
+
+// FAT (universal) magic. The on-disk bytes are CA FE BA BE / CF
+// (32-bit / 64-bit FAT). Our read_u32 is little-endian, so the FAT
+// header we actually see in memory is the byte-reversed form below
+// (kFatMagicLE / kFatMagic64LE). The header AND the per-arch tables
+// inside the FAT preamble are big-endian on disk, so we use
+// read_u32_be / read_u64_be to decode them.
+constexpr std::uint32_t kFatMagicLE    = 0xBEBAFECA;
+constexpr std::uint32_t kFatMagic64LE  = 0xBFBAFECA;
 
 constexpr std::uint32_t kLCSegment64           = 0x19;
 constexpr std::uint32_t kLCDyldChainedFixups   = 0x80000034;  // LC_DYLD_CHAINED_FIXUPS
 
-}  // namespace
+// CPU types we know how to prefer in a FAT dispatch. The acceptance
+// criteria in docs/35-field-report-followups.md §3 phase 3 says:
+// pick the SBTarget-triple-matching slice; absent that, prefer arm64e
+// over arm64 over x86_64. xref consumers today only care about ARM64;
+// x86_64 has no chained fixups (LC_DYLD_INFO_ONLY) and parse_chained_
+// fixups would no-op on it anyway. We only need the ARM64 constants —
+// non-ARM64 slices fall through to the empty-map return.
+constexpr std::uint32_t kCpuTypeArm64  = 0x0100000C;
+constexpr std::uint32_t kCpuSubTypeArm64E = 2;
+constexpr std::uint32_t kCpuSubTypeMask   = 0x00FFFFFFU;  // strip features
 
-ChainedFixupMap extract_chained_fixups_from_macho(
+std::uint32_t read_u32_be(const std::uint8_t* p) {
+  return (static_cast<std::uint32_t>(p[0]) << 24) |
+         (static_cast<std::uint32_t>(p[1]) << 16) |
+         (static_cast<std::uint32_t>(p[2]) << 8)  |
+         (static_cast<std::uint32_t>(p[3]));
+}
+
+std::uint64_t read_u64_be(const std::uint8_t* p) {
+  std::uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) {
+    v = (v << 8) | static_cast<std::uint64_t>(p[i]);
+  }
+  return v;
+}
+
+// Parse a thin (non-FAT) 64-bit Mach-O at `bytes` of length `size`.
+// The slice starts at offset 0 of the buffer. Returns the resolved
+// chained-fixup map or empty if the binary isn't a recognised
+// LE arm64 / arm64e Mach-O or doesn't carry LC_DYLD_CHAINED_FIXUPS.
+ChainedFixupMap extract_chained_fixups_from_thin_macho(
     const std::uint8_t* macho_bytes, std::size_t macho_size) {
   if (macho_bytes == nullptr || macho_size < 32) {
     return {};
   }
-  // Reject byte-swapped / 32-bit / FAT headers. FAT binaries would need
-  // us to pick the right arch slice; the field report only flagged
-  // single-arch arm64 binaries, so phase 2 just no-ops on FAT and the
-  // caller falls back to literal-operand scanning.
   const std::uint32_t magic = read_u32(macho_bytes);
   if (magic != kMagic64) {
-    if (magic == kMagic64Swap || magic == kFatMagic || magic == kFatMagic64 ||
-        magic == kFatMagicSwap || magic == kFatMagic64Swap) {
-      return {};
-    }
+    // Byte-swapped 64-bit / 32-bit / unrecognised: not our target.
     return {};
   }
 
@@ -408,6 +433,110 @@ ChainedFixupMap extract_chained_fixups_from_macho(
     return {};
   }
   return parse_chained_fixups(fixups_payload, fixups_size, segments);
+}
+
+// FAT slice selection (docs/35-field-report-followups.md §3 phase 3
+// gate 5). Iterate the fat_arch[] table, prefer arm64e, then arm64,
+// then anything else, then dispatch to the thin parser on the picked
+// slice's (offset, size) sub-region. The phase-3 acceptance criteria
+// say "match the SBTarget's triple"; here we approximate that with
+// arm64e-then-arm64 preference because the xref pipeline only
+// produces chained-fixup output on those archs.
+ChainedFixupMap extract_chained_fixups_from_fat(
+    const std::uint8_t* fat_bytes, std::size_t fat_size,
+    bool is_fat64) {
+  if (fat_bytes == nullptr || fat_size < 8) return {};
+  // fat_header: magic[0..4] nfat_arch[4..8]. Big-endian on disk.
+  const std::uint32_t nfat_arch = read_u32_be(fat_bytes + 4);
+  if (nfat_arch == 0 || nfat_arch > 16) {
+    // Hard ceiling — Apple's universal2 binaries top out at 2
+    // (arm64 + x86_64); a 64K-arch fat header is malformed.
+    return {};
+  }
+
+  const std::size_t arch_entry_size = is_fat64 ? 32 : 20;
+  const std::size_t table_size = arch_entry_size *
+                                  static_cast<std::size_t>(nfat_arch);
+  if (table_size > fat_size - 8) {
+    return {};
+  }
+
+  // Three-pass selection over the arch table: arm64e first, then any
+  // arm64, then bail. Anything else (x86_64, arm32) has no chained
+  // fixups so we silently skip them — the empty-map return is the
+  // caller's "no chained fixups" signal.
+  struct ArchSlice {
+    std::uint64_t offset = 0;
+    std::uint64_t size   = 0;
+    std::uint32_t cpu_type = 0;
+    std::uint32_t cpu_subtype_masked = 0;
+  };
+  std::vector<ArchSlice> archs;
+  archs.reserve(nfat_arch);
+  for (std::uint32_t i = 0; i < nfat_arch; ++i) {
+    const std::size_t entry_off = 8 + i * arch_entry_size;
+    const std::uint8_t* e = fat_bytes + entry_off;
+    ArchSlice a;
+    a.cpu_type           = read_u32_be(e + 0);
+    a.cpu_subtype_masked = read_u32_be(e + 4) & kCpuSubTypeMask;
+    if (is_fat64) {
+      a.offset = read_u64_be(e + 8);
+      a.size   = read_u64_be(e + 16);
+    } else {
+      a.offset = read_u32_be(e + 8);
+      a.size   = read_u32_be(e + 12);
+    }
+    archs.push_back(a);
+  }
+
+  auto pick_and_run = [&](const ArchSlice& a) -> ChainedFixupMap {
+    if (a.offset > fat_size || a.size > fat_size - a.offset) {
+      // Malformed FAT entry — out-of-bounds slice. Treat as no-op
+      // rather than throwing; a malformed universal binary's other
+      // slices may still be valid, but in practice this signals the
+      // file is hostile and the empty-map return is the right answer.
+      return {};
+    }
+    return extract_chained_fixups_from_thin_macho(
+        fat_bytes + a.offset, static_cast<std::size_t>(a.size));
+  };
+
+  for (const auto& a : archs) {
+    if (a.cpu_type == kCpuTypeArm64 &&
+        a.cpu_subtype_masked == kCpuSubTypeArm64E) {
+      auto m = pick_and_run(a);
+      if (!m.resolved.empty()) return m;
+    }
+  }
+  for (const auto& a : archs) {
+    if (a.cpu_type == kCpuTypeArm64 &&
+        a.cpu_subtype_masked != kCpuSubTypeArm64E) {
+      auto m = pick_and_run(a);
+      if (!m.resolved.empty()) return m;
+    }
+  }
+  // No arm64 slice with chained fixups (or x86_64-only binary).
+  // Empty map — caller falls back to the literal-operand scan.
+  return {};
+}
+
+}  // namespace
+
+ChainedFixupMap extract_chained_fixups_from_macho(
+    const std::uint8_t* macho_bytes, std::size_t macho_size) {
+  if (macho_bytes == nullptr || macho_size < 8) {
+    return {};
+  }
+  const std::uint32_t magic = read_u32(macho_bytes);
+  if (magic == kFatMagicLE) {
+    return extract_chained_fixups_from_fat(macho_bytes, macho_size,
+                                            /*is_fat64=*/false);
+  }
+  if (magic == kFatMagic64LE) {
+    return extract_chained_fixups_from_fat(macho_bytes, macho_size,
+                                            /*is_fat64=*/true);
+  }
+  return extract_chained_fixups_from_thin_macho(macho_bytes, macho_size);
 }
 
 }  // namespace ldb::backend
