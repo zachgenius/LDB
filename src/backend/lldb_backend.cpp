@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2441,9 +2442,82 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
         // code with no tracked ADRPs the boundary check is free.
         std::string current_function;
         bool current_function_known = false;
+        // Phase 4 item 3: function_starts records addresses we've
+        // discovered as function entries — every B / BL target that
+        // lands inside this code section is a "this is where a
+        // function starts" signal even when function_name_at returns
+        // "" (stripped binary). When the scanner reaches an
+        // instruction whose address is in this set, reset adrp_regs.
+        // Single-pass / forward-only: a B / BL at file_addr X to
+        // target Y only takes effect for Y > X (the scanner has
+        // already walked past Y < X by the time it sees the branch).
+        // Real compiler output emits BLs forward to callees that
+        // appear LATER in __text, so the common case is covered. A
+        // backward-only-reached function (e.g. indirect-only via
+        // vtable) still misses the boundary; documented as a
+        // phase-5 follow-up.
+        const std::uint64_t section_end = start + size;
+        std::unordered_set<std::uint64_t> function_starts;
+
+        // Helper: parse the LAST hex token (LLDB renders branch
+        // targets as `0xNNNNNNN`) from an operand string. Used by
+        // the conditional-branch boundary check (item 1) AND the
+        // function-start recording (item 3) AND the unresolvable-
+        // load detection (item 4).
+        auto parse_last_hex_in_operands =
+            [](const std::string& ops) -> std::optional<std::uint64_t> {
+          std::optional<std::uint64_t> result;
+          for (std::size_t scan = 0; scan + 2 <= ops.size(); ++scan) {
+            if (ops[scan] == '0' &&
+                (ops[scan + 1] == 'x' || ops[scan + 1] == 'X')) {
+              std::size_t hex_start = scan + 2;
+              std::uint64_t v = 0;
+              std::size_t end = hex_start;
+              while (end < ops.size()) {
+                char c = ops[end];
+                unsigned int d;
+                if (c >= '0' && c <= '9')
+                  d = static_cast<unsigned int>(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                  d = static_cast<unsigned int>(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F')
+                  d = static_cast<unsigned int>(c - 'A' + 10);
+                else break;
+                v = (v << 4) | d;
+                ++end;
+              }
+              if (end > hex_start) {
+                result = v;
+                scan = end - 1;
+              }
+            }
+          }
+          return result;
+        };
+
         for (const auto& i : insns) {
           std::string mnem_lower = i.mnemonic;
           for (auto& c : mnem_lower) c = static_cast<char>(std::tolower(c));
+
+          // Phase 4 item 3 (function-start reset). Check the current
+          // instruction's address against the function_starts set
+          // BEFORE gate 1's name-based check. The two are
+          // complementary: gate 1 fires on symbolized boundaries
+          // (different function name); item 3 fires on stripped
+          // boundaries (B / BL target previously recorded). Either
+          // is sufficient; the union is the discriminating signal.
+          if (!adrp_regs.empty() &&
+              function_starts.count(i.address) > 0) {
+            adrp_regs.clear();
+            current_function_known = false;
+            if (provenance != nullptr) {
+              provenance->adrp_pair_function_start_reset++;
+              std::ostringstream w;
+              w << "function-start reset at 0x" << std::hex << i.address
+                << " (target of a prior B / BL); adrp_regs cleared";
+              provenance->warnings.push_back(w.str());
+            }
+          }
 
           // Phase-3 gate 1 (function-boundary reset). When we have
           // tracked ADRP state, check the current instruction's
@@ -2641,6 +2715,27 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
               mnem_lower == "cbz"  || mnem_lower == "cbnz" ||
               mnem_lower == "tbz"  || mnem_lower == "tbnz";
 
+          // Phase 4 item 3: record B / BL targets as function-start
+          // hints. The scanner uses these to reset adrp_regs on the
+          // stripped-binary case where function_name_at returns ""
+          // and gate 1 can't tell two adjacent functions apart. We
+          // record both calls (BL — target is a callee function
+          // entry) and unconditional branches (B — target is a
+          // tail-call destination, also a function entry). BR has
+          // a register operand, not a literal address — skip.
+          // BLR / BLRAA / BLRAB / BLRAAZ / BLRABZ are also register-
+          // operand calls and don't expose a literal target. The
+          // recorded address must lie inside the current code
+          // section to be useful — out-of-section targets (calls
+          // into dyld stubs, etc.) won't be visited by our scanner.
+          if ((mnem_lower == "bl" || mnem_lower == "b") &&
+              !i.operands.empty()) {
+            auto t = parse_last_hex_in_operands(i.operands);
+            if (t.has_value() && *t >= start && *t < section_end) {
+              function_starts.insert(*t);
+            }
+          }
+
           if (is_call) {
             // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
             // callee may overwrite x0..x18 + x30 — the scanner has
@@ -2691,42 +2786,13 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
             // when there's no tracked state, the reset is a no-op and
             // function_name_at is the dominant cost. Same optimisation
             // gate 1 uses.
-            std::uint64_t branch_target = 0;
-            bool have_target = false;
-            const auto& ops = i.operands;
-            // Walk left-to-right looking for the LAST `0x...` token.
             // LLDB renders cbz / tbz with the conditional register
             // first and the address last; `b.eq 0x100003f00` puts the
-            // address first. Scanning to end-of-string and keeping
-            // the last hit covers both.
-            for (std::size_t scan = 0; scan + 2 <= ops.size(); ++scan) {
-              if (ops[scan] == '0' &&
-                  (ops[scan + 1] == 'x' || ops[scan + 1] == 'X')) {
-                std::size_t hex_start = scan + 2;
-                std::uint64_t v = 0;
-                std::size_t end = hex_start;
-                while (end < ops.size()) {
-                  char c = ops[end];
-                  unsigned int d;
-                  if (c >= '0' && c <= '9')
-                    d = static_cast<unsigned int>(c - '0');
-                  else if (c >= 'a' && c <= 'f')
-                    d = static_cast<unsigned int>(c - 'a' + 10);
-                  else if (c >= 'A' && c <= 'F')
-                    d = static_cast<unsigned int>(c - 'A' + 10);
-                  else break;
-                  v = (v << 4) | d;
-                  ++end;
-                }
-                if (end > hex_start) {
-                  branch_target = v;
-                  have_target = true;
-                  scan = end - 1;  // outer ++scan will advance past
-                }
-              }
-            }
-            if (have_target) {
-              auto sa_target = target.ResolveFileAddress(branch_target);
+            // address first. parse_last_hex_in_operands scans to end
+            // and keeps the last hit — works for both shapes.
+            auto branch_target = parse_last_hex_in_operands(i.operands);
+            if (branch_target.has_value()) {
+              auto sa_target = target.ResolveFileAddress(*branch_target);
               std::string target_fn = function_name_at(target, sa_target);
               // current_function was primed by gate 1 above (when
               // adrp_regs first became non-empty). The reset fires
@@ -2746,6 +2812,13 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
                     << target_fn << ") — adrp_regs cleared";
                   provenance->warnings.push_back(w.str());
                 }
+              }
+              // Also record the conditional-branch target as a
+              // function start when it falls inside this section.
+              // The taken side of a conditional that crosses functions
+              // is a function entry just like an unconditional B.
+              if (*branch_target >= start && *branch_target < section_end) {
+                function_starts.insert(*branch_target);
               }
             }
           }

@@ -136,6 +136,33 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     target_link_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
   endforeach()
 
+  # Phase-4 item 3 fixture (docs/35-field-report-followups.md §3):
+  # stripped-binary function-boundary leak. Build the assembly normally
+  # then run `strip -x` post-link to remove the non-global function
+  # symbols. The remaining symbol table holds `_main` (entry point) +
+  # `_strip_data` (the data needle the smoke test looks for); the two
+  # function labels `_pattern_strip_a` / `_pattern_strip_b` are gone,
+  # so function_name_at() returns "" at their addresses. The smoke
+  # test proves phase 4's function_starts reset still catches the
+  # boundary.
+  add_executable(ldb_fix_xref_stripped_fnleak
+                 asm/xref_stripped_fnleak.s)
+  set_target_properties(ldb_fix_xref_stripped_fnleak PROPERTIES
+    OUTPUT_NAME    xref_stripped_fnleak
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+    LINKER_LANGUAGE C
+  )
+  target_compile_options(ldb_fix_xref_stripped_fnleak PRIVATE -arch arm64)
+  target_link_options(ldb_fix_xref_stripped_fnleak PRIVATE -arch arm64)
+  # strip -x: removes non-global ("local") symbols. The function
+  # labels we want to erase are non-global; _main and _strip_data
+  # are .globl and survive.
+  add_custom_command(TARGET ldb_fix_xref_stripped_fnleak POST_BUILD
+    COMMAND ${CMAKE_STRIP} -x
+            $<TARGET_FILE:ldb_fix_xref_stripped_fnleak>
+    COMMENT "Stripping local symbols from xref_stripped_fnleak fixture"
+  )
+
   # Phase-3 post-review PAC-call fixture. PAC branch mnemonics
   # (BLRAA / BLRAB / BLRAAZ / BLRABZ / BRAA / BRAB / BRAAZ / BRABZ /
   # RETAA / RETAB) only exist on arm64e — clang refuses them with
