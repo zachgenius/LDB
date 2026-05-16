@@ -892,6 +892,51 @@ TEST_CASE("extract_chained_fixups_from_macho: empty triple falls back to "
   CHECK(m.image_base == 0x100000000ULL);
 }
 
+// ---------------------------------------------------------------------------
+// BindInfo schema (docs/35-field-report-followups.md §3 phase 4 item 6)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("BindInfo schema is default-constructible and empty",
+          "[chained_fixups][binds][schema]") {
+  // Phase 4 ships the schema; phase 5 populates it. This pins the
+  // default-constructed shape so callers can rely on the absent-bind
+  // field semantics (empty name, addend 0, ordinal 0, no resolved_addr).
+  ldb::backend::BindInfo b;
+  CHECK(b.name.empty());
+  CHECK(b.addend == 0);
+  CHECK(b.ordinal == 0);
+  CHECK_FALSE(b.resolved_addr.has_value());
+}
+
+TEST_CASE("ChainedFixupMap.binds is empty by default (phase 4)",
+          "[chained_fixups][binds][schema]") {
+  // The binds map is wired into ChainedFixupMap but populated only by
+  // phase 5's imports-table walk. Today's parser leaves it empty.
+  // This test exists so a future phase-5 commit can prove its
+  // population logic fires by flipping this assertion red.
+  ldb::backend::ChainedFixupMap m;
+  CHECK(m.binds.empty());
+}
+
+TEST_CASE("parse_chained_fixups leaves binds empty (phase 4 schema only)",
+          "[chained_fixups][binds][schema]") {
+  // Use vector A — a Mach-O with two ARM64E rebases and zero binds.
+  // The parser produces a non-empty resolved map and an empty binds
+  // map. Phase 5 will flip the test for vectors that carry actual
+  // bind entries (e.g. a synthetic vector with imports_count > 0).
+  std::vector<SegmentInfo> segs(1);
+  segs[0].vm_addr     = 0x100008000;
+  segs[0].vm_size     = 0x4000;
+  segs[0].data        = kVectorA_segment_bytes.data();
+  segs[0].data_size   = kVectorA_segment_bytes.size();
+
+  ChainedFixupMap m = parse_chained_fixups(
+      kVectorA_payload.data(), kVectorA_payload.size(), segs);
+
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.binds.empty());
+}
+
 TEST_CASE("extract_chained_fixups_from_macho: triple-matching slice missing "
           "falls back to preference order",
           "[chained_fixups][macho][fat][triple]") {
