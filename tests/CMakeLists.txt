@@ -106,6 +106,17 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     TIMEOUT 30
   )
 
+  # Phase-4 item 7 (docs/35-field-report-followups.md §3): moderate-
+  # size real-binary fixture with selref-style string-table xrefs,
+  # conditional-branch tail-call, malloc/free imports.
+  add_test(
+    NAME smoke_xref_real_world
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_real_world.py"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb_fix_real_world_xref>"
+  )
+  set_tests_properties(smoke_xref_real_world PROPERTIES TIMEOUT 30)
+
   # Phase-3 adversarial smoke tests for the ADRP-pair resolver
   # (docs/35-field-report-followups.md §3 phase 3). Each one targets
   # one specific phase-2 false-positive mode: ADD-clobber, cross-

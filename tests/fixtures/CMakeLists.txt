@@ -111,6 +111,31 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     -Wl,-fixup_chains
   )
 
+  # Phase-4 item 7 fixture (docs/35-field-report-followups.md §3): a
+  # moderate-size C program exercising multiple xref patterns
+  # (selref-style string-table indirection, conditional-branch
+  # tail-call, malloc/free imports). Compiled with -O1 so the
+  # compiler emits the ADRP+ADD / ADRP+LDR pairs the resolver targets;
+  # -Wl,-fixup_chains forces the chained-fixup encoding so the
+  # __DATA_CONST slot for k_string_table[] becomes a rebase entry.
+  # Real-binary spot-checking against /usr/bin/grep / /usr/lib/dyld is
+  # documented in the worklog (host-dependent, not automated in CI).
+  add_executable(ldb_fix_real_world_xref c/real_world_xref.c)
+  set_target_properties(ldb_fix_real_world_xref PROPERTIES
+    OUTPUT_NAME    real_world_xref
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+    C_STANDARD     11
+  )
+  target_compile_options(ldb_fix_real_world_xref PRIVATE
+    -arch arm64
+    -O1
+    -fno-omit-frame-pointer
+  )
+  target_link_options(ldb_fix_real_world_xref PRIVATE
+    -arch arm64
+    -Wl,-fixup_chains
+  )
+
   # Phase-3 adversarial fixtures (docs/35-field-report-followups.md §3
   # phase 3). Each one reproduces a specific phase-2 false-positive in
   # the ADRP-pair resolver. Hand-assembled `.s` so the instruction
