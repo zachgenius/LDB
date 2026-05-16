@@ -768,3 +768,321 @@ TEST_CASE("extract_chained_fixups_from_macho: FAT64 (cafebabf) picks arm64 slice
   CHECK(m.resolved.at(0x8008) == 0x100000600ULL);
   CHECK(m.image_base == 0x100000000ULL);
 }
+
+// ---------------------------------------------------------------------------
+// FAT triple-aware slice selection
+// (docs/35-field-report-followups.md §3 phase 4 item 2).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("extract_chained_fixups_from_macho: FAT picks arm64 slice when "
+          "triple says arm64",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // Same FAT layout as "FAT prefers arm64e over arm64" but with an
+  // arm64-targeted triple. Phase 4: the triple should override the
+  // phase-3 arm64e-first default and pick the plain arm64 slice.
+  // image_base proves the right slice was selected.
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSlice1Off = 0x2000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  // Slice 0: arm64e (subtype 2), vmaddr base 0x100000000
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  // Slice 1: arm64-all, vmaddr base 0x200000000
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 0);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho(fat, kSlice1Off, 0x200000000ULL);
+
+  // Triple says arm64 (no 'e') — slice 1's image_base must come back.
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64-apple-macosx14.0.0");
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x200000000ULL);
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: FAT picks arm64e slice when "
+          "triple says arm64e",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // Inverse of the test above — explicit arm64e triple still lands on
+  // slice 0 (which would also be the default).
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSlice1Off = 0x2000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 0);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho(fat, kSlice1Off, 0x200000000ULL);
+
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64e-apple-macosx14.0.0");
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x100000000ULL);
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: empty triple falls back to "
+          "phase-3 preference order",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // No triple — same as phase 3's default: arm64e wins. This pins the
+  // backward-compatible no-op case so existing callers (the ones that
+  // don't yet plumb SBTarget::GetTriple() through) keep behaving
+  // identically.
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSlice1Off = 0x2000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 0);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho(fat, kSlice1Off, 0x200000000ULL);
+
+  // Empty triple — preserves phase-3 default (arm64e first).
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size());
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x100000000ULL);
+}
+
+// ---------------------------------------------------------------------------
+// BindInfo schema (docs/35-field-report-followups.md §3 phase 4 item 6)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("BindInfo schema is default-constructible and empty",
+          "[chained_fixups][binds][schema]") {
+  // Phase 4 ships the schema; phase 5 populates it. This pins the
+  // default-constructed shape so callers can rely on the absent-bind
+  // field semantics (empty name, addend 0, ordinal 0, no resolved_addr).
+  ldb::backend::BindInfo b;
+  CHECK(b.name.empty());
+  CHECK(b.addend == 0);
+  CHECK(b.ordinal == 0);
+  CHECK_FALSE(b.resolved_addr.has_value());
+}
+
+TEST_CASE("ChainedFixupMap.binds is empty by default (phase 4)",
+          "[chained_fixups][binds][schema]") {
+  // The binds map is wired into ChainedFixupMap but populated only by
+  // phase 5's imports-table walk. Today's parser leaves it empty.
+  // This test exists so a future phase-5 commit can prove its
+  // population logic fires by flipping this assertion red.
+  ldb::backend::ChainedFixupMap m;
+  CHECK(m.binds.empty());
+}
+
+TEST_CASE("parse_chained_fixups leaves binds empty (phase 4 schema only)",
+          "[chained_fixups][binds][schema]") {
+  // Use vector A — a Mach-O with two ARM64E rebases and zero binds.
+  // The parser produces a non-empty resolved map and an empty binds
+  // map. Phase 5 will flip the test for vectors that carry actual
+  // bind entries (e.g. a synthetic vector with imports_count > 0).
+  std::vector<SegmentInfo> segs(1);
+  segs[0].vm_addr     = 0x100008000;
+  segs[0].vm_size     = 0x4000;
+  segs[0].data        = kVectorA_segment_bytes.data();
+  segs[0].data_size   = kVectorA_segment_bytes.size();
+
+  ChainedFixupMap m = parse_chained_fixups(
+      kVectorA_payload.data(), kVectorA_payload.size(), segs);
+
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.binds.empty());
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: triple-matching slice missing "
+          "falls back to preference order",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // FAT with only an arm64e slice. Triple says arm64. NO arm64 slice
+  // exists in the FAT — fall back to phase-3 preference (arm64e).
+  // This is the legitimate fallback path: when the FAT carries no
+  // slice the triple matches, we'd rather surface SOMETHING than
+  // nothing.
+  constexpr std::size_t kSlice0Off = 0x1000;
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice0Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 1);
+
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 2);                 // arm64e
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  emit_thin_arm64_macho(fat, kSlice0Off, 0x100000000ULL);
+
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64-apple-ios13.0");
+  REQUIRE(m.resolved.size() == 2);
+  CHECK(m.image_base == 0x100000000ULL);
+}
+
+// Emit a minimal arm64 Mach-O with one LC_SEGMENT_64 and NO chained
+// fixups. The parser walks the load commands; without
+// LC_DYLD_CHAINED_FIXUPS it returns ChainedFixupMap{} (empty
+// resolved/binds, image_base from segments). Used to construct the
+// "FAT slice exists but has no chained fixups" scenario for the C5
+// regression test below.
+std::size_t emit_thin_arm64_macho_no_fixups(std::vector<std::uint8_t>& buf,
+                                             std::size_t offset,
+                                             std::uint64_t vmaddr_base) {
+  constexpr std::size_t kHeader     = 32;
+  constexpr std::size_t kSegCmdSize = 72;
+  constexpr std::size_t kSegOff     = 0x100;
+  constexpr std::size_t kSegSize    = 0x10;
+  const std::size_t kFileSize = kSegOff + kSegSize;
+  REQUIRE(offset + kFileSize <= buf.size());
+
+  auto put_u32 = [&](std::size_t off, std::uint32_t v) {
+    buf[offset + off + 0] = static_cast<std::uint8_t>(v & 0xff);
+    buf[offset + off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xff);
+    buf[offset + off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xff);
+    buf[offset + off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xff);
+  };
+  auto put_u64 = [&](std::size_t off, std::uint64_t v) {
+    for (std::size_t i = 0; i < 8; ++i) {
+      buf[offset + off + i] =
+          static_cast<std::uint8_t>((v >> (i * 8)) & 0xff);
+    }
+  };
+
+  put_u32(0,  0xFEEDFACF);          // MH_MAGIC_64
+  put_u32(4,  0x0100000C);          // CPU_TYPE_ARM64
+  put_u32(8,  0);                   // cpu_subtype = ARM64_ALL
+  put_u32(12, 2);                   // filetype = MH_EXECUTE
+  put_u32(16, 1);                   // ncmds = 1 (one LC_SEGMENT_64)
+  put_u32(20, kSegCmdSize);
+  put_u32(24, 0);
+  put_u32(28, 0);
+
+  std::size_t off = kHeader;
+  put_u32(off + 0, 0x19);            // LC_SEGMENT_64
+  put_u32(off + 4, kSegCmdSize);
+  put_u64(off + 24, vmaddr_base + 0x8000);
+  put_u64(off + 32, 0x4000ULL);
+  put_u64(off + 40, kSegOff);
+  put_u64(off + 48, kSegSize);
+  // No LC_DYLD_CHAINED_FIXUPS — that's the whole point.
+
+  return kFileSize;
+}
+
+TEST_CASE("extract_chained_fixups_from_macho: triple-matched slice WITHOUT "
+          "chained fixups wins (C5 silent-wrong-result fix)",
+          "[chained_fixups][macho][fat][triple]") {
+  using ldb::backend::extract_chained_fixups_from_macho;
+
+  // The C5 silent-wrong-result regression
+  // (docs/35-field-report-followups.md §3 phase-4 cleanup C5):
+  // a FAT with both an arm64 slice (LC_DYLD_INFO_ONLY-era, no
+  // chained fixups) and an arm64e slice (with chained fixups). The
+  // triple says arm64 — LLDB loaded the arm64 slice and its
+  // image_base is the source of truth for the xref scan. The buggy
+  // phase-4 code returned the arm64 slice's empty parse only if
+  // resolved was non-empty; otherwise it silently fell through to
+  // the arm64e slice's parse and returned arm64e's image_base, which
+  // is the wrong basis for the arm64 binary the agent is analysing.
+  //
+  // Post-cleanup: a triple-matched slice's parse wins UNCONDITIONALLY
+  // — even when its chained-fixup map is empty. The caller then
+  // gets ChainedFixupMap{} (no chained-fixup-based xref resolution)
+  // and the literal-operand / ADRP-pair scan runs against the
+  // CORRECT image_base.
+  constexpr std::size_t kSlice0Off = 0x1000;   // arm64 (no fixups)
+  constexpr std::size_t kSlice1Off = 0x2000;   // arm64e (with fixups)
+  constexpr std::size_t kSliceSize = 0x300;
+  std::vector<std::uint8_t> fat(kSlice1Off + kSliceSize, 0);
+
+  put_u32_be(fat, 0, 0xCAFEBABE);
+  put_u32_be(fat, 4, 2);
+
+  // Slice 0: arm64 (cpu_type=0x0100000C, cpu_subtype=0).
+  put_u32_be(fat,  8, 0x0100000C);
+  put_u32_be(fat, 12, 0);
+  put_u32_be(fat, 16, kSlice0Off);
+  put_u32_be(fat, 20, kSliceSize);
+  put_u32_be(fat, 24, 12);
+
+  // Slice 1: arm64e (cpu_type=0x0100000C, cpu_subtype=2).
+  put_u32_be(fat, 28, 0x0100000C);
+  put_u32_be(fat, 32, 2);
+  put_u32_be(fat, 36, kSlice1Off);
+  put_u32_be(fat, 40, kSliceSize);
+  put_u32_be(fat, 44, 12);
+
+  emit_thin_arm64_macho_no_fixups(fat, kSlice0Off, 0x100000000ULL);
+  emit_thin_arm64_macho        (fat, kSlice1Off, 0x200000000ULL);
+
+  // Triple says arm64. The arm64 slice exists in the FAT — it must
+  // win, even though it has no chained fixups.
+  ChainedFixupMap m =
+      extract_chained_fixups_from_macho(fat.data(), fat.size(),
+                                         "arm64-apple-macosx14.0.0");
+  // The arm64 slice has no chained fixups → resolved is empty.
+  CHECK(m.resolved.empty());
+  // Critically, the image_base must come from the arm64 slice
+  // (image_base from its segments), NOT from the arm64e slice. If we
+  // accidentally fell through to arm64e the image_base would be
+  // 0x200000000.
+  //
+  // emit_thin_arm64_macho_no_fixups doesn't populate image_base via
+  // the chained-fixup header (there isn't one), but the parser's
+  // image_base derivation is "first chain-bearing segment's vm_addr
+  // - segment_offset", which only applies when there ARE chained
+  // fixups. With none, image_base stays at its default 0. What
+  // matters for C5 is that we DON'T get arm64e's 0x200000000 (which
+  // would corrupt the caller's xref slot lookup).
+  CHECK(m.image_base != 0x200000000ULL);
+}

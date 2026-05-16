@@ -244,42 +244,147 @@ If this slips, phase-1 (single-client persistent socket) is the
 useful core; phase-2 (multi-client + auto-spawn) can land as a
 separate branch.
 
-### Phase-2 follow-ups (post-phase-1 review)
+### Phase 2 — what shipped (this branch)
 
-These items were flagged by the linus-code-reviewer and security-
-auditor on `worktree-agent-ae73d824f609b6e86` and consciously
-deferred — phase 1 still ships, but the gaps are recorded so they
-don't get re-discovered as surprises.
+Phase-2 lands six items in order; see the commit log for the
+individual SHAs and the rationale per piece.
 
-- **In-flight RPC interruption on SIGTERM.** The accept loop polls
-  `g_shutdown` only between connections; a long-running `target.open`
-  or hung backend call holds the daemon up indefinitely. Three
-  candidate fixes:
-    1. Pump signals into a self-pipe and replace the blocking
-       `accept()` with `pselect`; abort the in-flight RPC by
-       closing the connection fd from the signal handler's side.
-    2. Expose a `daemon.shutdown` RPC that the client can call
-       to drain in-flight work and exit cleanly.
-    3. Add a per-RPC idle timeout (config knob; default off in
-       phase 1, on for phase 2).
-  All three need a thread-safety audit of the dispatcher's mutable
-  state before they're safe to land.
-- **Token auth for shared-uid environments.** Phase-1's trust model
-  (above) explicitly excludes shared-uid hosts; phase 2's token
-  auth covers them. Sketch: daemon writes a one-shot bearer to
-  `${PATH}.token` (mode 0600) at startup; the client reads it and
-  presents it on the first frame; daemon rejects connections that
-  don't present it. The token rotates on restart.
-- **Per-connection notification sinks.** Phase 1 re-points the
-  dispatcher's single `notif_sink` on accept and clears it on
-  disconnect — race-free only because at most one connection is
-  alive at a time. Multi-client phase 2 needs per-connection sinks
-  plumbed through `NonStopRuntime` so async notifications go to
-  the right peer.
-- **Dispatcher mutability audit.** Probes, sessions, breakpoints —
-  audit anything that today assumes single-client serial RPC.
-  Phase-1 mitigation is the "single connection at a time" promise;
-  multi-client phase 2 forces the audit.
+1. **Multi-subscriber notification sinks** (runtime change).
+   `NonStopRuntime` now owns a subscriber SET protected by
+   `sinks_mu_`. Each connection registers its own
+   `NotificationSink` via `add_notification_sink` and drops it on
+   disconnect via `remove_notification_sink`. The pre-phase-2
+   single-atomic-sink-pointer design was race-free only because
+   phase-1 allowed at most one connection alive at a time.
+   Post-review honesty fix (I1): the subscriber set is
+   broadcast-to-all — every live subscriber receives every
+   notification; per-target filtering happens at the client. The
+   prior wording ("without cross-talk") implied server-side
+   target_id routing, which is a phase-3 item. Subscriber storage
+   is `std::shared_ptr<NotificationSink>` so a concurrent disconnect
+   can't free a sink mid-emit (post-review C1 fix). The legacy
+   `set_notification_sink(sink)` API survives as a clear-then-add
+   shim for stdio mode.
+
+2. **Multi-client socket listener.** `socket_loop.cpp`'s accept
+   loop now spawns a `std::thread` per accepted connection. The
+   shared `Dispatcher` serialises overlapping RPC service through
+   a new `dispatch_mu_` outer mutex (acquired for the entire
+   `dispatch()` lifetime). Documented concurrency audit:
+     - `LldbBackend::Impl::mu` (existing): every public method
+       takes it; phase-3 chained-fixups branch's mu-drop-during-
+       file-IO pattern stays intact.
+     - `ProbeOrchestrator::mu_` (existing): every public method
+       takes it; callback paths re-acquire on re-entry.
+     - `SessionStore`, `ArtifactStore`: each has its own internal
+       mutex around sqlite. Single-writer assumption preserved
+       by WAL.
+     - `NonStopRuntime`: state-map shared_mutex + the new
+       subscriber-set shared_mutex.
+     - `Dispatcher`'s own mutable state (target_main_module_,
+       diff_cache_, cost_samples_, python_unwinders_,
+       rsp_channels_, active_session_writer_) — NOT thread-safe,
+       now covered by `dispatch_mu_`. Phase-3 refinement could
+       shard by target_id; not done here because the dispatcher
+       state would need to migrate to a per-target map first.
+
+3. **Client-side auto-spawn.** `tools/ldb/ldb` detects
+   ECONNREFUSED / ENOENT / ENXIO on the unix-socket connect()
+   and `fork+exec`s `ldbd --listen unix:PATH` detached
+   (`start_new_session=True` ⇒ setsid; stdin/stdout/stderr all
+   redirected to /dev/null to avoid pipe-inheritance hangs in
+   wrappers that capture_output the CLI; `LDB_LDBD_LOG_FILE`
+   redirects stderr instead for operators who want diagnostics).
+   Spawned daemon outlives the client. Resolution order for the
+   ldbd binary: `$LDB_LDBD_SPAWN` → `shutil.which("ldbd")` →
+   sibling-of-`ldb` heuristic.
+
+4. **Signal-driven accept-loop wakeup.** A self-pipe
+   (`g_shutdown_pipe`) replaces the bare `accept()` with
+   `poll(srv, pipe)`. The signal handler writes a byte (write(2)
+   is async-signal-safe); the accept loop wakes on POLLIN,
+   drains the pipe (both ends are `O_NONBLOCK` so the drain
+   loop terminates with EAGAIN), and checks `g_shutdown`.
+   Documented scope: shutdown stops accepting new RPCs
+   immediately but lets the currently-executing dispatch run to
+   completion — interrupting an in-flight LldbBackend SBAPI
+   call from outside is genuinely impossible against the LLDB
+   ABI.
+
+5. **`--listen-idle-timeout N`.** Opt-in shutdown when no
+   workers are alive and no new connection arrives within N
+   seconds. The accept loop's `poll()` timeout becomes
+   `N * 1000ms` when `live_workers == 0`; on `poll() == 0`, the
+   loop rechecks live_workers (closing the race where a worker
+   raced in during the gap) and, if still zero, exits cleanly.
+   A new atomic `g_live_workers` is bumped before
+   `std::thread` construction and decremented on worker exit;
+   workers write a wake byte to the self-pipe on exit so the
+   accept loop re-evaluates the timeout on platforms where
+   `poll`'s deadline survives spurious wakes.
+
+6. **`daemon.shutdown` RPC.** Dispatcher endpoint that invokes
+   a callback wired by `socket_loop.cpp` (sets `g_shutdown` +
+   writes to self-pipe). Returns -32002 with a "not supported
+   in this mode" message when run under `--stdio` (no
+   callback). Listed in `describe.endpoints`. The reply
+   (`{ok:true}`) is sent first; the accept loop's poll wakes
+   on the next byte from the self-pipe.
+
+### Phase 3 — carried forward
+
+Items deferred from the phase-2 work, in roughly priority order:
+
+- **Token auth for shared-uid environments.** Phase-1's trust
+  model (above) excludes shared-uid hosts. Phase-3 sketch:
+  daemon writes a one-shot bearer to `${PATH}.token` (mode
+  0600) at startup; the client reads it and presents it on the
+  first frame; daemon rejects connections that don't present
+  it. The token rotates on restart.
+- **Target_id-aware notification routing.** Phase-2's subscriber
+  set is broadcast-to-all: every live `OutputChannel` receives
+  every async notification regardless of which target_id it
+  originated from. Clients filter by `params.target_id` today.
+  Phase-3: have `NonStopRuntime` accept a target_id filter at
+  subscription time so the daemon does the filtering and per-
+  client traffic stays scoped to the targets they actually opened.
+- **Per-target dispatcher sharding (true per-connection
+  parallelism).** Phase-2 serialises all dispatch through
+  `dispatch_mu_`, so two clients hitting separate target_ids
+  still queue at the dispatcher. The dispatcher's per-target
+  mutable state (target_main_module_, the diff cache keyed by
+  snapshot, the cost-samples ring) would migrate to a per-target
+  map under a per-target mutex; the truly-global pieces
+  (active_session_writer_, recipe loader bookkeeping) stay under
+  the outer mutex. Phase-3 problem, not phase-2: today's workloads
+  don't appear to spend significant time contended on
+  `dispatch_mu_`.
+- **True in-flight RPC cancellation.** Phase-2 stops accepting
+  new RPCs on shutdown but waits for in-flight workers to
+  finish their current dispatch. LLDB SBAPI calls aren't
+  externally interruptible against the binary ABI; a real
+  cancellation story would require an `SBHostInterrupt`-style
+  shim plus dispatcher-side cooperation. Out of scope for
+  socket-daemon work; tracked separately.
+- **Worker reaping mid-flight.** Today the worker thread list
+  grows for the daemon's lifetime; phase-2 only joins on
+  shutdown. A long-lived daemon servicing many short-lived
+  connections accumulates `std::thread` state until exit.
+  Negligible at realistic session counts (~24 bytes per
+  entry) but a 20-line refactor away if it ever matters: each
+  worker posts its `thread::id` into a `done_ids` deque under
+  `done_mu` before returning; the main loop's idle paths join
+  + erase any threads in that list. Sketch left in
+  `socket_loop.cpp`'s `reap_finished_workers` lambda.
+- **TLS / cross-host transports.** Out of scope for socket-
+  daemon; the existing `--ssh` knob plus the socket path
+  inside the SSH tunnel covers the practical cross-host
+  story.
+- **Connection multiplexing within a single client.** One
+  client opening N parallel RPCs over one socket is a phase-3
+  story that requires both ID-tagged request/response routing
+  and a per-channel dispatcher state model. Not on any
+  current roadmap.
 
 ---
 
@@ -546,65 +651,136 @@ Post-cleanup ctest: 77/77. Eight phase-3 smokes (the original
 three plus xref_subclobber, xref_writeback_ldr, xref_str,
 xref_pac_callclobber, and the FAT64 unit test) all pass.
 
-### Phase 4 — carried forward
+### Phase 4 — what shipped (this branch)
 
-These items surfaced during the post-review cleanup but were not in
-scope for the phase-3 spec. Each is a real false-positive / false-
-negative the heuristic can't close without changes to data sources
-(symbol-context lookups, SBTarget triple plumbing, etc.) beyond the
-single-pass register-state machine.
+Seven items closed. Each commit on the phase-4 branch lands one
+acceptance gate; ctest 85/85 at branch tip.
 
-- **Two adjacent unsymbolized functions** — gate 1's function-name
-  boundary check (`function_name_at`) can't fire when both adjacent
-  functions report `""` (stripped binaries). The conservative B / BR
-  / RET reset still catches most cases; a binary that lacks any
-  terminator between two adjacent functions (e.g. compiler-emitted
-  trampolines, hand-rolled tail-call patterns) would let ADRP
-  tracking leak across. Phase 4 needs a symbol-context-by-section-
-  range fallback (find the SBSymbol whose [start, start+size]
-  covers the current insn).
+- **MOV-source classifier lift** (commit `fdbd1d5`): item 5.
+  Move `MovSrcKind` + `classify_mov_source` out of
+  `lldb_backend.cpp`'s anonymous namespace into
+  `xref_arm64_parsers.{h,cpp}` so unit tests can pin the alias-
+  name-first match order (xzr / wzr / sp / wsp / lr token-compared
+  BEFORE the prefix heuristic). Seven new unit tests under
+  `[xref][arm64]` cover the zero, immediate, stack-pointer,
+  link-register, xN/wN, and kOther arms. No behaviour change;
+  the lifted function is byte-identical to the previous in-place
+  implementation. 33 assertions / 13 cases pass.
 
-- **Conditional branches** (`b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz`)
-  that cross into code which uses the tracked registers differently
-  — phase 3 doesn't reset on these. The conservative-reset bar
-  argues that the next-iteration function-boundary check restores
-  sanity, but the worst-case false positive is a same-function
-  back-branch into a path that re-uses the page register for an
-  unrelated value.
+- **Conditional-branch boundary reset** (commit `311c439`):
+  item 1. Phase 3 reset adrp_regs on RET / unconditional B / BR
+  only. Phase 4 adds a check for conditional branches (b.cond /
+  cbz / cbnz / tbz / tbnz) whose target sits in a different
+  function — the scanner parses the target operand (LLDB renders
+  it as `0xNNNNNNN`), resolves to a function name, and resets
+  adrp_regs when distinct from the current function. Skip the
+  parse when adrp_regs is empty (function_name_at dominates
+  cost). New provenance counter `adrp_pair_cond_branch_reset`
+  signals when the path fires. Provenance schema also opens
+  `adrp_pair_function_start_reset` (item 3) and
+  `adrp_pair_unresolvable_load` (item 4) so the dispatcher
+  serialisation path doesn't need a second pass. Smoke fixture
+  `xref_condbranch.s` + `test_xref_condbranch.py` pin the
+  counter bump.
 
-- **MOV from XZR / WZR explicitly** — `mov xN, xzr` is the zero
-  immediate, not an ADRP page. Phase 3 handles this correctly by
-  accident (the prefix hack fell through to "kZero clobbers" via
-  the first-char-'x' detection; the post-review N7 cleanup makes
-  this explicit via `classify_mov_source`). Track in phase 4 for
-  any future regressions.
+- **FAT triple-aware slice picker** (commit `f10c04c`): item 2.
+  Phase 3's picker preferred arm64e > arm64 unconditionally; FAT
+  binaries where LLDB loaded the arm64 slice but the picker chose
+  arm64e produced zero matches due to image_base mismatch.
+  Phase 4 adds an optional `std::string_view triple` parameter to
+  `extract_chained_fixups_from_macho()`; the dispatcher passes
+  `SBTarget::GetTriple()` through; the picker classifies the
+  triple ("arm64e-" / "arm64-" / "x86_64-") into the preferred
+  (cpu_type, cpu_subtype) pair and tries the matching slice
+  first. ARM64_ALL (subtype 0) match also accepts ARM64_V8
+  (subtype 1) — the LLDB triple "arm64-" can land on either
+  subtype. Falls back to phase-3 preference order on empty
+  triple, unknown arch, or matching slice without chained fixups.
+  Four new unit tests under `[chained_fixups][macho][fat][triple]`
+  pin arm64 triple → arm64 slice, arm64e triple → arm64e slice,
+  empty triple → phase-3 default, missing-matching-slice → phase-3
+  fallback. 18/18 [chained_fixups] tests pass.
 
-- **STR-family already shipped** in the phase-3 post-review (commit
-  `306363a`); no longer carried.
+- **Stripped-binary function-start backstop** (commit `9b820b1`):
+  item 3. Phase 3's gate 1 uses `function_name_at()` to detect
+  function boundaries; in a stripped Mach-O without LC_SYMTAB
+  local symbols, `function_name_at` would return "" for adjacent
+  functions and gate 1 silently treats them as one. Phase 4
+  records every B / BL / conditional-branch target inside the
+  current code section as a function-start hint. The check fires
+  BEFORE gate 1: when the scanner reaches an instruction whose
+  address is in the `function_starts` set, adrp_regs resets and
+  the new `adrp_pair_function_start_reset` counter bumps. (On
+  macOS / Apple-silicon LLDB synthesises `___lldb_unnamed_symbol_<addr>`
+  names so gate 1 still works; phase 4's set is the backstop for
+  platforms or patterns where synthesised names don't disambiguate.)
+  Smoke fixture `xref_stripped_fnleak.s` uses `strip -x` post-link
+  to drop the local function labels; the smoke asserts zero false-
+  positive matches (gate 1 + function_starts together; correctness
+  is what matters, not which path fired).
 
-- **FAT slice picker triple plumbing** — the picker today returns
-  the arm64e slice's fixup map when both arm64 and arm64e have
-  chained fixups, even when LLDB loaded the arm64 slice. Phase 4
-  should thread SBTarget's triple through
-  `extract_chained_fixups_from_macho` so the picker matches what's
-  actually loaded. See the N9 cleanup comment in
-  `src/backend/chained_fixups.cpp`.
+- **PC-relative literal-load provenance** (commit `c83d3b0`):
+  item 4. Phase 3's gate 7 bumped `adrp_pair_skipped` for register-
+  offset LDRs with a tracked base. Phase 4 extends the family to
+  PC-relative literal loads (`ldr xN, #imm` / `ldr xN, 0xNNNN`)
+  which bypass the ADRP+pair pattern entirely. Detection shape
+  fires in the "memop didn't match resolve_adrp_consumer"
+  fallback when the operand is immediate-shaped (`#` / `0` / `-`)
+  rather than the `[xN, ...]` bracket. New
+  `adrp_pair_unresolvable_load` counter signals when the
+  resolver gave up on a load. Smoke fixture `xref_pcrel_literal.s`
+  pins the counter bump.
 
-- **Auth-rebase key-class filtering** — phase 3 doesn't distinguish
-  PAC key classes on rebase slots. A consumer that uses
-  `__auth_got` indirection vs `__got` is conflated.
+- **BindInfo schema** (commit `31121eb`): item 6 (scope-guard
+  invoked). The phase-4 spec allowed shipping only the schema if
+  the imports-table walk became too complex for one branch. The
+  walk spans three import-record formats (DYLD_CHAINED_IMPORT /
+  _IMPORT_ADDEND / _IMPORT_ADDEND64), ordinal indexing, string-
+  table lookup, optional SBTarget::FindSymbols, and runtime
+  resolved_addr semantics — roughly 150 LOC of byte-level parser
+  across three layouts. Ship only the schema additions:
+    * New `BindInfo` struct: name, addend, ordinal, resolved_addr.
+    * New `ChainedFixupMap::binds` map: rva → BindInfo, populated
+      by phase 5's walk; today's parser leaves it empty.
+  Three new unit tests pin the empty defaults. Phase 5 wires the
+  actual walk and flips these to populated.
 
-- **Real iOS .ipa smoke** — validate against `dyld_info --fixups`
-  output. The synthetic fixture is sufficient for the heuristic
-  layer but a real WeChat-class binary is the only way to surface
-  performance and edge-case ambiguity at scale.
+- **Real-binary validation fixture** (commit `5de6798`): item 7.
+  A moderate-size C-compiled fixture (`tests/fixtures/c/real_world_xref.c`)
+  exercising the resolver in shapes closer to real iOS app
+  binaries: static const string table with selref-style ADRP+LDR
+  through __DATA_CONST chained-fixup slots, multiple functions in
+  one TU, a conditional-branch tail-call to a different function,
+  malloc/free imports. Built with `-O1 -Wl,-fixup_chains` so the
+  string table becomes a chained-rebase region. Smoke test pins
+  every k_string_table[] entry surfaces at least one xref and a
+  non-pointer literal returns zero false positives. Spot-check
+  against `/usr/bin/uname` (arm64e-apple-macosx26.3.0; FAT picker
+  selected the arm64e slice correctly) — 8 sampled strings each
+  returned 1 xref with empty provenance. Documented as a manual
+  probe rather than CI assertion because system binaries change
+  across macOS versions.
 
-- **Bind resolution** (imports table parsing — phase 2's
-  resolved=0 stays on binds).
+### Phase 5 — carried forward
+
+Items not in phase-4 scope or deferred from phase-4's scope guard:
+
+- **Bind resolution (full)** — phase 4 shipped the BindInfo schema
+  and ChainedFixupMap::binds map; the imports-table walk (three
+  formats, ordinal lookup, string-table dereference, optional
+  SBTarget::FindSymbols for resolved_addr) is phase 5. Phase 5
+  populates binds for every chain entry and surfaces them as
+  xrefs when target_addr matches a bound symbol's resolved
+  address.
+
+- **Auth-rebase key-class filtering** — phase 3/4 don't
+  distinguish PAC key classes on rebase slots. A consumer that
+  uses `__auth_got` indirection vs `__got` is conflated.
 
 - **On-disk cache** of the fixup map keyed on `build_id` — phase
-  2's per-target rebuild is still cheap at fixture scale (~1 ms on
-  33 KB) but a real WeChat-class binary needs measurement.
+  2's per-target rebuild is cheap at fixture scale (~1 ms on
+  33 KB) but a real WeChat-class binary (500 MB+) needs
+  measurement before deciding the cache substrate.
 
 - **`correlate.symbols` / `correlate.strings`** wire-up. The
   symbol-index path doesn't consult the fixup map yet — it scans
@@ -612,6 +788,18 @@ single-pass register-state machine.
 
 - **Multi-module support.** `xref_address` only scans the main
   executable (module index 0).
+
+- **Full dataflow analysis** — basic-block CFG + liveness instead
+  of the single-pass last-ADRP-per-register heuristic. The phase-4
+  conditional-branch reset and function_starts backstop are the
+  conservative answer; full CFG would close the
+  back-branch-into-same-page-register edge case but materially
+  changes the resolver's cost model.
+
+- **Real iOS .ipa smoke (CI)** — phase 4 added the C fixture and
+  documented a manual `/usr/bin/uname` probe. CI assertions on
+  real iOS binaries are licence-sensitive and platform-fragile;
+  defer to spot-checks documented in the worklog.
 
 ### Out of scope (phase 2)
 

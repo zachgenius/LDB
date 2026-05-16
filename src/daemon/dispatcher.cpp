@@ -658,6 +658,11 @@ void decorate_provenance(Response& resp,
 
 Response Dispatcher::dispatch(const Request& req) {
   using clock = std::chrono::steady_clock;
+  // §2 phase 2 — outer serialisation lock. See dispatcher.h's
+  // dispatch_mu_ comment for the full rationale, including why
+  // this is a recursive_mutex (session.replay's loop re-enters
+  // dispatch() on the same thread).
+  std::lock_guard<std::recursive_mutex> dispatch_lk(dispatch_mu_);
   auto t0 = clock::now();
   Response resp = dispatch_inner(req);
   decorate_provenance(resp, backend_.get(), req);
@@ -720,6 +725,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
   try {
     if (req.method == "hello")              return handle_hello(req);
     if (req.method == "describe.endpoints") return handle_describe_endpoints(req);
+    if (req.method == "daemon.shutdown")    return handle_daemon_shutdown(req);
     if (req.method == "target.open")        return handle_target_open(req);
     if (req.method == "target.create_empty")return handle_target_create_empty(req);
     if (req.method == "target.attach")      return handle_target_attach(req);
@@ -924,6 +930,29 @@ Response Dispatcher::handle_hello(const Request& req) {
   return protocol::make_ok(req.id, std::move(data));
 }
 
+Response Dispatcher::handle_daemon_shutdown(const Request& req) {
+  // Refuse in stdio mode (no callback wired). The agent has no clean
+  // way to ask a stdio daemon to exit — closing stdin is the canonical
+  // signal — so a missing callback means we should fail loud rather
+  // than silently no-op.
+  if (!shutdown_callback_) {
+    return protocol::make_err(
+        req.id, ErrorCode::kBadState,
+        "daemon.shutdown is only available in --listen mode");
+  }
+  // Fire the callback AFTER we've assembled the reply. The reply is
+  // serialised back to the caller in the normal dispatch flow; the
+  // callback runs synchronously here, sets g_shutdown (or its
+  // equivalent), and writes to the self-pipe so the accept loop wakes.
+  // We can safely run it from this RPC thread because the callback
+  // does no I/O on the connection — it only touches the daemon's
+  // shutdown latch.
+  shutdown_callback_();
+  json data;
+  data["ok"] = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
 Response Dispatcher::handle_describe_endpoints(const Request& req) {
   // Catalog upgraded in M5 (plan §4.8). Each entry now carries proper
   // JSON Schema (draft 2020-12) for params/returns, plus
@@ -1030,6 +1059,20 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       obj({}),
       obj({{"endpoints", arr_of(obj_open(
           "Per-method record. See plan §4.8."))}}, {"endpoints"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("daemon.shutdown",
+      "Ask the daemon to exit cleanly. The reply (`{ok:true}`) is "
+      "sent first; then the accept loop is woken and the daemon "
+      "tears down the listener / lockfile / socket inode. In-flight "
+      "RPCs on other connections run to completion (LldbBackend "
+      "SBAPI calls aren't externally interruptible); no new "
+      "connections are accepted. Returns -32002 (kBadState) when "
+      "the daemon is running in --stdio mode (use stdin EOF or "
+      "SIGTERM there). §2 phase-2 of "
+      "docs/35-field-report-followups.md.",
+      obj({}),
+      obj({{"ok", bool_("Always true on success.")}}, {"ok"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== target.* ==============
@@ -1322,13 +1365,35 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
                   "offset operand the resolver couldn't statically "
                   "evaluate (e.g. `[xN, xM]`, `[xN, xM, lsl #imm]`). "
                   "Each skip is a potential xref the heuristic cannot "
-                  "surface; phase 4 will close the most common cases.")},
+                  "surface; phase 5 will close the most common cases.")},
               {"adrp_pair_writeback_cleared", uint_(
                   "Number of pre/post-indexed LDRs whose base register "
                   "the resolver cleared after the match emit. The "
                   "legitimate xref still fires; subsequent loads through "
                   "the same register are no longer trackable because "
                   "the writeback rewrote it.")},
+              {"adrp_pair_cond_branch_recorded", uint_(
+                  "Phase 4 item 1 (post-cleanup): number of cross-function "
+                  "conditional branches (b.cond / cbz / cbnz / tbz / tbnz) "
+                  "whose targets the scanner recorded as function_start "
+                  "hints. The source-side fall-through tracking is "
+                  "intentionally preserved; gate 3 fires when the scanner "
+                  "later reaches the taken side via the recorded hint.")},
+              {"adrp_pair_function_start_reset", uint_(
+                  "Phase 4 item 3: number of times the scanner crossed an "
+                  "instruction whose address was previously recorded as a "
+                  "function start (a B / BL / cross-fn cbz target inside "
+                  "the same code section) and cleared adrp_regs. Catches "
+                  "the stripped-binary case where gate 1's "
+                  "function_name_at returns \"\" for adjacent functions.")},
+              {"adrp_pair_unresolvable_load", uint_(
+                  "Phase 4 item 4: number of loads the resolver explicitly "
+                  "gave up on — PC-relative literal loads (`ldr xN, #imm` "
+                  "/ `ldr xN, 0xNNNN`) whose literal-pool slot can't be "
+                  "statically dereferenced. Distinct from "
+                  "adrp_pair_skipped (register-offset memops with a "
+                  "tracked base); together they cover the universe of "
+                  "memops the heuristic can't resolve.")},
               {"warnings", arr_of(str(), "Human-readable diagnostics "
                   "from the ADRP-pair resolver; emitted only when at "
                   "least one ambiguous pattern was encountered.")},
@@ -1340,15 +1405,35 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
   add("string.xref",
       "Find xrefs to an exact-text string. Combines address-hex "
       "detection (x86-64 direct loads) with LLDB comment-text "
-      "matching (ARM64 ADRP+ADD pairs).",
+      "matching (ARM64 ADRP+ADD pairs). The optional `provenance` "
+      "field surfaces ADRP-pair-resolver diagnostics aggregated "
+      "across every underlying xref scan — see xref.addr's "
+      "provenance for field semantics.",
       obj({
           {"target_id", target_id_param()},
           {"text",      str("Exact string text to match.")},
       }, {"target_id", "text"}),
-      with_defs(obj({{"results", arr_of(obj({
-          {"string", ref("StringEntry")},
-          {"xrefs",  arr_of(ref("XrefMatch"))},
-      }))}}, {"results"}),
+      with_defs(obj({
+          {"results", arr_of(obj({
+              {"string", ref("StringEntry")},
+              {"xrefs",  arr_of(ref("XrefMatch"))},
+          }))},
+          {"provenance", obj({
+              {"adrp_pair_skipped", uint_(
+                  "Aggregate across every underlying xref scan. See "
+                  "xref.addr.provenance.adrp_pair_skipped.")},
+              {"adrp_pair_writeback_cleared", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"adrp_pair_cond_branch_recorded", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"adrp_pair_function_start_reset", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"adrp_pair_unresolvable_load", uint_(
+                  "Aggregate; see xref.addr.")},
+              {"warnings", arr_of(str(), "Aggregate human-readable "
+                  "diagnostics from every xref scan.")},
+          })},
+      }, {"results"}),
           {{"StringEntry", string_entry_def()},
            {"XrefMatch",   xref_match_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "high");
@@ -4520,8 +4605,13 @@ Response Dispatcher::handle_string_xref(const Request& req) {
   }
 
   auto view_spec = protocol::view::parse_from_params(req.params);
+  // Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): collect
+  // the aggregate ADRP-pair-resolver provenance across every
+  // xref_address call so the agent sees skipped patterns even when
+  // it routed through string.xref instead of xref.addr.
+  backend::XrefProvenance prov;
   auto results = backend_->find_string_xrefs(
-      static_cast<backend::TargetId>(tid), *text);
+      static_cast<backend::TargetId>(tid), *text, &prov);
 
   json arr = json::array();
   for (const auto& r : results) {
@@ -4532,8 +4622,28 @@ Response Dispatcher::handle_string_xref(const Request& req) {
     one["xrefs"] = std::move(xrefs);
     arr.push_back(std::move(one));
   }
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "results"));
+  auto data = protocol::view::apply_to_array(
+      std::move(arr), view_spec, "results");
+  // Attach provenance only when at least one ADRP-pair-resolver counter
+  // bumped or a warning fired — same emission policy as xref.addr.
+  if (prov.adrp_pair_skipped > 0 ||
+      prov.adrp_pair_writeback_cleared > 0 ||
+      prov.adrp_pair_cond_branch_recorded > 0 ||
+      prov.adrp_pair_function_start_reset > 0 ||
+      prov.adrp_pair_unresolvable_load > 0 ||
+      !prov.warnings.empty()) {
+    json p = json::object();
+    p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
+    p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
+    p["adrp_pair_cond_branch_recorded"] = prov.adrp_pair_cond_branch_recorded;
+    p["adrp_pair_function_start_reset"] = prov.adrp_pair_function_start_reset;
+    p["adrp_pair_unresolvable_load"] = prov.adrp_pair_unresolvable_load;
+    json ws = json::array();
+    for (const auto& w : prov.warnings) ws.push_back(w);
+    p["warnings"] = std::move(ws);
+    data["provenance"] = std::move(p);
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_xref_addr(const Request& req) {
@@ -4565,12 +4675,20 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
   // cleared. Empty provenance is the common case and would cost ~30
   // bytes per response if always emitted; the explicit field is a
   // clear "this run had ambiguous patterns" signal when present.
+  // Phase 4 adds three new counters; the trigger condition expands to
+  // include them so they're surfaced when non-zero.
   if (prov.adrp_pair_skipped > 0 ||
       prov.adrp_pair_writeback_cleared > 0 ||
+      prov.adrp_pair_cond_branch_recorded > 0 ||
+      prov.adrp_pair_function_start_reset > 0 ||
+      prov.adrp_pair_unresolvable_load > 0 ||
       !prov.warnings.empty()) {
     json p = json::object();
     p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
     p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
+    p["adrp_pair_cond_branch_recorded"] = prov.adrp_pair_cond_branch_recorded;
+    p["adrp_pair_function_start_reset"] = prov.adrp_pair_function_start_reset;
+    p["adrp_pair_unresolvable_load"] = prov.adrp_pair_unresolvable_load;
     json ws = json::array();
     for (const auto& w : prov.warnings) ws.push_back(w);
     p["warnings"] = std::move(ws);

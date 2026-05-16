@@ -47,7 +47,8 @@ class LldbBackend final : public DebuggerBackend {
       xref_address(TargetId tid, std::uint64_t target_addr,
                    XrefProvenance* provenance = nullptr) override;
   std::vector<StringXrefResult>
-      find_string_xrefs(TargetId tid, const std::string& text) override;
+      find_string_xrefs(TargetId tid, const std::string& text,
+                        XrefProvenance* provenance = nullptr) override;
 
   ProcessStatus launch_process(TargetId tid,
                                const LaunchOptions& opts) override;

@@ -33,10 +33,20 @@ namespace ldb::daemon {
 // length-prefixed CBOR framing as the stdio loop. We don't (yet)
 // negotiate per-connection.
 //
+// `idle_timeout_sec` (0 = disabled, default): if no new connection
+// arrives within this many seconds AND no worker thread is alive,
+// the daemon exits cleanly. Phase-2 idle-shutdown knob for
+// orchestrators that want the daemon to die quietly after a burst
+// of activity. The "no workers alive" qualifier matters because a
+// long-lived agent session might idle for more than the timeout
+// while the user is thinking; killing the daemon out from under
+// it would be hostile.
+//
 // Returns 0 on clean shutdown, 1 on bind/listen failure or lock
 // collision.
 int run_socket_listener(Dispatcher& dispatcher,
                         const std::string& sock_path,
-                        protocol::WireFormat fmt);
+                        protocol::WireFormat fmt,
+                        int idle_timeout_sec = 0);
 
 }  // namespace ldb::daemon

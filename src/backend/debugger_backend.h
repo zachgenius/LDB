@@ -225,10 +225,37 @@ struct XrefProvenance {
   // addition (docs/35-field-report-followups.md §3 improvement 3).
   std::uint32_t adrp_pair_writeback_cleared = 0;
 
+  // Phase 4 item 1 (post-cleanup, docs/35-field-report-followups.md §3):
+  // conditional branch (b.cond / cbz / cbnz / tbz / tbnz) whose target
+  // sat in a different function. The branch target is recorded as a
+  // function_start hint so gate 3 fires when the scanner later reaches
+  // it. The source-side fall-through tracking is intentionally
+  // preserved (the original phase-4 unconditional clear was a silent
+  // wrong-result regression — see cleanup C1). A non-zero value signals
+  // the scanner saw a cross-function cond-branch and bookkept its
+  // target.
+  std::uint32_t adrp_pair_cond_branch_recorded = 0;
+
+  // Phase 4 item 3 (docs/35-field-report-followups.md §3): the scanner
+  // crossed an instruction whose address was previously recorded as a
+  // function start (a B / BR / BL target inside __TEXT/__text) and
+  // reset adrp_regs. Catches the stripped-binary case where two
+  // adjacent functions both report function_name_at = "" and gate 1
+  // can't tell them apart.
+  std::uint32_t adrp_pair_function_start_reset = 0;
+
+  // Phase 4 item 4 (docs/35-field-report-followups.md §3): the
+  // scanner saw a load/store it deliberately gave up on resolving
+  // (pre/post-indexed LDR with untracked base, PC-relative literal
+  // load, ...). Distinct from adrp_pair_skipped (which is the
+  // register-offset case); together they cover the universe of
+  // memops the heuristic can't statically resolve.
+  std::uint32_t adrp_pair_unresolvable_load = 0;
+
   // Human-readable warnings — phase 3 starts with a single
   // "register-offset LDR skipped" warning when adrp_pair_skipped > 0.
-  // Phase 4 will extend with more codes as additional patterns
-  // accumulate (auth-rebase semantics, multi-start pages, ...).
+  // Phase 4 extends with codes for conditional-branch resets,
+  // function-start resets, and other unresolvable-load shapes.
   std::vector<std::string> warnings;
 };
 
@@ -626,8 +653,18 @@ class DebuggerBackend {
   // Returns a result per matching StringMatch; each carries the
   // string and the xrefs to its address. Empty result = string not
   // found OR no xrefs. Throws backend::Error for invalid target_id.
+  //
+  // The `provenance` out-param (optional) is the AGGREGATE of every
+  // underlying xref_address call's provenance — counters sum, warning
+  // strings concat. Phase-4 cleanup I1
+  // (docs/35-field-report-followups.md §3): the prior signature had
+  // no provenance, so `string.xref` callers silently lost every
+  // adrp_pair_* diagnostic the ADRP-pair resolver produced. Without
+  // these counters an agent can't decide whether the heuristic was
+  // authoritative on this binary.
   virtual std::vector<StringXrefResult>
-      find_string_xrefs(TargetId tid, const std::string& text) = 0;
+      find_string_xrefs(TargetId tid, const std::string& text,
+                        XrefProvenance* provenance = nullptr) = 0;
 
   // --- Process lifecycle -------------------------------------------------
   //

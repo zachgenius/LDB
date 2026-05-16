@@ -119,3 +119,33 @@ TEST_CASE("string.xref: invalid target_id throws backend::Error",
       fx.backend->find_string_xrefs(/*tid=*/9999, "anything"),
       ldb::backend::Error);
 }
+
+// Phase-4 cleanup I1 (docs/35-field-report-followups.md §3): the prior
+// find_string_xrefs signature dropped every adrp_pair_* provenance
+// counter the ADRP-pair resolver produced. The threaded signature
+// surfaces an aggregate XrefProvenance across all underlying
+// xref_address calls.
+TEST_CASE("string.xref: threads XrefProvenance through to xref_address",
+          "[backend][string_xref][provenance]") {
+  auto fx = open_fixture();
+  ldb::backend::XrefProvenance prov;
+  auto results = fx.backend->find_string_xrefs(
+      fx.target_id, "btp_schema.xml", &prov);
+  REQUIRE_FALSE(results.empty());
+
+  // The fixture is a real C binary with at least one tracked ADRP+ADD
+  // (we asserted the xrefs themselves above). Whether any
+  // adrp_pair_* counter bumps depends on the resolver's gates against
+  // this binary's compilation; what we MUST verify is that the
+  // provenance struct is accepted and the call completes — i.e. the
+  // optional-arg plumbing exists. A non-instrumented call (provenance
+  // nullptr default) must produce identical xref results.
+  ldb::backend::XrefProvenance ignored;
+  (void)ignored;  // suppress unused; we don't compare counters
+  auto results_no_prov = fx.backend->find_string_xrefs(
+      fx.target_id, "btp_schema.xml");
+  REQUIRE(results.size() == results_no_prov.size());
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    CHECK(results[i].xrefs.size() == results_no_prov[i].xrefs.size());
+  }
+}

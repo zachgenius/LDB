@@ -111,6 +111,31 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     -Wl,-fixup_chains
   )
 
+  # Phase-4 item 7 fixture (docs/35-field-report-followups.md §3): a
+  # moderate-size C program exercising multiple xref patterns
+  # (selref-style string-table indirection, conditional-branch
+  # tail-call, malloc/free imports). Compiled with -O1 so the
+  # compiler emits the ADRP+ADD / ADRP+LDR pairs the resolver targets;
+  # -Wl,-fixup_chains forces the chained-fixup encoding so the
+  # __DATA_CONST slot for k_string_table[] becomes a rebase entry.
+  # Real-binary spot-checking against /usr/bin/grep / /usr/lib/dyld is
+  # documented in the worklog (host-dependent, not automated in CI).
+  add_executable(ldb_fix_real_world_xref c/real_world_xref.c)
+  set_target_properties(ldb_fix_real_world_xref PROPERTIES
+    OUTPUT_NAME    real_world_xref
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+    C_STANDARD     11
+  )
+  target_compile_options(ldb_fix_real_world_xref PRIVATE
+    -arch arm64
+    -O1
+    -fno-omit-frame-pointer
+  )
+  target_link_options(ldb_fix_real_world_xref PRIVATE
+    -arch arm64
+    -Wl,-fixup_chains
+  )
+
   # Phase-3 adversarial fixtures (docs/35-field-report-followups.md §3
   # phase 3). Each one reproduces a specific phase-2 false-positive in
   # the ADRP-pair resolver. Hand-assembled `.s` so the instruction
@@ -124,7 +149,13 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
       xref_callclobber
       xref_subclobber
       xref_writeback_ldr
-      xref_str)
+      xref_str
+      xref_condbranch
+      xref_pcrel_literal
+      xref_cond_fallthrough
+      xref_cond_same_fn
+      xref_csel
+      xref_ldp_clobber)
     add_executable(ldb_fix_${_phase3_fix} asm/${_phase3_fix}.s)
     set_target_properties(ldb_fix_${_phase3_fix} PROPERTIES
       OUTPUT_NAME    ${_phase3_fix}
@@ -134,6 +165,33 @@ if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
     target_compile_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
     target_link_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
   endforeach()
+
+  # Phase-4 item 3 fixture (docs/35-field-report-followups.md §3):
+  # stripped-binary function-boundary leak. Build the assembly normally
+  # then run `strip -x` post-link to remove the non-global function
+  # symbols. The remaining symbol table holds `_main` (entry point) +
+  # `_strip_data` (the data needle the smoke test looks for); the two
+  # function labels `_pattern_strip_a` / `_pattern_strip_b` are gone,
+  # so function_name_at() returns "" at their addresses. The smoke
+  # test proves phase 4's function_starts reset still catches the
+  # boundary.
+  add_executable(ldb_fix_xref_stripped_fnleak
+                 asm/xref_stripped_fnleak.s)
+  set_target_properties(ldb_fix_xref_stripped_fnleak PROPERTIES
+    OUTPUT_NAME    xref_stripped_fnleak
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+    LINKER_LANGUAGE C
+  )
+  target_compile_options(ldb_fix_xref_stripped_fnleak PRIVATE -arch arm64)
+  target_link_options(ldb_fix_xref_stripped_fnleak PRIVATE -arch arm64)
+  # strip -x: removes non-global ("local") symbols. The function
+  # labels we want to erase are non-global; _main and _strip_data
+  # are .globl and survive.
+  add_custom_command(TARGET ldb_fix_xref_stripped_fnleak POST_BUILD
+    COMMAND ${CMAKE_STRIP} -x
+            $<TARGET_FILE:ldb_fix_xref_stripped_fnleak>
+    COMMENT "Stripping local symbols from xref_stripped_fnleak fixture"
+  )
 
   # Phase-3 post-review PAC-call fixture. PAC branch mnemonics
   # (BLRAA / BLRAB / BLRAAZ / BLRABZ / BRAA / BRAB / BRAAZ / BRABZ /
