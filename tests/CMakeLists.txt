@@ -887,6 +887,31 @@ set_tests_properties(smoke_socket_autospawn PROPERTIES
   TIMEOUT 60
 )
 
+# §2 phase 2: `daemon.shutdown` RPC tears the daemon down cleanly.
+# Reply ok=true is sent first; then the accept loop wakes (self-pipe)
+# and the listener / lockfile / socket inode are unlinked.
+add_test(
+  NAME smoke_daemon_shutdown_rpc
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_daemon_shutdown_rpc.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_daemon_shutdown_rpc PROPERTIES
+  TIMEOUT 30
+)
+
+# §2 phase 2: SIGTERM with an idle connection still alive — the
+# self-pipe wakes the accept loop within ~100ms so shutdown
+# completes within a few seconds (vs hanging in pre-fix
+# blocking accept).
+add_test(
+  NAME smoke_socket_interruption
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_interruption.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_interruption PROPERTIES
+  TIMEOUT 30
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(

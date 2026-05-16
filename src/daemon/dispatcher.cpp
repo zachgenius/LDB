@@ -731,6 +731,7 @@ Response Dispatcher::dispatch_inner(const Request& req) {
   try {
     if (req.method == "hello")              return handle_hello(req);
     if (req.method == "describe.endpoints") return handle_describe_endpoints(req);
+    if (req.method == "daemon.shutdown")    return handle_daemon_shutdown(req);
     if (req.method == "target.open")        return handle_target_open(req);
     if (req.method == "target.create_empty")return handle_target_create_empty(req);
     if (req.method == "target.attach")      return handle_target_attach(req);
@@ -935,6 +936,29 @@ Response Dispatcher::handle_hello(const Request& req) {
   return protocol::make_ok(req.id, std::move(data));
 }
 
+Response Dispatcher::handle_daemon_shutdown(const Request& req) {
+  // Refuse in stdio mode (no callback wired). The agent has no clean
+  // way to ask a stdio daemon to exit — closing stdin is the canonical
+  // signal — so a missing callback means we should fail loud rather
+  // than silently no-op.
+  if (!shutdown_callback_) {
+    return protocol::make_err(
+        req.id, ErrorCode::kBadState,
+        "daemon.shutdown is only available in --listen mode");
+  }
+  // Fire the callback AFTER we've assembled the reply. The reply is
+  // serialised back to the caller in the normal dispatch flow; the
+  // callback runs synchronously here, sets g_shutdown (or its
+  // equivalent), and writes to the self-pipe so the accept loop wakes.
+  // We can safely run it from this RPC thread because the callback
+  // does no I/O on the connection — it only touches the daemon's
+  // shutdown latch.
+  shutdown_callback_();
+  json data;
+  data["ok"] = true;
+  return protocol::make_ok(req.id, std::move(data));
+}
+
 Response Dispatcher::handle_describe_endpoints(const Request& req) {
   // Catalog upgraded in M5 (plan §4.8). Each entry now carries proper
   // JSON Schema (draft 2020-12) for params/returns, plus
@@ -1041,6 +1065,20 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
       obj({}),
       obj({{"endpoints", arr_of(obj_open(
           "Per-method record. See plan §4.8."))}}, {"endpoints"}),
+      /*requires_target=*/false, /*requires_stopped=*/false, "low");
+
+  add("daemon.shutdown",
+      "Ask the daemon to exit cleanly. The reply (`{ok:true}`) is "
+      "sent first; then the accept loop is woken and the daemon "
+      "tears down the listener / lockfile / socket inode. In-flight "
+      "RPCs on other connections run to completion (LldbBackend "
+      "SBAPI calls aren't externally interruptible); no new "
+      "connections are accepted. Returns -32002 (kBadState) when "
+      "the daemon is running in --stdio mode (use stdin EOF or "
+      "SIGTERM there). §2 phase-2 of "
+      "docs/35-field-report-followups.md.",
+      obj({}),
+      obj({{"ok", bool_("Always true on success.")}}, {"ok"}),
       /*requires_target=*/false, /*requires_stopped=*/false, "low");
 
   // ============== target.* ==============

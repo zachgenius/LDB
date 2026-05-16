@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -75,6 +76,18 @@ class Dispatcher {
   }
   void remove_notification_sink(SubscriptionHandle h) {
     nonstop_.remove_notification_sink(h);
+  }
+
+  // Wire a callback to be invoked by the `daemon.shutdown` RPC after
+  // the handler returns its `{ok: true}` reply. In listen mode the
+  // socket loop sets this to a function that writes a byte to its
+  // self-pipe, which causes the accept loop to wake up and exit. In
+  // stdio mode this is left unset; the only way to stop a stdio
+  // daemon is SIGTERM (or stdin EOF) — `daemon.shutdown` returns
+  // -32002 with a "not supported in this mode" message when no
+  // callback has been wired.
+  void set_shutdown_callback(std::function<void()> cb) {
+    shutdown_callback_ = std::move(cb);
   }
 
   // Test-only seam: install a pre-made RspChannel under target_id +
@@ -231,9 +244,19 @@ class Dispatcher {
   // touching the dispatcher's bookkeeping.
   std::mutex                                               dispatch_mu_;
 
+  // Wired by set_shutdown_callback (only in listen mode today). The
+  // `daemon.shutdown` handler invokes this after the reply is sent
+  // so the socket loop's accept thread wakes up and exits cleanly.
+  // Empty in stdio mode — the handler returns -32002 there.
+  std::function<void()>                                    shutdown_callback_;
+
   // Handlers
   protocol::Response handle_hello(const protocol::Request& req);
   protocol::Response handle_describe_endpoints(const protocol::Request& req);
+  // §2 phase 2 — `daemon.shutdown`. Invokes shutdown_callback_ after
+  // replying ok=true. Returns -32002 (kBadState) if no callback was
+  // wired (stdio mode).
+  protocol::Response handle_daemon_shutdown(const protocol::Request& req);
   protocol::Response handle_target_open(const protocol::Request& req);
   protocol::Response handle_target_create_empty(const protocol::Request& req);
   protocol::Response handle_target_attach(const protocol::Request& req);

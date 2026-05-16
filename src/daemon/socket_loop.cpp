@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/socket.h>
@@ -32,20 +33,37 @@ namespace ldb::daemon {
 
 namespace {
 
-// File-scope termination flag set by SIGTERM/SIGINT. The accept loop
-// polls it between connections; on the main thread we block both
-// signals during dispatch so a signal arriving mid-RPC can't interleave
-// with the SBAPI calls. The signal handler must touch nothing the
-// stdlib doesn't allow from async-signal context — std::atomic<int>
-// stores are conformant.
+// File-scope termination flag set by SIGTERM/SIGINT or by the
+// `daemon.shutdown` RPC. The accept loop's poll() wakes on either the
+// listener fd OR the self-pipe; once g_shutdown is non-zero it exits
+// the loop. The signal handler must touch nothing the stdlib doesn't
+// allow from async-signal context — std::atomic<int> stores and the
+// write(2) to g_shutdown_pipe[1] are both conformant.
 //
 // Explicit `static` (alongside the surrounding anonymous namespace) so
 // the file-scope intent is unambiguous to readers and to any future
 // refactor that flattens the namespace.
 static std::atomic<int> g_shutdown{0};
 
+// Self-pipe pattern for signal-driven accept-loop wake-up. The write
+// end is closed-on-fork (FD_CLOEXEC); the signal handler writes a
+// single byte to it so poll() returns POLLIN on the read end and the
+// loop notices the shutdown flag without the race that plain
+// "g_shutdown.load() inside accept()" would have on a multi-second
+// hung RPC. -1 sentinel means "not initialised yet" — the signal
+// handler checks before calling write so an early signal during
+// startup is a no-op (the loop hasn't started running anyway).
+static int g_shutdown_pipe[2] = {-1, -1};
+
 static void on_term_signal(int sig) {
   g_shutdown.store(sig, std::memory_order_release);
+  if (g_shutdown_pipe[1] >= 0) {
+    const char byte = 'q';
+    // Best-effort write; an already-full pipe (multiple signals
+    // coalesced) is fine — one byte is enough to wake poll().
+    // write() in a signal handler is async-signal-safe per POSIX.
+    (void) ::write(g_shutdown_pipe[1], &byte, 1);
+  }
 }
 
 // Minimal fd-backed streambuf: one read buffer, one write buffer, both
@@ -449,6 +467,49 @@ int run_socket_listener(Dispatcher& dispatcher,
     return 1;
   }
 
+  // Self-pipe for signal-driven and daemon.shutdown-driven wake-up.
+  // Both ends are CLOEXEC so a forked subprocess (we don't fork
+  // today but might in the future) doesn't inherit the file
+  // descriptor. The pipe is non-blocking on write because the
+  // signal handler must not stall — if the pipe is full (multiple
+  // signals in flight), the write fails with EAGAIN and we lose a
+  // wake-up, but the EARLIER write already set g_shutdown so the
+  // loop will exit on its next pass anyway.
+  if (::pipe(g_shutdown_pipe) != 0) {
+    log::error(std::string("pipe(): ") + std::strerror(errno));
+    ::close(srv);
+    ::unlink(sock_path.c_str());
+    ::close(lock_fd);
+    return 1;
+  }
+  ::fcntl(g_shutdown_pipe[0], F_SETFD, FD_CLOEXEC);
+  ::fcntl(g_shutdown_pipe[1], F_SETFD, FD_CLOEXEC);
+  // Both ends non-blocking. Write end so the signal handler can't
+  // deadlock if the kernel pipe is full (multiple signals
+  // coalesced). Read end so the drain loop's terminating read
+  // returns EAGAIN instead of blocking — without that the loop
+  // hangs after consuming the single wake-up byte, because the
+  // pipe is now empty and the next read() would block until more
+  // data arrives.
+  {
+    int fl0 = ::fcntl(g_shutdown_pipe[0], F_GETFL);
+    if (fl0 >= 0) ::fcntl(g_shutdown_pipe[0], F_SETFL, fl0 | O_NONBLOCK);
+    int fl1 = ::fcntl(g_shutdown_pipe[1], F_GETFL);
+    if (fl1 >= 0) ::fcntl(g_shutdown_pipe[1], F_SETFL, fl1 | O_NONBLOCK);
+  }
+
+  // `daemon.shutdown` RPC handler invokes this. We push a byte into
+  // the self-pipe to wake the accept loop; g_shutdown is set in
+  // both this path and the signal handler so the loop notices on
+  // its next wake-up regardless of who fired.
+  dispatcher.set_shutdown_callback([]() {
+    g_shutdown.store(1, std::memory_order_release);
+    if (g_shutdown_pipe[1] >= 0) {
+      const char byte = 'q';
+      (void) ::write(g_shutdown_pipe[1], &byte, 1);
+    }
+  });
+
   install_signal_handlers();
 
   log::info("listening on unix:" + sock_path +
@@ -485,11 +546,43 @@ int run_socket_listener(Dispatcher& dispatcher,
   (void) reap_finished_workers;
 
   while (g_shutdown.load(std::memory_order_acquire) == 0) {
+    // poll() on listener fd + self-pipe so a SIGTERM (or
+    // daemon.shutdown's callback) wakes us promptly instead of
+    // waiting for accept() to return naturally. Phase-1 used
+    // bare accept() with EINTR handling; that worked only because
+    // there was nothing else to wait for. Phase-2 adds the
+    // shutdown self-pipe so a hung listener (no incoming
+    // connections) still exits within ~milliseconds of the
+    // shutdown signal.
+    ::pollfd fds[2];
+    fds[0].fd = srv;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    fds[1].fd = g_shutdown_pipe[0];
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
+    int pr = ::poll(fds, 2, -1);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      log::error(std::string("poll: ") + std::strerror(errno));
+      continue;
+    }
+    if (fds[1].revents & POLLIN) {
+      // Drain the wake-up byte(s). Multiple signals coalesce
+      // into a single drain; g_shutdown is the real signal. The
+      // read end is non-blocking, so this loop terminates with
+      // EAGAIN once the pipe is empty.
+      char drain[64];
+      while (::read(g_shutdown_pipe[0], drain, sizeof(drain)) > 0) {}
+      if (g_shutdown.load(std::memory_order_acquire) != 0) break;
+    }
+    if (!(fds[0].revents & POLLIN)) continue;
+
     ::sockaddr_un peer{};
     socklen_t peer_len = sizeof(peer);
     int conn = ::accept(srv, reinterpret_cast<::sockaddr*>(&peer), &peer_len);
     if (conn < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR || errno == EAGAIN) continue;
       log::error(std::string("accept: ") + std::strerror(errno));
       continue;
     }
@@ -556,6 +649,19 @@ int run_socket_listener(Dispatcher& dispatcher,
 
   ::close(lock_fd);
   ::unlink(lock_path.c_str());
+
+  // Tear down the self-pipe. The dispatcher's shutdown callback
+  // closes over g_shutdown_pipe[1]; we clear it AFTER the worker
+  // joins above so any callback still in flight harmlessly writes
+  // to a now-closed fd (the write returns EBADF; we don't care).
+  if (g_shutdown_pipe[0] >= 0) {
+    ::close(g_shutdown_pipe[0]);
+    g_shutdown_pipe[0] = -1;
+  }
+  if (g_shutdown_pipe[1] >= 0) {
+    ::close(g_shutdown_pipe[1]);
+    g_shutdown_pipe[1] = -1;
+  }
   return 0;
 }
 
