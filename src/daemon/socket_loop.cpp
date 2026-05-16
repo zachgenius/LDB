@@ -447,12 +447,24 @@ void serve_socket_client(Dispatcher* dispatcher,
   FdOstream  out_stream(conn);
   protocol::OutputChannel out(out_stream, fmt);
 
-  protocol::StreamNotificationSink sink(out);
-  auto sub = dispatcher->add_notification_sink(&sink);
+  // Post-review C1: heap-allocate the per-connection sink via
+  // std::make_shared so a concurrent listener-thread emit_stopped_
+  // can't UAF on a stack-local. The dispatcher / NonStopRuntime
+  // holds a strong ref for the duration of the registration; the
+  // emitter's snapshot bumps the count for the duration of the
+  // delivery. When remove_notification_sink runs here, the runtime
+  // drops its ref but any in-flight emit still has its snapshot's
+  // ref — the sink destructs cleanly on the LAST ref drop.
+  auto sink = std::make_shared<protocol::StreamNotificationSink>(out);
+  auto sub = dispatcher->add_notification_sink(sink);
 
   (void) serve_one_connection(*dispatcher, out, in, fmt);
 
   dispatcher->remove_notification_sink(sub);
+  // sink (the local shared_ptr) drops its ref here; if any listener
+  // still holds a snapshot ref, the sink stays alive until that
+  // emit() returns and the snapshot vector destructs.
+  sink.reset();
   ::close(conn);
   g_live_workers.fetch_sub(1, std::memory_order_release);
   // Wake the accept loop's poll() so it re-evaluates the idle

@@ -390,11 +390,15 @@ int main(int argc, char** argv) {
   // Post-V1 #21 phase-2 (docs/27): single stdout writer with mutex;
   // the listener thread's thread.event notifications and the
   // dispatcher's replies funnel through this so they never byte-
-  // interleave. The sink is borrowed by the dispatcher; both live
-  // for the duration of main(), so the borrow is stable.
+  // interleave. Post-review C1: the sink is held by shared_ptr by
+  // the dispatcher / NonStopRuntime so the listener-thread emit
+  // path cannot race against a destruction of the sink. Stdio mode
+  // is single-client and doesn't exercise that race, but the API
+  // is the same in both modes.
   ldb::protocol::OutputChannel out(std::cout, wire_format);
-  ldb::protocol::StreamNotificationSink notif_sink(out);
-  dispatcher.set_notification_sink(&notif_sink);
+  auto notif_sink =
+      std::make_shared<ldb::protocol::StreamNotificationSink>(out);
+  dispatcher.set_notification_sink(notif_sink);
 
   if (stdio_mode) {
     return ldb::daemon::run_stdio_loop(dispatcher, out, wire_format);

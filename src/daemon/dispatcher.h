@@ -53,26 +53,30 @@ class Dispatcher {
 
   protocol::Response dispatch(const protocol::Request& req);
 
-  // Install the daemon's notification sink. The sink is borrowed —
-  // the caller (main.cpp's StreamNotificationSink over the OutputChannel)
-  // owns the lifetime. Called once at startup before any RPCs arrive
-  // in stdio mode. See docs/27.
+  // Install the daemon's notification sink. The sink is held by
+  // shared_ptr (post-review C1); the runtime keeps it alive for the
+  // duration of its registration. Called once at startup before any
+  // RPCs arrive in stdio mode. See docs/27.
   //
   // For multi-client socket mode (§2 phase 2), prefer add/remove —
   // set_notification_sink REPLACES the entire subscriber set, which
   // is the right thing for a single-writer daemon but loses every
   // other connection's sink. The socket loop calls add+remove instead.
-  void set_notification_sink(protocol::NotificationSink* sink) {
-    nonstop_.set_notification_sink(sink);
+  void set_notification_sink(
+      std::shared_ptr<protocol::NotificationSink> sink) {
+    nonstop_.set_notification_sink(std::move(sink));
   }
 
   // Subscribe / unsubscribe a notification sink without disturbing the
   // others. Used by the §2 phase-2 socket loop: each connection adds
   // its OutputChannel's sink on accept and removes it on disconnect.
-  // The sink is borrowed; the caller owns the lifetime.
+  // The sink is held by shared_ptr (post-review C1) so a remove on
+  // one thread cannot free the sink under a concurrent emit on the
+  // listener thread.
   using SubscriptionHandle = runtime::NonStopRuntime::SubscriptionHandle;
-  SubscriptionHandle add_notification_sink(protocol::NotificationSink* sink) {
-    return nonstop_.add_notification_sink(sink);
+  SubscriptionHandle add_notification_sink(
+      std::shared_ptr<protocol::NotificationSink> sink) {
+    return nonstop_.add_notification_sink(std::move(sink));
   }
   void remove_notification_sink(SubscriptionHandle h) {
     nonstop_.remove_notification_sink(h);

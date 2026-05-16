@@ -70,8 +70,9 @@ void write_packet(int fd, std::string_view payload) {
 TEST_CASE("listener: apply T-reply records kStopped + fires thread.event",
           "[nonstop_listener][apply][T]") {
   NonStopRuntime rt;
-  CapturingNotificationSink sink;
-  rt.set_notification_sink(&sink);
+  auto sink_sp = std::make_shared<CapturingNotificationSink>();
+  auto& sink = *sink_sp;
+  rt.set_notification_sink(sink_sp);
   NonStopListener listener(rt);
 
   // Standard T stop reply: type=05 (SIGTRAP), thread=hex tid 0x4d2 = 1234,
@@ -99,8 +100,9 @@ TEST_CASE("listener: apply S-reply with no thread kv defaults tid to 0",
   // The listener still records a stop; tid defaults to 0 since the
   // server didn't say which thread.
   NonStopRuntime rt;
-  CapturingNotificationSink sink;
-  rt.set_notification_sink(&sink);
+  auto sink_sp = std::make_shared<CapturingNotificationSink>();
+  auto& sink = *sink_sp;
+  rt.set_notification_sink(sink_sp);
   NonStopListener listener(rt);
 
   listener.apply_stop_reply_for_test(TargetId{1}, "S0b");
@@ -115,8 +117,9 @@ TEST_CASE("listener: apply S-reply with no thread kv defaults tid to 0",
 TEST_CASE("listener: apply W-reply records kStopped with reason=exited",
           "[nonstop_listener][apply][W]") {
   NonStopRuntime rt;
-  CapturingNotificationSink sink;
-  rt.set_notification_sink(&sink);
+  auto sink_sp = std::make_shared<CapturingNotificationSink>();
+  auto& sink = *sink_sp;
+  rt.set_notification_sink(sink_sp);
   NonStopListener listener(rt);
 
   listener.apply_stop_reply_for_test(TargetId{1}, "W00");
@@ -131,8 +134,9 @@ TEST_CASE("listener: apply W-reply records kStopped with reason=exited",
 TEST_CASE("listener: garbled payload is silently dropped",
           "[nonstop_listener][apply][garbled]") {
   NonStopRuntime rt;
-  CapturingNotificationSink sink;
-  rt.set_notification_sink(&sink);
+  auto sink_sp = std::make_shared<CapturingNotificationSink>();
+  auto& sink = *sink_sp;
+  rt.set_notification_sink(sink_sp);
   NonStopListener listener(rt);
 
   // Random non-stop-reply payload — parse_stop_reply returns nullopt.
@@ -145,8 +149,9 @@ TEST_CASE("listener: garbled payload is silently dropped",
 TEST_CASE("listener: live thread observes register → server packet → notification",
           "[nonstop_listener][live]") {
   NonStopRuntime rt;
-  CapturingNotificationSink sink;
-  rt.set_notification_sink(&sink);
+  auto sink_sp = std::make_shared<CapturingNotificationSink>();
+  auto& sink = *sink_sp;
+  rt.set_notification_sink(sink_sp);
 
   // Tight poll interval so the test wakes quickly.
   NonStopListener listener(rt, std::chrono::milliseconds(5));

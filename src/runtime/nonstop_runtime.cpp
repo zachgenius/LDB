@@ -81,29 +81,48 @@ NonStopRuntime::stop_event_seq(backend::TargetId target) const {
 }
 
 NonStopRuntime::SubscriptionHandle
-NonStopRuntime::add_notification_sink(protocol::NotificationSink* sink) {
+NonStopRuntime::add_notification_sink(
+    std::shared_ptr<protocol::NotificationSink> sink) {
   std::unique_lock lk(sinks_mu_);
   SubscriptionHandle h = next_handle_++;
-  sinks_.push_back({h, sink});
+  sinks_.push_back({h, std::move(sink)});
   return h;
 }
 
 void NonStopRuntime::remove_notification_sink(SubscriptionHandle h) {
-  std::unique_lock lk(sinks_mu_);
-  for (auto it = sinks_.begin(); it != sinks_.end(); ++it) {
-    if (it->handle == h) {
-      sinks_.erase(it);
-      return;
+  // Move the to-be-removed shared_ptr out of the vector under the lock,
+  // then drop the local AFTER releasing the lock — destructor work
+  // (e.g. closing a socket from inside the sink's destructor) must
+  // not run with sinks_mu_ held, in case it indirectly tries to
+  // re-enter the runtime.
+  std::shared_ptr<protocol::NotificationSink> doomed;
+  {
+    std::unique_lock lk(sinks_mu_);
+    for (auto it = sinks_.begin(); it != sinks_.end(); ++it) {
+      if (it->handle == h) {
+        doomed = std::move(it->sink);
+        sinks_.erase(it);
+        break;
+      }
     }
   }
+  // doomed destructs here, lock released.
 }
 
-void NonStopRuntime::set_notification_sink(protocol::NotificationSink* sink) {
-  std::unique_lock lk(sinks_mu_);
-  sinks_.clear();
-  if (sink != nullptr) {
-    sinks_.push_back({next_handle_++, sink});
+void NonStopRuntime::set_notification_sink(
+    std::shared_ptr<protocol::NotificationSink> sink) {
+  // Move the about-to-be-replaced sinks out of the vector before
+  // dropping them, for the same reason as remove_notification_sink:
+  // destructors should not run with sinks_mu_ held.
+  std::vector<Subscription> doomed;
+  {
+    std::unique_lock lk(sinks_mu_);
+    doomed.swap(sinks_);
+    if (sink != nullptr) {
+      sinks_.push_back({next_handle_++, std::move(sink)});
+    }
   }
+  // doomed's contents destruct here, lock released.
 }
 
 void NonStopRuntime::emit_stopped_(backend::TargetId target,
@@ -111,10 +130,18 @@ void NonStopRuntime::emit_stopped_(backend::TargetId target,
                                     std::uint64_t seq,
                                     const ThreadStop& info) const {
   // Snapshot the subscriber list under the shared lock, then drop it
-  // before calling sink->emit. Sinks can block (OutputChannel's mutex,
-  // a captor's vector grow); holding sinks_mu_ across that would
-  // serialise every concurrent emit through one writer's slow path.
-  std::vector<protocol::NotificationSink*> snapshot;
+  // before calling sink->emit. Sinks can block (OutputChannel's
+  // mutex, a captor's vector grow); holding sinks_mu_ across that
+  // would serialise every concurrent emit through one writer's slow
+  // path.
+  //
+  // Post-review C1: the snapshot is `vector<shared_ptr>`, not
+  // `vector<NotificationSink*>`. Each copy bumps the refcount, so
+  // every sink in the snapshot stays alive across the iteration
+  // even if a concurrent remove_notification_sink + sink destruction
+  // wins the race against the listener-thread dereference. With raw
+  // pointers, the same race produced a TSan-confirmed UAF.
+  std::vector<std::shared_ptr<protocol::NotificationSink>> snapshot;
   {
     std::shared_lock lk(sinks_mu_);
     snapshot.reserve(sinks_.size());
