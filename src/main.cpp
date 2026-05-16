@@ -190,7 +190,13 @@ int main(int argc, char** argv) {
       print_usage();
       return 0;
     } else if (a == "--version") {
-      std::cout << ldb::kVersionString << '\n';
+      // Print "ldbd <version>" not just "<version>": the `ldb` CLI's
+      // auto-spawn probe (`_looks_like_ldbd`) greps the output of
+      // `--version` for the literal "ldbd" so a misconfigured
+      // `$LDB_LDBD_SPAWN` pointing at e.g. /usr/bin/yes is rejected
+      // before we burn the 3s retry-then-fail path. Matches the
+      // `ldb-dap --version` convention.
+      std::cout << "ldbd " << ldb::kVersionString << '\n';
       return 0;
     } else if (a == "--stdio") {
       stdio_mode = true;

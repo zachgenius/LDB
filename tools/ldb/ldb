@@ -283,13 +283,62 @@ def default_socket_path() -> str:
     return os.path.join(tmpdir, f"ldbd-{uid}.sock")
 
 
+def _looks_like_ldbd(path: str) -> bool:
+    """Run `<path> --version` and check the output contains `ldbd`.
+
+    Post-review I5: `LDB_LDBD_SPAWN` was checked with `os.access(path,
+    X_OK)` only. If pointed at a generic executable like `/usr/bin/yes`
+    the spawn forked a process that never bound; the client retried
+    for ~3s and then surfaced "auto-spawned ldbd never began
+    accepting" with no hint that the operator's env var was wrong.
+
+    A lightweight `--version` probe with a tight timeout costs a few
+    ms at startup and converts the failure mode from "3s of mystery
+    retries" to "ldb: LDB_LDBD_SPAWN points at /usr/bin/yes which
+    does not look like ldbd".
+
+    Returns True if the probe succeeded AND its stdout/stderr
+    contains the literal string "ldbd". A path that can't be exec'd,
+    times out, or produces unrelated output returns False; the caller
+    then falls through to the next resolution step.
+    """
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    # `ldbd --version` prints something like "ldbd 1.6.1"; we accept
+    # the literal "ldbd" anywhere in stdout or stderr to avoid pinning
+    # the format. Other binaries called via this path (e.g. /usr/bin/yes)
+    # won't contain the string.
+    return "ldbd" in (proc.stdout + proc.stderr)
+
+
 def _resolve_autospawn_ldbd() -> str | None:
     """Find an `ldbd` binary suitable for auto-spawn.
 
     Resolution order:
       1. `$LDB_LDBD_SPAWN`           — explicit operator override (also
                                        used by the smoke test to pin
-                                       the build's ldbd binary).
+                                       the build's ldbd binary). We
+                                       validate it's actually an ldbd
+                                       (post-review I5) — `--version`
+                                       must succeed AND the output
+                                       must contain "ldbd". A mistyped
+                                       path that's executable but
+                                       isn't ldbd would otherwise spawn
+                                       a child that never binds and
+                                       the client would burn ~3s of
+                                       retries before failing with
+                                       "auto-spawned ldbd never began
+                                       accepting" — no signal that
+                                       the env var was wrong.
       2. `shutil.which("ldbd")`      — `ldbd` on `$PATH`.
       3. `_find_ldbd_sibling()`      — `<repo>/build/bin/ldbd` if the
                                        `ldb` CLI is being run from a
@@ -300,8 +349,18 @@ def _resolve_autospawn_ldbd() -> str | None:
     because `--ldbd` is mutually exclusive with `--socket` anyway.
     """
     env = os.environ.get("LDB_LDBD_SPAWN")
-    if env and os.access(env, os.X_OK):
-        return env
+    if env:
+        if not os.access(env, os.X_OK):
+            sys.stderr.write(
+                f"ldb: LDB_LDBD_SPAWN={env!r} is not executable; "
+                f"ignoring and falling through to PATH lookup\n")
+        elif not _looks_like_ldbd(env):
+            sys.stderr.write(
+                f"ldb: LDB_LDBD_SPAWN={env!r} does not look like ldbd "
+                f"(--version did not mention ldbd); ignoring and "
+                f"falling through to PATH lookup\n")
+        else:
+            return env
     onpath = shutil.which("ldbd")
     if onpath:
         return onpath
@@ -315,13 +374,17 @@ def _autospawn_daemon(sock_path: str, verbose: bool) -> bool:
     """Fork+exec `ldbd --listen unix:<sock_path>` detached from us.
 
     "Detached" = the daemon outlives the client process. We
-    fork-exec a child that calls `setsid()` and closes stdin/stdout
-    (logs still go to its own stderr — operators ran into
-    `os.devnull` redirection making debugging impossible, so we
-    leave stderr connected to whatever the original process had).
-    Returns True if the spawn was initiated (caller still waits for
-    the socket to start accepting), False if no ldbd binary was
-    found.
+    fork-exec a child that calls `setsid()`. stdin/stdout are
+    redirected to /dev/null. stderr is ALSO redirected to /dev/null
+    by default — this is what the post-review N1 cleanup pins. A
+    prior version inherited the client's stderr but that broke any
+    caller that wrapped `ldb` with subprocess.run(capture_output=
+    True) because the daemon kept the captured-stderr pipe alive
+    indefinitely. Operators who want diagnostics export
+    LDB_LDBD_LOG_FILE; stderr then goes to that path instead of
+    /dev/null. Returns True if the spawn was initiated (caller still
+    waits for the socket to start accepting), False if no ldbd
+    binary was found.
     """
     ldbd = _resolve_autospawn_ldbd()
     if not ldbd:
@@ -413,25 +476,41 @@ class _SocketProc:
             if not _autospawn_daemon(sock_path, verbose):
                 raise IOError(
                     f"could not auto-spawn ldbd for {sock_path!r}: "
-                    f"daemon binary not found"
+                    f"daemon binary not found. Check LDB_LDBD_SPAWN, "
+                    f"$PATH, and the sibling-of-ldb heuristic."
                 ) from None
             # Retry the connect with bounded backoff. The auto-spawned
-            # daemon needs a moment to bind + listen; 200ms * 10
-            # retries (~2s) is generous on macOS, very loose on Linux.
-            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            # daemon needs a moment to bind + listen; 200ms * 15 retries
+            # (~3s) is generous on macOS, very loose on Linux. (N2:
+            # was previously commented as "200ms * 10 (~2s)" which
+            # didn't match the loop bound — pinning the comment to
+            # the actual constants now.)
+            self._sock = None
             connected = False
+            last_err: OSError | None = None
             for _ in range(15):
+                # N5: re-create the socket inside the retry loop. A
+                # POSIX socket whose connect() failed is left in an
+                # unspecified state — reusing it for another connect()
+                # works on macOS and Linux today but is pedantically
+                # undefined. Allocating fresh is one extra syscall per
+                # iteration and removes the corner case entirely.
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
-                    self._sock.connect(sock_path)
+                    s.connect(sock_path)
+                    self._sock = s
                     connected = True
                     break
-                except OSError:
+                except OSError as retry_err:
+                    last_err = retry_err
+                    s.close()
                     time.sleep(0.2)
             if not connected:
-                self._sock.close()
                 raise IOError(
                     f"auto-spawned ldbd never began accepting on "
-                    f"{sock_path!r}"
+                    f"{sock_path!r}; last connect error: {last_err}. "
+                    f"Check stderr / LDB_LDBD_LOG_FILE for daemon-side "
+                    f"errors."
                 ) from None
         # 5-minute recv timeout matches the daemon's SO_RCVTIMEO. A
         # hung daemon (deadlocked dispatcher, runaway target.open)

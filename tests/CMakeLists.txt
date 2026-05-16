@@ -964,6 +964,24 @@ set_tests_properties(smoke_socket_autospawn_logs PROPERTIES
   TIMEOUT 30
 )
 
+# §2 phase 2 post-review I5: a mistyped `$LDB_LDBD_SPAWN` pointing at
+# an X_OK but non-ldbd binary should be rejected at resolve-time with
+# a clear stderr diagnostic, not silently spawned and then surfaced
+# as "auto-spawned ldbd never began accepting" after 3s of retries.
+# The resolver runs `<path> --version` and greps for "ldbd"; this
+# test pins both the rejection and the graceful-degradation path
+# (sibling fallback rescues the invocation).
+add_test(
+  NAME smoke_socket_autospawn_validates_binary
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_autospawn_validates_binary.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_autospawn_validates_binary PROPERTIES
+  TIMEOUT 30
+)
+
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and
 # assert the documented shape. Cheap, fast, runs without ldbd.
 add_test(
