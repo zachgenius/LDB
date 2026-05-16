@@ -19,7 +19,8 @@ class LldbBackend final : public DebuggerBackend {
   LldbBackend(const LldbBackend&) = delete;
   LldbBackend& operator=(const LldbBackend&) = delete;
 
-  OpenResult open_executable(const std::string& path) override;
+  OpenResult open_executable(const std::string& path,
+                             const OpenOptions& opts = OpenOptions{}) override;
   OpenResult create_empty_target() override;
   OpenResult load_core(const std::string& core_path) override;
   std::vector<Module> list_modules(TargetId tid) override;
@@ -43,7 +44,8 @@ class LldbBackend final : public DebuggerBackend {
                         std::uint64_t start_addr,
                         std::uint64_t end_addr) override;
   std::vector<XrefMatch>
-      xref_address(TargetId tid, std::uint64_t target_addr) override;
+      xref_address(TargetId tid, std::uint64_t target_addr,
+                   XrefProvenance* provenance = nullptr) override;
   std::vector<StringXrefResult>
       find_string_xrefs(TargetId tid, const std::string& text) override;
 

@@ -229,20 +229,26 @@ inline json view_param() {
 
 inline json module_def() {
   return obj({
-      {"name",       str()},
-      {"path",       str()},
-      {"build_id",   str()},
-      {"uuid",       str()},
-      {"file_addr",  uint_()},
-      {"load_addr",  uint_()},
-      {"sections",   arr_of(obj({
+      {"name",          str()},
+      {"path",          str()},
+      {"build_id",      str()},
+      {"uuid",          str()},
+      {"file_addr",     uint_()},
+      {"load_addr",     uint_()},
+      {"section_count", uint_("Total top-level + nested sections. Always "
+                              "populated, even when the `sections` array is "
+                              "absent (cheap target.open shape).")},
+      {"sections",      arr_of(obj({
           {"name", str()},
           {"file_addr", uint_()},
           {"load_addr", uint_()},
           {"size",      uint_()},
           {"perm",      str()},
           {"type",      str()},
-      }))},
+      }), "Inline only when the endpoint walked the section table "
+          "(module.list / load_core, or target.open with "
+          "view.include_sections=true). Absent on default target.open "
+          "responses — call module.list to enumerate.")},
   });
 }
 

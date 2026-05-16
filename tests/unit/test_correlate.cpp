@@ -399,7 +399,7 @@ class StubBackend : public ldb::backend::DebuggerBackend {
   }
 
   // Stubs — none of the rest are touched by correlate.types.
-  ldb::backend::OpenResult open_executable(const std::string&) override { return {}; }
+  ldb::backend::OpenResult open_executable(const std::string&, const ldb::backend::OpenOptions& = {}) override { return {}; }
   ldb::backend::OpenResult create_empty_target() override { return {}; }
   ldb::backend::OpenResult load_core(const std::string&) override { return {}; }
   std::vector<ldb::backend::Module> list_modules(TID) override { return {}; }
@@ -416,7 +416,7 @@ class StubBackend : public ldb::backend::DebuggerBackend {
   std::vector<ldb::backend::DisasmInsn>
       disassemble_range(TID, std::uint64_t, std::uint64_t) override { return {}; }
   std::vector<ldb::backend::XrefMatch>
-      xref_address(TID, std::uint64_t) override { return {}; }
+      xref_address(TID, std::uint64_t, ldb::backend::XrefProvenance*) override { return {}; }
   std::vector<ldb::backend::StringXrefResult>
       find_string_xrefs(TID, const std::string&) override { return {}; }
   ldb::backend::ProcessStatus

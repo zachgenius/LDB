@@ -75,20 +75,14 @@ protocol::json response_to_json(const protocol::Response& r) {
 
 }  // namespace
 
-int run_stdio_loop(Dispatcher& dispatcher,
-                   protocol::OutputChannel& out,
-                   protocol::WireFormat fmt) {
-  // Disable stdio sync — keep things flowing.
-  std::ios_base::sync_with_stdio(false);
-  std::cin.tie(nullptr);
-
-  log::info(std::string("stdio loop ready (format=") +
-            (fmt == protocol::WireFormat::kCbor ? "cbor" : "json") + ")");
-
+int serve_one_connection(Dispatcher& dispatcher,
+                         protocol::OutputChannel& out,
+                         std::istream& in,
+                         protocol::WireFormat fmt) {
   while (true) {
     std::optional<protocol::json> incoming;
     try {
-      incoming = protocol::read_message(std::cin, fmt);
+      incoming = protocol::read_message(in, fmt);
     } catch (const protocol::Error& e) {
       // Malformed framing — log to stderr and try to surface a typed
       // error to the peer if we can. With JSON we can recover (sender
@@ -112,7 +106,7 @@ int run_stdio_loop(Dispatcher& dispatcher,
       }
       continue;
     }
-    if (!incoming.has_value()) break;  // clean EOF
+    if (!incoming.has_value()) return 0;  // clean EOF
 
     protocol::Response resp;
     bool is_notification = false;
@@ -134,9 +128,22 @@ int run_stdio_loop(Dispatcher& dispatcher,
       return 1;
     }
   }
+}
+
+int run_stdio_loop(Dispatcher& dispatcher,
+                   protocol::OutputChannel& out,
+                   protocol::WireFormat fmt) {
+  // Disable stdio sync — keep things flowing.
+  std::ios_base::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  log::info(std::string("stdio loop ready (format=") +
+            (fmt == protocol::WireFormat::kCbor ? "cbor" : "json") + ")");
+
+  int rc = serve_one_connection(dispatcher, out, std::cin, fmt);
 
   log::info("stdin closed; shutting down");
-  return 0;
+  return rc;
 }
 
 }  // namespace ldb::daemon

@@ -39,7 +39,8 @@ class GdbMiBackend final : public DebuggerBackend {
   GdbMiBackend& operator=(const GdbMiBackend&) = delete;
 
   // ── target / process lifecycle ──────────────────────────────────────
-  OpenResult open_executable(const std::string& path) override;
+  OpenResult open_executable(const std::string& path,
+                             const OpenOptions& opts = OpenOptions{}) override;
   OpenResult create_empty_target() override;
   OpenResult load_core(const std::string& core_path) override;
   ProcessStatus launch_process(TargetId tid,
@@ -84,7 +85,8 @@ class GdbMiBackend final : public DebuggerBackend {
       disassemble_range(TargetId tid, std::uint64_t lo,
                         std::uint64_t hi) override;
   std::vector<XrefMatch>
-      xref_address(TargetId tid, std::uint64_t addr) override;
+      xref_address(TargetId tid, std::uint64_t addr,
+                   XrefProvenance* provenance = nullptr) override;
   std::vector<StringXrefResult>
       find_string_xrefs(TargetId tid, const std::string& text) override;
 

@@ -298,9 +298,17 @@ json module_to_json(const backend::Module& m) {
   j["uuid"] = m.uuid;
   j["triple"] = m.triple;
   j["load_addr"] = m.load_address;
-  json secs = json::array();
-  for (const auto& s : m.sections) secs.push_back(section_to_json(s));
-  j["sections"] = std::move(secs);
+  j["section_count"] = m.section_count;
+  // sections inline only when the backend actually filled them (the
+  // open_executable / load_core path that asked for the full walk).
+  // For the cheap default `target.open` shape we leave the key off
+  // entirely so the agent can distinguish "absent, ask for it via
+  // module.list" from "present but empty".
+  if (!m.sections.empty()) {
+    json secs = json::array();
+    for (const auto& s : m.sections) secs.push_back(section_to_json(s));
+    j["sections"] = std::move(secs);
+  }
   return j;
 }
 
@@ -1027,9 +1035,24 @@ Response Dispatcher::handle_describe_endpoints(const Request& req) {
   // ============== target.* ==============
 
   add("target.open",
-      "Create a target from a binary on disk (no process).",
-      obj({{"path", str("Absolute path to executable on the daemon's host.")}},
-          {"path"}),
+      "Create a target from a binary on disk (no process). The default "
+      "response is summary-only: each module reports path, uuid, triple, "
+      "load_addr, and section_count, but the section table is NOT inlined "
+      "(call module.list when you need it). Pass "
+      "view={include_sections:true} to inline the full per-module section "
+      "walk in the response — useful for one-shot CLI introspection of a "
+      "small binary, expensive for hundred-MB Mach-Os.",
+      obj({
+          {"path", str("Absolute path to executable on the daemon's host.")},
+          {"view", obj({
+              {"include_sections", bool_(
+                  "Default false. When true, each returned module carries "
+                  "an inline `sections` array with the recursive section "
+                  "walk (same shape as module.list). When false (default), "
+                  "only `section_count` is returned and `sections` is "
+                  "omitted.")},
+          })},
+      }, {"path"}),
       with_defs(obj({
           {"target_id", uint_min(1)},
           {"triple",    str()},
@@ -1282,13 +1305,35 @@ with_defs(      obj({{"instructions", arr_of(ref("Insn"))}}, {"instructions"}),
 
   add("xref.addr",
       "Find every instruction in the main executable that references "
-      "an address. Detects direct branches reliably; ARM64 ADRP+ADD "
-      "reconstruction is a known gap.",
+      "an address. Detects direct branches reliably; ARM64 ADRP+ADD/LDR "
+      "reconstruction handles the common compiler-emitted shapes (see "
+      "docs/35-field-report-followups.md §3). Skipped patterns surface "
+      "as `provenance.warnings` when present.",
       obj({
           {"target_id", target_id_param()},
           {"addr",      address_param()},
       }, {"target_id", "addr"}),
-with_defs(      obj({{"matches", arr_of(ref("XrefMatch"))}}, {"matches"}),
+      with_defs(obj({
+          {"matches", arr_of(ref("XrefMatch"))},
+          {"provenance", obj({
+              {"adrp_pair_skipped", uint_(
+                  "Number of register-offset LDR instructions whose "
+                  "base register held a tracked ADRP page but whose "
+                  "offset operand the resolver couldn't statically "
+                  "evaluate (e.g. `[xN, xM]`, `[xN, xM, lsl #imm]`). "
+                  "Each skip is a potential xref the heuristic cannot "
+                  "surface; phase 4 will close the most common cases.")},
+              {"adrp_pair_writeback_cleared", uint_(
+                  "Number of pre/post-indexed LDRs whose base register "
+                  "the resolver cleared after the match emit. The "
+                  "legitimate xref still fires; subsequent loads through "
+                  "the same register are no longer trackable because "
+                  "the writeback rewrote it.")},
+              {"warnings", arr_of(str(), "Human-readable diagnostics "
+                  "from the ADRP-pair resolver; emitted only when at "
+                  "least one ambiguous pattern was encountered.")},
+          })},
+      }, {"matches"}),
           {{"XrefMatch", xref_match_def()}}),
       /*requires_target=*/true, /*requires_stopped=*/false, "high");
 
@@ -3142,7 +3187,16 @@ Response Dispatcher::handle_target_open(const Request& req) {
                               "missing string param 'path'");
   }
 
-  auto res = backend_->open_executable(*path);
+  backend::OpenOptions open_opts{};
+  if (auto vit = req.params.find("view");
+      vit != req.params.end() && vit->is_object()) {
+    if (auto inc = vit->find("include_sections");
+        inc != vit->end() && inc->is_boolean()) {
+      open_opts.include_sections = inc->get<bool>();
+    }
+  }
+
+  auto res = backend_->open_executable(*path, open_opts);
   // Remember the executable's {build_id, path} for resolve_main_module.
   // OpenResult docs say modules[0] is "typically the executable itself"
   // — explicitly relied on here. If that ever changes, the picker
@@ -4497,12 +4551,32 @@ Response Dispatcher::handle_xref_addr(const Request& req) {
                               "missing uint param 'addr'");
   }
   auto view_spec = protocol::view::parse_from_params(req.params);
+  // Phase-3 gate 7 (docs/35-field-report-followups.md §3) — populate a
+  // provenance struct so the response can surface ADRP-pair-resolver
+  // skips (register-offset LDR with a tracked base, etc.).
+  backend::XrefProvenance prov;
   auto refs = backend_->xref_address(
-      static_cast<backend::TargetId>(tid), addr);
+      static_cast<backend::TargetId>(tid), addr, &prov);
   json arr = json::array();
   for (const auto& r : refs) arr.push_back(xref_match_to_json(r));
-  return protocol::make_ok(req.id,
-      protocol::view::apply_to_array(std::move(arr), view_spec, "matches"));
+  auto data = protocol::view::apply_to_array(std::move(arr), view_spec,
+                                              "matches");
+  // Attach provenance only when something was actually skipped or
+  // cleared. Empty provenance is the common case and would cost ~30
+  // bytes per response if always emitted; the explicit field is a
+  // clear "this run had ambiguous patterns" signal when present.
+  if (prov.adrp_pair_skipped > 0 ||
+      prov.adrp_pair_writeback_cleared > 0 ||
+      !prov.warnings.empty()) {
+    json p = json::object();
+    p["adrp_pair_skipped"] = prov.adrp_pair_skipped;
+    p["adrp_pair_writeback_cleared"] = prov.adrp_pair_writeback_cleared;
+    json ws = json::array();
+    for (const auto& w : prov.warnings) ws.push_back(w);
+    p["warnings"] = std::move(ws);
+    data["provenance"] = std::move(p);
+  }
+  return protocol::make_ok(req.id, std::move(data));
 }
 
 Response Dispatcher::handle_disasm_range(const Request& req) {

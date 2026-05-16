@@ -90,6 +90,61 @@ set_tests_properties(smoke_string_xref PROPERTIES
   TIMEOUT 30
 )
 
+# docs/35-field-report-followups.md §3 phase 2 — xref.addr must follow
+# chained-fixup slot indirection on Apple silicon arm64 builds with
+# -Wl,-fixup_chains. The fixture only builds on that host; the test
+# is gated identically. Linux + non-arm64 macOS skip it cleanly because
+# the fixture target doesn't exist there.
+if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
+  add_test(
+    NAME smoke_xref_chained_fixup
+    COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_chained_fixup.sh"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb_fix_chain_slot>"
+  )
+  set_tests_properties(smoke_xref_chained_fixup PROPERTIES
+    TIMEOUT 30
+  )
+
+  # Phase-3 adversarial smoke tests for the ADRP-pair resolver
+  # (docs/35-field-report-followups.md §3 phase 3). Each one targets
+  # one specific phase-2 false-positive mode: ADD-clobber, cross-
+  # function leak, BL-clobber. All three were silently wrong against
+  # 25f35de; phase 3's deterministic register-state clobber rules
+  # turn them green.
+  foreach(_phase3_smoke
+      xref_addclobber
+      xref_fnleak
+      xref_callclobber
+      xref_subclobber
+      xref_writeback_ldr
+      xref_str)
+    add_test(
+      NAME smoke_${_phase3_smoke}
+      COMMAND python3
+              "${CMAKE_SOURCE_DIR}/tests/smoke/test_${_phase3_smoke}.py"
+              "$<TARGET_FILE:ldbd>"
+              "$<TARGET_FILE:ldb_fix_${_phase3_smoke}>"
+    )
+    set_tests_properties(smoke_${_phase3_smoke} PROPERTIES TIMEOUT 30)
+  endforeach()
+
+  # Phase-3 post-review PAC-call smoke. Gated on the arm64e toolchain
+  # probe in tests/fixtures/CMakeLists.txt — without it the fixture
+  # target doesn't exist and the test would fail to resolve
+  # $<TARGET_FILE:ldb_fix_xref_pac_callclobber> at generate time.
+  if(LDB_CAN_COMPILE_ARM64E)
+    add_test(
+      NAME smoke_xref_pac_callclobber
+      COMMAND python3
+              "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_pac_callclobber.py"
+              "$<TARGET_FILE:ldbd>"
+              "$<TARGET_FILE:ldb_fix_xref_pac_callclobber>"
+    )
+    set_tests_properties(smoke_xref_pac_callclobber PROPERTIES TIMEOUT 30)
+  endif()
+endif()
+
 add_test(
   NAME smoke_view_module_list
   COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_module_list.sh"
@@ -97,6 +152,21 @@ add_test(
           "$<TARGET_FILE:ldb_fix_sleeper>"
 )
 set_tests_properties(smoke_view_module_list PROPERTIES
+  TIMEOUT 30
+)
+
+# Asserts target.open is summary-by-default and gates the section
+# walk behind view.include_sections=true. Motivated by the 503 MB
+# Mach-O case where the inline section table was 2.2 MB of wire data
+# per call (and the section walk itself was expensive). See worklog
+# 2026-05-16.
+add_test(
+  NAME smoke_target_open_view
+  COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_target_open_view.sh"
+          "$<TARGET_FILE:ldbd>"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_target_open_view PROPERTIES
   TIMEOUT 30
 )
 
@@ -549,6 +619,20 @@ set_tests_properties(smoke_ldb_cli PROPERTIES
   TIMEOUT 30
 )
 
+# docs/35-field-report-followups.md §1: when neither the script nor the
+# daemon is on $PATH, the CLI must still find the in-tree daemon as a
+# sibling of the script. Pins the new precedence layer between $PATH
+# and the CWD-relative fallback.
+add_test(
+  NAME smoke_cli_sibling_lookup
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_cli_sibling_lookup.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+)
+set_tests_properties(smoke_cli_sibling_lookup PROPERTIES
+  TIMEOUT 30
+)
+
 add_test(
   NAME smoke_ldbpack
   COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_ldbpack.py"
@@ -735,6 +819,44 @@ add_test(
 )
 set_tests_properties(smoke_dap_shim PROPERTIES
   TIMEOUT 60
+)
+
+# Field-report follow-up §2 phase 1 — persistent unix-socket daemon.
+# `--listen unix:PATH` is single-client (one connection at a time);
+# `target_id` and other dispatcher state survive across a disconnect.
+# This test exercises the cross-cutting promise — daemon stays up,
+# client reconnects, target_id remains valid.
+add_test(
+  NAME smoke_socket_lifecycle
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_lifecycle.py"
+          "$<TARGET_FILE:ldbd>"
+          "${CMAKE_SOURCE_DIR}/tools/ldb/ldb"
+          "$<TARGET_FILE:ldb_fix_structs>"
+)
+set_tests_properties(smoke_socket_lifecycle PROPERTIES
+  TIMEOUT 30
+)
+
+# Two `ldbd --listen unix:$same_path` daemons must not coexist — flock
+# on `${sock}.lock` makes the second fail fast with a clear message.
+add_test(
+  NAME smoke_socket_collision
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_collision.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_collision PROPERTIES
+  TIMEOUT 30
+)
+
+# Phase-1 access control is filesystem-permission only: socket mode 0600
+# and (when we create the parent dir) 0700. Pin the invariant.
+add_test(
+  NAME smoke_socket_perms
+  COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/smoke/test_socket_perms.py"
+          "$<TARGET_FILE:ldbd>"
+)
+set_tests_properties(smoke_socket_perms PROPERTIES
+  TIMEOUT 30
 )
 
 # Infrastructure sanity check — parse `.github/workflows/ci.yml` and

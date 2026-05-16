@@ -2,6 +2,7 @@
 #include "backend/gdbmi/backend.h"
 #include "backend/lldb_backend.h"
 #include "daemon/dispatcher.h"
+#include "daemon/socket_loop.h"
 #include "daemon/stdio_loop.h"
 #include "ldb/version.h"
 #include "observers/exec_allowlist.h"
@@ -25,14 +26,54 @@ namespace {
 void print_usage() {
   std::cerr <<
     "ldbd " << ldb::kVersionString << "\n"
-    "Usage: ldbd [--stdio] [--format json|cbor]\n"
+    "Usage: ldbd [--stdio | --listen unix:PATH] [--format json|cbor]\n"
     "            [--log-level debug|info|warn|error]\n"
     "            [--store-root <path>]\n"
     "            [--observer-exec-allowlist <path>] [-h|--help]\n"
     "\n"
     "Modes:\n"
     "  --stdio          Read JSON-RPC from stdin, write responses to stdout\n"
-    "                   (default)\n"
+    "                   (default).\n"
+    "  --listen unix:PATH\n"
+    "                   Bind a unix-domain socket at PATH and serve\n"
+    "                   JSON-RPC connections one at a time (phase 1:\n"
+    "                   single-client, persistent daemon). target_id and\n"
+    "                   other dispatcher state survive across client\n"
+    "                   disconnects. PATH must be absolute.\n"
+    "\n"
+    "                   Access control is filesystem-only plus a\n"
+    "                   defense-in-depth peer-uid check:\n"
+    "                     * socket inode mode 0600,\n"
+    "                     * parent dir 0700 if we create it (and we\n"
+    "                       refuse to use a pre-existing parent that\n"
+    "                       is a symlink, owned by another uid, or\n"
+    "                       group/other-writable),\n"
+    "                     * the lockfile is opened with O_NOFOLLOW to\n"
+    "                       refuse a pre-staged symlinked lockfile,\n"
+    "                     * every accepted connection is checked with\n"
+    "                       getpeereid() and rejected if the peer's\n"
+    "                       uid differs from ours,\n"
+    "                     * accepted connections get a 300s\n"
+    "                       SO_RCVTIMEO so a stalled peer doesn't pin\n"
+    "                       the daemon forever.\n"
+    "                   A `${PATH}.lock` file is taken with flock\n"
+    "                   LOCK_EX|LOCK_NB to prevent two daemons binding\n"
+    "                   the same path.\n"
+    "\n"
+    "                   Trust model (phase 1): the uid is a single\n"
+    "                   trust domain. Shared-uid hosts (multi-tenant\n"
+    "                   CI runners, NFS-homed uid, LLM sandboxes\n"
+    "                   running inside the daemon's uid) are out of\n"
+    "                   scope — phase 2 will add token auth for those.\n"
+    "                   See docs/35-field-report-followups.md §2.\n"
+    "                   Mutually exclusive with --stdio.\n"
+    "\n"
+    "                   Default path policy when PATH is omitted by the\n"
+    "                   client side (the daemon always wants an\n"
+    "                   explicit absolute PATH):\n"
+    "                     $XDG_RUNTIME_DIR/ldbd.sock   (if set)\n"
+    "                     $TMPDIR/ldbd-$UID.sock       (else)\n"
+    "                     /tmp/ldbd-$UID.sock          (last resort)\n"
     "  --format <fmt>   Wire format on stdin/stdout. `json` (default) is\n"
     "                   line-delimited JSON. `cbor` is length-prefixed RFC\n"
     "                   8949 binary frames (4-byte big-endian uint32 length\n"
@@ -127,6 +168,8 @@ std::string resolve_backend(const std::string& cli_arg) {
 
 int main(int argc, char** argv) {
   bool stdio_mode = true;  // M0 has only stdio; flag is forward-compat.
+  bool listen_mode = false;
+  std::string listen_socket_path;
   std::string store_root_arg;
   std::string observer_exec_allowlist_arg;
   std::string backend_arg;
@@ -142,6 +185,34 @@ int main(int argc, char** argv) {
       return 0;
     } else if (a == "--stdio") {
       stdio_mode = true;
+    } else if (a == "--listen" && i + 1 < argc) {
+      // Currently only the `unix:PATH` form is accepted. A future
+      // `tcp:HOST:PORT` form would land here behind the same flag.
+      std::string spec = argv[++i];
+      constexpr const char* kPrefix = "unix:";
+      if (spec.rfind(kPrefix, 0) != 0) {
+        std::cerr << "ldbd: --listen requires a unix:PATH argument; got "
+                  << spec << "\n";
+        return 2;
+      }
+      listen_socket_path = spec.substr(std::strlen(kPrefix));
+      if (listen_socket_path.empty()) {
+        std::cerr << "ldbd: --listen unix: requires a non-empty PATH\n";
+        return 2;
+      }
+      // Refuse relative paths. The default-path policies in both the
+      // daemon's --help text and the client's `default_socket_path()`
+      // always produce absolute paths; restricting the user-supplied
+      // form to absolute prevents accidentally bind()ing inside a
+      // CWD the operator didn't expect, and gives the symlinked-
+      // parent guard in ensure_parent_dir() a fixed reference point.
+      if (listen_socket_path[0] != '/') {
+        std::cerr << "ldbd: --listen unix:PATH must be absolute (got: "
+                  << listen_socket_path << ")\n";
+        return 2;
+      }
+      listen_mode = true;
+      stdio_mode = false;
     } else if (a == "--format" && i + 1 < argc) {
       if (!parse_wire_format(argv[++i], wire_format)) {
         std::cerr << "invalid format: " << argv[i]
@@ -277,6 +348,15 @@ int main(int argc, char** argv) {
 
   ldb::daemon::Dispatcher dispatcher(backend, artifacts, sessions, probes,
                                      exec_allowlist, backend_name);
+
+  if (listen_mode) {
+    // §2 phase 1: listen mode owns its own per-connection OutputChannel.
+    // run_socket_listener installs and removes the notification sink
+    // around each accept()ed connection so async notifications go to
+    // the right peer. No stdout writer is created at startup.
+    return ldb::daemon::run_socket_listener(dispatcher, listen_socket_path,
+                                            wire_format);
+  }
 
   // Post-V1 #21 phase-2 (docs/27): single stdout writer with mutex;
   // the listener thread's thread.event notifications and the

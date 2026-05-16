@@ -1,0 +1,723 @@
+# Field Report Follow-ups (2026-05-16)
+
+Three items deferred from `fix/target-open-lazy-load` (commits `8cb6915`
++ `191b049`). Source: a RE engineer driving LDB against a 503 MB iOS
+arm64 Mach-O. The killer (`target.open` runtime + response size) was
+fixed in that branch. This doc captures the design + sequencing for
+what's left.
+
+Read in order: §1 → §2 → §3. They're independent in terms of code
+seams but interact in terms of which test fixtures we need on hand
+(see §4).
+
+---
+
+## 1. CLI sibling lookup for `ldbd`
+
+### Problem
+
+`tools/ldb/ldb` looks up the daemon via, in order:
+
+1. `--ldbd PATH` flag if given.
+2. `$PATH` (`shutil.which("ldbd")`).
+3. `./build/bin/ldbd` relative to the user's CWD.
+
+For an in-tree dev flow this is awkward: `ldb` lives at
+`<repo>/tools/ldb/ldb`, `ldbd` lives at `<repo>/build/bin/ldbd`, and
+neither is on `$PATH`. Running `ldb target.open ...` from anywhere
+other than the repo root fails with "ldbd not found." The reporter hit
+this and had to pass `--ldbd /Users/.../build/bin/ldbd` on every
+invocation.
+
+### Proposed fix
+
+Add a **sibling-lookup heuristic** between steps 2 and 3:
+
+```python
+def find_ldbd_sibling() -> Optional[str]:
+    # tools/ldb/ldb -> tools/ldb -> tools -> <repo>
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    cand = repo_root / "build" / "bin" / "ldbd"
+    return str(cand) if cand.is_file() and os.access(cand, os.X_OK) else None
+```
+
+Insert into `find_ldbd()` in `tools/ldb/ldb`:
+
+```python
+def find_ldbd(explicit: Optional[str]) -> str:
+    if explicit:
+        # Validate executability up front; otherwise the failure
+        # surfaces deep inside subprocess.Popen as a confusing EACCES.
+        if not os.access(explicit, os.X_OK):
+            raise SystemExit(f"ldb: --ldbd {explicit!r} not executable")
+        return explicit
+    if which := shutil.which("ldbd"):
+        return which
+    if sibling := find_ldbd_sibling():
+        return sibling
+    if os.path.isfile("./build/bin/ldbd"):
+        return "./build/bin/ldbd"
+    raise SystemExit("ldb: ldbd not found; pass --ldbd PATH")
+```
+
+### Out of scope (for this slice)
+
+- **`make install` target** — pulling `ldb` + `ldbd` into a configurable
+  prefix (e.g. `~/.local/bin`) is the right answer for shipping, but
+  it's a CMake-side change and changes the install surface for
+  downstream packagers. Track separately.
+- **Auto-build if the sibling is missing-but-source-present.** Too
+  magical; would mask a stale-build bug.
+
+### Tests
+
+- Add to `tests/smoke/test_ldb_cli.py` (or a new
+  `test_cli_sibling_lookup.py`): with `$PATH` scrubbed of `ldbd` and no
+  `--ldbd` flag, the CLI still finds the in-tree daemon.
+- Keep the existing `--ldbd PATH` precedence behaviour and pin it in
+  the same test.
+
+### Risk
+
+Low. Pure Python, no daemon-side changes, narrow heuristic gated on
+`__file__` landing under a recognisable repo layout. False-positive
+case: someone vendors `tools/ldb/ldb` into their own repo with a
+different layout — they won't have a sibling `build/bin/ldbd`, the
+heuristic returns `None`, fall-through to the existing fallback path.
+No regression possible.
+
+### Effort
+
+~30 min: 10 min code + 15 min test + 5 min worklog.
+
+---
+
+## 2. Persistent socket-attached daemon
+
+### Problem
+
+Every `ldb <subcommand>` spawns a fresh `ldbd --stdio` child, sends one
+request, and reaps the child. `target_id` and any other daemon-side
+state die with the subprocess. The reporter wanted to issue several
+calls in sequence — `target.open`, then `symbol.find`, then
+`disasm.function` — from a shell script, *without* having to hold open
+a single Python-driven REPL.
+
+Current options for state persistence:
+
+- **`--repl`** — interactive REPL with persistent daemon. Works, but
+  requires the agent to drive stdin (awkward from a shell script that
+  wants one process per command).
+- **A wrapper script that drives the REPL** — possible but ugly; every
+  user has to invent it.
+
+### Proposed design
+
+A new `ldbd --listen unix:/path/to/ldbd.sock` mode + a `ldb --socket
+/path/to/ldbd.sock` client knob.
+
+#### Wire shape
+
+Same JSON-RPC framing the stdio mode already uses; just a different
+fd source. `read_message` / `write_response` in `src/protocol/` are
+already abstracted over `std::istream`/`std::ostream` (and the
+`OutputChannel`). The change is the listener layer.
+
+Server side, sketch:
+
+```cpp
+// new src/daemon/socket_listener.cpp
+//
+// accept() loop. Each connection gets its own thread that wraps the
+// connection fd in iostream-compatible socketbufs and calls the same
+// run_stdio_loop dispatcher path. Connections share the Dispatcher
+// (and therefore the backend's target table), so target_id from one
+// connection is visible to the next.
+```
+
+Lifecycle questions to resolve before code:
+
+| Question | Tentative answer |
+|---|---|
+| Where does the socket live? | `$XDG_RUNTIME_DIR/ldbd.sock` if set, else `$TMPDIR/ldbd-$UID.sock`. Never world-readable. |
+| When does the daemon exit? | Phase 1: explicit `daemon.shutdown` RPC or SIGTERM. Phase 2: idle timeout (no connections for N seconds). |
+| What if two `ldbd --listen` race on the same path? | One acquires an `flock()` on `${sock}.lock`; the second fails fast with "daemon already listening." |
+| Auto-spawn from the client? | Phase 1: **no.** The user runs `ldbd --listen ...` once explicitly. Phase 2: client tries `connect()`, falls back to `fork+exec(ldbd --listen ...)` if `ECONNREFUSED`/`ENOENT`. |
+| Auth? | uid-only via filesystem permissions (mode 0600 on the socket, parent dir 0700). No cross-user access. Document it; don't add token auth in phase 1. |
+| Concurrent calls from multiple clients? | Dispatcher is already thread-safe enough for the read-only static surface (uses `impl_->mu`). Audit the mutable paths (probes, sessions, breakpoints) before exposing — possibly serialise per-target via a per-target mutex in phase 1. |
+
+#### Trust model
+
+Phase 1 explicitly assumes **the uid is a single trust domain**.
+That assumption shapes every access-control decision in the daemon:
+
+- Socket inode lives at mode 0600; parent dir at 0700 when the
+  daemon creates it.
+- The daemon refuses to use a pre-existing parent that is a symlink,
+  is owned by another uid, or has group/other permission bits set.
+- The sidecar lockfile is opened with `O_NOFOLLOW` to refuse a pre-
+  staged symlink (otherwise a same-uid attacker could pre-create
+  `${PATH}.lock` as a symlink to e.g. `~/.ssh/authorized_keys` and
+  have our `ftruncate`+`pwrite(pid)` corrupt the symlink target).
+- Every accepted connection is run through `getpeereid()`; peers
+  whose uid differs from the daemon's are rejected before the first
+  byte is read.
+- Accepted connections carry a 300-second `SO_RCVTIMEO` so a stalled
+  peer doesn't pin the daemon's accept loop indefinitely.
+
+Explicitly **out of scope** for phase 1:
+
+- **Shared-uid hosts.** Multi-tenant CI runners, NFS-homed uid where
+  several humans share one account, LLM/agent sandboxes that run
+  inside the daemon's uid — all of these collapse the trust
+  boundary the phase-1 design relies on. Anyone wanting LDB in that
+  shape should wait for phase 2.
+- **Cross-uid access.** No SUID, no group-readable sockets, no
+  cross-user proxying. The "two engineers share a host" pattern
+  requires phase 2.
+
+Phase-2 will add token auth (the daemon hands out a one-shot bearer
+on startup; the client presents it before the first RPC) so the
+shared-uid and cross-uid cases become tractable without re-doing
+the filesystem permissions story.
+
+#### Client side
+
+`tools/ldb/ldb`:
+
+```python
+class DaemonSpec:
+    local_ldbd: str | None
+    ssh_target: str | None
+    socket_path: str | None  # NEW
+
+def spawn_daemon(spec, fmt, verbose):
+    if spec.socket_path:
+        return connect_socket(spec.socket_path, fmt, verbose)
+    # ... existing ssh + local-exec paths ...
+```
+
+`connect_socket()` opens the unix socket, returns a fake `Popen`-like
+object whose `stdin`/`stdout` are the socket's send/recv halves so the
+existing `JsonTransport`/`CborTransport` plumbing works unchanged.
+
+The CLI gets a new top-level option `--socket PATH` plus env override
+`LDB_SOCKET`. Mutually exclusive with `--ssh` and `--ldbd`.
+
+#### Tests
+
+- `tests/smoke/test_socket_lifecycle.py`: start `ldbd --listen`,
+  connect twice from two `ldb` processes, assert target_id from
+  connection #1 is reachable from connection #2.
+- Unit test for the listener's `flock` collision behaviour (two
+  `ldbd --listen` on the same path → second exits 1).
+- Tests for the file-mode and parent-dir-mode being uid-only.
+
+### Risks
+
+- **Concurrency audit is non-trivial.** Today's dispatcher assumes
+  single-client semantics — one RPC at a time, completing before the
+  next is read. Phase 1 mitigates by serialising all requests through
+  a single per-daemon mutex (correct, dumb, slow); phase 2 can refine
+  per-target.
+- **Long-running daemon is a new failure mode** — a state leak in
+  any endpoint that didn't matter when the daemon lived for ~50ms
+  now lives for hours. Audit `Dispatcher` for `std::vector`s that
+  only grow (e.g. event histories, diff caches).
+- **`--listen` reuses the JSON-RPC framing but multiplexes connections
+  over one dispatcher.** Notifications (`thread.event` etc.) currently
+  go to one `OutputChannel`. We need per-connection sinks; the
+  existing `notif_sink` plumbing in `src/main.cpp:288` is single-
+  consumer. This is the biggest non-obvious work.
+
+### Effort
+
+Probably 2–3 days. Roughly:
+
+- Day 1: socket-listener skeleton + flock + single-client path; tests.
+- Day 2: notification-sink refactor for multi-client; concurrency
+  audit + per-target serialisation.
+- Day 3: client-side `--socket` + auto-spawn fallback + lifecycle
+  tests (idle timeout, signal handling).
+
+If this slips, phase-1 (single-client persistent socket) is the
+useful core; phase-2 (multi-client + auto-spawn) can land as a
+separate branch.
+
+### Phase-2 follow-ups (post-phase-1 review)
+
+These items were flagged by the linus-code-reviewer and security-
+auditor on `worktree-agent-ae73d824f609b6e86` and consciously
+deferred — phase 1 still ships, but the gaps are recorded so they
+don't get re-discovered as surprises.
+
+- **In-flight RPC interruption on SIGTERM.** The accept loop polls
+  `g_shutdown` only between connections; a long-running `target.open`
+  or hung backend call holds the daemon up indefinitely. Three
+  candidate fixes:
+    1. Pump signals into a self-pipe and replace the blocking
+       `accept()` with `pselect`; abort the in-flight RPC by
+       closing the connection fd from the signal handler's side.
+    2. Expose a `daemon.shutdown` RPC that the client can call
+       to drain in-flight work and exit cleanly.
+    3. Add a per-RPC idle timeout (config knob; default off in
+       phase 1, on for phase 2).
+  All three need a thread-safety audit of the dispatcher's mutable
+  state before they're safe to land.
+- **Token auth for shared-uid environments.** Phase-1's trust model
+  (above) explicitly excludes shared-uid hosts; phase 2's token
+  auth covers them. Sketch: daemon writes a one-shot bearer to
+  `${PATH}.token` (mode 0600) at startup; the client reads it and
+  presents it on the first frame; daemon rejects connections that
+  don't present it. The token rotates on restart.
+- **Per-connection notification sinks.** Phase 1 re-points the
+  dispatcher's single `notif_sink` on accept and clears it on
+  disconnect — race-free only because at most one connection is
+  alive at a time. Multi-client phase 2 needs per-connection sinks
+  plumbed through `NonStopRuntime` so async notifications go to
+  the right peer.
+- **Dispatcher mutability audit.** Probes, sessions, breakpoints —
+  audit anything that today assumes single-client serial RPC.
+  Phase-1 mitigation is the "single connection at a time" promise;
+  multi-client phase 2 forces the audit.
+
+---
+
+## 3. ARM64e chained fixups for selrefs / xref indexing
+
+### Problem
+
+On iOS 13+ / macOS 11+ ARM64e binaries, pointer-bearing sections
+(`__objc_selrefs`, `__objc_classrefs`, `__got`, `__auth_got`, etc.)
+no longer store raw VAs. Each 64-bit slot is a chained-fixup
+descriptor:
+
+```
+[63]    bind/rebase flag
+[62:51] next chain link offset (0 = end of chain)
+[50:32] auth diversifier + key
+[31: 0] rebase target offset (relative to image base) OR bind ordinal
+```
+
+Exact layout is per the `dyld_chained_fixups_header` + `dyld_chained_ptr_64e`
+union in `<mach-o/fixup-chains.h>`. The OS's dyld applies these at load
+time; static-analysis tools see only the encoded form on disk.
+
+LDB's xref and string-xref pipelines (`xref.address`, `string.xref`,
+the symbol-index correlation passes) scan section bytes looking for
+literal 64-bit VAs that match a target. On a chained-fixup binary,
+**none of the values in the relevant sections are literal VAs**, so
+LDB silently produces zero or wrong results. Field report: the
+reporter routed around LDB and wrote a custom ARM64 disassembler.
+
+### Proposed approach
+
+A new pre-pass in the symbol indexer (see `docs/23-symbol-index.md`)
+that materialises a per-module "logical pointer map":
+
+```cpp
+// new include/ldb/backend/chained_fixups.h
+namespace ldb::backend {
+
+// Parse LC_DYLD_CHAINED_FIXUPS from a module's bytes; for each pointer
+// slot in the rebase/bind regions, compute the logical pointer value
+// that dyld would have written.
+struct ChainedFixupMap {
+  // file_addr → logical pointer value (image_base + rebase_offset for
+  // rebases; bind_target_addr for binds with a resolved symbol;
+  // 0 for unresolved binds).
+  std::unordered_map<std::uint64_t, std::uint64_t> resolved;
+};
+
+ChainedFixupMap parse_chained_fixups(const lldb::SBModule& m);
+
+}  // namespace ldb::backend
+```
+
+The map is built once per module (cached under
+`symbol_index.cache_root/<build_id>/fixups.bin`) and consulted by:
+
+- `xref_address` — before treating a 64-bit slot as a literal pointer,
+  look up the resolved value from the map.
+- `find_string_xrefs` — same.
+- `correlate.symbols` / `correlate.strings` — same.
+
+### Implementation sketch
+
+1. **Load command iteration.** `SBModule::GetObjectFileHeaderAddress()`
+   + raw byte reads of the `LC_DYLD_CHAINED_FIXUPS` segment-relative
+   payload. LLDB's SBAPI doesn't expose the chained-fixup tables
+   directly, so this is byte-level Mach-O parsing.
+2. **Header parsing.** `dyld_chained_fixups_header` →
+   `dyld_chained_starts_in_image` → per-segment
+   `dyld_chained_starts_in_segment` → per-page chain start.
+3. **Chain walking.** For each starting page offset, walk the chain
+   via `next` deltas, decoding each 64-bit value as either a rebase
+   or a bind. Stop when `next == 0`.
+4. **Materialisation.** Rebases resolve to `image_base + target_offset`;
+   binds resolve via the imports table to a symbol whose load address
+   may or may not be known (return 0 if unknown — caller-of-callers
+   can filter).
+5. **Cache invalidation.** Keyed on the module's build-id; immutable.
+
+### Phase 1 — what shipped (commits `1c0c8bb`, `359e738`, `d99cff9`)
+
+- `include/ldb/backend/chained_fixups.h` — public `parse_chained_fixups()`
+  + `ChainedFixupMap` (rva-keyed) + `SegmentInfo` callers populate from
+  Mach-O LC_SEGMENT_64s.
+- `src/backend/chained_fixups.cpp` — header walk, per-segment chain
+  walk, ARM64E (formats 1/9/12) + PTR_64 / PTR_64_OFFSET (formats 2/6)
+  decode. Multi-start pages, 32-bit formats, and bind resolution all
+  throw `phase 2` errors.
+- `tests/unit/test_chained_fixups.cpp` — five hand-built vectors
+  covering single-page, multi-page, auth-rebase, USERLAND, and the
+  unsupported-format error path.
+
+### Phase 2 — what shipped (this branch)
+
+The minimal wire-up needed to stop `xref.address` returning empty on
+chained-fixup binaries. Real iOS app validation deferred to phase 3.
+
+- `include/ldb/backend/chained_fixups.h` — new
+  `extract_chained_fixups_from_macho(bytes, size)` helper. Walks
+  `LC_SEGMENT_64` + `LC_DYLD_CHAINED_FIXUPS` from raw Mach-O bytes;
+  returns empty map on non-Mach-O / no-chained-fixup inputs (Linux
+  ELF, FAT binaries, classic LC_DYLD_INFO_ONLY) so callers can wire
+  it unconditionally without a Mach-O sniff.
+- `src/backend/lldb_backend.cpp` — `LldbBackend::Impl` gets
+  `chained_fixup_maps` / `chained_fixup_loaded` per-target caches
+  (lazy-init on first xref query; reaped in `close_target`). No
+  on-disk cache — phase 3.
+- `xref_address` — keeps the literal-operand + RIP-relative scans
+  intact, then runs an ARM64 ADRP-pair resolver. ADRP records the
+  absolute target page per destination register; the next consumer
+  (`add xN, src, #imm` or `ldr xN, [src, #imm]`) computes
+  `page + imm`. The target is matched against (a) the caller's
+  needle directly, and (b) the chained-fixup map's `slot_rva →
+  resolved_value` table for LDR-style consumers (slot-load
+  indirection). Results from all paths are deduped by instruction
+  address. Logic is sequential, single-pass — no liveness analysis;
+  the "last ADRP wins for this register" heuristic matches what
+  compiler-emitted ADRP+immediate-use code expects.
+- `tests/unit/test_chained_fixups.cpp` — two new cases covering the
+  Mach-O extractor: null / ELF magic → empty map; minimal arm64
+  Mach-O with one segment + one LC_DYLD_CHAINED_FIXUPS round-trips
+  through Vector A's payload.
+- `tests/fixtures/c/chain_slot.c` + `tests/smoke/test_xref_chained_fixup.sh`
+  — Apple-silicon-arm64-gated synthetic fixture. A pointer slot in
+  `__DATA/__data` rebases to a string in `__TEXT/__cstring`;
+  `reference_string()` loads through the slot via ADRP+LDR. Smoke
+  test pins both `xref.addr` and `string.xref` against the string's
+  file address. Without the wire-up the result is empty; with it,
+  the LDR inside `reference_string` is surfaced.
+
+### Phase 3 — acceptance criteria for the ADRP-pair resolver
+
+The phase-2 resolver is a "last ADRP wins for this register" heuristic.
+That subsumes the common compiler-emitted single-def-then-immediate-use
+case but produces false positives across control flow (calls clobber
+caller-saved regs; branches end basic blocks). Phase 3 closes those
+gaps. Acceptance gates:
+
+- **BL / BLR** clears `adrp_regs` entries for `x0`–`x18` and `x30`
+  (AAPCS64 call-clobber set — anything else is callee-saved and may
+  still hold the prior ADRP).
+- **RET / unconditional B / BR Xn** clears all of `adrp_regs` (function
+  boundary; the next block can't safely assume any prior page).
+- **ADD `dst, src, #imm`** with `src != dst`: clears `adrp_regs[dst]`.
+  Phase 3 does NOT propagate the chain through arithmetic — modelling
+  proper dataflow (especially through SXTW / LSL shifts) is out of
+  scope. The clear is the conservative answer.
+- **ADD `dst, dst, #imm`**: clears `adrp_regs[dst]` for the same
+  reason — the value is no longer the ADRP page.
+- **MOV `dst, src`**: clears `adrp_regs[dst]` unless `src` is also
+  tracked (in which case propagate the page through MOV). The simple
+  shape is the only one worth modelling — anything register-to-register
+  with a shift is real dataflow.
+- **FAT (universal) Mach-O**: parse the slice matching the SBTarget's
+  triple (or, if absent, prefer arm64e over arm64 over x86_64) instead
+  of returning an empty fixup map. Today extract_chained_fixups_from_macho
+  silently no-ops on FAT magic.
+- **Adversarial smoke tests**: at minimum cover call-clobber (ADRP →
+  BL → LDR-against-stale-register), cross-function (function boundary
+  doesn't carry ADRP state forward), and ADD-then-LDR (LDR against an
+  ADD-derived address that phase 3 must NOT resolve). The phase-2
+  fixture (`chain_slot.c`) only exercises the happy path; the
+  regression bar for phase 3 is **zero false positives** from these
+  patterns.
+- **`provenance.warnings` field** on `xref.address` responses: count
+  of "ADRP-pair resolutions skipped due to ambiguity" (e.g. a tracked
+  ADRP that was clobbered by an untracked instruction between def and
+  use). A non-zero count surfaces to the caller that the heuristic
+  isn't authoritative on this binary, which the agent can use to
+  prefer the chained-fixup map or fall back to symbol-index correlate.
+
+### Phase 3 — what shipped (this branch)
+
+All seven acceptance gates above closed. Commits on the phase-3
+branch (each addresses one or more gates):
+
+- **TDD-red fixtures** (commit `adc083a`): three hand-assembled
+  ARM64 fixtures (`tests/fixtures/asm/xref_{addclobber,fnleak,
+  callclobber}.s`) + Python smoke drivers
+  (`tests/smoke/test_xref_{addclobber,fnleak,callclobber}.py`)
+  reproducing the phase-2 false positives. Built and tests added
+  before the implementation; they FAILED against `25f35de` with the
+  expected single-match output.
+
+- **ADRP-pair register-state clobber rules** (commit `7419945`):
+  gates 1 (function-boundary reset, lazy `function_name_at`), 2
+  (AAPCS64 BL/BLR caller-saved set), 3 (ADD always clears dst), 4
+  (MOV propagate-or-clobber). All three adversarial smoke tests
+  flip to green; ctest 73/73.
+
+- **FAT (universal) Mach-O slice selection** (commit `eebebca`):
+  gate 5. Refactored thin-Mach-O walk into a helper; new FAT
+  dispatcher iterates fat_arch[] / fat_arch_64[], prefers arm64e
+  > arm64. Three new unit tests cover slice picking, arm64e
+  preference, and malformed-FAT rejection.
+
+- **`provenance.warnings` field** (commit `c01fa47`): gate 7.
+  `XrefProvenance` struct in `debugger_backend.h`; xref.address
+  takes an optional out-param. Dispatcher attaches the provenance
+  block to the response only when something was skipped. Phase 3
+  populates one case (register-offset LDR with tracked base);
+  phase 4 will accumulate more.
+
+### Phase 3 — post-review cleanup (this branch, post-`96d079b`)
+
+A linus-style review of the five phase-3 commits surfaced a punch
+list of silent false-positive vectors and false-negatives in the
+same family the spec was meant to close. Every reviewer-flagged
+item landed on this branch:
+
+- **SUB clobber** (commit `f57b16c`): `sub xN, xN, #imm` has
+  identical destination-write semantics to ADD but was missed by
+  the original phase-3 patch. Extend gate 3 to cover ADD / SUB /
+  ADDS / SUBS; only ADD has a match-emit (no compiler computes
+  targets as `page - imm`). New fixture
+  `tests/fixtures/asm/xref_subclobber.s` + smoke.
+
+- **PAC-authenticated branch family** (commit `62b6e47`): arm64e's
+  BLRAA / BLRAB / BLRAAZ / BLRABZ are AAPCS64 calls — same clobber
+  set as BL / BLR — and BRAA / BRAB / BRAAZ / BRABZ end basic
+  blocks like BR, and RETAA / RETAB end functions like RET. The
+  original phase-3 matched only bare spellings. Refactor the post-
+  emit switch to use `is_call` / `is_indirect_branch` /
+  `is_return` named flags that fold in the PAC variants. New
+  fixture `tests/fixtures/asm/xref_pac_callclobber.s` — gated on
+  the arm64e toolchain (CMake `CheckCSourceCompiles` probe;
+  fixture built thin via `OSX_ARCHITECTURES` override to avoid the
+  default fat-slice path that downcasts to arm64).
+
+- **Pre/post-indexed LDR/STR writeback** (commit `8e46141`):
+  `ldr xN, [xM, #imm]!` (pre) and `ldr xN, [xM], #imm` (post)
+  rewrite the base register as a side effect. The phase-3 resolver
+  emitted the match for the legitimate effective address but never
+  cleared `adrp_regs[xM]`, leaving a downstream LDR free to false-
+  match the stale page. New `AdrpResolved::has_writeback` /
+  `writeback_base` fields; post-emit clobber + provenance
+  `adrp_pair_writeback_cleared` counter + human-readable warning.
+  Fixture exercises both shapes.
+
+- **STR / STUR / STRH / STRB / STP / LDUR consumers** (commit
+  `306363a`): phase 3 modelled only LDR-family loads, so stores
+  through an ADRP-tracked base were invisible to `xref.addr` — a
+  user asking "what writes to this global?" got an empty answer.
+  Refactor the address-operand parsing into a reusable helper
+  (`parse_adrp_addr_operand`); collapse the resolver into three
+  buckets (is_load, is_store_one_reg, is_store_pair) that share
+  the same parser. STP gets a two-register prefix-skip. Fixture
+  covers STR / STP / STRB.
+
+- **Nits N5–N10** (commit `01494da`): apply_mov_state return-value
+  used to short-circuit `resolve_adrp_consumer`; AAPCS64 clobber
+  replaced with allocation-free iterate-and-erase + predicate
+  helper; MOV source classifier replaces the brittle first-char
+  heuristic with explicit alias-name comparison; FAT64 unit test
+  for the `0xCAFEBABF` magic + 32-byte `fat_arch_64` path that
+  the prior FAT tests left uncovered; FAT slice picker comment
+  documents the empty-map fallthrough hazard (phase-4 follow-up:
+  thread SBTarget's triple through the extractor); x29/x30
+  comment fixed to state AAPCS64 callee-saved semantics
+  correctly.
+
+Post-cleanup ctest: 77/77. Eight phase-3 smokes (the original
+three plus xref_subclobber, xref_writeback_ldr, xref_str,
+xref_pac_callclobber, and the FAT64 unit test) all pass.
+
+### Phase 4 — carried forward
+
+These items surfaced during the post-review cleanup but were not in
+scope for the phase-3 spec. Each is a real false-positive / false-
+negative the heuristic can't close without changes to data sources
+(symbol-context lookups, SBTarget triple plumbing, etc.) beyond the
+single-pass register-state machine.
+
+- **Two adjacent unsymbolized functions** — gate 1's function-name
+  boundary check (`function_name_at`) can't fire when both adjacent
+  functions report `""` (stripped binaries). The conservative B / BR
+  / RET reset still catches most cases; a binary that lacks any
+  terminator between two adjacent functions (e.g. compiler-emitted
+  trampolines, hand-rolled tail-call patterns) would let ADRP
+  tracking leak across. Phase 4 needs a symbol-context-by-section-
+  range fallback (find the SBSymbol whose [start, start+size]
+  covers the current insn).
+
+- **Conditional branches** (`b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz`)
+  that cross into code which uses the tracked registers differently
+  — phase 3 doesn't reset on these. The conservative-reset bar
+  argues that the next-iteration function-boundary check restores
+  sanity, but the worst-case false positive is a same-function
+  back-branch into a path that re-uses the page register for an
+  unrelated value.
+
+- **MOV from XZR / WZR explicitly** — `mov xN, xzr` is the zero
+  immediate, not an ADRP page. Phase 3 handles this correctly by
+  accident (the prefix hack fell through to "kZero clobbers" via
+  the first-char-'x' detection; the post-review N7 cleanup makes
+  this explicit via `classify_mov_source`). Track in phase 4 for
+  any future regressions.
+
+- **STR-family already shipped** in the phase-3 post-review (commit
+  `306363a`); no longer carried.
+
+- **FAT slice picker triple plumbing** — the picker today returns
+  the arm64e slice's fixup map when both arm64 and arm64e have
+  chained fixups, even when LLDB loaded the arm64 slice. Phase 4
+  should thread SBTarget's triple through
+  `extract_chained_fixups_from_macho` so the picker matches what's
+  actually loaded. See the N9 cleanup comment in
+  `src/backend/chained_fixups.cpp`.
+
+- **Auth-rebase key-class filtering** — phase 3 doesn't distinguish
+  PAC key classes on rebase slots. A consumer that uses
+  `__auth_got` indirection vs `__got` is conflated.
+
+- **Real iOS .ipa smoke** — validate against `dyld_info --fixups`
+  output. The synthetic fixture is sufficient for the heuristic
+  layer but a real WeChat-class binary is the only way to surface
+  performance and edge-case ambiguity at scale.
+
+- **Bind resolution** (imports table parsing — phase 2's
+  resolved=0 stays on binds).
+
+- **On-disk cache** of the fixup map keyed on `build_id` — phase
+  2's per-target rebuild is still cheap at fixture scale (~1 ms on
+  33 KB) but a real WeChat-class binary needs measurement.
+
+- **`correlate.symbols` / `correlate.strings`** wire-up. The
+  symbol-index path doesn't consult the fixup map yet — it scans
+  raw section bytes and treats them as literal pointers.
+
+- **Multi-module support.** `xref_address` only scans the main
+  executable (module index 0).
+
+### Out of scope (phase 2)
+
+Carried over to phase 3 (most of these now live in the phase-4
+list above):
+
+- **On-disk cache** of the fixup map keyed on `build_id`. Today the
+  map is rebuilt on every `target.open`. Cheap enough at fixture
+  scale (33 KB binary → ~1 ms); needs measuring on real WeChat-
+  scale targets before deciding the cache substrate.
+- **`correlate.symbols` / `correlate.strings`** wire-up. The symbol-
+  index path doesn't consult the fixup map yet — it scans raw
+  section bytes and treats them as literal pointers.
+- **Bind resolution.** Phase 1 records `slot_rva → 0` for binds; the
+  imports table parse + lazy load-address resolution lives in
+  phase 3 once the symbol-index has a stable cross-module surface.
+- **Multi-module support.** xref_address only scans the main
+  executable (module index 0), same as before phase 2.
+- **WeChat-scale validation.** Synthetic fixture is sufficient for
+  this branch. Real iOS app smoke is a separate work item; the
+  symptom in the field report is the slot-load case the fixture
+  reproduces.
+
+### Test plan
+
+Real iOS Mach-O fixtures are licence-sensitive and large; ship a
+**synthetic ARM64e binary** instead:
+
+- A tiny C++ program with one Obj-C++ TU containing 3–4 selectors.
+- Compile with `clang -arch arm64e -mmacosx-version-min=11.0
+  -fuse-ld=lld -Wl,-fixup_chains`.
+- Verify `LC_DYLD_CHAINED_FIXUPS` is present via `otool -l`.
+- Add to `tests/fixtures/`; CMake target gated on `arch=arm64e` host
+  capability.
+
+Tests:
+
+- Unit: feed known LC_DYLD_CHAINED_FIXUPS bytes through
+  `parse_chained_fixups()`; assert the resolved map matches the
+  pre-dyld values dumped by `dyld_info --fixups`.
+- Smoke: `xref.address` against a selref pointer in the fixture
+  returns the call site that loads it; without the fix, the same
+  call returns empty.
+
+### Risks
+
+- **Spec drift.** Chained-fixup format has revved across iOS versions
+  (v1 with `dyld_chained_ptr_64`, v2 with `dyld_chained_ptr_64e`,
+  segmented chains, page-overflow fixups). The reference is
+  `<mach-o/fixup-chains.h>` from the host SDK — track upstream
+  cdefs. Phase 1 implements the most-common subset (ARM64E
+  page-relative pointers); phase 2 covers split-segment and the
+  legacy v1 binaries.
+- **No SBAPI escape hatch.** We're parsing Mach-O bytes manually,
+  parallel to LLDB. If LLDB later exposes a chained-fixup decoder
+  via SBAPI, swap to it.
+- **Cross-OS portability.** Linux ELF doesn't have an analogue; the
+  pre-pass should no-op on non-Mach-O modules.
+
+### Effort
+
+Probably a week of focused work, dominated by:
+
+- 1–2 days: fixture-generation pipeline.
+- 2 days: parser + unit tests.
+- 1 day: indexer wire-up + smoke.
+- 1 day: cache-format + the "what happens on stale dyld_info"
+  failure mode.
+
+This is the largest of the three and the only one with cross-cutting
+correctness implications. It should land *after* the symbol-index
+work in `docs/23-symbol-index.md` matures so we have a stable caching
+substrate to plug into.
+
+---
+
+## 4. Sequencing
+
+Recommended order (smallest blast radius first; user value last):
+
+1. **§1 CLI sibling lookup** — half-hour fix that gets the in-tree
+   dev flow unstuck. No design risk.
+2. **§2 socket daemon, phase 1 (single-client persistent)** — useful
+   on its own; tests catch concurrency assumptions before phase 2.
+3. **§3 chained-fixups parser**, behind a build flag
+   (`-DLDB_ENABLE_CHAINED_FIXUPS=ON`) initially. Land after the
+   symbol-index cache work; gate the new code path on
+   `static.module_uses_chained_fixups()` so non-iOS workflows pay
+   nothing.
+4. **§2 socket daemon, phase 2 (multi-client + auto-spawn)** —
+   ergonomics polish. Defer until phase 1 has shipped and we know
+   whether anyone actually wanted multi-client.
+
+§1 and §3 don't interact. §2 and §3 cross paths only if a
+`--listen`-mode daemon is asked to handle a chained-fixup binary —
+i.e. the long-running daemon walks the same code path the short-
+lived one does, so no extra integration cost.
+
+## 5. Out of scope (for all three)
+
+- **CLI install target / packaging.** Separate concern; tracked in
+  `docs/03-ldb-full-roadmap.md` under v2 distribution.
+- **Windows host support.** Unix-socket transport assumes a unix
+  domain socket; named pipes on Windows is a separate transport
+  abstraction, not a phase-2 follow-up of §2.
+- **GUI client / web UI.** The socket transport is a prerequisite for
+  one, but the UI itself is a different project entirely.
+- **Rewriting xref scanning in Rust / Capstone-only.** §3 lives
+  inside whatever language the existing indexer uses (C++).

@@ -84,6 +84,93 @@ target_compile_options(ldb_fix_looper PRIVATE
   -fno-eliminate-unused-debug-types
 )
 
+# Chained-fixup fixture for docs/35-field-report-followups.md §3 phase 2.
+# Only built on Apple Silicon hosts: the smoke test that drives this
+# fixture (tests/smoke/test_xref_chained_fixup.sh) inspects an arm64
+# LC_DYLD_CHAINED_FIXUPS payload, which only Apple's linker emits and
+# which is only meaningfully decodable when the host can disassemble
+# arm64. The CMake guard mirrors the add_test() guard in
+# tests/CMakeLists.txt so a fresh `cmake --build` doesn't fail on Linux.
+if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
+  add_executable(ldb_fix_chain_slot c/chain_slot.c)
+  set_target_properties(ldb_fix_chain_slot PROPERTIES
+    OUTPUT_NAME    chain_slot
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+    C_STANDARD     11
+  )
+  target_compile_options(ldb_fix_chain_slot PRIVATE
+    -arch arm64
+    -g -O0
+    -fno-omit-frame-pointer
+  )
+  # -Wl,-fixup_chains forces the linker to emit LC_DYLD_CHAINED_FIXUPS
+  # even when the deployment target wouldn't have demanded it. This is
+  # the flag whose output the parse_chained_fixups() pipeline targets.
+  target_link_options(ldb_fix_chain_slot PRIVATE
+    -arch arm64
+    -Wl,-fixup_chains
+  )
+
+  # Phase-3 adversarial fixtures (docs/35-field-report-followups.md §3
+  # phase 3). Each one reproduces a specific phase-2 false-positive in
+  # the ADRP-pair resolver. Hand-assembled `.s` so the instruction
+  # stream is deterministic and the smoke tests can pin offsets.
+  # enable_language(ASM) is scoped to this CMakeLists — the rest of the
+  # project compiles C/C++ only.
+  enable_language(ASM)
+  foreach(_phase3_fix
+      xref_addclobber
+      xref_fnleak
+      xref_callclobber
+      xref_subclobber
+      xref_writeback_ldr
+      xref_str)
+    add_executable(ldb_fix_${_phase3_fix} asm/${_phase3_fix}.s)
+    set_target_properties(ldb_fix_${_phase3_fix} PROPERTIES
+      OUTPUT_NAME    ${_phase3_fix}
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+      LINKER_LANGUAGE C
+    )
+    target_compile_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
+    target_link_options(ldb_fix_${_phase3_fix} PRIVATE -arch arm64)
+  endforeach()
+
+  # Phase-3 post-review PAC-call fixture. PAC branch mnemonics
+  # (BLRAA / BLRAB / BLRAAZ / BLRABZ / BRAA / BRAB / BRAAZ / BRABZ /
+  # RETAA / RETAB) only exist on arm64e — clang refuses them with
+  # -arch arm64. Probe the toolchain by attempting an arm64e compile
+  # at configure time so a fresh Apple silicon dev box without the
+  # arm64e SDK pieces SKIPs the test cleanly instead of erroring at
+  # build time.
+  include(CheckCSourceCompiles)
+  set(_saved_required_flags ${CMAKE_REQUIRED_FLAGS})
+  set(CMAKE_REQUIRED_FLAGS "-arch arm64e")
+  check_c_source_compiles("int main(void){return 0;}"
+    LDB_CAN_COMPILE_ARM64E)
+  set(CMAKE_REQUIRED_FLAGS ${_saved_required_flags})
+
+  if(LDB_CAN_COMPILE_ARM64E)
+    add_executable(ldb_fix_xref_pac_callclobber
+                   asm/xref_pac_callclobber.s)
+    set_target_properties(ldb_fix_xref_pac_callclobber PROPERTIES
+      OUTPUT_NAME    xref_pac_callclobber
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/fixtures
+      LINKER_LANGUAGE C
+      # Force a single-arch thin Mach-O. The default project-wide
+      # CMAKE_OSX_ARCHITECTURES (arm64) plus our `-arch arm64e`
+      # compile-option would otherwise produce a FAT universal binary;
+      # LLDB then picks the arm64 slice, which has the PAC bytes laid
+      # out the same but is reported with a non-arm64e triple, and the
+      # xref disassembler reads the wrong section bytes. Overriding
+      # OSX_ARCHITECTURES at the target level prevents the
+      # auto-injection of project-level arch flags.
+      OSX_ARCHITECTURES "arm64e"
+    )
+    target_compile_options(ldb_fix_xref_pac_callclobber PRIVATE -arch arm64e)
+    target_link_options(ldb_fix_xref_pac_callclobber PRIVATE -arch arm64e)
+  endif()
+endif()
+
 # C++ fixture for symbol.find demangled-name lookup (papercut #3).
 # Itanium ABI mangles `ldb_fix::Widget::poke(long)` to a known mangled
 # symbol; we lean on the demangled name from LLDB SBSymbol::GetName()

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "backend/lldb_backend.h"
 
+#include "backend/xref_arm64_parsers.h"
+#include "ldb/backend/chained_fixups.h"
 #include "transport/rr.h"
 #include "transport/ssh.h"
 
 #include <algorithm>
+#include <array>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -18,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string_view>
 #include <tuple>
 #include <signal.h>
@@ -110,7 +114,21 @@ void collect_sections(lldb::SBSection parent, std::vector<Section>& out,
   }
 }
 
-Module convert_module(lldb::SBModule m) {
+// Count the top-level + nested sections in a module without
+// materialising any Section records. The recursion mirrors
+// collect_sections but only increments a counter — same shape, no
+// allocations, no name/perm/type fetches.
+std::uint64_t count_sections(lldb::SBSection parent) {
+  std::uint64_t total = 1;
+  size_t n = parent.GetNumSubSections();
+  for (size_t i = 0; i < n; ++i) {
+    auto sub = parent.GetSubSectionAtIndex(i);
+    if (sub.IsValid()) total += count_sections(sub);
+  }
+  return total;
+}
+
+Module convert_module(lldb::SBModule m, bool include_sections) {
   Module out;
   lldb::SBFileSpec file = m.GetFileSpec();
   if (file.IsValid()) {
@@ -125,12 +143,25 @@ Module convert_module(lldb::SBModule m) {
   // Triple
   if (const char* tr = m.GetTriple()) out.triple = tr;
 
-  // Top-level sections
   size_t n = m.GetNumSections();
-  out.sections.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    auto s = m.GetSectionAtIndex(i);
-    if (s.IsValid()) collect_sections(s, out.sections);
+  if (include_sections) {
+    out.sections.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      auto s = m.GetSectionAtIndex(i);
+      if (s.IsValid()) collect_sections(s, out.sections);
+    }
+    out.section_count = out.sections.size();
+  } else {
+    // Cheap path: just count. The recursion is bounded by the Mach-O /
+    // ELF section nesting depth (typically 2), so the worst case for a
+    // 587-section iOS app is one GetNumSubSections per top-level
+    // section — orders of magnitude less work than the full walk.
+    std::uint64_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+      auto s = m.GetSectionAtIndex(i);
+      if (s.IsValid()) total += count_sections(s);
+    }
+    out.section_count = total;
   }
   return out;
 }
@@ -268,6 +299,18 @@ struct LldbBackend::Impl {
   // snapshot_for_target call, which is dwarfed by the digest hash.
   lldb::SBListener module_listener;
 
+  // Per-target chained-fixup map cache. Lazy-initialised on first
+  // xref query against the target; in-memory only (phase 3 will add
+  // on-disk caching keyed on build_id). The cached map covers only the
+  // main executable (module index 0) — same scope as xref_address.
+  // See docs/35-field-report-followups.md §3 phase 2.
+  //
+  // The optional<> distinguishes "never queried" from "queried and the
+  // binary has no chained fixups": the latter caches an empty map so
+  // subsequent calls don't re-read the on-disk Mach-O. Guarded by `mu`.
+  std::unordered_map<TargetId, ChainedFixupMap> chained_fixup_maps;
+  std::unordered_map<TargetId, bool>            chained_fixup_loaded;
+
   // Breakpoint callback registry. A separate mutex from `mu` so the
   // hot-path lookup from LLDB's event thread doesn't contend with
   // dispatcher-thread target operations.
@@ -334,6 +377,18 @@ LldbBackend::LldbBackend() : impl_(std::make_unique<Impl>()) {
   ensure_lldb_initialized();
   impl_->debugger = lldb::SBDebugger::Create();
   impl_->debugger.SetAsync(false);
+  // Stop LLDB from eagerly parsing the entire symbol table + DWARF on
+  // CreateTarget. For a stripped 503 MB Obj-C iOS Mach-O this single
+  // knob was the difference between target.open returning in <1s and
+  // never returning (RSS grew linearly at ~5 MB/s past 36 GB, building
+  // an in-memory index over __objc_methname / function symbols that
+  // nobody had asked for yet). Symbol queries (symbol.find,
+  // disasm.function, ...) still work — they just trigger the parse
+  // on demand, scoped to the module they actually need.
+  if (const char* name = impl_->debugger.GetInstanceName()) {
+    lldb::SBDebugger::SetInternalVariable("target.preload-symbols", "false",
+                                          name);
+  }
   // Module-load listener (slice 1c). Created up front and reused for
   // every target's broadcaster — synchronous drain in
   // snapshot_for_target means we never block on it.
@@ -364,7 +419,8 @@ LldbBackend::~LldbBackend() {
   // on ensure_lldb_initialized.
 }
 
-OpenResult LldbBackend::open_executable(const std::string& path) {
+OpenResult LldbBackend::open_executable(const std::string& path,
+                                        const OpenOptions& opts) {
   lldb::SBError err;
   // CreateTarget(filename, triple, platform, add_dependent_modules, error)
   auto target = impl_->debugger.CreateTarget(
@@ -390,7 +446,9 @@ OpenResult LldbBackend::open_executable(const std::string& path) {
   res.modules.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     auto mod = target.GetModuleAtIndex(i);
-    if (mod.IsValid()) res.modules.push_back(convert_module(mod));
+    if (mod.IsValid()) {
+      res.modules.push_back(convert_module(mod, opts.include_sections));
+    }
   }
   return res;
 }
@@ -467,7 +525,12 @@ OpenResult LldbBackend::load_core(const std::string& core_path) {
   res.modules.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     auto mod = target.GetModuleAtIndex(i);
-    if (mod.IsValid()) res.modules.push_back(convert_module(mod));
+    // load_core is the postmortem-analysis entry point; the caller has
+    // already paid the cost of opening a core file and almost certainly
+    // wants the module-level section detail to navigate the snapshot.
+    if (mod.IsValid()) {
+      res.modules.push_back(convert_module(mod, /*include_sections=*/true));
+    }
   }
   return res;
 }
@@ -488,7 +551,10 @@ std::vector<Module> LldbBackend::list_modules(TargetId tid) {
   out.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     auto m = target.GetModuleAtIndex(i);
-    if (m.IsValid()) out.push_back(convert_module(m));
+    // module.list shape is unchanged: callers expect sections inline.
+    // Projection out of sections is the view descriptor's job
+    // (view.fields=["path","uuid",...]).
+    if (m.IsValid()) out.push_back(convert_module(m, /*include_sections=*/true));
   }
   // Stable ordering (audit §3.3 / R4): sort by module path ascending.
   // LLDB's load-order iteration is per-target and stable, but two
@@ -1743,6 +1809,507 @@ bool rip_relative_targets(const std::string& operands,
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// ARM64 ADRP-pair target resolution (docs/35-field-report-followups.md §3
+// phase 2). The existing literal-operand scan misses ADRP because LLDB
+// renders the operand as a 21-bit page count (e.g. "x8, 4"), not as the
+// absolute page address. We need the absolute target to match against
+// (a) the caller's needle directly, and (b) chained-fixup slot
+// addresses whose resolved value is the needle.
+//
+// We parse the small subset of ADRP / ADD-imm / LDR-imm-unsigned-offset
+// operand text emitted by LLDB:
+//
+//   adrp x8, 4               → page = (pc & ~0xfff) + (4 << 12)
+//   add  x0, x8, #0x440      → target = page + 0x440
+//   add  x0, x8, 1088        → same (LLDB sometimes drops the 0x prefix)
+//   ldr  x8, [x8]            → target = page + 0
+//   ldr  x8, [x8, #0x440]    → target = page + 0x440
+//   ldr  x8, [x8, 1088]      → same
+//
+// Edge cases we intentionally don't handle here:
+//   - LDR with a register offset / shifted index (`[x8, x9]`, `[x8, x9, lsl #3]`)
+//   - ADRP whose register is later clobbered by an unrelated insn before
+//     the load/add — we'd need real liveness analysis. The common case
+//     in compiler-emitted code is ADRP+LDR/ADD as adjacent or near-adjacent
+//     instructions, which a single-register "last ADRP wins" map handles.
+//
+// Phase 3 (docs/35-field-report-followups.md §3) layers deterministic
+// register-state clobber rules on top of the phase-2 single-pass scan:
+//   - BL / BLR → clear x0..x18 + x30 (AAPCS64 caller-saved set)
+//   - RET / B / BR / function-boundary transition → clear entire map
+//   - ADD writes (any form) → clear adrp_regs[dst] AFTER emit (the dst
+//     no longer holds an ADRP page once we've folded the imm in)
+//   - MOV xN, xM → propagate adrp_regs[xM] into adrp_regs[xN]
+//   - MOV xN, #imm / MOVZ / MOVK / MOVN / MOV xN, sp / MOV xN, lr →
+//     clear adrp_regs[dst]
+// These rules don't add a dataflow pass — they're per-instruction
+// state mutations the loop applies inline.
+struct AdrpPair {
+  std::uint64_t page = 0;  // absolute target page (already << 12'd)
+  std::uint64_t pc   = 0;  // pc of the ADRP that set this register
+};
+
+// The decimal/hex/signed/register parsers live in
+// src/backend/xref_arm64_parsers.{h,cpp} so unit tests can exercise
+// them without standing up a live LLDB target.
+using xref_arm64::parse_int_at;
+using xref_arm64::parse_reg_at;
+using xref_arm64::parse_uint_at;
+
+// Extract the target address an ARM64 memory operand refers to, given a
+// known {adrp_page, register_name} pair. Recognised shapes:
+//
+//   ADD   reg, src_reg, #<imm>                  → page + imm
+//   LDR   xN,  [src_reg]                        → page + 0,   slot-load
+//   LDR   xN,  [src_reg, #<imm>]                → page + imm, slot-load
+//   LDR   wN,  [src_reg{, #imm}]                → page + imm, NOT slot-load
+//   LDRSW xN,  [src_reg{, #imm}]                → page + imm, NOT slot-load
+//   LDRH/LDRB  reg, [src_reg{, #imm}]           → page + imm, NOT slot-load
+//
+// `mnemonic` is lower-cased by the caller. Returns std::nullopt when
+// the instruction doesn't fit one of the patterns above. The
+// `is_slot_load` flag is what gates the chained-fixup map lookup: it's
+// only meaningful for 8-byte LDRs into x-registers, because the
+// chained-fixup map keys 64-bit pointer slots. A 32-bit ldr/ldrsw or a
+// halfword/byte load is consuming the same effective address as a real
+// chained pointer would, so its direct ADRP target match is still
+// useful, but it cannot resolve through a slot.
+struct AdrpResolved {
+  std::uint64_t target = 0;
+  bool is_slot_load = false;
+  // True iff the consumer instruction had a pre- or post-indexed
+  // writeback that rewrites the base register (`[xM, #imm]!` or
+  // `[xM], #imm`). The match-emit for the legitimate effective
+  // address still fires, but the caller must then clear
+  // adrp_regs[base_reg] so a subsequent LDR through xM doesn't
+  // false-match the now-stale page.
+  bool has_writeback = false;
+  // The base register whose tracking should be cleared on writeback.
+  // Only meaningful when has_writeback is true.
+  std::string writeback_base;
+};
+
+// AAPCS64 caller-saved general-purpose register set. A BL / BLR (and
+// the PAC-authenticated branch family) clears any tracked ADRP page
+// held in one of these regs because the callee is free to overwrite
+// them. x19..x28 are callee-saved per AAPCS64 — the callee is required
+// to preserve them across the call.
+//
+// x29 (FP) is callee-saved per AAPCS64 — the callee is required to
+// restore it before returning, so we leave it alone. x30 (LR) is the
+// return-address register; BL writes the return address there, so it
+// belongs in the clobber set.
+//
+// The classifier is a small switch on the first-character + numeric
+// suffix; faster than a hash-set lookup and avoids the 20-string
+// per-call construction the original implementation performed (each
+// `adrp_regs.erase(std::string(reg))` allocated a temporary
+// std::string for the key conversion).
+bool is_aapcs64_caller_saved(std::string_view reg) {
+  if (reg.size() < 2 || reg.size() > 3) return false;
+  if (reg[0] != 'x') return false;
+  // x0..x18: caller-saved. x30: caller-saved. Everything else: not.
+  if (reg.size() == 2) {
+    // x0..x9
+    return reg[1] >= '0' && reg[1] <= '9';
+  }
+  // x10..x18 or x30
+  if (reg[1] < '0' || reg[1] > '9' || reg[2] < '0' || reg[2] > '9') {
+    return false;
+  }
+  int n = (reg[1] - '0') * 10 + (reg[2] - '0');
+  return (n >= 10 && n <= 18) || n == 30;
+}
+
+void clobber_aapcs64_caller_saved(
+    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  // Iterate-and-erase-by-predicate to avoid the 20-string-per-call
+  // construction the kAapcs64CallerSavedGPR table loop performed.
+  // Typical adrp_regs holds 1–3 entries; the inner check is a small
+  // switch and erase() returns the next iterator.
+  for (auto it = adrp_regs.begin(); it != adrp_regs.end(); ) {
+    if (is_aapcs64_caller_saved(it->first)) {
+      it = adrp_regs.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// MOV xN, xM is a register-to-register copy with no shift. LLDB
+// renders it identically to ARM64 disasm: "mov  x0, x8". The phase-3
+// rule (docs/35-field-report-followups.md §3) propagates ADRP
+// tracking through this shape — if xM has a tracked page, so does
+// xN. Any other MOV form (immediate, MOVZ/MOVK/MOVN, mov xN, sp,
+// mov xN, lr, mov xN, xzr) clears adrp_regs[xN] because the result
+// isn't an ADRP page. Returns true iff the instruction was a MOV
+// that we handled (caller must NOT then fall through to the
+// resolve_adrp_consumer path).
+//
+// Note: arm64 doesn't have a real MOV instruction — it's an alias
+// for ORR xN, xzr, xM (reg-reg) or MOVZ/MOVN/MOVK (imm). LLDB
+// canonicalises the alias back to "mov" in its disasm output, which
+// is what we match against here.
+// Tokenise the MOV source operand to one of:
+//   - kImmediate     — `#<n>`
+//   - kZero          — `xzr` / `wzr`
+//   - kStackPointer  — `sp` / `wsp`
+//   - kLinkRegister  — `lr` (alias for x30)
+//   - kWReg          — wN — the upper 32 bits are zeroed, so even if
+//                     the source happened to be tracked, the copy is
+//                     not a page address.
+//   - kXReg          — xN — the only shape that propagates.
+//   - kOther         — unrecognised; conservative clobber.
+enum class MovSrcKind { kOther, kImmediate, kZero, kStackPointer,
+                       kLinkRegister, kWReg, kXReg };
+
+MovSrcKind classify_mov_source(std::string_view tok) {
+  if (tok.empty()) return MovSrcKind::kOther;
+  if (tok[0] == '#') return MovSrcKind::kImmediate;
+  // Strip a trailing comma/space if the caller left it on. parse_reg_at
+  // normalises register tokens for the xN/wN case below; for the
+  // alias-name cases we compare exactly against the canonical
+  // spellings.
+  if (tok == "xzr" || tok == "wzr") return MovSrcKind::kZero;
+  if (tok == "sp"  || tok == "wsp") return MovSrcKind::kStackPointer;
+  if (tok == "lr") return MovSrcKind::kLinkRegister;
+  if (tok.size() >= 2 && (tok[0] == 'x' || tok[0] == 'w')) {
+    // Verify the rest are digits; otherwise treat as kOther.
+    for (std::size_t i = 1; i < tok.size(); ++i) {
+      if (tok[i] < '0' || tok[i] > '9') return MovSrcKind::kOther;
+    }
+    return tok[0] == 'x' ? MovSrcKind::kXReg : MovSrcKind::kWReg;
+  }
+  return MovSrcKind::kOther;
+}
+
+// Apply a MOV instruction's effect on the ADRP-tracking map. Returns
+// true iff the mnemonic was recognised as a MOV variant — the caller
+// (`resolve_adrp_consumer`) uses this to short-circuit and skip
+// LDR/ADD parsing, which would never apply.
+//
+// Recognised shapes:
+//   mov  xN, xM       — propagate xM's tracking to xN (or clear if xM
+//                       isn't tracked).
+//   mov  xN, <other>  — clobber xN. Covers immediate, xzr/wzr, sp,
+//                       lr, wN copies, and anything we can't parse.
+//   movz/movn/movk    — immediate-loading; always clobber xN.
+bool apply_mov_state(
+    const std::string& mnemonic, const std::string& operands,
+    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  if (mnemonic != "mov" && mnemonic != "movz" && mnemonic != "movk" &&
+      mnemonic != "movn") {
+    return false;
+  }
+  auto [ok_dst, dst, p1] = parse_reg_at(operands, 0);
+  if (!ok_dst) return true;  // unparseable — be conservative, ignore
+  if (mnemonic == "movz" || mnemonic == "movn" || mnemonic == "movk") {
+    // Immediate-loading MOVs always clobber the page.
+    adrp_regs.erase(dst);
+    return true;
+  }
+  // Skip ", " or whitespace between dst and src.
+  std::size_t pos = p1;
+  while (pos < operands.size() &&
+         (operands[pos] == ' ' || operands[pos] == ',')) ++pos;
+  // Lift the source token (up to next whitespace, comma, or end) and
+  // classify by exact match against the canonical alias spellings.
+  // Order of token isolation: dst is canonicalised by parse_reg_at;
+  // src is matched raw because the alias spellings (xzr, wzr, sp,
+  // wsp, lr) don't pass through parse_reg_at as plain xN names.
+  std::size_t tok_end = pos;
+  while (tok_end < operands.size() &&
+         operands[tok_end] != ' ' && operands[tok_end] != ',' &&
+         operands[tok_end] != '\t') {
+    ++tok_end;
+  }
+  std::string_view tok(operands.data() + pos, tok_end - pos);
+  switch (classify_mov_source(tok)) {
+    case MovSrcKind::kXReg: {
+      // Propagate if src is tracked; otherwise dst becomes untracked.
+      // parse_reg_at canonicalises here too so the lookup hits the
+      // normalised key.
+      auto [ok_src, src, _p2] = parse_reg_at(operands, pos);
+      if (!ok_src) {
+        adrp_regs.erase(dst);
+        return true;
+      }
+      auto it = adrp_regs.find(src);
+      if (it != adrp_regs.end()) {
+        adrp_regs[dst] = it->second;
+      } else {
+        adrp_regs.erase(dst);
+      }
+      return true;
+    }
+    case MovSrcKind::kImmediate:
+    case MovSrcKind::kZero:
+    case MovSrcKind::kStackPointer:
+    case MovSrcKind::kLinkRegister:
+    case MovSrcKind::kWReg:
+    case MovSrcKind::kOther:
+      // All these clobber the destination's tracked page.
+      adrp_regs.erase(dst);
+      return true;
+  }
+  return true;  // unreachable; appeases -Wreturn-type
+}
+
+// ARM64 ADD / SUB (and the flag-setting ADDS / SUBS variants) all
+// write an arithmetic result, not an ADRP page, into the destination
+// register. The phase-3 rule is the same in every shape: after we've
+// consumed the (possibly-tracked) source for the resolve_adrp_consumer
+// match, clear adrp_regs[dst] so the next instruction can't reach back
+// through dst to an obsolete page.
+//
+// SUB joins the family because its destination-write semantics are
+// identical to ADD's — `sub xN, xN, #imm` overwrites the tracked
+// register exactly as `add xN, xN, #imm` does. The original phase-3
+// patch only clobbered on ADD, leaving SUB as a silent false-positive
+// vector (covered by xref_subclobber post-review fixture).
+//
+// Note on match-emit: ADD currently emits a direct-target match when
+// `page + imm == target_addr` (the legitimate ADRP+ADD pattern).
+// SUB+ADRP doesn't have a corresponding "compute target = page - imm"
+// pattern in real compiler output (compilers emit ADD with a signed
+// immediate or pre-compute via a different scheme). We only model the
+// SUB clobber here, not a SUB match-emit; resolve_adrp_consumer
+// remains ADD-only.
+//
+// Handles:
+//   add/sub/adds/subs  xN, xM, #imm        — xN may equal xM
+//   add/sub/adds/subs  xN, xM, xL{, shift} — register-register
+void clobber_arith_destination(
+    const std::string& operands,
+    std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  auto [ok_dst, dst, _p] = parse_reg_at(operands, 0);
+  if (ok_dst) {
+    adrp_regs.erase(dst);
+  }
+}
+
+// Parse the `[base{, #imm}]` / `[base], #imm` / `[base, #imm]!` /
+// `[base]` shapes starting at `pos` in `operands`. On success returns
+// the resolved base register name, the immediate offset, and a pair of
+// writeback flags (pre/post-indexed). On failure returns {false, ...}.
+//
+// Pre-indexed writeback: `[base, #imm]!` — base ← base+imm before load.
+// Post-indexed writeback: `[base], #imm` — base ← base+imm after load.
+// No-writeback: `[base]` (imm=0) or `[base, #imm]`.
+//
+// The effective address differs per form: pre-indexed and no-writeback
+// both compute base+imm; post-indexed computes base (the writeback
+// rewrites after the load). The caller fills AdrpResolved.target
+// accordingly.
+struct AdrpAddrOperand {
+  bool ok = false;
+  std::string base;
+  std::uint64_t imm = 0;
+  bool pre_writeback = false;
+  bool post_writeback = false;
+};
+
+AdrpAddrOperand parse_adrp_addr_operand(const std::string& operands,
+                                         std::size_t pos) {
+  AdrpAddrOperand r;
+  while (pos < operands.size() &&
+         (operands[pos] == ' ' || operands[pos] == ',')) ++pos;
+  if (pos >= operands.size() || operands[pos] != '[') return r;
+  ++pos;
+  auto [ok_src, src, p_after_src] = parse_reg_at(operands, pos);
+  if (!ok_src) return r;
+  r.base = src;
+  pos = p_after_src;
+  while (pos < operands.size() && operands[pos] == ' ') ++pos;
+  if (pos < operands.size() && operands[pos] == ',') {
+    // `, #imm]` or `, #imm]!`
+    ++pos;
+    auto [ok_imm, v, p_after_imm] = parse_uint_at(operands, pos);
+    if (!ok_imm) return r;
+    r.imm = v;
+    pos = p_after_imm;
+    while (pos < operands.size() && operands[pos] == ' ') ++pos;
+    if (pos >= operands.size() || operands[pos] != ']') return r;
+    ++pos;
+    if (pos < operands.size() && operands[pos] == '!') {
+      r.pre_writeback = true;
+    }
+  } else if (pos < operands.size() && operands[pos] == ']') {
+    // `]` or `], #imm`
+    ++pos;
+    while (pos < operands.size() && operands[pos] == ' ') ++pos;
+    if (pos < operands.size() && operands[pos] == ',') {
+      ++pos;
+      auto [ok_imm, v, _p] = parse_uint_at(operands, pos);
+      if (!ok_imm) return r;
+      r.imm = v;
+      r.post_writeback = true;
+    }
+  } else {
+    return r;
+  }
+  r.ok = true;
+  return r;
+}
+
+std::optional<AdrpResolved>
+resolve_adrp_consumer(const std::string& mnemonic, const std::string& operands,
+                      const std::unordered_map<std::string, AdrpPair>& adrp_regs) {
+  // Short-circuit on mnemonics that can never be an ADRP-pair consumer
+  // (MOV variants, calls, returns, ...). The post-emit state-mutation
+  // block in xref_address handles state changes for these; running
+  // the operand parser below would just churn for nothing. N5 cleanup
+  // — the prior apply_mov_state return value was discarded.
+  if (mnemonic == "mov" || mnemonic == "movz" || mnemonic == "movk" ||
+      mnemonic == "movn") {
+    return std::nullopt;
+  }
+  if (mnemonic == "add") {
+    // "add  dst, src, #imm"
+    auto [ok_dst, dst, p1] = parse_reg_at(operands, 0);
+    if (!ok_dst) return std::nullopt;
+    auto [ok_src, src, p2] = parse_reg_at(operands, p1);
+    if (!ok_src) return std::nullopt;
+    auto it = adrp_regs.find(src);
+    if (it == adrp_regs.end()) return std::nullopt;
+    // imm
+    std::size_t pos = p2;
+    while (pos < operands.size() &&
+           (operands[pos] == ' ' || operands[pos] == ',')) ++pos;
+    auto [ok_imm, imm, _p] = parse_uint_at(operands, pos);
+    if (!ok_imm) return std::nullopt;
+    AdrpResolved r;
+    r.target = it->second.page + imm;
+    return r;
+  }
+  // LDR-family (load) consumer mnemonics. Phase 3 originally modelled
+  // only these; the post-review spec (docs/35-field-report-followups.md
+  // §3 improvement 4) extends to STR-family (stores) below, since a
+  // user asking "what writes to this global?" is a real field-report
+  // gap that the ADRP-pair pipeline should answer.
+  const bool is_load =
+      mnemonic == "ldr"   || mnemonic == "ldrsw" ||
+      mnemonic == "ldrh"  || mnemonic == "ldrb"  ||
+      mnemonic == "ldur";
+  // STR-family. STR/STUR/STRH/STRB share the same operand shape as
+  // LDR (one source register + address operand). STP pairs two
+  // source registers before the address operand and needs a special
+  // path. STUR is the unscaled-immediate variant; LLDB renders it as
+  // a distinct mnemonic so it has to be enumerated.
+  const bool is_store_one_reg =
+      mnemonic == "str"   || mnemonic == "stur"  ||
+      mnemonic == "strh"  || mnemonic == "strb";
+  const bool is_store_pair = mnemonic == "stp";
+  if (!is_load && !is_store_one_reg && !is_store_pair) {
+    return std::nullopt;
+  }
+
+  // Snapshot the destination/source register's first character *before*
+  // parse_reg_at canonicalises it (w8 → x8). The slot-load gate below
+  // needs the original width to distinguish `ldr xN, ...` (a 64-bit
+  // slot load — what the chained-fixup map indexes) from `ldr wN, ...`
+  // (a 32-bit load — same effective address, but the value at that
+  // address isn't a pointer). For stores this width is unused but
+  // costs nothing to capture.
+  std::size_t dst_start = 0;
+  while (dst_start < operands.size() &&
+         (operands[dst_start] == ' ' || operands[dst_start] == '\t' ||
+          operands[dst_start] == ',')) ++dst_start;
+  char dst_width = (dst_start < operands.size())
+                       ? static_cast<char>(std::tolower(operands[dst_start]))
+                       : '\0';
+
+  // Skip the data register(s). LDR / STR / STUR / STRH / STRB have one;
+  // STP / LDP have two.
+  auto [ok_first, _first, p1] = parse_reg_at(operands, 0);
+  if (!ok_first) return std::nullopt;
+  std::size_t pos = p1;
+  if (is_store_pair) {
+    // Second register of the pair.
+    while (pos < operands.size() &&
+           (operands[pos] == ' ' || operands[pos] == ',')) ++pos;
+    auto [ok_second, _second, p2] = parse_reg_at(operands, pos);
+    if (!ok_second) return std::nullopt;
+    pos = p2;
+  }
+
+  AdrpAddrOperand a = parse_adrp_addr_operand(operands, pos);
+  if (!a.ok) return std::nullopt;
+  auto it = adrp_regs.find(a.base);
+  if (it == adrp_regs.end()) return std::nullopt;
+
+  AdrpResolved r;
+  // Pre-indexed: effective = page + imm (writeback BEFORE memop).
+  // Post-indexed: effective = page (writeback AFTER memop).
+  // No-writeback: effective = page + imm.
+  if (a.post_writeback) {
+    r.target = it->second.page;
+  } else {
+    r.target = it->second.page + a.imm;
+  }
+  // Slot-indirection only applies to 8-byte LDRs into x-registers.
+  // Halfword/byte loads, LDRSW, and all store forms have effective
+  // addresses that may match a slot but don't dereference one as a
+  // chained pointer. We still emit the direct ADRP-target match so
+  // the caller can resolve string-byte loads and store targets.
+  r.is_slot_load = (mnemonic == "ldr" && dst_width == 'x');
+  r.has_writeback = a.pre_writeback || a.post_writeback;
+  if (r.has_writeback) r.writeback_base = a.base;
+  return r;
+}
+
+// Read the on-disk bytes backing an SBModule. Used by the chained-
+// fixup wire-up (docs/35-field-report-followups.md §3 phase 2) to feed
+// LC_DYLD_CHAINED_FIXUPS / LC_SEGMENT_64 commands to
+// extract_chained_fixups_from_macho(). Returns empty vector on any
+// failure — caller treats that as "binary has no chained fixups."
+//
+// We deliberately re-read the file rather than going through SBModule's
+// section-data API. The chained-fixup payload sits in LC_DYLD_CHAINED_FIXUPS,
+// which is in __LINKEDIT and isn't always materialised through SBSection
+// (the section walker collapses __LINKEDIT into housekeeping fields).
+// File-mode is also cheaper than walking LLDB's section tree for the
+// ncmds load commands.
+std::vector<std::uint8_t> read_module_file_bytes(lldb::SBModule mod) {
+  if (!mod.IsValid()) return {};
+  auto fs = mod.GetFileSpec();
+  if (!fs.IsValid()) return {};
+  char path[4096];
+  if (fs.GetPath(path, sizeof(path)) <= 0) return {};
+
+  int fd = ::open(path, O_RDONLY);
+  if (fd < 0) return {};
+
+  struct stat st;
+  if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
+    ::close(fd);
+    return {};
+  }
+
+  // Reasonable upper bound: don't slurp anything above 2 GiB into a
+  // single vector. Real arm64 binaries are tens-to-hundreds of MiB.
+  const std::size_t size = static_cast<std::size_t>(st.st_size);
+  constexpr std::size_t kMaxRead = 2ULL * 1024 * 1024 * 1024;
+  if (size > kMaxRead) {
+    ::close(fd);
+    return {};
+  }
+
+  std::vector<std::uint8_t> buf(size);
+  std::size_t off = 0;
+  while (off < size) {
+    ssize_t n = ::read(fd, buf.data() + off, size - off);
+    if (n <= 0) {
+      ::close(fd);
+      return {};
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  ::close(fd);
+  return buf;
+}
+
 std::string function_name_at(lldb::SBTarget target, lldb::SBAddress addr) {
   if (!addr.IsValid()) return {};
   auto sc = target.ResolveSymbolContextForAddress(
@@ -1761,7 +2328,8 @@ std::string function_name_at(lldb::SBTarget target, lldb::SBAddress addr) {
 }  // namespace
 
 std::vector<XrefMatch>
-LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
+LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr,
+                          XrefProvenance* provenance) {
   lldb::SBTarget target;
   {
     std::lock_guard<std::mutex> lk(impl_->mu);
@@ -1782,6 +2350,88 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
   auto mod = target.GetModuleAtIndex(0);
   if (!mod.IsValid()) return out;
 
+  // Lazy-load + cache the chained-fixup map for this target. On non-
+  // chained-fixup binaries (Linux ELF, older Mach-O) the map is empty
+  // and the adrp-pair resolver below still runs — it falls through to
+  // the direct-target match path, which subsumes the literal-operand
+  // scan for ARM64 ADRP+ADD/LDR pairs that the existing
+  // string_references_address heuristic misses.
+  //
+  // Three-phase pattern: check-flag-under-lock → read+parse-outside-lock
+  // → double-check-and-publish-under-lock. The on-disk Mach-O can be
+  // 500+ MiB (real iOS apps); holding impl_->mu across that read would
+  // block every other RPC and the listener-thread breakpoint dispatch
+  // path for the full read+parse duration. Phase-1 stdio dispatcher is
+  // single-RPC so the benign race below (two callers both load, only
+  // the first publishes) is forward-compatible with the upcoming
+  // socket-daemon multi-client surface in §2.
+  ChainedFixupMap fixup_map;
+  bool need_load = false;
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->chained_fixup_loaded.find(tid);
+    if (it == impl_->chained_fixup_loaded.end() || !it->second) {
+      need_load = true;
+    }
+  }
+  if (need_load) {
+    auto bytes = read_module_file_bytes(mod);
+    ChainedFixupMap m;
+    if (!bytes.empty()) {
+      try {
+        m = extract_chained_fixups_from_macho(bytes.data(), bytes.size());
+      } catch (const Error&) {
+        // Malformed payload: publish an empty map so we don't retry on
+        // every call. Phase 3 will surface this as a diagnostic.
+      }
+    }
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto& flag = impl_->chained_fixup_loaded[tid];
+    if (!flag) {
+      impl_->chained_fixup_maps[tid] = std::move(m);
+      flag = true;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    // find() not operator[]: a concurrent close_target could in theory
+    // evict our entry between the publish above and this read. The
+    // operator[] default-construction would silently re-create an
+    // empty entry and leak it; find() lets us simply fall through with
+    // an empty local map. In the stdio dispatcher this race window is
+    // empty by construction (single RPC at a time).
+    auto map_it = impl_->chained_fixup_maps.find(tid);
+    if (map_it != impl_->chained_fixup_maps.end()) {
+      fixup_map = map_it->second;
+    }
+  }
+
+  // Image base for converting slot file-addresses to chained-fixup
+  // RVAs. The parser already computed this from the first chain-
+  // bearing segment's (vm_addr - segment_offset); reuse it rather than
+  // re-deriving from LLDB's section table. Zero when the binary has
+  // no chained fixups, in which case the slot-load path below
+  // short-circuits on the empty `resolved` map anyway.
+  const std::uint64_t image_base = fixup_map.image_base;
+
+  // Match an instruction's adrp-resolved target against (a) the
+  // caller's needle directly, and (b) the slot-resolves-to-needle
+  // case for chained-fixup binaries. Returns true if either matched.
+  auto target_matches = [&](std::uint64_t adrp_target,
+                            bool is_slot_load) -> bool {
+    if (adrp_target == target_addr) return true;  // direct ADRP+ADD
+    if (!is_slot_load) return false;
+    if (fixup_map.resolved.empty()) return false;
+    // For a load through a slot, adrp_target is the slot's *file
+    // address*. The chained-fixup map indexes slots by RVA (file_addr
+    // - image_base). Translate the file address into an RVA.
+    if (adrp_target < image_base) return false;
+    std::uint64_t rva = adrp_target - image_base;
+    auto it = fixup_map.resolved.find(rva);
+    if (it == fixup_map.resolved.end()) return false;
+    return it->second == target_addr;
+  };
+
   std::function<void(lldb::SBSection)> visit = [&](lldb::SBSection sec) {
     if (!sec.IsValid()) return;
 
@@ -1790,11 +2440,138 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
       std::uint64_t size  = sec.GetByteSize();
       if (start != 0 && size > 0) {
         auto insns = disassemble_range_lldb(target, start, start + size);
+        // Track recent ADRP results per destination register. Phase 3
+        // (docs/35-field-report-followups.md §3) augments the phase-2
+        // "last ADRP wins for this register" map with deterministic
+        // clobber rules — BL/BLR clears caller-saved, function-boundary
+        // transitions reset the map, ADD writes clear adrp_regs[dst]
+        // AFTER the match emit, MOV propagates or clears.
+        std::unordered_map<std::string, AdrpPair> adrp_regs;
+        // Track the enclosing function for boundary detection. We only
+        // resolve `function_name_at` when adrp_regs is non-empty; on
+        // code with no tracked ADRPs the boundary check is free.
+        std::string current_function;
+        bool current_function_known = false;
         for (const auto& i : insns) {
-          if (string_references_address(i.operands, target_addr) ||
+          std::string mnem_lower = i.mnemonic;
+          for (auto& c : mnem_lower) c = static_cast<char>(std::tolower(c));
+
+          // Phase-3 gate 1 (function-boundary reset). When we have
+          // tracked ADRP state, check the current instruction's
+          // function against the one the state was recorded under.
+          // A mismatch means we walked past RET / fell into a new
+          // function via tail-call / hit an unconditional B target
+          // and the prior ADRP is no longer in scope.
+          if (!adrp_regs.empty()) {
+            auto sa = target.ResolveFileAddress(i.address);
+            std::string fn = function_name_at(target, sa);
+            if (current_function_known && fn != current_function) {
+              adrp_regs.clear();
+            }
+            current_function = std::move(fn);
+            current_function_known = true;
+          }
+
+          if (mnem_lower == "adrp") {
+            // "adrp xN, <imm>" — record the absolute target page. The
+            // immediate is *signed* (21-bit, +/- 1 MiB pages); LLDB
+            // emits e.g. `adrp x8, -2` for pages below the PC's page.
+            // parse_uint_at would refuse the leading '-' and we'd
+            // either miss the xref or — worse — silently bind to a
+            // stale prior ADRP entry for the same register.
+            auto [ok_dst, dst, p1] = parse_reg_at(i.operands, 0);
+            if (ok_dst) {
+              std::size_t pos = p1;
+              while (pos < i.operands.size() &&
+                     (i.operands[pos] == ' ' || i.operands[pos] == ','))
+                ++pos;
+              auto [ok_imm, imm, _e] = parse_int_at(i.operands, pos);
+              if (ok_imm) {
+                AdrpPair p;
+                p.pc   = i.address;
+                // Cast → shift → add. Two's-complement wrap on the
+                // unsigned addition is exactly the page-below-PC case
+                // we want; for positive imm the high bits are zero
+                // and the math is identical to the old unsigned path.
+                p.page = (i.address & ~static_cast<std::uint64_t>(0xfff)) +
+                         (static_cast<std::uint64_t>(imm) << 12);
+                adrp_regs[dst] = p;
+                // First tracked ADRP in this section needs current_function
+                // primed; subsequent iterations refresh on the boundary
+                // check above. Cheap when an ADRP is rare; on hot ADRP-
+                // emitting code the per-iteration lookup dominates anyway.
+                if (!current_function_known) {
+                  auto sa = target.ResolveFileAddress(i.address);
+                  current_function = function_name_at(target, sa);
+                  current_function_known = true;
+                }
+              }
+            }
+            // Note: ADRP itself never matches a string-pointer target
+            // (its result is a page-aligned address, not the load
+            // target). We don't emit an xref for it directly — the
+            // paired ADD/LDR is the canonical xref site.
+          }
+
+          bool matched_literal =
+              string_references_address(i.operands, target_addr) ||
               string_references_address(i.comment,  target_addr) ||
               rip_relative_targets(i.operands, i.address, i.byte_size,
-                                    target_addr)) {
+                                    target_addr);
+
+          bool matched_adrp = false;
+          // Captured so the post-emit register-state mutation block can
+          // apply the LDR pre/post-indexed writeback clobber AFTER the
+          // match emit. resolve_adrp_consumer fires regardless of
+          // whether the consumer matched the needle — we still need to
+          // know "this consumer rewrites its base" so subsequent loads
+          // through the same register don't false-match.
+          std::optional<AdrpResolved> consumer_resolved;
+          if (!matched_literal) {
+            auto resolved = resolve_adrp_consumer(mnem_lower, i.operands,
+                                                  adrp_regs);
+            if (resolved) {
+              matched_adrp = target_matches(resolved->target,
+                                            resolved->is_slot_load);
+              consumer_resolved = resolved;
+            } else if (provenance != nullptr &&
+                       (mnem_lower == "ldr"   || mnem_lower == "ldrsw" ||
+                        mnem_lower == "ldrh"  || mnem_lower == "ldrb"  ||
+                        mnem_lower == "ldur"  ||
+                        mnem_lower == "str"   || mnem_lower == "stur"  ||
+                        mnem_lower == "strh"  || mnem_lower == "strb")) {
+              // Phase-3 gate 7 (docs/35-field-report-followups.md §3).
+              // resolve_adrp_consumer rejected this memop — most
+              // commonly because the address operand is `[xN, xM]` or
+              // `[xN, xM, lsl #imm]` rather than the immediate form we
+              // model. If xN was nonetheless an ADRP-tracked register,
+              // the memop *might* have been the consumer for that ADRP
+              // (the runtime value depends on xM, which we can't
+              // statically resolve). Surface a provenance counter so
+              // the caller can decide to fall back to symbol-index.
+              // STP intentionally omitted: its two-register prefix
+              // makes the [base] sniff more involved and the false-
+              // positive cost of skipping it silently is low compared
+              // to the precision loss from a false counter bump.
+              std::size_t pos = 0;
+              auto [ok_dst, _dst, p1] = parse_reg_at(i.operands, pos);
+              if (ok_dst) {
+                pos = p1;
+                while (pos < i.operands.size() &&
+                       (i.operands[pos] == ' ' || i.operands[pos] == ','))
+                  ++pos;
+                if (pos < i.operands.size() && i.operands[pos] == '[') {
+                  ++pos;
+                  auto [ok_src, src, _p] = parse_reg_at(i.operands, pos);
+                  if (ok_src && adrp_regs.count(src)) {
+                    provenance->adrp_pair_skipped++;
+                  }
+                }
+              }
+            }
+          }
+
+          if (matched_literal || matched_adrp) {
             XrefMatch m;
             m.address   = i.address;
             m.byte_size = i.byte_size;
@@ -1804,6 +2581,92 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
             auto sa = target.ResolveFileAddress(i.address);
             m.function = function_name_at(target, sa);
             out.push_back(std::move(m));
+          }
+
+          // Pre/post-indexed LDR/STR writeback (post-review
+          // improvement 3, docs/35-field-report-followups.md §3). The
+          // match-emit above has already captured the legitimate xref
+          // against the memop's effective address; now clear the base
+          // register's tracking so a subsequent memop through it can't
+          // false-match the stale page. Bumping the counter + emitting
+          // a warning surfaces the clobber to the caller via
+          // provenance.
+          if (consumer_resolved && consumer_resolved->has_writeback) {
+            adrp_regs.erase(consumer_resolved->writeback_base);
+            if (provenance != nullptr) {
+              provenance->adrp_pair_writeback_cleared++;
+              std::ostringstream w;
+              w << "pre/post-indexed " << mnem_lower
+                << " writeback at 0x" << std::hex << i.address
+                << " cleared ADRP tracking for register "
+                << consumer_resolved->writeback_base;
+              provenance->warnings.push_back(w.str());
+            }
+          }
+
+          // Phase-3 register-state mutations (after match emit so the
+          // instruction we just resolved doesn't lose its tracking
+          // mid-emit). Order matters: call clobber first because a
+          // call-site has no other state-mutating effect we care about;
+          // ADD/MOV are exclusive of each other and of calls.
+          //
+          // The PAC-authenticated branch family (BLRAA, BLRAB, BLRAAZ,
+          // BLRABZ for calls; BRAA, BRAB, BRAAZ, BRABZ for indirect
+          // branches; RETAA, RETAB for returns) is treated identically
+          // to its plain sibling. AAPCS64 caller-saved semantics are
+          // independent of PAC — a PAC call is still a call and still
+          // overwrites x0..x18 + x30. The original phase-3 patch
+          // matched only bare "bl"/"blr"/"br"/"ret"; the post-review
+          // spec extends each clause to the full family.
+          const bool is_call =
+              mnem_lower == "bl"     || mnem_lower == "blr"    ||
+              mnem_lower == "blraa"  || mnem_lower == "blrab"  ||
+              mnem_lower == "blraaz" || mnem_lower == "blrabz";
+          const bool is_indirect_branch =
+              mnem_lower == "br"     ||
+              mnem_lower == "braa"   || mnem_lower == "brab"   ||
+              mnem_lower == "braaz"  || mnem_lower == "brabz";
+          const bool is_return =
+              mnem_lower == "ret"    ||
+              mnem_lower == "retaa"  || mnem_lower == "retab";
+
+          if (is_call) {
+            // Gate 2: AAPCS64 caller-saved clobber. Even a leaf-only
+            // callee may overwrite x0..x18 + x30 — the scanner has
+            // no way to know the callee's behaviour.
+            clobber_aapcs64_caller_saved(adrp_regs);
+          } else if (mnem_lower == "add" || mnem_lower == "sub" ||
+                     mnem_lower == "adds" || mnem_lower == "subs") {
+            // Gate 3: ADD / SUB (and the flag-setting siblings) write
+            // a computed value, not an ADRP page. Clear adrp_regs[dst]
+            // regardless of whether dst==src or the second operand was
+            // tracked. resolve_adrp_consumer has already run; the match
+            // (if any — only the ADD shape emits one) is already in
+            // `out`. SUB joins per the post-review spec: same
+            // destination-write semantics, same false-positive class.
+            clobber_arith_destination(i.operands, adrp_regs);
+          } else if (mnem_lower == "mov" || mnem_lower == "movz" ||
+                     mnem_lower == "movk" || mnem_lower == "movn") {
+            // Gate 4: MOV may propagate or clobber. The bool return is
+            // discarded here — the mnemonic check above already
+            // narrowed to MOV variants. The same return is what lets
+            // resolve_adrp_consumer short-circuit on MOV without
+            // running the LDR/STR operand parser (see the early-bail
+            // at the top of resolve_adrp_consumer).
+            (void)apply_mov_state(mnem_lower, i.operands, adrp_regs);
+          } else if (is_return || is_indirect_branch || mnem_lower == "b") {
+            // Gate 1 follow-up: end-of-basic-block instructions that
+            // exit the current function reset the entire map. We don't
+            // distinguish "B to within current function" from
+            // "B to tail-call target" — both look the same in the
+            // disasm and the next-iteration function-boundary check
+            // will restore tracking when we re-enter the right
+            // function via subsequent ADRPs. The conservative reset is
+            // the phase-3 acceptance bar. Function-boundary detection
+            // by symbol name would miss the two-adjacent-stripped-
+            // functions case; phase-4 follow-up tracked in the worklog.
+            adrp_regs.clear();
+            current_function_known = false;
           }
         }
       }
@@ -1817,6 +2680,36 @@ LldbBackend::xref_address(TargetId tid, std::uint64_t target_addr) {
 
   size_t nsec = mod.GetNumSections();
   for (size_t i = 0; i < nsec; ++i) visit(mod.GetSectionAtIndex(i));
+
+  // Dedupe by instruction address — the literal-operand path and the
+  // ADRP-pair path can both match the same instruction (e.g. on x86-64
+  // RIP-relative loads where the operand already carries the target
+  // and we also walk the trivial ADRP-pair pattern with zero results).
+  // stable_sort because std::unique below keeps the first survivor of
+  // each address group; an unstable sort would let nondeterministic
+  // ordering pick which of two equal-address entries wins on rebuilds.
+  std::stable_sort(out.begin(), out.end(),
+                   [](const XrefMatch& a, const XrefMatch& b) {
+                     return a.address < b.address;
+                   });
+  auto last = std::unique(out.begin(), out.end(),
+                          [](const XrefMatch& a, const XrefMatch& b) {
+                            return a.address == b.address;
+                          });
+  out.erase(last, out.end());
+
+  // Phase-3 gate 7: emit a human-readable warning when at least one
+  // register-offset LDR was skipped. The agent uses this to decide
+  // whether the ADRP-pair heuristic is authoritative on this binary
+  // or whether it should fall back to symbol-index correlate.
+  if (provenance != nullptr && provenance->adrp_pair_skipped > 0) {
+    provenance->warnings.push_back(
+        "adrp-pair resolver skipped " +
+        std::to_string(provenance->adrp_pair_skipped) +
+        " register-offset LDR(s) with tracked base "
+        "(`[xN, xM]` / `[xN, xM, lsl #imm]`) — these are potential xrefs "
+        "the heuristic cannot statically resolve");
+  }
 
   return out;
 }
@@ -3874,6 +4767,8 @@ void LldbBackend::close_target(TargetId tid) {
     impl_->core_sha256.erase(tid);
     impl_->live_state.erase(tid);
     impl_->reverse_capable.erase(tid);
+    impl_->chained_fixup_maps.erase(tid);
+    impl_->chained_fixup_loaded.erase(tid);
     // §9 — drop the label so its string becomes available for reuse.
     if (auto lit = impl_->labels.find(tid); lit != impl_->labels.end()) {
       impl_->label_owners.erase(lit->second);
