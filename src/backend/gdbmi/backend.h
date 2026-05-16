@@ -85,7 +85,8 @@ class GdbMiBackend final : public DebuggerBackend {
       disassemble_range(TargetId tid, std::uint64_t lo,
                         std::uint64_t hi) override;
   std::vector<XrefMatch>
-      xref_address(TargetId tid, std::uint64_t addr) override;
+      xref_address(TargetId tid, std::uint64_t addr,
+                   XrefProvenance* provenance = nullptr) override;
   std::vector<StringXrefResult>
       find_string_xrefs(TargetId tid, const std::string& text) override;
 

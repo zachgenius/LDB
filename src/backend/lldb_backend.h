@@ -44,7 +44,8 @@ class LldbBackend final : public DebuggerBackend {
                         std::uint64_t start_addr,
                         std::uint64_t end_addr) override;
   std::vector<XrefMatch>
-      xref_address(TargetId tid, std::uint64_t target_addr) override;
+      xref_address(TargetId tid, std::uint64_t target_addr,
+                   XrefProvenance* provenance = nullptr) override;
   std::vector<StringXrefResult>
       find_string_xrefs(TargetId tid, const std::string& text) override;
 

@@ -90,6 +90,61 @@ set_tests_properties(smoke_string_xref PROPERTIES
   TIMEOUT 30
 )
 
+# docs/35-field-report-followups.md §3 phase 2 — xref.addr must follow
+# chained-fixup slot indirection on Apple silicon arm64 builds with
+# -Wl,-fixup_chains. The fixture only builds on that host; the test
+# is gated identically. Linux + non-arm64 macOS skip it cleanly because
+# the fixture target doesn't exist there.
+if(APPLE AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
+  add_test(
+    NAME smoke_xref_chained_fixup
+    COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_chained_fixup.sh"
+            "$<TARGET_FILE:ldbd>"
+            "$<TARGET_FILE:ldb_fix_chain_slot>"
+  )
+  set_tests_properties(smoke_xref_chained_fixup PROPERTIES
+    TIMEOUT 30
+  )
+
+  # Phase-3 adversarial smoke tests for the ADRP-pair resolver
+  # (docs/35-field-report-followups.md §3 phase 3). Each one targets
+  # one specific phase-2 false-positive mode: ADD-clobber, cross-
+  # function leak, BL-clobber. All three were silently wrong against
+  # 25f35de; phase 3's deterministic register-state clobber rules
+  # turn them green.
+  foreach(_phase3_smoke
+      xref_addclobber
+      xref_fnleak
+      xref_callclobber
+      xref_subclobber
+      xref_writeback_ldr
+      xref_str)
+    add_test(
+      NAME smoke_${_phase3_smoke}
+      COMMAND python3
+              "${CMAKE_SOURCE_DIR}/tests/smoke/test_${_phase3_smoke}.py"
+              "$<TARGET_FILE:ldbd>"
+              "$<TARGET_FILE:ldb_fix_${_phase3_smoke}>"
+    )
+    set_tests_properties(smoke_${_phase3_smoke} PROPERTIES TIMEOUT 30)
+  endforeach()
+
+  # Phase-3 post-review PAC-call smoke. Gated on the arm64e toolchain
+  # probe in tests/fixtures/CMakeLists.txt — without it the fixture
+  # target doesn't exist and the test would fail to resolve
+  # $<TARGET_FILE:ldb_fix_xref_pac_callclobber> at generate time.
+  if(LDB_CAN_COMPILE_ARM64E)
+    add_test(
+      NAME smoke_xref_pac_callclobber
+      COMMAND python3
+              "${CMAKE_SOURCE_DIR}/tests/smoke/test_xref_pac_callclobber.py"
+              "$<TARGET_FILE:ldbd>"
+              "$<TARGET_FILE:ldb_fix_xref_pac_callclobber>"
+    )
+    set_tests_properties(smoke_xref_pac_callclobber PROPERTIES TIMEOUT 30)
+  endif()
+endif()
+
 add_test(
   NAME smoke_view_module_list
   COMMAND "${CMAKE_SOURCE_DIR}/tests/smoke/test_view_module_list.sh"

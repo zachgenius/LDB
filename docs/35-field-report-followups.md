@@ -360,6 +360,281 @@ The map is built once per module (cached under
    can filter).
 5. **Cache invalidation.** Keyed on the module's build-id; immutable.
 
+### Phase 1 — what shipped (commits `1c0c8bb`, `359e738`, `d99cff9`)
+
+- `include/ldb/backend/chained_fixups.h` — public `parse_chained_fixups()`
+  + `ChainedFixupMap` (rva-keyed) + `SegmentInfo` callers populate from
+  Mach-O LC_SEGMENT_64s.
+- `src/backend/chained_fixups.cpp` — header walk, per-segment chain
+  walk, ARM64E (formats 1/9/12) + PTR_64 / PTR_64_OFFSET (formats 2/6)
+  decode. Multi-start pages, 32-bit formats, and bind resolution all
+  throw `phase 2` errors.
+- `tests/unit/test_chained_fixups.cpp` — five hand-built vectors
+  covering single-page, multi-page, auth-rebase, USERLAND, and the
+  unsupported-format error path.
+
+### Phase 2 — what shipped (this branch)
+
+The minimal wire-up needed to stop `xref.address` returning empty on
+chained-fixup binaries. Real iOS app validation deferred to phase 3.
+
+- `include/ldb/backend/chained_fixups.h` — new
+  `extract_chained_fixups_from_macho(bytes, size)` helper. Walks
+  `LC_SEGMENT_64` + `LC_DYLD_CHAINED_FIXUPS` from raw Mach-O bytes;
+  returns empty map on non-Mach-O / no-chained-fixup inputs (Linux
+  ELF, FAT binaries, classic LC_DYLD_INFO_ONLY) so callers can wire
+  it unconditionally without a Mach-O sniff.
+- `src/backend/lldb_backend.cpp` — `LldbBackend::Impl` gets
+  `chained_fixup_maps` / `chained_fixup_loaded` per-target caches
+  (lazy-init on first xref query; reaped in `close_target`). No
+  on-disk cache — phase 3.
+- `xref_address` — keeps the literal-operand + RIP-relative scans
+  intact, then runs an ARM64 ADRP-pair resolver. ADRP records the
+  absolute target page per destination register; the next consumer
+  (`add xN, src, #imm` or `ldr xN, [src, #imm]`) computes
+  `page + imm`. The target is matched against (a) the caller's
+  needle directly, and (b) the chained-fixup map's `slot_rva →
+  resolved_value` table for LDR-style consumers (slot-load
+  indirection). Results from all paths are deduped by instruction
+  address. Logic is sequential, single-pass — no liveness analysis;
+  the "last ADRP wins for this register" heuristic matches what
+  compiler-emitted ADRP+immediate-use code expects.
+- `tests/unit/test_chained_fixups.cpp` — two new cases covering the
+  Mach-O extractor: null / ELF magic → empty map; minimal arm64
+  Mach-O with one segment + one LC_DYLD_CHAINED_FIXUPS round-trips
+  through Vector A's payload.
+- `tests/fixtures/c/chain_slot.c` + `tests/smoke/test_xref_chained_fixup.sh`
+  — Apple-silicon-arm64-gated synthetic fixture. A pointer slot in
+  `__DATA/__data` rebases to a string in `__TEXT/__cstring`;
+  `reference_string()` loads through the slot via ADRP+LDR. Smoke
+  test pins both `xref.addr` and `string.xref` against the string's
+  file address. Without the wire-up the result is empty; with it,
+  the LDR inside `reference_string` is surfaced.
+
+### Phase 3 — acceptance criteria for the ADRP-pair resolver
+
+The phase-2 resolver is a "last ADRP wins for this register" heuristic.
+That subsumes the common compiler-emitted single-def-then-immediate-use
+case but produces false positives across control flow (calls clobber
+caller-saved regs; branches end basic blocks). Phase 3 closes those
+gaps. Acceptance gates:
+
+- **BL / BLR** clears `adrp_regs` entries for `x0`–`x18` and `x30`
+  (AAPCS64 call-clobber set — anything else is callee-saved and may
+  still hold the prior ADRP).
+- **RET / unconditional B / BR Xn** clears all of `adrp_regs` (function
+  boundary; the next block can't safely assume any prior page).
+- **ADD `dst, src, #imm`** with `src != dst`: clears `adrp_regs[dst]`.
+  Phase 3 does NOT propagate the chain through arithmetic — modelling
+  proper dataflow (especially through SXTW / LSL shifts) is out of
+  scope. The clear is the conservative answer.
+- **ADD `dst, dst, #imm`**: clears `adrp_regs[dst]` for the same
+  reason — the value is no longer the ADRP page.
+- **MOV `dst, src`**: clears `adrp_regs[dst]` unless `src` is also
+  tracked (in which case propagate the page through MOV). The simple
+  shape is the only one worth modelling — anything register-to-register
+  with a shift is real dataflow.
+- **FAT (universal) Mach-O**: parse the slice matching the SBTarget's
+  triple (or, if absent, prefer arm64e over arm64 over x86_64) instead
+  of returning an empty fixup map. Today extract_chained_fixups_from_macho
+  silently no-ops on FAT magic.
+- **Adversarial smoke tests**: at minimum cover call-clobber (ADRP →
+  BL → LDR-against-stale-register), cross-function (function boundary
+  doesn't carry ADRP state forward), and ADD-then-LDR (LDR against an
+  ADD-derived address that phase 3 must NOT resolve). The phase-2
+  fixture (`chain_slot.c`) only exercises the happy path; the
+  regression bar for phase 3 is **zero false positives** from these
+  patterns.
+- **`provenance.warnings` field** on `xref.address` responses: count
+  of "ADRP-pair resolutions skipped due to ambiguity" (e.g. a tracked
+  ADRP that was clobbered by an untracked instruction between def and
+  use). A non-zero count surfaces to the caller that the heuristic
+  isn't authoritative on this binary, which the agent can use to
+  prefer the chained-fixup map or fall back to symbol-index correlate.
+
+### Phase 3 — what shipped (this branch)
+
+All seven acceptance gates above closed. Commits on the phase-3
+branch (each addresses one or more gates):
+
+- **TDD-red fixtures** (commit `adc083a`): three hand-assembled
+  ARM64 fixtures (`tests/fixtures/asm/xref_{addclobber,fnleak,
+  callclobber}.s`) + Python smoke drivers
+  (`tests/smoke/test_xref_{addclobber,fnleak,callclobber}.py`)
+  reproducing the phase-2 false positives. Built and tests added
+  before the implementation; they FAILED against `25f35de` with the
+  expected single-match output.
+
+- **ADRP-pair register-state clobber rules** (commit `7419945`):
+  gates 1 (function-boundary reset, lazy `function_name_at`), 2
+  (AAPCS64 BL/BLR caller-saved set), 3 (ADD always clears dst), 4
+  (MOV propagate-or-clobber). All three adversarial smoke tests
+  flip to green; ctest 73/73.
+
+- **FAT (universal) Mach-O slice selection** (commit `eebebca`):
+  gate 5. Refactored thin-Mach-O walk into a helper; new FAT
+  dispatcher iterates fat_arch[] / fat_arch_64[], prefers arm64e
+  > arm64. Three new unit tests cover slice picking, arm64e
+  preference, and malformed-FAT rejection.
+
+- **`provenance.warnings` field** (commit `c01fa47`): gate 7.
+  `XrefProvenance` struct in `debugger_backend.h`; xref.address
+  takes an optional out-param. Dispatcher attaches the provenance
+  block to the response only when something was skipped. Phase 3
+  populates one case (register-offset LDR with tracked base);
+  phase 4 will accumulate more.
+
+### Phase 3 — post-review cleanup (this branch, post-`96d079b`)
+
+A linus-style review of the five phase-3 commits surfaced a punch
+list of silent false-positive vectors and false-negatives in the
+same family the spec was meant to close. Every reviewer-flagged
+item landed on this branch:
+
+- **SUB clobber** (commit `f57b16c`): `sub xN, xN, #imm` has
+  identical destination-write semantics to ADD but was missed by
+  the original phase-3 patch. Extend gate 3 to cover ADD / SUB /
+  ADDS / SUBS; only ADD has a match-emit (no compiler computes
+  targets as `page - imm`). New fixture
+  `tests/fixtures/asm/xref_subclobber.s` + smoke.
+
+- **PAC-authenticated branch family** (commit `62b6e47`): arm64e's
+  BLRAA / BLRAB / BLRAAZ / BLRABZ are AAPCS64 calls — same clobber
+  set as BL / BLR — and BRAA / BRAB / BRAAZ / BRABZ end basic
+  blocks like BR, and RETAA / RETAB end functions like RET. The
+  original phase-3 matched only bare spellings. Refactor the post-
+  emit switch to use `is_call` / `is_indirect_branch` /
+  `is_return` named flags that fold in the PAC variants. New
+  fixture `tests/fixtures/asm/xref_pac_callclobber.s` — gated on
+  the arm64e toolchain (CMake `CheckCSourceCompiles` probe;
+  fixture built thin via `OSX_ARCHITECTURES` override to avoid the
+  default fat-slice path that downcasts to arm64).
+
+- **Pre/post-indexed LDR/STR writeback** (commit `8e46141`):
+  `ldr xN, [xM, #imm]!` (pre) and `ldr xN, [xM], #imm` (post)
+  rewrite the base register as a side effect. The phase-3 resolver
+  emitted the match for the legitimate effective address but never
+  cleared `adrp_regs[xM]`, leaving a downstream LDR free to false-
+  match the stale page. New `AdrpResolved::has_writeback` /
+  `writeback_base` fields; post-emit clobber + provenance
+  `adrp_pair_writeback_cleared` counter + human-readable warning.
+  Fixture exercises both shapes.
+
+- **STR / STUR / STRH / STRB / STP / LDUR consumers** (commit
+  `306363a`): phase 3 modelled only LDR-family loads, so stores
+  through an ADRP-tracked base were invisible to `xref.addr` — a
+  user asking "what writes to this global?" got an empty answer.
+  Refactor the address-operand parsing into a reusable helper
+  (`parse_adrp_addr_operand`); collapse the resolver into three
+  buckets (is_load, is_store_one_reg, is_store_pair) that share
+  the same parser. STP gets a two-register prefix-skip. Fixture
+  covers STR / STP / STRB.
+
+- **Nits N5–N10** (commit `01494da`): apply_mov_state return-value
+  used to short-circuit `resolve_adrp_consumer`; AAPCS64 clobber
+  replaced with allocation-free iterate-and-erase + predicate
+  helper; MOV source classifier replaces the brittle first-char
+  heuristic with explicit alias-name comparison; FAT64 unit test
+  for the `0xCAFEBABF` magic + 32-byte `fat_arch_64` path that
+  the prior FAT tests left uncovered; FAT slice picker comment
+  documents the empty-map fallthrough hazard (phase-4 follow-up:
+  thread SBTarget's triple through the extractor); x29/x30
+  comment fixed to state AAPCS64 callee-saved semantics
+  correctly.
+
+Post-cleanup ctest: 77/77. Eight phase-3 smokes (the original
+three plus xref_subclobber, xref_writeback_ldr, xref_str,
+xref_pac_callclobber, and the FAT64 unit test) all pass.
+
+### Phase 4 — carried forward
+
+These items surfaced during the post-review cleanup but were not in
+scope for the phase-3 spec. Each is a real false-positive / false-
+negative the heuristic can't close without changes to data sources
+(symbol-context lookups, SBTarget triple plumbing, etc.) beyond the
+single-pass register-state machine.
+
+- **Two adjacent unsymbolized functions** — gate 1's function-name
+  boundary check (`function_name_at`) can't fire when both adjacent
+  functions report `""` (stripped binaries). The conservative B / BR
+  / RET reset still catches most cases; a binary that lacks any
+  terminator between two adjacent functions (e.g. compiler-emitted
+  trampolines, hand-rolled tail-call patterns) would let ADRP
+  tracking leak across. Phase 4 needs a symbol-context-by-section-
+  range fallback (find the SBSymbol whose [start, start+size]
+  covers the current insn).
+
+- **Conditional branches** (`b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz`)
+  that cross into code which uses the tracked registers differently
+  — phase 3 doesn't reset on these. The conservative-reset bar
+  argues that the next-iteration function-boundary check restores
+  sanity, but the worst-case false positive is a same-function
+  back-branch into a path that re-uses the page register for an
+  unrelated value.
+
+- **MOV from XZR / WZR explicitly** — `mov xN, xzr` is the zero
+  immediate, not an ADRP page. Phase 3 handles this correctly by
+  accident (the prefix hack fell through to "kZero clobbers" via
+  the first-char-'x' detection; the post-review N7 cleanup makes
+  this explicit via `classify_mov_source`). Track in phase 4 for
+  any future regressions.
+
+- **STR-family already shipped** in the phase-3 post-review (commit
+  `306363a`); no longer carried.
+
+- **FAT slice picker triple plumbing** — the picker today returns
+  the arm64e slice's fixup map when both arm64 and arm64e have
+  chained fixups, even when LLDB loaded the arm64 slice. Phase 4
+  should thread SBTarget's triple through
+  `extract_chained_fixups_from_macho` so the picker matches what's
+  actually loaded. See the N9 cleanup comment in
+  `src/backend/chained_fixups.cpp`.
+
+- **Auth-rebase key-class filtering** — phase 3 doesn't distinguish
+  PAC key classes on rebase slots. A consumer that uses
+  `__auth_got` indirection vs `__got` is conflated.
+
+- **Real iOS .ipa smoke** — validate against `dyld_info --fixups`
+  output. The synthetic fixture is sufficient for the heuristic
+  layer but a real WeChat-class binary is the only way to surface
+  performance and edge-case ambiguity at scale.
+
+- **Bind resolution** (imports table parsing — phase 2's
+  resolved=0 stays on binds).
+
+- **On-disk cache** of the fixup map keyed on `build_id` — phase
+  2's per-target rebuild is still cheap at fixture scale (~1 ms on
+  33 KB) but a real WeChat-class binary needs measurement.
+
+- **`correlate.symbols` / `correlate.strings`** wire-up. The
+  symbol-index path doesn't consult the fixup map yet — it scans
+  raw section bytes and treats them as literal pointers.
+
+- **Multi-module support.** `xref_address` only scans the main
+  executable (module index 0).
+
+### Out of scope (phase 2)
+
+Carried over to phase 3 (most of these now live in the phase-4
+list above):
+
+- **On-disk cache** of the fixup map keyed on `build_id`. Today the
+  map is rebuilt on every `target.open`. Cheap enough at fixture
+  scale (33 KB binary → ~1 ms); needs measuring on real WeChat-
+  scale targets before deciding the cache substrate.
+- **`correlate.symbols` / `correlate.strings`** wire-up. The symbol-
+  index path doesn't consult the fixup map yet — it scans raw
+  section bytes and treats them as literal pointers.
+- **Bind resolution.** Phase 1 records `slot_rva → 0` for binds; the
+  imports table parse + lazy load-address resolution lives in
+  phase 3 once the symbol-index has a stable cross-module surface.
+- **Multi-module support.** xref_address only scans the main
+  executable (module index 0), same as before phase 2.
+- **WeChat-scale validation.** Synthetic fixture is sufficient for
+  this branch. Real iOS app smoke is a separate work item; the
+  symptom in the field report is the slot-load case the fixture
+  reproduces.
+
 ### Test plan
 
 Real iOS Mach-O fixtures are licence-sensitive and large; ship a

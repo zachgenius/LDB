@@ -203,6 +203,35 @@ struct XrefMatch {
   std::string function;          // owning function name (best-effort)
 };
 
+// Phase-3 (docs/35-field-report-followups.md §3) provenance accompanying
+// an xref.address response. Populated by xref_address when the ADRP-
+// pair resolver encountered situations its single-pass heuristic
+// couldn't resolve. The caller surfaces this on the wire so the agent
+// can branch on it (e.g. fall back to symbol-index correlate when
+// the warning count is non-trivial).
+struct XrefProvenance {
+  // Number of times an LDR with an ADRP-tracked base register was
+  // skipped because its address operand was a register-offset
+  // (`[xN, xM]` or `[xN, xM, lsl #imm]`) rather than the
+  // immediate-offset form the resolver models. Each such skip is one
+  // potential xref the heuristic can't surface.
+  std::uint32_t adrp_pair_skipped = 0;
+
+  // Number of times a pre- or post-indexed LDR through an ADRP-
+  // tracked base caused the base register to be cleared. The
+  // legitimate xref against the load's effective address still fires;
+  // this counter exists so the caller can see that subsequent loads
+  // through the same register are no longer trackable. Post-review
+  // addition (docs/35-field-report-followups.md §3 improvement 3).
+  std::uint32_t adrp_pair_writeback_cleared = 0;
+
+  // Human-readable warnings — phase 3 starts with a single
+  // "register-offset LDR skipped" warning when adrp_pair_skipped > 0.
+  // Phase 4 will extend with more codes as additional patterns
+  // accumulate (auth-rebase semantics, multi-start pages, ...).
+  std::vector<std::string> warnings;
+};
+
 struct StringXrefResult {
   StringMatch string;
   std::vector<XrefMatch> xrefs;
@@ -579,11 +608,15 @@ class DebuggerBackend {
   // Find every instruction in the main executable that references
   // `target_addr`, by scanning operand and comment strings of each
   // disassembled instruction for the address as a hex literal. Catches
-  // direct branches reliably; ADRP+ADD reconstruction (for arm64
-  // PC-relative loads) is not yet implemented and may miss some
-  // references. Throws backend::Error for invalid target_id.
+  // direct branches reliably; ARM64 ADRP+ADD/LDR reconstruction lives
+  // alongside (docs/35-field-report-followups.md §3) and may surface
+  // warnings via `provenance` for patterns the heuristic skipped.
+  // The `provenance` out-param is optional — pass nullptr if the
+  // caller doesn't care to inspect skipped-ADRP-pair diagnostics.
+  // Throws backend::Error for invalid target_id.
   virtual std::vector<XrefMatch>
-      xref_address(TargetId tid, std::uint64_t target_addr) = 0;
+      xref_address(TargetId tid, std::uint64_t target_addr,
+                   XrefProvenance* provenance = nullptr) = 0;
 
   // Find xrefs to every instance of an exact-text string in the main
   // executable. Combines two detection paths to handle both x86-64

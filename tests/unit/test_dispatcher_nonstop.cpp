@@ -82,7 +82,7 @@ class NoOpBackend : public DebuggerBackend {
   std::vector<ldb::backend::DisasmInsn>
       disassemble_range(TID, std::uint64_t, std::uint64_t) override { return {}; }
   std::vector<ldb::backend::XrefMatch>
-      xref_address(TID, std::uint64_t) override { return {}; }
+      xref_address(TID, std::uint64_t, ldb::backend::XrefProvenance*) override { return {}; }
   std::vector<ldb::backend::StringXrefResult>
       find_string_xrefs(TID, const std::string&) override { return {}; }
   ProcessStatus launch_process(TID, const ldb::backend::LaunchOptions&) override { return {}; }

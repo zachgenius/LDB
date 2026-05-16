@@ -86,7 +86,7 @@ class DisasmStub : public DebuggerBackend {
   ldb::backend::DebuggerBackend::ModuleStrings
       iterate_strings(TID, std::string_view) override { return {}; }
   std::vector<ldb::backend::XrefMatch>
-      xref_address(TID, std::uint64_t) override { return {}; }
+      xref_address(TID, std::uint64_t, ldb::backend::XrefProvenance*) override { return {}; }
   std::vector<ldb::backend::StringXrefResult>
       find_string_xrefs(TID, const std::string&) override { return {}; }
   ldb::backend::ProcessStatus
