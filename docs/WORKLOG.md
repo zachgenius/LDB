@@ -4,6 +4,130 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-16 — ARM64 chained-fixup xref phase 3 — post-review cleanup
+
+**Goal:** Close the punch list from the opus-model linus-style review
+of the five phase-3 commits. Reviewer's argument: every flagged item
+is in-scope for the phase-3 spec, not phase 4, because each is a
+silent false-positive in the same family the spec was meant to close
+(SUB shares destination-write semantics with ADD; PAC branches share
+AAPCS64 with BL/BLR; writeback LDR shares "base register written, old
+page gone" with ADD-clobber).
+
+**Done:**
+
+- **SUB clobber + smoke (commit `f57b16c`):** rename
+  `clobber_add_destination` → `clobber_arith_destination`; extend the
+  post-emit switch to fire on ADD / SUB / ADDS / SUBS. SUB has only
+  the clobber half (no match-emit — compilers don't compute targets
+  as `page - imm`). New `tests/fixtures/asm/xref_subclobber.s` +
+  smoke driver. Proven RED against `worktree-phase3-adrp` HEAD
+  pre-fix (1 false-positive LDR in pattern_subclobber); GREEN after.
+
+- **PAC-authenticated branch family + smoke (commit `62b6e47`):**
+  refactor the post-emit switch to use named flags `is_call` /
+  `is_indirect_branch` / `is_return` that fold in BLRAA / BLRAB /
+  BLRAAZ / BLRABZ (calls), BRAA / BRAB / BRAAZ / BRABZ (indirect
+  branches), RETAA / RETAB (returns). New
+  `tests/fixtures/asm/xref_pac_callclobber.s` — gated on the arm64e
+  toolchain via `CheckCSourceCompiles` probe + `OSX_ARCHITECTURES`
+  override to force a thin arm64e binary (the default fat-slice path
+  downcast to arm64 and silently emitted the wrong slice).
+
+- **Pre/post-indexed LDR/STR writeback + provenance (commit
+  `8e46141`):** `AdrpResolved` grows `has_writeback` /
+  `writeback_base` fields. The address-operand parser now recognises
+  `[base, #imm]!` (pre-indexed) and `[base], #imm` (post-indexed) in
+  addition to the existing `[base]` / `[base, #imm]`. Post-emit
+  clobber clears `adrp_regs[base]` after the legitimate xref fires.
+  New `XrefProvenance::adrp_pair_writeback_cleared` counter +
+  per-instance warning string; dispatcher attaches the provenance
+  when the counter is non-zero; describe.endpoints schema updated.
+
+- **STR / STUR / STRH / STRB / STP / LDUR consumers (commit
+  `306363a`):** extract `parse_adrp_addr_operand` helper; collapse
+  the resolver into is_load / is_store_one_reg / is_store_pair
+  buckets. STP gets a two-register prefix-skip. Closes a real
+  field-report trust gap ("what writes to this global?" returned
+  empty). New `tests/fixtures/asm/xref_str.s` exercises STR (single-
+  reg), STP (pair), STRB (byte) — three different operand shapes.
+
+- **Nits N5–N10 (commit `01494da`):** apply_mov_state's bool return
+  used to short-circuit resolve_adrp_consumer on MOV; AAPCS64
+  clobber replaced with allocation-free iterate-and-erase + small-
+  switch predicate (was 20 allocations per BL); MOV source
+  classifier replaces the brittle first-char heuristic with explicit
+  alias-name comparison; FAT64 unit test for the `0xCAFEBABF` magic
+  path; FAT slice picker comment + x29/x30 AAPCS64 comment fix.
+
+- **Docs (this commit):** `docs/35-field-report-followups.md §3`
+  gains a "Phase 3 — post-review cleanup" subsection summarising
+  the five fix commits, plus an explicit "Phase 4 — carried
+  forward" section enumerating items reviewer flagged as out of
+  phase-3 scope (two-adjacent-stripped-functions function-boundary
+  fallback; conditional branches; MOV from XZR/WZR; FAT slice
+  triple plumbing; auth-rebase key classes).
+
+**Decisions:**
+
+- **PAC fixture is gated** on a `CheckCSourceCompiles` probe rather
+  than blanket Apple-silicon-arm64. The arm64e toolchain exists on
+  every modern Apple silicon Mac with current Xcode but the gate
+  is principled: future hosts without the arm64e SDK pieces SKIP
+  cleanly instead of failing at build time.
+
+- **PAC fixture forces a thin arm64e binary** via
+  `OSX_ARCHITECTURES "arm64e"`. The default CMAKE_OSX_ARCHITECTURES
+  is `arm64` project-wide; `target_compile_options(... -arch arm64e)`
+  only ADDS to that, producing a fat binary whose arm64 slice LLDB
+  picks first. The override is the only way to make `xref.addr`
+  actually disassemble the PAC mnemonics.
+
+- **SUB gets clobber only, no match-emit.** Compilers don't emit
+  `adrp + sub` for target computation (they emit `add x, x, -imm`
+  with a signed immediate, or pre-compute via a different scheme).
+  Modelling a SUB match-emit would add false-positives without
+  closing any real recall gap.
+
+- **STP excluded from the LDR-skipped provenance sniff.** The two-
+  register prefix complicates the `[base]` detection enough that
+  a careless implementation would false-bump on legitimate STPs
+  the resolver actually did handle. Precision loss > recall loss
+  for the provenance counter.
+
+- **Writeback warning is per-instance**, not a single rollup. Each
+  cleared base register gets its own `provenance.warnings` entry
+  with the instruction address and register name; phase-2-style
+  rollups lose the address resolution that's load-bearing on real
+  binaries.
+
+**Surprises / blockers:**
+
+- The PAC fixture initially "passed" the TDD-red check because LLDB
+  was unable to read the section bytes from the fat arm64 slice —
+  the disassembler returned all-zero `udf #0x0`. Rewrote the
+  fixture to be thin arm64e via the OSX_ARCHITECTURES override.
+
+- The first PAC fixture draft put an `add x0, x0, #0` between the
+  ADRP and the BLRAAZ, which would have clobbered x0 via the ADD
+  rule before the BLRAAZ ever ran. Reshape to match
+  xref_callclobber.s's pattern (ADRP, then BLRAAZ, no ADD in
+  between — the LDR after BLRAAZ is the false-positive target).
+
+- The pre/post-indexed LDR fixture initially used `#0x100` as the
+  writeback immediate, which is outside the imm9 signed [-256, 255]
+  range. Switched to `#0x40`.
+
+**Next:**
+
+Phase 4 — see `docs/35-field-report-followups.md §3` "Phase 4 —
+carried forward" subsection for the full enumeration. Top of list:
+real iOS smoke against `dyld_info --fixups`; SBTarget-triple
+threading through `extract_chained_fixups_from_macho`; symbol-
+context-by-section-range fallback for stripped-function boundaries.
+
+---
+
 ## 2026-05-16 — ARM64 chained-fixup xref ADRP-pair phase 3 (§3)
 
 **Goal:** Close the silently-wrong patterns in phase 2's ADRP-pair
