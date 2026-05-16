@@ -223,6 +223,97 @@ path is exercised end-to-end.
 
 ---
 
+## 2026-05-16 — chained-fixup parser: post-review cleanup
+
+**Goal:** Apply the `linus-code-reviewer` punch list against
+1741662 before the branch can merge. End-to-end driver against a
+real arm64 binary already confirmed no bit-layout bugs (parser
+output matches `dyld_info -fixups`); these items are clarity /
+coverage hygiene only.
+
+**Done:**
+
+- `68cfe4f` refactor(backend): drop `SegmentInfo::file_offset`
+  (dead field — every caller set it, parser never read it).
+  Renamed the conceptual key in `ChainedFixupMap::resolved` from
+  "file_addr" to "rva" (image-base-relative VM offset). Type is
+  unchanged; only the docstring and the impl's local variable
+  name moved. Added `FIXME(phase 2):
+  docs/35-field-report-followups.md §3` comments at both phase-2
+  throw sites (`unsupported_format()` and the multi-start page
+  rejection) so they're greppable. Reordered the
+  `starts_in_segment` bounds check: require 22-byte header first,
+  validate `size >= 22`, then use `size` to range-check the body
+  — the previous ordering was safe but read as "trust size before
+  validating it".
+- `<TBD>` test(backend): added Vector D (ARM64E auth-rebase,
+  format 1) and Vector E (ARM64E_USERLAND, format 9) unit
+  vectors to `tests/unit/test_chained_fixups.cpp`. D closes the
+  coverage gap on `decode_arm64e()`'s `auth=1, bind=0` branch.
+  E closes the gap on the format-9 codepath (used on pre-macOS-12
+  / pre-iOS-15 arm64e builds — shares decode with format 12 but
+  has its own test now so a future regression on format 9 can't
+  hide behind format 12 coverage). Total: 5 test cases / 14
+  assertions in the `[chained_fixups]` filter; full `unit_tests`
+  ctest target stays green (~114s).
+
+**Decisions:**
+
+- Chose deletion over documentation for `SegmentInfo::file_offset`
+  (option (a) per the punch list). YAGNI per CLAUDE.md; phase 2
+  can re-add the field if the indexer wire-up actually needs an
+  on-disk-offset map. Keeping a documented-dead field invites a
+  future reader to wire it in incorrectly.
+- Map key type stays `unordered_map<u64, u64>` — only the
+  documented meaning ("rva") and the local variable changed. The
+  schema is observed by no external caller in phase 1 so renaming
+  the concept is free.
+- Vector D and E are minimal single-slot synthetic chains. The
+  reviewer specifically asked for "one slot is enough; one test
+  case", and the phase-1 parser ignores PAC key / diversity
+  metadata anyway — recording the resolved pointer value is the
+  testable observable.
+
+**Surprises / blockers:**
+
+- None. The refactor + new vectors landed without disturbing the
+  existing Vector A/B/C tests.
+
+**Phase-2 integration hazards to remember:**
+
+- **`SegmentInfo` file_offset vs image-base-relative offset.** The
+  parser keys its map by `(vm_addr - image_base)`, not by file
+  offset. When phase 2 wires this into the indexer, the caller
+  will be constructing `SegmentInfo` from `SBSection` and will
+  have both quantities at hand — a caller that mistakenly looks
+  up "file offsets" out of a symbol table or DWARF info will get
+  a mismatch with no diagnostic. The header docstring on
+  `ChainedFixupMap::resolved` now spells this out explicitly;
+  cross-reference it from the indexer code when wiring.
+- **`segment_offset == (vm_addr - image_base)` assumption.** For
+  standard userland Mach-O this holds (segment_offset in the
+  starts_in_segment struct equals the segment's offset from
+  image_base). FAT slices, framework stubs, and hand-crafted
+  binaries may violate it. Phase 2 should validate this
+  invariant per-segment or compute image_base from the
+  __TEXT/__PAGEZERO segment list directly rather than
+  back-deriving it from the first segment with chain data.
+- **Format 9 auth-rebase coverage.** With Vectors D + E in place
+  the *unit-test* coverage on `decode_arm64e()` is complete (both
+  auth=0 and auth=1 branches, both vmaddr-target and offset-target
+  variants). Real-world iOS binary validation (multiple binds per
+  page, `auth_got` entries, multi-page chains spanning
+  `__DATA_CONST` and `__DATA`) is still phase-2 work — that's
+  where the multi-start-page path will need to come off the FIXME
+  list.
+
+**Next:** Phase 2 picks up from the same place the original
+phase-1 worklog called out — indexer wire-up, cache, imports
+table. The hazards above are reminders to the future implementer,
+not new tasks.
+
+---
+
 ## 2026-05-13 — v1.6.1 patch: skill packaging
 
 **Goal:** Make the shipped `re-analyze` skill conform to the

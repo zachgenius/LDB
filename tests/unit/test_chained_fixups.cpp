@@ -194,6 +194,117 @@ constexpr std::array<std::uint8_t, 60> kVectorC_payload = {
     0x00, 0x00,
 };
 
+// ---------------------------------------------------------------------------
+// Vector D — ARM64E auth-rebase
+// ---------------------------------------------------------------------------
+// Format 1 (DYLD_CHAINED_PTR_ARM64E), single slot, auth-rebase variant.
+// Closes the coverage gap on decode_arm64e()'s `auth=1, bind=0` branch
+// in src/backend/chained_fixups.cpp.
+//
+// dyld_chained_ptr_arm64e_auth_rebase bit layout (LE):
+//   target    [31:0]    — always a runtime offset for auth variants
+//   diversity [47:32]   — 16-bit diversifier
+//   addrDiv   [48]      — address-diversified flag
+//   key       [50:49]   — PAC key (IA/IB/DA/DB)
+//   next      [61:51]   — 11-bit stride count
+//   bind      [62]      — 0 for auth-rebase
+//   auth      [63]      — 1 for auth variant
+//
+// Image base 0x1_0000_0000. One segment at vmaddr 0x1_0000_8000 (file
+// offset 0x8000, size 0x4000). One slot at file 0x8000.
+//
+//   target = 0x500
+//   diversity = 0x1234
+//   addrDiv = 0
+//   key = 2
+//   next = 0 (end of chain)
+//   bind = 0
+//   auth = 1
+//
+// raw = 0x8004_1234_0000_0500
+//     = (1ULL << 63) | (2ULL << 49) | (0x1234ULL << 32) | 0x500
+//
+// Expected resolved: image_base + target = 0x100000500.
+// (The parser drops auth metadata in phase 1 — only the resolved
+// pointer value is recorded; PAC key/diversity belong to phase 2.)
+constexpr std::array<std::uint8_t, 60> kVectorD_payload = {
+    0x00, 0x00, 0x00, 0x00,
+    0x1c, 0x00, 0x00, 0x00,
+    0x3c, 0x00, 0x00, 0x00,
+    0x3c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+
+    0x01, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00,
+
+    0x18, 0x00, 0x00, 0x00,
+    0x00, 0x40,
+    0x01, 0x00,              // pointer_format = DYLD_CHAINED_PTR_ARM64E
+    0x00, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00,
+    0x00, 0x00,
+};
+
+constexpr std::array<std::uint8_t, 8> kVectorD_segment_bytes = {
+    // file 0x8000: 0x8004_1234_0000_0500 (LE)
+    0x00, 0x05, 0x00, 0x00, 0x34, 0x12, 0x04, 0x80,
+};
+
+// ---------------------------------------------------------------------------
+// Vector E — ARM64E_USERLAND (format 9) rebase
+// ---------------------------------------------------------------------------
+// Format 9 (DYLD_CHAINED_PTR_ARM64E_USERLAND) shares decode_arm64e()
+// with format 12 (USERLAND24) but is the path used on macOS/iOS arm64
+// builds without USERLAND24 (everything pre macOS 12 / iOS 15). Same
+// bit layout as format 1, but rebase targets are runtime offsets
+// (image-base-relative) rather than vmaddrs.
+//
+// dyld_chained_ptr_arm64e_rebase bit layout (LE):
+//   target [42:0], high8 [50:43], next [61:51], bind [62], auth [63]
+//
+// Image base 0x1_0000_0000. One segment at vmaddr 0x1_0000_8000 (file
+// offset 0x8000, size 0x4000). One slot at file 0x8000.
+//
+//   target = 0x600 (runtime offset — added to image_base)
+//   high8 = 0
+//   next = 0 (end of chain)
+//   bind = 0
+//   auth = 0
+//
+// raw = 0x0000_0000_0000_0600
+//
+// Expected resolved: image_base + target = 0x100000600.
+constexpr std::array<std::uint8_t, 60> kVectorE_payload = {
+    0x00, 0x00, 0x00, 0x00,
+    0x1c, 0x00, 0x00, 0x00,
+    0x3c, 0x00, 0x00, 0x00,
+    0x3c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+
+    0x01, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00,
+
+    0x18, 0x00, 0x00, 0x00,
+    0x00, 0x40,
+    0x09, 0x00,              // pointer_format = DYLD_CHAINED_PTR_ARM64E_USERLAND
+    0x00, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00,
+    0x00, 0x00,
+};
+
+constexpr std::array<std::uint8_t, 8> kVectorE_segment_bytes = {
+    // file 0x8000: 0x0000_0000_0000_0600 (LE)
+    0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
 }  // namespace
 
 TEST_CASE("parse_chained_fixups: ARM64E single-page two-rebase chain",
@@ -228,6 +339,36 @@ TEST_CASE("parse_chained_fixups: 64_OFFSET multi-page chain",
   CHECK(m.resolved.at(0x4008) == 0x100000600ULL);
   CHECK(m.resolved.at(0x5000) == 0x100000700ULL);
   CHECK(m.resolved.at(0x5008) == 0x100000800ULL);
+}
+
+TEST_CASE("parse_chained_fixups: ARM64E auth-rebase single slot",
+          "[chained_fixups]") {
+  std::vector<SegmentInfo> segs(1);
+  segs[0].vm_addr     = 0x100008000;
+  segs[0].vm_size     = 0x4000;
+  segs[0].data        = kVectorD_segment_bytes.data();
+  segs[0].data_size   = kVectorD_segment_bytes.size();
+
+  ChainedFixupMap m = parse_chained_fixups(
+      kVectorD_payload.data(), kVectorD_payload.size(), segs);
+
+  REQUIRE(m.resolved.size() == 1);
+  CHECK(m.resolved.at(0x8000) == 0x100000500ULL);
+}
+
+TEST_CASE("parse_chained_fixups: ARM64E_USERLAND (format 9) rebase",
+          "[chained_fixups]") {
+  std::vector<SegmentInfo> segs(1);
+  segs[0].vm_addr     = 0x100008000;
+  segs[0].vm_size     = 0x4000;
+  segs[0].data        = kVectorE_segment_bytes.data();
+  segs[0].data_size   = kVectorE_segment_bytes.size();
+
+  ChainedFixupMap m = parse_chained_fixups(
+      kVectorE_payload.data(), kVectorE_payload.size(), segs);
+
+  REQUIRE(m.resolved.size() == 1);
+  CHECK(m.resolved.at(0x8000) == 0x100000600ULL);
 }
 
 TEST_CASE("parse_chained_fixups: unsupported format reports phase 2",
