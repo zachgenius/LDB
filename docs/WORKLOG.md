@@ -4,6 +4,70 @@ Daily/per-session journal. Newest entries on top. See `CLAUDE.md` for the format
 
 ---
 
+## 2026-05-17 — Post-v1.6.2 CI follow-ups
+
+**Goal:** Triage and fix the master CI failures that landed after
+the v1.6.2 release commit (`fa95ac1`). Two unrelated regressions
+surfaced; the second was masked by the first.
+
+**Done:**
+
+- `e9560b3` — **Build fix.** `src/backend/xref_arm64_parsers.h`
+  declared `std::optional<std::uint64_t>` without including
+  `<optional>`. Local builds pulled it in transitively via other
+  STL headers, but CI's Homebrew LLVM 22 / apt LLDB 18 toolchains
+  don't, so all four jobs failed at compile. One-line `#include`
+  in the header; no behaviour change.
+- **Socket perms fix (this commit).** With the build green on CI,
+  `smoke_socket_perms` started failing on both Linux jobs (passed
+  on macOS): `socket mode should be 0600, got 0o700`. Root cause
+  was an incorrect assumption in `bind_listener`: socket fds on
+  Linux are backed by sockfs (anonymous inode), so the defensive
+  `fchmod(fd, 0600)` returns success but modifies the sockfs
+  inode rather than the on-disk inode that `bind()` created. With
+  umask 0077, Linux `unix_bind_bsd` produces `0777 & ~umask =
+  0700` on disk and nothing tightens it. Fixed by setting
+  `umask(0177)` instead, so `bind()` lands the disk inode at 0600
+  atomically. The fchmod/chmod fallback now becomes pure
+  defence-in-depth (kept for filesystems that ignore umask).
+  Comments at both call sites updated to describe the actual
+  sockfs-vs-on-disk semantics rather than the prior misleading
+  TOCTOU story.
+
+**Decisions:**
+
+- Preferred the umask-only fix over making the path-based chmod
+  unconditional. The umask path keeps the property the original
+  code wanted (no instant where the on-disk inode is more
+  permissive than 0600) — the chmod path-based fallback would
+  briefly expose 0700 between bind() and chmod().
+- Did not touch `ensure_parent_dir`'s `umask(0077)`. That one is
+  correct: `mkdir(parent, 0700) & ~0077 = 0700`, which is the
+  documented behaviour the smoke test pins.
+
+**Surprises / blockers:**
+
+- Confirmed empirically that Linux's `fchmod()` on AF_UNIX socket
+  fds returns 0 but is a no-op on the bind-created inode — the
+  fd's `f_inode` points into sockfs, not the filesystem. This is
+  the kind of platform divergence that only Linux CI catches; the
+  comment in `bind_listener` had it backwards (it claimed fchmod
+  was the primary defence and umask was the fallback).
+- The §2 phase-2 socket daemon work shipped without ever running
+  the perms test on Linux. The portability commit `81d2b97` got
+  the build green but not the test — a useful reminder that
+  "compiles on Linux" is not "behaves on Linux."
+
+**Next:**
+
+- Watch CI on this commit to confirm green across all four jobs.
+- Consider adding an `lstat`-after-bind sanity check that hard-
+  fails startup if the on-disk inode mode is anything other than
+  0600, so any future regression here is caught at boot rather
+  than only by the smoke test.
+
+---
+
 ## 2026-05-16 — §2 phase-2 post-review cleanup
 
 **Goal:** Close out the opus-linus-style review findings on

@@ -364,11 +364,18 @@ bool ensure_parent_dir(const std::string& sock_path) {
 }
 
 // Bind a SOCK_STREAM unix socket with the inode landing at mode 0600.
-// POSIX bind() honours umask, so we set umask 0077 transiently to make
-// the inode 0600 atomically — there's no window where someone could
-// open() the socket between bind() and an explicit fchmod(). The
-// atomicity claim only holds because daemon startup is single-
-// threaded; a sibling thread changing umask mid-call would void it.
+// POSIX bind() honours umask. The kernel-supplied mode for AF_UNIX
+// bind is 0777 (both Linux unix_bind_bsd and BSD/Darwin uipc_bind),
+// so an umask of 0177 yields 0600 atomically — no window where the
+// inode is more permissive than 0600 between bind() and any later
+// chmod. Earlier comments here claimed umask 0077 was sufficient,
+// relying on a defensive fchmod(fd, 0600) to tighten the mode. That
+// doesn't work on Linux: socket fds are backed by sockfs (anonymous
+// inode), so fchmod returns success but modifies the sockfs inode,
+// not the on-disk inode bind() created — leaving the on-disk socket
+// at 0700. The atomicity claim only holds because daemon startup is
+// single-threaded; a sibling thread changing umask mid-call would
+// void it.
 int bind_listener(const std::string& sock_path) {
   // Refuse paths the kernel can't fit. sun_path is typically 104/108
   // bytes; truncating silently produces a socket at the wrong path,
@@ -410,7 +417,7 @@ int bind_listener(const std::string& sock_path) {
   // refactor.
   std::memcpy(addr.sun_path, sock_path.c_str(), sock_path.size() + 1);
 
-  mode_t old = ::umask(0077);
+  mode_t old = ::umask(0177);
   int rc = ::bind(fd, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr));
   int bind_errno = errno;
   ::umask(old);
@@ -422,12 +429,15 @@ int bind_listener(const std::string& sock_path) {
   }
 
   // Defensive chmod — some filesystems (e.g. tmpfs over NFS) ignore
-  // umask. fchmod on the listener fd closes a tiny TOCTOU window
-  // where an FS filter could replace the inode between bind() and a
-  // path-based chmod, so we try it first. macOS rejects fchmod() on
-  // AF_UNIX socket fds with EINVAL; on that platform we fall back to
-  // path-based chmod, which is still defended by the umask(0077)
-  // trick above making the bind() inode land at 0600 atomically.
+  // umask. On Linux the listener fd refers to an anonymous sockfs
+  // inode rather than the on-disk inode bind() created, so fchmod
+  // here is a no-op for our purposes (it returns 0 but doesn't
+  // change the on-disk mode); we still try it because on BSDs the
+  // socket fd's inode is on-disk and fchmod is a smaller TOCTOU
+  // window than the path-based chmod. macOS rejects fchmod() on
+  // AF_UNIX socket fds with EINVAL; on that platform we fall back
+  // to path-based chmod. With umask(0177) above making the bind()
+  // inode land at 0600 atomically, this is pure defence in depth.
   if (::fchmod(fd, 0600) != 0) {
     int fchmod_errno = errno;
     if (fchmod_errno == EINVAL || fchmod_errno == ENOTSUP) {
